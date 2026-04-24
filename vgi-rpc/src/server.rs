@@ -87,13 +87,20 @@ pub type StreamHandler =
 #[derive(Default)]
 pub struct RpcServerBuilder {
     server_id: Option<String>,
+    server_version: Option<String>,
     protocol_name: Option<String>,
     enable_describe: bool,
+    dispatch_hook: Option<Arc<dyn crate::hooks::DispatchHook>>,
 }
 
 impl RpcServerBuilder {
     pub fn server_id(mut self, id: impl Into<String>) -> Self {
         self.server_id = Some(id.into());
+        self
+    }
+
+    pub fn server_version(mut self, v: impl Into<String>) -> Self {
+        self.server_version = Some(v.into());
         self
     }
 
@@ -107,14 +114,21 @@ impl RpcServerBuilder {
         self
     }
 
+    pub fn with_hook(mut self, hook: Arc<dyn crate::hooks::DispatchHook>) -> Self {
+        self.dispatch_hook = Some(hook);
+        self
+    }
+
     pub fn build(self) -> RpcServer {
         RpcServer {
             methods: HashMap::new(),
             server_id: self
                 .server_id
                 .unwrap_or_else(|| crate::util::short_random_id()),
+            server_version: self.server_version.unwrap_or_default(),
             protocol_name: self.protocol_name.unwrap_or_default(),
             describe_enabled: self.enable_describe,
+            dispatch_hook: self.dispatch_hook,
         }
     }
 }
@@ -241,8 +255,10 @@ impl MethodInfo {
 pub struct RpcServer {
     methods: HashMap<String, MethodInfo>,
     pub server_id: String,
+    pub(crate) server_version: String,
     pub(crate) protocol_name: String,
     pub(crate) describe_enabled: bool,
+    pub(crate) dispatch_hook: Option<Arc<dyn crate::hooks::DispatchHook>>,
 }
 
 impl RpcServer {
@@ -357,6 +373,14 @@ impl RpcServer {
             log_sink: Arc::new(Mutex::new(Vec::new())),
         };
 
+        let stats = Arc::new(Mutex::new(crate::hooks::CallStatistics::default()));
+        // Record the unary request batch as input stats (one row).
+        {
+            let mut s = stats.lock().unwrap();
+            s.input_batches = 1;
+            s.input_rows = req.batch.num_rows() as u64;
+        }
+
         // Built-in __describe__ introspection.
         if self.describe_enabled && req.method == crate::introspect::DESCRIBE_METHOD_NAME {
             match crate::introspect::build_describe(
@@ -397,11 +421,36 @@ impl RpcServer {
             return Ok(true);
         };
 
+        let dispatch_info = crate::hooks::DispatchInfo {
+            method: req.method.clone(),
+            method_type: match info.method_type {
+                MethodType::Unary => "unary",
+                _ => "stream",
+            },
+            server_id: self.server_id.clone(),
+            request_id: req.request_id.clone(),
+            transport_metadata: Arc::new(req.metadata.clone()),
+            principal: String::new(),
+            auth_domain: String::new(),
+            authenticated: false,
+        };
+        let hook_token = self
+            .dispatch_hook
+            .as_ref()
+            .map(|h| h.on_dispatch_start(&dispatch_info));
+
+        let mut app_err: Option<RpcError> = None;
         match info.method_type {
-            MethodType::Unary => self.serve_unary(w, &req, info, &ctx)?,
+            MethodType::Unary => self.serve_unary(w, &req, info, &ctx, &stats, &mut app_err)?,
             MethodType::Producer | MethodType::Exchange | MethodType::Dynamic => {
-                self.serve_stream(r, w, &req, info, &ctx)?
+                self.serve_stream(r, w, &req, info, &ctx, &stats, &mut app_err)?
             }
+        }
+
+        if let Some(hook) = self.dispatch_hook.as_ref() {
+            let token = hook_token.unwrap_or(0);
+            let final_stats = stats.lock().unwrap().clone();
+            hook.on_dispatch_end(token, &dispatch_info, app_err.as_ref(), &final_stats);
         }
         Ok(true)
     }
@@ -461,6 +510,8 @@ impl RpcServer {
         req: &Request,
         info: &MethodInfo,
         ctx: &CallContext,
+        stats: &Arc<Mutex<crate::hooks::CallStatistics>>,
+        app_err: &mut Option<RpcError>,
     ) -> Result<()> {
         let result = (info.unary.as_ref().unwrap())(req, ctx);
         let logs = ctx.drain_logs();
@@ -475,6 +526,11 @@ impl RpcServer {
                     Some(b) => b,
                     None => empty_batch(&info.result_schema)?,
                 };
+                {
+                    let mut s = stats.lock().unwrap();
+                    s.output_batches = 1;
+                    s.output_rows = out_batch.num_rows() as u64;
+                }
                 sw.write(&out_batch, None)?;
                 sw.finish()?;
             }
@@ -487,6 +543,7 @@ impl RpcServer {
                 let md = build_error_metadata(&err, &self.server_id, &req.request_id);
                 sw.write(&empty_batch(&info.result_schema)?, Some(&md))?;
                 sw.finish()?;
+                *app_err = Some(err);
             }
         }
         Ok(())
@@ -499,6 +556,8 @@ impl RpcServer {
         req: &Request,
         info: &MethodInfo,
         ctx: &CallContext,
+        stats: &Arc<Mutex<crate::hooks::CallStatistics>>,
+        app_err: &mut Option<RpcError>,
     ) -> Result<()> {
         let init_result = (info.stream.as_ref().unwrap())(req, ctx);
         let init_logs = ctx.drain_logs();
@@ -518,6 +577,7 @@ impl RpcServer {
                 // Drain any client input (ticks / exchange batches) so the transport
                 // is clean for the next request.
                 let _ = drain_input(r);
+                *app_err = Some(err);
                 return Ok(());
             }
         };
@@ -572,6 +632,11 @@ impl RpcServer {
             let Some(ReadBatch { batch: input_batch, metadata: input_md }) = read else {
                 break;
             };
+            {
+                let mut s = stats.lock().unwrap();
+                s.input_batches += 1;
+                s.input_rows += input_batch.num_rows() as u64;
+            }
 
             // Cancellation signal.
             if md_get(&input_md, CANCEL_KEY).is_some() {
@@ -617,6 +682,7 @@ impl RpcServer {
             if let Err(err) = iter_result {
                 let md = build_error_metadata(&err, &self.server_id, &req.request_id);
                 out_writer.write(&empty_batch(output_schema.as_ref())?, Some(&md))?;
+                *app_err = Some(err);
                 break;
             }
 
@@ -630,6 +696,11 @@ impl RpcServer {
                         out_writer.write(&empty_batch(output_schema.as_ref())?, Some(&md))?;
                     }
                     Emitted::Batch { batch, metadata } => {
+                        {
+                            let mut s = stats.lock().unwrap();
+                            s.output_batches += 1;
+                            s.output_rows += batch.num_rows() as u64;
+                        }
                         out_writer.write(&batch, metadata.as_ref())?;
                     }
                 }

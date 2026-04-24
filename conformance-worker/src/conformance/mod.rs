@@ -16,11 +16,27 @@ use vgi_rpc::RpcServer;
 
 /// Build an `RpcServer` with all conformance methods registered.
 pub fn build_server() -> RpcServer {
-    let mut srv = RpcServer::builder()
+    let mut builder = RpcServer::builder()
         .server_id("rust-conf-0001")
         .protocol_name("ConformanceService")
-        .enable_describe(true)
-        .build();
+        .server_version("rust-conformance-0.2.0")
+        .enable_describe(true);
+
+    // When VGI_ACCESS_LOG is set, emit JSON-per-call access records to that
+    // file. Used for manual validation against vgi_rpc.access_log_conformance.
+    if let Ok(path) = std::env::var("VGI_ACCESS_LOG") {
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => {
+                let hook = vgi_rpc::AccessLogHook::new(f, "rust-conformance-0.2.0");
+                builder = builder.with_hook(hook);
+            }
+            Err(e) => {
+                eprintln!("[vgi-rpc] could not open VGI_ACCESS_LOG={path:?}: {e}");
+            }
+        }
+    }
+
+    let mut srv = builder.build();
     unary::register(&mut srv);
     streams::register(&mut srv);
     srv

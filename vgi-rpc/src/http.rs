@@ -428,8 +428,28 @@ async fn handle_unary(
     };
 
     let ctx = build_call_ctx(&server, &req);
+    let dispatch_info = crate::hooks::DispatchInfo {
+        method: req.method.clone(),
+        method_type: "unary",
+        server_id: server.server_id.clone(),
+        request_id: req.request_id.clone(),
+        transport_metadata: Arc::new(req.metadata.clone()),
+        principal: String::new(),
+        auth_domain: String::new(),
+        authenticated: false,
+    };
+    let hook = server.dispatch_hook.clone();
+    let hook_token = hook.as_ref().map(|h| h.on_dispatch_start(&dispatch_info));
+
+    let mut stats = crate::hooks::CallStatistics {
+        input_batches: 1,
+        input_rows: req.batch.num_rows() as u64,
+        ..Default::default()
+    };
+
     let result = (info.unary.as_ref().unwrap())(&req, &ctx);
     let logs = ctx.drain_logs();
+    let mut app_err: Option<RpcError> = None;
 
     let mut buf = Vec::new();
     {
@@ -442,14 +462,26 @@ async fn handle_unary(
             Ok(batch_opt) => {
                 let out_batch = batch_opt
                     .unwrap_or_else(|| empty_batch(&info.result_schema).unwrap());
+                stats.output_batches = 1;
+                stats.output_rows = out_batch.num_rows() as u64;
                 let _ = sw.write(&out_batch, None);
             }
             Err(err) => {
                 let md = build_error_metadata(&err, &server.server_id, &req.request_id);
                 let _ = sw.write(&empty_batch(&info.result_schema).unwrap(), Some(&md));
+                app_err = Some(err);
             }
         }
         let _ = sw.finish();
+    }
+
+    if let Some(hook) = hook {
+        hook.on_dispatch_end(
+            hook_token.unwrap_or(0),
+            &dispatch_info,
+            app_err.as_ref(),
+            &stats,
+        );
     }
     arrow_response(StatusCode::OK, buf)
 }

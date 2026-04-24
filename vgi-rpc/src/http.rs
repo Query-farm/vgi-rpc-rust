@@ -44,25 +44,139 @@ struct Session {
     input_schema: Option<SchemaRef>,
     state: StreamStateKind,
     method: String,
+    last_access: std::time::Instant,
 }
 
+/// HTTP server state shared across all handlers.
+///
+/// Build via [`HttpState::builder`] (preferred) or [`HttpState::new`] for a
+/// default configuration.
 pub struct HttpState {
     server: Arc<RpcServer>,
     sessions: Mutex<HashMap<String, Session>>,
     signing_key: [u8; 32],
     producer_batch_limit: usize,
+    token_ttl: std::time::Duration,
+    max_sessions: usize,
+    max_body_size: usize,
+}
+
+/// Fluent builder for [`HttpState`].
+#[derive(Default)]
+pub struct HttpStateBuilder {
+    server: Option<Arc<RpcServer>>,
+    signing_key: Option<[u8; 32]>,
+    producer_batch_limit: Option<usize>,
+    token_ttl: Option<std::time::Duration>,
+    max_sessions: Option<usize>,
+    max_body_size: Option<usize>,
+}
+
+impl HttpStateBuilder {
+    pub fn server(mut self, server: Arc<RpcServer>) -> Self {
+        self.server = Some(server);
+        self
+    }
+
+    /// HMAC signing key used for state tokens. Must be ≥16 bytes; when the
+    /// slice is longer, only the first 32 bytes are used. When not set, a
+    /// random 32-byte key is generated at `build()` time.
+    pub fn signing_key(mut self, key: &[u8]) -> Self {
+        let mut k = [0u8; 32];
+        let n = key.len().min(32);
+        k[..n].copy_from_slice(&key[..n]);
+        self.signing_key = Some(k);
+        self
+    }
+
+    /// Maximum data batches per producer HTTP response (0 = unbounded).
+    /// Default `1` to mirror the Python/Go servers.
+    pub fn producer_batch_limit(mut self, n: usize) -> Self {
+        self.producer_batch_limit = Some(n);
+        self
+    }
+
+    /// How long an HTTP stream session is kept alive between requests.
+    /// Default `5 minutes`.
+    pub fn token_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.token_ttl = Some(ttl);
+        self
+    }
+
+    /// Maximum number of concurrent HTTP stream sessions. New sessions are
+    /// rejected with `RuntimeError` when the cap is hit. Default `10_000`.
+    pub fn max_sessions(mut self, n: usize) -> Self {
+        self.max_sessions = Some(n);
+        self
+    }
+
+    /// Maximum request body size (post-decompression) in bytes. Default
+    /// `64 * 1024 * 1024` (64 MiB).
+    pub fn max_body_size(mut self, n: usize) -> Self {
+        self.max_body_size = Some(n);
+        self
+    }
+
+    pub fn build(self) -> Arc<HttpState> {
+        let server = self.server.expect("HttpStateBuilder::server is required");
+        let signing_key = self.signing_key.unwrap_or_else(|| {
+            let mut k = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut k);
+            k
+        });
+        let state = Arc::new(HttpState {
+            server,
+            sessions: Mutex::new(HashMap::new()),
+            signing_key,
+            producer_batch_limit: self.producer_batch_limit.unwrap_or(1),
+            token_ttl: self
+                .token_ttl
+                .unwrap_or_else(|| std::time::Duration::from_secs(300)),
+            max_sessions: self.max_sessions.unwrap_or(10_000),
+            max_body_size: self.max_body_size.unwrap_or(64 * 1024 * 1024),
+        });
+        HttpState::spawn_reaper(Arc::downgrade(&state));
+        state
+    }
 }
 
 impl HttpState {
+    /// Create an `HttpState` with default configuration. See [`HttpState::builder`]
+    /// for the full set of knobs.
     pub fn new(server: Arc<RpcServer>) -> Arc<Self> {
-        let mut key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
-        Arc::new(Self {
-            server,
-            sessions: Mutex::new(HashMap::new()),
-            signing_key: key,
-            producer_batch_limit: 1,
-        })
+        Self::builder().server(server).build()
+    }
+
+    pub fn builder() -> HttpStateBuilder {
+        HttpStateBuilder::default()
+    }
+
+    pub fn token_ttl(&self) -> std::time::Duration {
+        self.token_ttl
+    }
+
+    pub fn max_body_size(&self) -> usize {
+        self.max_body_size
+    }
+
+    fn spawn_reaper(state: std::sync::Weak<HttpState>) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(s) = state.upgrade() else {
+                    return;
+                };
+                let ttl = s.token_ttl;
+                let now = std::time::Instant::now();
+                let mut guard = s.sessions.lock().unwrap();
+                guard.retain(|_, sess| now.duration_since(sess.last_access) < ttl);
+            }
+        });
     }
 
     fn sign_token(&self, session_id: &str) -> String {
@@ -129,17 +243,32 @@ fn has_arrow_ct(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-fn maybe_decompress(headers: &HeaderMap, body: &Bytes) -> Result<Vec<u8>> {
+fn maybe_decompress(headers: &HeaderMap, body: &Bytes, max_size: usize) -> Result<Vec<u8>> {
     let enc = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if enc.eq_ignore_ascii_case("zstd") {
-        zstd::decode_all(body.as_ref())
-            .map_err(|e| RpcError::runtime_error(format!("zstd decode: {e}")))
-    } else {
-        Ok(body.to_vec())
+    if body.len() > max_size {
+        return Err(RpcError::runtime_error(format!(
+            "Request body exceeds max size ({} bytes > {})",
+            body.len(),
+            max_size
+        )));
     }
+    let decoded = if enc.eq_ignore_ascii_case("zstd") {
+        zstd::decode_all(body.as_ref())
+            .map_err(|e| RpcError::runtime_error(format!("zstd decode: {e}")))?
+    } else {
+        body.to_vec()
+    };
+    if decoded.len() > max_size {
+        return Err(RpcError::runtime_error(format!(
+            "Decompressed body exceeds max size ({} bytes > {})",
+            decoded.len(),
+            max_size
+        )));
+    }
+    Ok(decoded)
 }
 
 fn parse_request_from_body(body: &[u8]) -> Result<Request> {
@@ -251,7 +380,7 @@ async fn handle_unary(
     }
     let server = state.server.clone();
 
-    let body = match maybe_decompress(&headers, &body) {
+    let body = match maybe_decompress(&headers, &body, state.max_body_size) {
         Ok(b) => b,
         Err(e) => {
             return arrow_response(
@@ -339,7 +468,7 @@ async fn handle_stream_init(
         return plain_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "need arrow content type".into());
     }
     let server = state.server.clone();
-    let body = match maybe_decompress(&headers, &body) {
+    let body = match maybe_decompress(&headers, &body, state.max_body_size) {
         Ok(b) => b,
         Err(e) => {
             return arrow_response(
@@ -442,8 +571,20 @@ async fn handle_stream_init(
             input_schema,
             state: ss,
             method: method.clone(),
+            last_access: std::time::Instant::now(),
         };
-        state.sessions.lock().unwrap().insert(session_id, session);
+        let mut guard = state.sessions.lock().unwrap();
+        if guard.len() >= state.max_sessions {
+            let err = RpcError::runtime_error(format!(
+                "HTTP stream session cap reached ({}); try again shortly.",
+                state.max_sessions
+            ));
+            return arrow_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                error_stream_bytes(&Schema::empty(), &err, &state.server.server_id, ""),
+            );
+        }
+        guard.insert(session_id, session);
     }
 
     arrow_response(StatusCode::OK, body_buf)
@@ -518,7 +659,7 @@ async fn handle_stream_exchange(
     }
 
     let server = state.server.clone();
-    let body = match maybe_decompress(&headers, &body) {
+    let body = match maybe_decompress(&headers, &body, state.max_body_size) {
         Ok(b) => b,
         Err(e) => {
             return arrow_response(
@@ -557,13 +698,34 @@ async fn handle_stream_exchange(
         }
     };
 
-    let Some(mut session) = state.sessions.lock().unwrap().remove(&session_id) else {
-        let err = RpcError::runtime_error("State token expired or unknown");
+    let (removed, existed_but_expired) = {
+        let mut guard = state.sessions.lock().unwrap();
+        match guard.remove(&session_id) {
+            Some(s) => {
+                let expired = std::time::Instant::now().duration_since(s.last_access)
+                    >= state.token_ttl;
+                (Some(s), expired)
+            }
+            None => (None, false),
+        }
+    };
+    let Some(mut session) = removed else {
+        let err = RpcError::runtime_error("State token unknown");
         return arrow_response(
             StatusCode::BAD_REQUEST,
             error_stream_bytes(&Schema::empty(), &err, &server.server_id, ""),
         );
     };
+    if existed_but_expired {
+        let err = RpcError::runtime_error(format!(
+            "State token expired (ttl: {:?})",
+            state.token_ttl
+        ));
+        return arrow_response(
+            StatusCode::BAD_REQUEST,
+            error_stream_bytes(&Schema::empty(), &err, &server.server_id, ""),
+        );
+    }
 
     let req = Request {
         method: session.method.clone(),
@@ -611,6 +773,7 @@ async fn handle_stream_exchange(
             let _ = sw.finish();
         }
         if !finished {
+            session.last_access = std::time::Instant::now();
             state.sessions.lock().unwrap().insert(session_id, session);
         }
         let _ = finished;
@@ -681,6 +844,7 @@ async fn handle_stream_exchange(
     }
 
     if keep_session {
+        session.last_access = std::time::Instant::now();
         state.sessions.lock().unwrap().insert(session_id, session);
     }
     arrow_response(StatusCode::OK, body_buf)
@@ -693,4 +857,62 @@ fn read_input_batch(body: &[u8]) -> Result<(RecordBatch, Metadata)> {
         .ok_or_else(|| RpcError::runtime_error("no batch in exchange request"))?;
     r.drain()?;
     Ok((batch, metadata))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn state_with_key() -> Arc<HttpState> {
+        use crate::server::RpcServer;
+        let server = Arc::new(RpcServer::builder().server_id("test").build());
+        HttpState::builder()
+            .server(server)
+            .signing_key(&[7u8; 32])
+            .token_ttl(Duration::from_millis(50))
+            .max_sessions(4)
+            .max_body_size(1024)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn sign_verify_roundtrip() {
+        let s = state_with_key();
+        let token = s.sign_token("sess-abc");
+        assert_eq!(s.verify_token(&token).unwrap(), "sess-abc");
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_tampered() {
+        let s = state_with_key();
+        let mut token = s.sign_token("sess-abc");
+        // Flip a byte in the signature half.
+        let idx = token.len() - 2;
+        let byte = token.as_bytes()[idx];
+        let replacement = if byte == b'A' { 'B' } else { 'A' };
+        token.replace_range(idx..idx + 1, &replacement.to_string());
+        assert!(s.verify_token(&token).is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_different_key() {
+        use crate::server::RpcServer;
+        let server = Arc::new(RpcServer::builder().server_id("test").build());
+        let a = HttpState::builder()
+            .server(server.clone())
+            .signing_key(&[1u8; 32])
+            .build();
+        let b = HttpState::builder().server(server).signing_key(&[2u8; 32]).build();
+        let tok = a.sign_token("sess-abc");
+        assert!(b.verify_token(&tok).is_err());
+    }
+
+    #[tokio::test]
+    async fn decompress_rejects_oversize() {
+        let hdr = HeaderMap::new();
+        let body = Bytes::from(vec![0u8; 1025]);
+        let err = super::maybe_decompress(&hdr, &body, 1024).unwrap_err();
+        assert!(err.message.contains("exceeds max size"));
+    }
 }

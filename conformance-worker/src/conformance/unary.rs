@@ -11,18 +11,28 @@ use super::types;
 pub fn register(s: &mut RpcServer) {
     // --- Scalar echo ---
     s.register(
-        MethodInfo::unary("echo_string", ps::echo_string(), r::schema_string(), |req, _| {
-            let v = p::str_col(req, "value")?.to_string();
-            Ok(Some(r::unary_string(r::schema_string(), &v)?))
-        })
+        MethodInfo::unary(
+            "echo_string",
+            ps::echo_string(),
+            r::schema_string(),
+            |req, _| {
+                let v = p::str_col(req, "value")?.to_string();
+                Ok(Some(r::unary_string(r::schema_string(), &v)?))
+            },
+        )
         .doc("Echo a string value.")
         .param_type("value", "str"),
     );
     s.register(
-        MethodInfo::unary("echo_bytes", ps::echo_bytes(), r::schema_bytes(), |req, _| {
-            let v = p::bytes_col(req, "data")?.to_vec();
-            Ok(Some(r::unary_bytes(r::schema_bytes(), &v)?))
-        })
+        MethodInfo::unary(
+            "echo_bytes",
+            ps::echo_bytes(),
+            r::schema_bytes(),
+            |req, _| {
+                let v = p::bytes_col(req, "data")?.to_vec();
+                Ok(Some(r::unary_bytes(r::schema_bytes(), &v)?))
+            },
+        )
         .doc("Echo a bytes value.")
         .param_type("data", "bytes"),
     );
@@ -35,10 +45,15 @@ pub fn register(s: &mut RpcServer) {
         .param_type("value", "int"),
     );
     s.register(
-        MethodInfo::unary("echo_float", ps::echo_float(), r::schema_float64(), |req, _| {
-            let v = p::f64_col(req, "value")?;
-            Ok(Some(r::unary_float64(r::schema_float64(), v)?))
-        })
+        MethodInfo::unary(
+            "echo_float",
+            ps::echo_float(),
+            r::schema_float64(),
+            |req, _| {
+                let v = p::f64_col(req, "value")?;
+                Ok(Some(r::unary_float64(r::schema_float64(), v)?))
+            },
+        )
         .doc("Echo a float value.")
         .param_type("value", "float"),
     );
@@ -53,9 +68,12 @@ pub fn register(s: &mut RpcServer) {
 
     // --- Void ---
     s.register(
-        MethodInfo::unary("void_noop", ps::void_noop(), r::schema_empty(), |_req, _| {
-            Ok(None)
-        })
+        MethodInfo::unary(
+            "void_noop",
+            ps::void_noop(),
+            r::schema_empty(),
+            |_req, _| Ok(None),
+        )
         .doc("No-op returning void."),
     );
     s.register(
@@ -71,18 +89,28 @@ pub fn register(s: &mut RpcServer) {
 
     // --- Complex type echo ---
     s.register(
-        MethodInfo::unary("echo_enum", ps::echo_enum(), r::schema_dict_enum(), |req, _| {
-            let v = p::enum_str(req, "status")?;
-            Ok(Some(r::unary_enum(r::schema_dict_enum(), &v)?))
-        })
+        MethodInfo::unary(
+            "echo_enum",
+            ps::echo_enum(),
+            r::schema_dict_enum(),
+            |req, _| {
+                let v = p::enum_str(req, "status")?;
+                Ok(Some(r::unary_enum(r::schema_dict_enum(), &v)?))
+            },
+        )
         .doc("Echo an enum value.")
         .param_type("status", "Status"),
     );
     s.register(
-        MethodInfo::unary("echo_list", ps::echo_list(), r::schema_list_str(), |req, _| {
-            let v = p::list_str(req, "values")?;
-            Ok(Some(r::unary_list_str(r::schema_list_str(), &v)?))
-        })
+        MethodInfo::unary(
+            "echo_list",
+            ps::echo_list(),
+            r::schema_list_str(),
+            |req, _| {
+                let v = p::list_str(req, "values")?;
+                Ok(Some(r::unary_list_str(r::schema_list_str(), &v)?))
+            },
+        )
         .doc("Echo a list of strings.")
         .param_type("values", "list[str]"),
     );
@@ -106,7 +134,10 @@ pub fn register(s: &mut RpcServer) {
             r::schema_nested_list_i64(),
             |req, _| {
                 let v = p::nested_list_i64(req, "matrix")?;
-                Ok(Some(r::unary_nested_list_i64(r::schema_nested_list_i64(), &v)?))
+                Ok(Some(r::unary_nested_list_i64(
+                    r::schema_nested_list_i64(),
+                    &v,
+                )?))
             },
         )
         .doc("Echo a nested list.")
@@ -121,7 +152,10 @@ pub fn register(s: &mut RpcServer) {
             r::schema_opt_string(),
             |req, _| {
                 let v = p::opt_str(req, "value")?;
-                Ok(Some(r::unary_opt_string(r::schema_opt_string(), v.as_deref())?))
+                Ok(Some(r::unary_opt_string(
+                    r::schema_opt_string(),
+                    v.as_deref(),
+                )?))
             },
         )
         .doc("Echo an optional string (may be None).")
@@ -151,7 +185,10 @@ pub fn register(s: &mut RpcServer) {
                 let bytes = p::bytes_col(req, "point")?;
                 let point = types::Point::deserialize_ipc(bytes)?;
                 let ipc = point.serialize_ipc()?;
-                Ok(Some(r::unary_binary_dataclass(r::schema_binary_dataclass(), ipc)?))
+                Ok(Some(r::unary_binary_dataclass(
+                    r::schema_binary_dataclass(),
+                    ipc,
+                )?))
             },
         )
         .doc("Echo a Point dataclass.")
@@ -166,7 +203,10 @@ pub fn register(s: &mut RpcServer) {
                 let bytes = p::bytes_col(req, "data")?;
                 let at = types::AllTypes::deserialize_ipc(bytes)?;
                 let ipc = at.serialize_ipc()?;
-                Ok(Some(r::unary_binary_dataclass(r::schema_binary_dataclass(), ipc)?))
+                Ok(Some(r::unary_binary_dataclass(
+                    r::schema_binary_dataclass(),
+                    ipc,
+                )?))
             },
         )
         .doc("Echo an AllTypes dataclass exercising every type mapping.")
@@ -181,7 +221,10 @@ pub fn register(s: &mut RpcServer) {
                 let bytes = p::bytes_col(req, "box")?;
                 let (tl, br, label) = types::deserialize_bounding_box_ipc(bytes)?;
                 let ipc = types::serialize_bounding_box_ipc(&tl, &br, &label)?;
-                Ok(Some(r::unary_binary_dataclass(r::schema_binary_dataclass(), ipc)?))
+                Ok(Some(r::unary_binary_dataclass(
+                    r::schema_binary_dataclass(),
+                    ipc,
+                )?))
             },
         )
         .doc("Echo a BoundingBox with nested Points.")
@@ -190,59 +233,84 @@ pub fn register(s: &mut RpcServer) {
 
     // --- Dataclass as parameter ---
     s.register(
-        MethodInfo::unary("inspect_point", ps::inspect_point(), r::schema_string(), |req, _| {
-            let bytes = p::bytes_col(req, "point")?;
-            let point = types::Point::deserialize_ipc(bytes)?;
-            let txt = format!(
-                "Point({}, {})",
-                format_float(point.x),
-                format_float(point.y)
-            );
-            Ok(Some(r::unary_string(r::schema_string(), &txt)?))
-        })
+        MethodInfo::unary(
+            "inspect_point",
+            ps::inspect_point(),
+            r::schema_string(),
+            |req, _| {
+                let bytes = p::bytes_col(req, "point")?;
+                let point = types::Point::deserialize_ipc(bytes)?;
+                let txt = format!(
+                    "Point({}, {})",
+                    format_float(point.x),
+                    format_float(point.y)
+                );
+                Ok(Some(r::unary_string(r::schema_string(), &txt)?))
+            },
+        )
         .doc("Accept a Point param (pa.binary() on wire), return formatted string.")
         .param_type("point", "Point"),
     );
 
     // --- Annotated ---
     s.register(
-        MethodInfo::unary("echo_int32", ps::echo_int32(), r::schema_int32(), |req, _| {
-            let v = p::i64_col(req, "value")? as i32;
-            Ok(Some(r::unary_int32(r::schema_int32(), v)?))
-        })
+        MethodInfo::unary(
+            "echo_int32",
+            ps::echo_int32(),
+            r::schema_int32(),
+            |req, _| {
+                let v = p::i64_col(req, "value")? as i32;
+                Ok(Some(r::unary_int32(r::schema_int32(), v)?))
+            },
+        )
         .doc("Echo an int32 value.")
         .param_type("value", "int"),
     );
     s.register(
-        MethodInfo::unary("echo_float32", ps::echo_float32(), r::schema_float32(), |req, _| {
-            let v = p::f64_col(req, "value")? as f32;
-            Ok(Some(r::unary_float32(r::schema_float32(), v)?))
-        })
+        MethodInfo::unary(
+            "echo_float32",
+            ps::echo_float32(),
+            r::schema_float32(),
+            |req, _| {
+                let v = p::f64_col(req, "value")? as f32;
+                Ok(Some(r::unary_float32(r::schema_float32(), v)?))
+            },
+        )
         .doc("Echo a float32 value.")
         .param_type("value", "float"),
     );
 
     // --- Multi-param & defaults ---
     s.register(
-        MethodInfo::unary("add_floats", ps::add_floats(), r::schema_float64(), |req, _| {
-            let a = p::f64_col(req, "a")?;
-            let b = p::f64_col(req, "b")?;
-            Ok(Some(r::unary_float64(r::schema_float64(), a + b)?))
-        })
+        MethodInfo::unary(
+            "add_floats",
+            ps::add_floats(),
+            r::schema_float64(),
+            |req, _| {
+                let a = p::f64_col(req, "a")?;
+                let b = p::f64_col(req, "b")?;
+                Ok(Some(r::unary_float64(r::schema_float64(), a + b)?))
+            },
+        )
         .doc("Add two floats.")
         .param_type("a", "float")
         .param_type("b", "float"),
     );
     s.register(
-        MethodInfo::unary("concatenate", ps::concatenate(), r::schema_string(), |req, _| {
-            let prefix = p::str_col(req, "prefix")?.to_string();
-            let suffix = p::str_col(req, "suffix")?.to_string();
-            let sep = p::opt_str(req, "separator")?.unwrap_or_else(|| "-".to_string());
-            Ok(Some(r::unary_string(
-                r::schema_string(),
-                &format!("{prefix}{sep}{suffix}"),
-            )?))
-        })
+        MethodInfo::unary(
+            "concatenate",
+            ps::concatenate(),
+            r::schema_string(),
+            |req, _| {
+                let prefix = p::str_col(req, "prefix")?.to_string();
+                let suffix = p::str_col(req, "suffix")?.to_string();
+                let sep = p::opt_str(req, "separator")?.unwrap_or_else(|| "-".to_string());
+                Ok(Some(r::unary_string(
+                    r::schema_string(),
+                    &format!("{prefix}{sep}{suffix}"),
+                )?))
+            },
+        )
         .doc("Concatenate prefix + separator + suffix.")
         .param_type("prefix", "str")
         .param_type("suffix", "str")
@@ -256,8 +324,8 @@ pub fn register(s: &mut RpcServer) {
             r::schema_string(),
             |req, _| {
                 let required = p::i64_col(req, "required")?;
-                let optional_str = p::opt_str(req, "optional_str")?
-                    .unwrap_or_else(|| "default".to_string());
+                let optional_str =
+                    p::opt_str(req, "optional_str")?.unwrap_or_else(|| "default".to_string());
                 let optional_int = p::opt_i64(req, "optional_int")?.unwrap_or(42);
                 Ok(Some(r::unary_string(
                     r::schema_string(),
@@ -398,7 +466,12 @@ pub fn register(s: &mut RpcServer) {
 
 fn format_float(f: f64) -> String {
     let s = format!("{f}");
-    if !s.contains('.') && !s.contains('e') && !s.contains('E') && !s.contains("inf") && !s.contains("NaN") {
+    if !s.contains('.')
+        && !s.contains('e')
+        && !s.contains('E')
+        && !s.contains("inf")
+        && !s.contains("NaN")
+    {
         format!("{s}.0")
     } else {
         s

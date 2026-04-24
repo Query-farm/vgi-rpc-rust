@@ -142,8 +142,8 @@ pub fn map_string_int64(req: &Request, name: &str) -> Result<Vec<(String, i64)>>
 
 /// Read a string-valued dictionary-encoded enum column.
 pub fn enum_str(req: &Request, name: &str) -> Result<String> {
-    use arrow_array::DictionaryArray;
     use arrow_array::types::{Int16Type, Int32Type};
+    use arrow_array::DictionaryArray;
     let a = col(req, name)?;
     if let Some(d) = a.as_any().downcast_ref::<DictionaryArray<Int16Type>>() {
         let key = d.keys().value(0);

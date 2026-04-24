@@ -8,7 +8,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi_rpc::{
-    server::{MethodType, Request},
+    server::MethodType,
     stream::{ExchangeState, OutputCollector, ProducerState, StreamResult, StreamStateKind},
     CallContext, LogLevel, MethodInfo, Result, RpcError, RpcServer,
 };
@@ -168,7 +168,10 @@ impl ProducerState for Dynamic {
         let mut arrs: Vec<ArrayRef> = Vec::new();
         arrs.push(Arc::new(Int64Array::from(vec![self.cur])));
         if self.include_strings {
-            arrs.push(Arc::new(StringArray::from(vec![format!("row-{}", self.cur)])));
+            arrs.push(Arc::new(StringArray::from(vec![format!(
+                "row-{}",
+                self.cur
+            )])));
         }
         if self.include_floats {
             arrs.push(Arc::new(Float64Array::from(vec![(self.cur as f64) * 1.5])));
@@ -326,13 +329,21 @@ pub fn register(srv: &mut RpcServer) {
 
     // --- Producers ---
     srv.register(
-        MethodInfo::stream("produce_n", MethodType::Producer, ps::count_only(), |req, _| {
-            let count = p::i64_col(req, "count")?;
-            Ok(StreamResult::producer(
-                counter_schema(),
-                Box::new(Counter { total: count, cur: 0 }),
-            ))
-        })
+        MethodInfo::stream(
+            "produce_n",
+            MethodType::Producer,
+            ps::count_only(),
+            |req, _| {
+                let count = p::i64_col(req, "count")?;
+                Ok(StreamResult::producer(
+                    counter_schema(),
+                    Box::new(Counter {
+                        total: count,
+                        cur: 0,
+                    }),
+                ))
+            },
+        )
         .doc("Produce count batches with {index, value}.")
         .param_type("count", "int"),
     );
@@ -369,7 +380,11 @@ pub fn register(srv: &mut RpcServer) {
                 let batches = p::i64_col(req, "batch_count")?;
                 Ok(StreamResult::producer(
                     counter_schema(),
-                    Box::new(Large { rows, batches, cur: 0 }),
+                    Box::new(Large {
+                        rows,
+                        batches,
+                        cur: 0,
+                    }),
                 ))
             },
         )
@@ -386,7 +401,10 @@ pub fn register(srv: &mut RpcServer) {
                 let count = p::i64_col(req, "count")?;
                 Ok(StreamResult::producer(
                     counter_schema(),
-                    Box::new(Logging { total: count, cur: 0 }),
+                    Box::new(Logging {
+                        total: count,
+                        cur: 0,
+                    }),
                 ))
             },
         )
@@ -433,7 +451,10 @@ pub fn register(srv: &mut RpcServer) {
                 )?;
                 Ok(StreamResult::producer(
                     counter_schema(),
-                    Box::new(Counter { total: count, cur: 0 }),
+                    Box::new(Counter {
+                        total: count,
+                        cur: 0,
+                    }),
                 )
                 .with_header(header))
             },
@@ -456,7 +477,10 @@ pub fn register(srv: &mut RpcServer) {
                 )?;
                 Ok(StreamResult::producer(
                     counter_schema(),
-                    Box::new(Counter { total: count, cur: 0 }),
+                    Box::new(Counter {
+                        total: count,
+                        cur: 0,
+                    }),
                 )
                 .with_header(header))
             },
@@ -478,7 +502,10 @@ pub fn register(srv: &mut RpcServer) {
                 let header_batch = types::build_rich_header(seed).to_record_batch()?;
                 Ok(StreamResult::producer(
                     counter_schema(),
-                    Box::new(Counter { total: count, cur: 0 }),
+                    Box::new(Counter {
+                        total: count,
+                        cur: 0,
+                    }),
                 )
                 .with_header(header_batch))
             },
@@ -486,7 +513,10 @@ pub fn register(srv: &mut RpcServer) {
         .doc("Produce batches with a rich multi-type stream header.")
         .param_type("seed", "int")
         .param_type("count", "int")
-        .param_doc("seed", "Determines all header field values deterministically.")
+        .param_doc(
+            "seed",
+            "Determines all header field values deterministically.",
+        )
         .param_doc("count", "Number of {index, value} batches to produce.")
         .header_schema(rich_hdr.clone()),
     );
@@ -522,10 +552,19 @@ pub fn register(srv: &mut RpcServer) {
         .param_type("count", "int")
         .param_type("include_strings", "bool")
         .param_type("include_floats", "bool")
-        .param_doc("seed", "Determines all header field values deterministically.")
+        .param_doc(
+            "seed",
+            "Determines all header field values deterministically.",
+        )
         .param_doc("count", "Number of batches to produce.")
-        .param_doc("include_strings", "Whether to include a ``label: utf8`` column.")
-        .param_doc("include_floats", "Whether to include a ``score: float64`` column.")
+        .param_doc(
+            "include_strings",
+            "Whether to include a ``label: utf8`` column.",
+        )
+        .param_doc(
+            "include_floats",
+            "Whether to include a ``score: float64`` column.",
+        )
         .header_schema(rich_hdr.clone()),
     );
 
@@ -610,7 +649,11 @@ pub fn register(srv: &mut RpcServer) {
             ps::exchange_zero_columns(),
             |_req, _| {
                 let empty = Arc::new(Schema::empty());
-                Ok(StreamResult::exchange(empty.clone(), empty, Box::new(ZeroColumn)))
+                Ok(StreamResult::exchange(
+                    empty.clone(),
+                    empty,
+                    Box::new(ZeroColumn),
+                ))
             },
         )
         .doc("Exchange stream with zero-column input and output."),
@@ -675,7 +718,10 @@ pub fn register(srv: &mut RpcServer) {
         .doc("Exchange stream with a rich multi-type header.")
         .param_type("seed", "int")
         .param_type("factor", "float")
-        .param_doc("seed", "Determines all header field values deterministically.")
+        .param_doc(
+            "seed",
+            "Determines all header field values deterministically.",
+        )
         .param_doc("factor", "Multiplier applied to input values.")
         .header_schema(rich_hdr.clone()),
     );

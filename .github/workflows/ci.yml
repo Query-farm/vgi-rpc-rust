@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt-clippy-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-features
+
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps --all-features
+
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install vgi-rpc conformance harness
+        run: |
+          python -m pip install --upgrade pip
+          pip install "vgi-rpc[http,cli]>=0.1.13" pytest pytest-timeout httpx
+
+      - name: Build conformance worker
+        run: cargo build -p vgi-rpc-conformance-rust
+
+      - name: Symlink worker
+        run: |
+          ln -sf target/debug/vgi-rpc-conformance-rust conformance-worker-rust
+
+      - name: Run conformance suite
+        env:
+          VGI_TRANSPORTS: pipe,subprocess,http,unix
+          RUST_CONFORMANCE_WORKER: ${{ github.workspace }}/conformance-worker-rust
+        run: |
+          python -m pytest test_rust_conformance.py --timeout=3 --timeout-method=signal -v

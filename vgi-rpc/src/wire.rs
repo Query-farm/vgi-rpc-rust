@@ -14,9 +14,9 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer as ArrowBuffer;
 use arrow_ipc::{
-    convert as ipc_convert, root_as_message, reader as ipc_reader, writer::DictionaryTracker,
-    writer::IpcDataGenerator, writer::IpcWriteOptions, writer::write_message, Buffer as FbBuffer,
-    FieldNode, KeyValue, KeyValueArgs, MessageBuilder, MessageHeader, MetadataVersion,
+    convert as ipc_convert, reader as ipc_reader, root_as_message, writer::write_message,
+    writer::DictionaryTracker, writer::IpcDataGenerator, writer::IpcWriteOptions,
+    Buffer as FbBuffer, FieldNode, KeyValue, KeyValueArgs, MessageBuilder, MessageHeader,
     RecordBatchBuilder,
 };
 use arrow_schema::{Schema, SchemaRef};
@@ -29,7 +29,8 @@ pub type Metadata = Vec<(String, String)>;
 
 /// Look up a key in a [`Metadata`] list.
 pub fn md_get<'a>(md: &'a Metadata, key: &str) -> Option<&'a str> {
-    md.iter().find_map(|(k, v)| (k == key).then_some(v.as_str()))
+    md.iter()
+        .find_map(|(k, v)| (k == key).then_some(v.as_str()))
 }
 
 // ---------------------------------------------------------------------------
@@ -57,11 +58,8 @@ impl<W: Write> StreamWriter<W> {
         let opts = IpcWriteOptions::default();
         let data_gen = IpcDataGenerator::default();
         let mut dict_tracker = DictionaryTracker::new(false);
-        let encoded = data_gen.schema_to_bytes_with_dictionary_tracker(
-            schema,
-            &mut dict_tracker,
-            &opts,
-        );
+        let encoded =
+            data_gen.schema_to_bytes_with_dictionary_tracker(schema, &mut dict_tracker, &opts);
         write_message(&mut writer, encoded, &opts)?;
         Ok(Self {
             writer,
@@ -315,10 +313,7 @@ impl<R: Read> StreamReader<R> {
                     return Ok(Some(ReadBatch { batch, metadata }));
                 }
                 MessageHeader::Schema => {
-                    return Err(RpcError::new(
-                        "IPC",
-                        "unexpected schema message mid-stream",
-                    ));
+                    return Err(RpcError::new("IPC", "unexpected schema message mid-stream"));
                 }
                 MessageHeader::NONE => continue,
                 other => {
@@ -408,7 +403,10 @@ fn read_message_bytes(r: &mut impl Read) -> Result<Option<RawMessage>> {
     if body_length > 0 && !read_exact(r, &mut body)? {
         return Err(RpcError::new("IOError", "unexpected EOF in message body"));
     }
-    Ok(Some(RawMessage { message_bytes, body }))
+    Ok(Some(RawMessage {
+        message_bytes,
+        body,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -417,8 +415,8 @@ fn read_message_bytes(r: &mut impl Read) -> Result<Option<RawMessage>> {
 
 /// Build a zero-row `RecordBatch` matching the given schema.
 pub fn empty_batch(schema: &Schema) -> Result<RecordBatch> {
-    use arrow_array::RecordBatchOptions;
     use arrow_array::array::new_empty_array;
+    use arrow_array::RecordBatchOptions;
     let cols: Vec<arrow_array::ArrayRef> = schema
         .fields()
         .iter()

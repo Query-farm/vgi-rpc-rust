@@ -287,7 +287,12 @@ fn parse_request_from_body(body: &[u8]) -> Result<Request> {
         )));
     }
     let request_id = md_get(&metadata, REQUEST_ID_KEY).unwrap_or("").to_string();
-    Ok(Request { method, request_id, batch, metadata })
+    Ok(Request {
+        method,
+        request_id,
+        batch,
+        metadata,
+    })
 }
 
 fn build_call_ctx(server: &Arc<RpcServer>, req: &Request) -> CallContext {
@@ -376,7 +381,10 @@ async fn handle_unary(
     body: Bytes,
 ) -> Response {
     if !has_arrow_ct(&headers) {
-        return plain_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "need arrow content type".into());
+        return plain_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "need arrow content type".into(),
+        );
     }
     let server = state.server.clone();
 
@@ -419,7 +427,10 @@ async fn handle_unary(
         return arrow_response(StatusCode::OK, buf);
     }
 
-    let Some(info) = server.method(&method).filter(|m| m.method_type == MethodType::Unary) else {
+    let Some(info) = server
+        .method(&method)
+        .filter(|m| m.method_type == MethodType::Unary)
+    else {
         let err = RpcError::new("AttributeError", format!("Unknown method: '{}'", method));
         return arrow_response(
             StatusCode::NOT_FOUND,
@@ -460,8 +471,8 @@ async fn handle_unary(
         }
         match result {
             Ok(batch_opt) => {
-                let out_batch = batch_opt
-                    .unwrap_or_else(|| empty_batch(&info.result_schema).unwrap());
+                let out_batch =
+                    batch_opt.unwrap_or_else(|| empty_batch(&info.result_schema).unwrap());
                 stats.output_batches = 1;
                 stats.output_rows = out_batch.num_rows() as u64;
                 let _ = sw.write(&out_batch, None);
@@ -497,7 +508,10 @@ async fn handle_stream_init(
     body: Bytes,
 ) -> Response {
     if !has_arrow_ct(&headers) {
-        return plain_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "need arrow content type".into());
+        return plain_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "need arrow content type".into(),
+        );
     }
     let server = state.server.clone();
     let body = match maybe_decompress(&headers, &body, state.max_body_size) {
@@ -519,7 +533,10 @@ async fn handle_stream_init(
         }
     };
 
-    let Some(info) = server.method(&method).filter(|m| m.method_type != MethodType::Unary) else {
+    let Some(info) = server
+        .method(&method)
+        .filter(|m| m.method_type != MethodType::Unary)
+    else {
         let err = RpcError::new(
             "AttributeError",
             format!("Unknown stream method: '{}'", method),
@@ -687,7 +704,10 @@ async fn handle_stream_exchange(
     body: Bytes,
 ) -> Response {
     if !has_arrow_ct(&headers) {
-        return plain_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "need arrow content type".into());
+        return plain_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "need arrow content type".into(),
+        );
     }
 
     let server = state.server.clone();
@@ -734,8 +754,8 @@ async fn handle_stream_exchange(
         let mut guard = state.sessions.lock().unwrap();
         match guard.remove(&session_id) {
             Some(s) => {
-                let expired = std::time::Instant::now().duration_since(s.last_access)
-                    >= state.token_ttl;
+                let expired =
+                    std::time::Instant::now().duration_since(s.last_access) >= state.token_ttl;
                 (Some(s), expired)
             }
             None => (None, false),
@@ -749,10 +769,8 @@ async fn handle_stream_exchange(
         );
     };
     if existed_but_expired {
-        let err = RpcError::runtime_error(format!(
-            "State token expired (ttl: {:?})",
-            state.token_ttl
-        ));
+        let err =
+            RpcError::runtime_error(format!("State token expired (ttl: {:?})", state.token_ttl));
         return arrow_response(
             StatusCode::BAD_REQUEST,
             error_stream_bytes(&Schema::empty(), &err, &server.server_id, ""),
@@ -786,7 +804,7 @@ async fn handle_stream_exchange(
 
     if matches!(session.state, StreamStateKind::Producer(_)) {
         // Producer continuation.
-        let mut finished;
+        let finished;
         {
             let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
             finished = run_producer(
@@ -818,8 +836,7 @@ async fn handle_stream_exchange(
             match crate::server::cast_batch_public(&batch, exp) {
                 Ok(b) => b,
                 Err(e) => {
-                    let mut sw =
-                        StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
+                    let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
                     let md = build_error_metadata(&e, &server.server_id, &req.request_id);
                     let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                     let _ = sw.finish();
@@ -856,8 +873,7 @@ async fn handle_stream_exchange(
                 match item {
                     Emitted::Log(log) => {
                         let md = build_log_metadata(&log, &server.server_id, &req.request_id);
-                        let _ =
-                            sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                     }
                     Emitted::Batch { batch, metadata } => {
                         let mut md = metadata.unwrap_or_default();
@@ -935,7 +951,10 @@ mod tests {
             .server(server.clone())
             .signing_key(&[1u8; 32])
             .build();
-        let b = HttpState::builder().server(server).signing_key(&[2u8; 32]).build();
+        let b = HttpState::builder()
+            .server(server)
+            .signing_key(&[2u8; 32])
+            .build();
         let tok = a.sign_token("sess-abc");
         assert!(b.verify_token(&tok).is_err());
     }

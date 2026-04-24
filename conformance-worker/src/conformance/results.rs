@@ -3,10 +3,7 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    builder::{
-        BinaryBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int32Builder, Int64Builder,
-        ListBuilder, MapFieldNames, MapBuilder, StringBuilder,
-    },
+    builder::{BinaryBuilder, Int64Builder, ListBuilder, MapBuilder, MapFieldNames, StringBuilder},
     ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
     RecordBatch, StringArray,
 };
@@ -14,9 +11,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi_rpc::Result;
 
 pub fn schema_result(data_type: DataType, nullable: bool) -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new(
-        "result", data_type, nullable,
-    )]))
+    Arc::new(Schema::new(vec![Field::new("result", data_type, nullable)]))
 }
 
 pub fn schema_string() -> SchemaRef {
@@ -177,10 +172,7 @@ pub fn unary_nested_list_i64(schema: SchemaRef, vals: &[Vec<i64>]) -> Result<Rec
     Ok(RecordBatch::try_new(schema, vec![arr])?)
 }
 
-pub fn unary_map_str_int64(
-    schema: SchemaRef,
-    entries: &[(String, i64)],
-) -> Result<RecordBatch> {
+pub fn unary_map_str_int64(schema: SchemaRef, entries: &[(String, i64)]) -> Result<RecordBatch> {
     let field_names = MapFieldNames {
         entry: "entries".into(),
         key: "keys".into(),

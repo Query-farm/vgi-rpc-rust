@@ -78,7 +78,10 @@ impl DispatchHook for AccessLogHook {
         rec.insert("authenticated".into(), json!(info.authenticated));
         rec.insert("principal".into(), json!(info.principal));
         rec.insert("auth_domain".into(), json!(info.auth_domain));
-        rec.insert("duration_ms".into(), json!((duration_ms * 100.0).round() / 100.0));
+        rec.insert(
+            "duration_ms".into(),
+            json!((duration_ms * 100.0).round() / 100.0),
+        );
         rec.insert("input_batches".into(), json!(stats.input_batches));
         rec.insert("output_batches".into(), json!(stats.output_batches));
         rec.insert("input_rows".into(), json!(stats.input_rows));
@@ -126,8 +129,7 @@ mod tests {
                 Ok(())
             }
         }
-        let hook: Arc<dyn DispatchHook> =
-            AccessLogHook::new(BufSink(buf.clone()), "1.2.3");
+        let hook: Arc<dyn DispatchHook> = AccessLogHook::new(BufSink(buf.clone()), "1.2.3");
 
         let info = DispatchInfo {
             method: "echo_string".into(),
@@ -164,8 +166,7 @@ mod tests {
                 Ok(())
             }
         }
-        let hook: Arc<dyn DispatchHook> =
-            AccessLogHook::new(BufSink(buf.clone()), "1.2.3");
+        let hook: Arc<dyn DispatchHook> = AccessLogHook::new(BufSink(buf.clone()), "1.2.3");
         let info = DispatchInfo {
             method: "raise_value_error".into(),
             method_type: "unary",

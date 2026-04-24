@@ -158,7 +158,11 @@ pub fn produce_large_batches() -> SchemaRef {
     ])
 }
 pub fn produce_error_mid_stream() -> SchemaRef {
-    s(vec![Field::new("emit_before_error", DataType::Int64, false)])
+    s(vec![Field::new(
+        "emit_before_error",
+        DataType::Int64,
+        false,
+    )])
 }
 
 // ---- exchange streams ----

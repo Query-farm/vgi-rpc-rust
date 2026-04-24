@@ -6,9 +6,9 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    builder::{BinaryBuilder, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder},
-    Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
+    builder::{Int64Builder, StringBuilder},
+    Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use vgi_rpc::wire::{StreamReader, StreamWriter};
@@ -182,18 +182,10 @@ pub fn all_types_schema() -> SchemaRef {
         Field::new("list_of_str", list_str_type(), false),
         Field::new("dict_field", map_str_i64_type(), false),
         Field::new("enum_field", dict_enum_type(), false),
-        Field::new(
-            "nested_point",
-            DataType::Struct(point_fields()),
-            false,
-        ),
+        Field::new("nested_point", DataType::Struct(point_fields()), false),
         Field::new("optional_str", DataType::Utf8, true),
         Field::new("optional_int", DataType::Int64, true),
-        Field::new(
-            "optional_nested",
-            DataType::Struct(point_fields()),
-            true,
-        ),
+        Field::new("optional_nested", DataType::Struct(point_fields()), true),
         Field::new("list_of_nested", list_point_type(), false),
         Field::new("annotated_int32", DataType::Int32, false),
         Field::new("annotated_float32", DataType::Float32, false),
@@ -227,7 +219,9 @@ pub struct AllTypes {
 
 impl AllTypes {
     pub fn to_record_batch(&self) -> Result<RecordBatch> {
-        use arrow_array::builder::{ListBuilder, MapBuilder, MapFieldNames, StringDictionaryBuilder};
+        use arrow_array::builder::{
+            ListBuilder, MapBuilder, MapFieldNames, StringDictionaryBuilder,
+        };
         use arrow_array::types::Int16Type;
 
         let schema = all_types_schema();
@@ -416,8 +410,16 @@ impl AllTypes {
                 .downcast_ref::<MapArray>()
                 .unwrap();
             let entry = ma.value(0);
-            let keys = entry.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            let vals = entry.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            let keys = entry
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let vals = entry
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
             (0..keys.len())
                 .map(|i| (keys.value(i).to_string(), vals.value(i)))
                 .collect()
@@ -460,7 +462,11 @@ impl AllTypes {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            if a.is_null(0) { None } else { Some(a.value(0)) }
+            if a.is_null(0) {
+                None
+            } else {
+                Some(a.value(0))
+            }
         };
         let optional_nested = {
             let s = col("optional_nested")?
@@ -519,8 +525,16 @@ impl AllTypes {
                 .downcast_ref::<MapArray>()
                 .unwrap();
             let entry = ma.value(0);
-            let keys = entry.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            let vals = entry.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            let keys = entry
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let vals = entry
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
             (0..keys.len())
                 .map(|i| (keys.value(i).to_string(), vals.value(i).to_string()))
                 .collect()
@@ -553,8 +567,7 @@ fn struct_from_point(p: &Point, nullable: bool) -> Result<StructArray> {
     let fields = point_fields();
     let x: ArrayRef = Arc::new(Float64Array::from(vec![p.x]));
     let y: ArrayRef = Arc::new(Float64Array::from(vec![p.y]));
-    let cols: Vec<(Arc<Field>, ArrayRef)> =
-        vec![(fields[0].clone(), x), (fields[1].clone(), y)];
+    let cols: Vec<(Arc<Field>, ArrayRef)> = vec![(fields[0].clone(), x), (fields[1].clone(), y)];
     let _ = nullable;
     Ok(StructArray::from(cols))
 }
@@ -568,17 +581,18 @@ fn struct_from_optional_point(p: Option<&Point>) -> Result<StructArray> {
             let x: ArrayRef = Arc::new(Float64Array::from(vec![Some(0.0)]));
             let y: ArrayRef = Arc::new(Float64Array::from(vec![Some(0.0)]));
             let nulls = NullBuffer::from(vec![false]);
-            let cols: Vec<(Arc<Field>, ArrayRef)> = vec![
-                (fields[0].clone(), x),
-                (fields[1].clone(), y),
-            ];
-            Ok(StructArray::try_new(fields, cols.into_iter().map(|(_, a)| a).collect(), Some(nulls))?)
+            let cols: Vec<(Arc<Field>, ArrayRef)> =
+                vec![(fields[0].clone(), x), (fields[1].clone(), y)];
+            Ok(StructArray::try_new(
+                fields,
+                cols.into_iter().map(|(_, a)| a).collect(),
+                Some(nulls),
+            )?)
         }
     }
 }
 
 fn list_of_points(pts: &[Point]) -> Result<ListArray> {
-    use arrow_array::builder::StructBuilder;
     // We build the struct children manually because StructBuilder helpers
     // for externally-typed fields require care. Use low-level construction.
     let mut xs = Vec::with_capacity(pts.len());
@@ -590,19 +604,12 @@ fn list_of_points(pts: &[Point]) -> Result<ListArray> {
     let fields = point_fields();
     let x_arr: ArrayRef = Arc::new(Float64Array::from(xs));
     let y_arr: ArrayRef = Arc::new(Float64Array::from(ys));
-    let struct_arr = StructArray::try_new(
-        fields.clone(),
-        vec![x_arr, y_arr],
-        None,
-    )?;
-    let offsets = arrow_buffer::OffsetBuffer::new(
-        arrow_buffer::ScalarBuffer::from(vec![0i32, pts.len() as i32]),
-    );
-    let field = Arc::new(Field::new(
-        "item",
-        DataType::Struct(fields),
-        true,
-    ));
+    let struct_arr = StructArray::try_new(fields.clone(), vec![x_arr, y_arr], None)?;
+    let offsets = arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![
+        0i32,
+        pts.len() as i32,
+    ]));
+    let field = Arc::new(Field::new("item", DataType::Struct(fields), true));
     Ok(ListArray::new(field, offsets, Arc::new(struct_arr), None))
 }
 
@@ -638,7 +645,10 @@ pub fn build_rich_header(seed: i64) -> AllTypes {
     };
     let optional_int = if seed % 2 == 1 { Some(seed * 3) } else { None };
     let optional_nested = if seed.rem_euclid(3) == 0 {
-        Some(Point { x: seed as f64, y: 0.0 })
+        Some(Point {
+            x: seed as f64,
+            y: 0.0,
+        })
     } else {
         None
     };
@@ -690,11 +700,7 @@ pub fn build_dynamic_schema(include_strings: bool, include_floats: bool) -> Sche
 }
 
 /// Build a BoundingBox record batch (for echo_bounding_box).
-pub fn bounding_box_batch(
-    top: &Point,
-    bot: &Point,
-    label: &str,
-) -> Result<RecordBatch> {
+pub fn bounding_box_batch(top: &Point, bot: &Point, label: &str) -> Result<RecordBatch> {
     let schema = bounding_box_schema();
     let tl = struct_from_point(top, false)?;
     let br = struct_from_point(bot, false)?;
@@ -728,11 +734,7 @@ pub fn bounding_box_from_batch(batch: &RecordBatch) -> Result<(Point, Point, Str
     Ok((point_from_struct(tl, 0)?, point_from_struct(br, 0)?, label))
 }
 
-pub fn serialize_bounding_box_ipc(
-    top: &Point,
-    bot: &Point,
-    label: &str,
-) -> Result<Vec<u8>> {
+pub fn serialize_bounding_box_ipc(top: &Point, bot: &Point, label: &str) -> Result<Vec<u8>> {
     let schema = bounding_box_schema();
     let batch = bounding_box_batch(top, bot, label)?;
     let mut buf = Vec::new();
@@ -744,9 +746,7 @@ pub fn serialize_bounding_box_ipc(
     Ok(buf)
 }
 
-pub fn deserialize_bounding_box_ipc(
-    bytes: &[u8],
-) -> Result<(Point, Point, String)> {
+pub fn deserialize_bounding_box_ipc(bytes: &[u8]) -> Result<(Point, Point, String)> {
     let mut r = StreamReader::new(bytes)?;
     let rb = r
         .read_next()?

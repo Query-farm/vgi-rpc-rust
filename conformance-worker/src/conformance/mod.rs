@@ -25,7 +25,11 @@ pub fn build_server() -> RpcServer {
     // When VGI_ACCESS_LOG is set, emit JSON-per-call access records to that
     // file. Used for manual validation against vgi_rpc.access_log_conformance.
     if let Ok(path) = std::env::var("VGI_ACCESS_LOG") {
-        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             Ok(f) => {
                 let hook = vgi_rpc::AccessLogHook::new(f, "rust-conformance-0.2.0");
                 builder = builder.with_hook(hook);

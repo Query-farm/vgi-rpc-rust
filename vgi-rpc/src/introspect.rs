@@ -8,9 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, StringBuilder,
-};
+use arrow_array::builder::{BinaryBuilder, BooleanBuilder, StringBuilder};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
@@ -149,7 +147,10 @@ pub fn build_describe(
     let md: Metadata = vec![
         (PROTOCOL_NAME_KEY.to_string(), protocol_name.to_string()),
         (REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string()),
-        (DESCRIBE_VERSION_KEY.to_string(), DESCRIBE_VERSION.to_string()),
+        (
+            DESCRIBE_VERSION_KEY.to_string(),
+            DESCRIBE_VERSION.to_string(),
+        ),
         (SERVER_ID_KEY.to_string(), server_id.to_string()),
     ];
 

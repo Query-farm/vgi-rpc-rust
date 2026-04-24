@@ -11,7 +11,10 @@ use crate::wire::Metadata;
 
 /// An entry in the output collector — either a data batch or a pending log.
 pub(crate) enum Emitted {
-    Batch { batch: RecordBatch, metadata: Option<Metadata> },
+    Batch {
+        batch: RecordBatch,
+        metadata: Option<Metadata>,
+    },
     Log(LogMessage),
 }
 
@@ -47,7 +50,10 @@ impl OutputCollector {
                 batch.schema().fields()
             )));
         }
-        self.items.push(Emitted::Batch { batch, metadata: None });
+        self.items.push(Emitted::Batch {
+            batch,
+            metadata: None,
+        });
         Ok(())
     }
 
@@ -62,7 +68,8 @@ impl OutputCollector {
 
     /// Append a client-directed log message.
     pub fn client_log(&mut self, level: LogLevel, message: impl Into<String>) {
-        self.items.push(Emitted::Log(LogMessage::new(level, message)));
+        self.items
+            .push(Emitted::Log(LogMessage::new(level, message)));
     }
 
     /// Append a client-directed log message with extras.

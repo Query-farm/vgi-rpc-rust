@@ -14,10 +14,7 @@ use crate::metadata::{
     CANCEL_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY, REQUEST_ID_KEY, REQUEST_VERSION,
     REQUEST_VERSION_KEY, RPC_METHOD_KEY, SERVER_ID_KEY,
 };
-use crate::stream::{
-    empty_schema, Emitted, ExchangeState, OutputCollector, ProducerState, StreamResult,
-    StreamStateKind,
-};
+use crate::stream::{empty_schema, Emitted, OutputCollector, StreamResult, StreamStateKind};
 use crate::wire::{empty_batch, md_get, Metadata, ReadBatch, StreamReader, StreamWriter};
 
 /// Context supplied to each handler invocation.
@@ -73,15 +70,11 @@ pub enum MethodType {
 }
 
 /// A handler function for a unary RPC method.
-pub type UnaryHandler = Arc<
-    dyn Fn(&Request, &CallContext) -> Result<Option<RecordBatch>>
-        + Send
-        + Sync,
->;
+pub type UnaryHandler =
+    Arc<dyn Fn(&Request, &CallContext) -> Result<Option<RecordBatch>> + Send + Sync>;
 
 /// A handler function for a streaming RPC method.
-pub type StreamHandler =
-    Arc<dyn Fn(&Request, &CallContext) -> Result<StreamResult> + Send + Sync>;
+pub type StreamHandler = Arc<dyn Fn(&Request, &CallContext) -> Result<StreamResult> + Send + Sync>;
 
 /// Fluent builder for [`RpcServer`] with describe/identity/version knobs.
 #[derive(Default)]
@@ -122,9 +115,7 @@ impl RpcServerBuilder {
     pub fn build(self) -> RpcServer {
         RpcServer {
             methods: HashMap::new(),
-            server_id: self
-                .server_id
-                .unwrap_or_else(|| crate::util::short_random_id()),
+            server_id: self.server_id.unwrap_or_else(crate::util::short_random_id),
             server_version: self.server_version.unwrap_or_default(),
             protocol_name: self.protocol_name.unwrap_or_default(),
             describe_enabled: self.enable_describe,
@@ -169,10 +160,7 @@ impl MethodInfo {
         name: impl Into<String>,
         params_schema: SchemaRef,
         result_schema: SchemaRef,
-        handler: impl Fn(&Request, &CallContext) -> Result<Option<RecordBatch>>
-            + Send
-            + Sync
-            + 'static,
+        handler: impl Fn(&Request, &CallContext) -> Result<Option<RecordBatch>> + Send + Sync + 'static,
     ) -> Self {
         let has_return = !result_schema.fields().is_empty();
         Self {
@@ -231,11 +219,7 @@ impl MethodInfo {
         self
     }
 
-    pub fn param_default(
-        mut self,
-        param: impl Into<String>,
-        value: serde_json::Value,
-    ) -> Self {
+    pub fn param_default(mut self, param: impl Into<String>, value: serde_json::Value) -> Self {
         self.param_defaults.push((param.into(), value));
         self
     }
@@ -280,6 +264,10 @@ impl RpcServer {
         self.describe_enabled
     }
 
+    pub fn server_version(&self) -> &str {
+        &self.server_version
+    }
+
     /// Register a method described by a [`MethodInfo`].
     pub fn register(&mut self, info: MethodInfo) {
         self.methods.insert(info.name.clone(), info);
@@ -292,10 +280,7 @@ impl RpcServer {
         &mut self,
         name: impl Into<String>,
         result_schema: SchemaRef,
-        handler: impl Fn(&Request, &CallContext) -> Result<Option<RecordBatch>>
-            + Send
-            + Sync
-            + 'static,
+        handler: impl Fn(&Request, &CallContext) -> Result<Option<RecordBatch>> + Send + Sync + 'static,
     ) {
         self.register(MethodInfo::unary(
             name,
@@ -392,13 +377,7 @@ impl RpcServer {
                     crate::introspect::write_describe_response(w, &batch, &md)?;
                 }
                 Err(err) => {
-                    write_error_stream(
-                        w,
-                        &empty_schema(),
-                        &err,
-                        &self.server_id,
-                        &req.request_id,
-                    )?;
+                    write_error_stream(w, &empty_schema(), &err, &self.server_id, &req.request_id)?;
                 }
             }
             return Ok(true);
@@ -473,9 +452,7 @@ impl RpcServer {
         };
         reader.drain()?;
         let method = md_get(&metadata, RPC_METHOD_KEY).ok_or_else(|| {
-            RpcError::protocol_error(
-                "Missing 'vgi_rpc.method' in request batch custom_metadata.",
-            )
+            RpcError::protocol_error("Missing 'vgi_rpc.method' in request batch custom_metadata.")
         })?;
         let version = md_get(&metadata, REQUEST_VERSION_KEY).ok_or_else(|| {
             RpcError::version_error(format!(
@@ -549,6 +526,7 @@ impl RpcServer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn serve_stream<R: Read, W: Write>(
         &self,
         r: &mut R,
@@ -629,7 +607,11 @@ impl RpcServer {
                 Ok(x) => x,
                 Err(_) => break,
             };
-            let Some(ReadBatch { batch: input_batch, metadata: input_md }) = read else {
+            let Some(ReadBatch {
+                batch: input_batch,
+                metadata: input_md,
+            }) = read
+            else {
                 break;
             };
             {
@@ -655,8 +637,7 @@ impl RpcServer {
                         Ok(b) => b,
                         Err(e) => {
                             let md = build_error_metadata(&e, &self.server_id, &req.request_id);
-                            out_writer
-                                .write(&empty_batch(output_schema.as_ref())?, Some(&md))?;
+                            out_writer.write(&empty_batch(output_schema.as_ref())?, Some(&md))?;
                             break 'lockstep;
                         }
                     }
@@ -664,8 +645,7 @@ impl RpcServer {
                 _ => input_batch,
             };
 
-            let mut out =
-                OutputCollector::new(output_schema.clone(), input_schema.is_none());
+            let mut out = OutputCollector::new(output_schema.clone(), input_schema.is_none());
 
             let iter_result = match &mut state {
                 StreamStateKind::Producer(p) => p.produce(&mut out, ctx),

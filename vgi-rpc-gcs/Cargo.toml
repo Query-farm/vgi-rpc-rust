@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "GCS-backed ExternalStorage for vgi-rpc (pluggable V4 signed URL factory)"
+readme = "README.md"
+keywords = ["vgi-rpc", "gcs", "arrow", "storage"]
+categories = ["network-programming"]
 
 [dependencies]
 vgi-rpc = { path = "../vgi-rpc", default-features = false, features = ["http"] }

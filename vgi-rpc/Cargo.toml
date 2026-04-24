@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Transport-agnostic RPC framework built on Apache Arrow IPC"
+readme = "README.md"
+keywords = ["rpc", "arrow", "ipc", "streaming", "http"]
+categories = ["network-programming", "web-programming::http-server", "data-structures"]
 
 [features]
 default = ["http"]

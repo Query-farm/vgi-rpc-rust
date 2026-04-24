@@ -7,23 +7,14 @@ mod conformance;
 
 use std::io::{self, Write};
 use std::sync::Arc;
-use tokio::signal;
 
 fn main() {
     let server = Arc::new(conformance::build_server());
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() > 1 && args[1] == "--http" {
-        #[cfg(feature = "http")]
-        {
-            run_http(server);
-            return;
-        }
-        #[cfg(not(feature = "http"))]
-        {
-            eprintln!("built without http feature");
-            std::process::exit(2);
-        }
+        run_http(server);
+        return;
     }
 
     if args.len() > 2 && args[1] == "--unix" {
@@ -58,9 +49,20 @@ fn run_unix(server: Arc<vgi_rpc::RpcServer>, path: &str) {
     }
 }
 
-#[cfg(feature = "http")]
-fn run_http(_server: Arc<vgi_rpc::RpcServer>) {
-    // HTTP implementation lands in a follow-up milestone; for now bail out.
-    eprintln!("--http transport not yet implemented");
-    std::process::exit(3);
+fn run_http(server: Arc<vgi_rpc::RpcServer>) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async move {
+        let state = vgi_rpc::http::HttpState::new(server);
+        let app = vgi_rpc::http::build_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tcp");
+        let port = listener.local_addr().unwrap().port();
+        println!("PORT:{port}");
+        io::stdout().flush().ok();
+        axum::serve(listener, app).await.expect("axum serve");
+    });
 }

@@ -477,6 +477,10 @@ fn drain_input<R: Read>(r: &mut R) -> Result<()> {
     Ok(())
 }
 
+pub fn cast_batch_public(batch: &RecordBatch, target: &Schema) -> Result<RecordBatch> {
+    cast_batch(batch, target)
+}
+
 fn cast_batch(batch: &RecordBatch, target: &Schema) -> Result<RecordBatch> {
     if batch.num_columns() != target.fields().len() {
         return Err(RpcError::type_error(format!(

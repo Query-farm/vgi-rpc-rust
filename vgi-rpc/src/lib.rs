@@ -7,11 +7,18 @@
 pub mod access_log;
 pub mod auth;
 pub mod errors;
+pub mod retry;
+
+#[cfg(feature = "otel")]
+pub mod otel;
+
 pub mod hooks;
 pub mod introspect;
 pub mod log;
 pub mod metadata;
 pub(crate) mod probe;
+#[cfg(feature = "sentry")]
+pub mod sentry;
 pub mod server;
 pub mod stream;
 pub(crate) mod util;
@@ -26,5 +33,6 @@ pub use errors::{Result, RpcError};
 pub use hooks::{CallStatistics, ChainHook, DispatchHook, DispatchInfo, HookToken, SharedHook};
 pub use introspect::{DESCRIBE_METHOD_NAME, DESCRIBE_VERSION};
 pub use log::{LogLevel, LogMessage};
+pub use retry::RetryConfig;
 pub use server::{CallContext, MethodInfo, MethodType, RpcServer, RpcServerBuilder};
 pub use stream::{ExchangeState, OutputCollector, ProducerState, StreamResult};

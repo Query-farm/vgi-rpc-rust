@@ -2,6 +2,24 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased] — Phase 3: observability + HTTP polish
+
+- **Added** `otel::OtelHook` (feature `otel`): per-call `tracing` events
+  tagged `vgi_rpc.otel` with method, principal, status, durations,
+  statistics; `OtelMetrics` counter/histogram for in-memory scraping;
+  W3C `traceparent` extraction helper.
+- **Added** `sentry::SentryHook` (feature `sentry`): thin `DispatchHook`
+  that emits `tracing::error!` events tagged `vgi_rpc.sentry` on
+  handler errors so a `sentry-tracing` layer can capture them.
+- **Added** `retry::RetryConfig` with exponential backoff + jitter +
+  iterator schedule.
+- **Added** HTTP polish: CORS (`cors_origins` / `cors_max_age`) with
+  preflight handler, `Accept-Encoding: zstd` response compression via
+  an axum middleware, URL prefix mounting, `GET /` landing page,
+  `GET /describe` API reference page, `GET /health` liveness probe.
+- **Added** 12 new unit tests and a `tests/http_polish.rs` integration
+  suite (CORS, prefix, health, describe page, zstd response).
+
 ## [Unreleased] — Phase 2: auth surface
 
 - **Added** core auth framework: `AuthContext`, `AuthRequest`, `Authenticate`

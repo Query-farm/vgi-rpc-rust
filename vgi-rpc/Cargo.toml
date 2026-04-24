@@ -12,6 +12,8 @@ http = ["dep:axum", "dep:tokio", "dep:hmac", "dep:sha2", "dep:base64", "dep:rand
 jwt = []
 oauth-pkce = []
 mtls-pem = []
+otel = []
+sentry = []
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -64,6 +64,13 @@ pub struct HttpState {
     oauth_metadata: Option<Arc<crate::auth::oauth::OAuthResourceMetadata>>,
     oauth_metadata_json: Option<Vec<u8>>,
     www_authenticate: Option<String>,
+    cors_origins: Option<String>,
+    cors_max_age: u32,
+    prefix: String,
+    response_compression_level: Option<i32>,
+    landing_page_enabled: bool,
+    describe_page_enabled: bool,
+    health_enabled: bool,
 }
 
 /// Fluent builder for [`HttpState`].
@@ -77,6 +84,13 @@ pub struct HttpStateBuilder {
     max_body_size: Option<usize>,
     authenticate: Option<crate::auth::Authenticate>,
     oauth_metadata: Option<Arc<crate::auth::oauth::OAuthResourceMetadata>>,
+    cors_origins: Option<String>,
+    cors_max_age: Option<u32>,
+    prefix: Option<String>,
+    response_compression_level: Option<i32>,
+    landing_page_enabled: Option<bool>,
+    describe_page_enabled: Option<bool>,
+    health_enabled: Option<bool>,
 }
 
 impl HttpStateBuilder {
@@ -142,6 +156,50 @@ impl HttpStateBuilder {
         self
     }
 
+    /// Enable CORS with the given `Access-Control-Allow-Origin` value.
+    /// Pass `"*"` for a permissive server or a specific origin URL.
+    pub fn cors_origins(mut self, origins: impl Into<String>) -> Self {
+        self.cors_origins = Some(origins.into());
+        self
+    }
+
+    /// Override the preflight cache lifetime (seconds). Default `7200`.
+    pub fn cors_max_age(mut self, seconds: u32) -> Self {
+        self.cors_max_age = Some(seconds);
+        self
+    }
+
+    /// Mount the router under a URL prefix (e.g. `/v1`). Default empty.
+    pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = Some(prefix.into());
+        self
+    }
+
+    /// Enable zstd response compression at the given level (1..=22) when
+    /// the client sends `Accept-Encoding: zstd`. Default off.
+    pub fn response_compression_level(mut self, level: i32) -> Self {
+        self.response_compression_level = Some(level);
+        self
+    }
+
+    /// Serve a friendly HTML landing page at `GET /`. Default on.
+    pub fn enable_landing_page(mut self, enabled: bool) -> Self {
+        self.landing_page_enabled = Some(enabled);
+        self
+    }
+
+    /// Serve an API reference HTML page at `GET /describe`. Default on.
+    pub fn enable_describe_page(mut self, enabled: bool) -> Self {
+        self.describe_page_enabled = Some(enabled);
+        self
+    }
+
+    /// Serve a liveness probe at `GET /health`. Default on.
+    pub fn enable_health(mut self, enabled: bool) -> Self {
+        self.health_enabled = Some(enabled);
+        self
+    }
+
     pub fn build(self) -> Arc<HttpState> {
         let server = self.server.expect("HttpStateBuilder::server is required");
         let signing_key = self.signing_key.unwrap_or_else(|| {
@@ -168,6 +226,13 @@ impl HttpStateBuilder {
             oauth_metadata: self.oauth_metadata,
             oauth_metadata_json,
             www_authenticate,
+            cors_origins: self.cors_origins,
+            cors_max_age: self.cors_max_age.unwrap_or(7200),
+            prefix: self.prefix.unwrap_or_default(),
+            response_compression_level: self.response_compression_level,
+            landing_page_enabled: self.landing_page_enabled.unwrap_or(true),
+            describe_page_enabled: self.describe_page_enabled.unwrap_or(true),
+            health_enabled: self.health_enabled.unwrap_or(true),
         });
         HttpState::spawn_reaper(Arc::downgrade(&state));
         state
@@ -245,15 +310,218 @@ impl HttpState {
 }
 
 pub fn build_router(state: Arc<HttpState>) -> Router {
-    Router::new()
-        .route("/:method", post(handle_unary))
-        .route("/:method/init", post(handle_stream_init))
-        .route("/:method/exchange", post(handle_stream_exchange))
+    build_router_inner(state.clone()).layer(axum::middleware::from_fn_with_state(
+        state,
+        postprocess_middleware,
+    ))
+}
+
+async fn postprocess_middleware(
+    axum::extract::State(state): axum::extract::State<Arc<HttpState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    use axum::body::to_bytes;
+    let req_headers = req.headers().clone();
+    let resp = next.run(req).await;
+    let (mut parts, body) = resp.into_parts();
+    let bytes = to_bytes(body, usize::MAX).await.unwrap_or_default();
+    let is_arrow = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        == Some(ARROW_CONTENT_TYPE);
+
+    if is_arrow {
+        if let Some(level) = state.response_compression_level {
+            let accepts = req_headers
+                .get(header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if accepts.contains("zstd") {
+                if let Ok(compressed) = zstd::encode_all(std::io::Cursor::new(&bytes), level) {
+                    parts
+                        .headers
+                        .insert(header::CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+                    attach_cors_headers(&state, &mut parts.headers, &req_headers, false);
+                    let body_new = axum::body::Body::from(compressed);
+                    return Response::from_parts(parts, body_new);
+                }
+            }
+        }
+    }
+    attach_cors_headers(&state, &mut parts.headers, &req_headers, false);
+    Response::from_parts(parts, axum::body::Body::from(bytes))
+}
+
+fn build_router_inner(state: Arc<HttpState>) -> Router {
+    let prefix = state.prefix.clone();
+    let api = Router::new()
+        .route("/:method", post(handle_unary).options(handle_preflight))
         .route(
-            crate::auth::oauth::OAuthResourceMetadata::well_known_path(),
-            axum::routing::get(handle_oauth_metadata),
+            "/:method/init",
+            post(handle_stream_init).options(handle_preflight),
         )
-        .with_state(state)
+        .route(
+            "/:method/exchange",
+            post(handle_stream_exchange).options(handle_preflight),
+        );
+
+    let mut app = if prefix.is_empty() {
+        api
+    } else {
+        Router::new().nest(&prefix, api)
+    };
+
+    app = app.route(
+        &format!(
+            "{}{}",
+            prefix,
+            crate::auth::oauth::OAuthResourceMetadata::well_known_path()
+        ),
+        axum::routing::get(handle_oauth_metadata),
+    );
+
+    if state.health_enabled {
+        app = app.route(
+            &format!("{prefix}/health"),
+            axum::routing::get(handle_health),
+        );
+    }
+    if state.landing_page_enabled {
+        let landing_path = if prefix.is_empty() {
+            "/".to_string()
+        } else {
+            prefix.clone()
+        };
+        app = app.route(&landing_path, axum::routing::get(handle_landing));
+    }
+    if state.describe_page_enabled {
+        app = app.route(
+            &format!("{prefix}/describe"),
+            axum::routing::get(handle_describe_page),
+        );
+    }
+
+    app.with_state(state)
+}
+
+async fn handle_preflight(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> Response {
+    let mut h = HeaderMap::new();
+    attach_cors_headers(&state, &mut h, &headers, true);
+    (StatusCode::NO_CONTENT, h).into_response()
+}
+
+async fn handle_health() -> Response {
+    (StatusCode::OK, "ok\n").into_response()
+}
+
+async fn handle_landing(State(state): State<Arc<HttpState>>) -> Response {
+    let body = render_landing(&state);
+    let mut h = HeaderMap::new();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    (StatusCode::OK, h, body).into_response()
+}
+
+async fn handle_describe_page(State(state): State<Arc<HttpState>>) -> Response {
+    let body = render_describe_page(&state);
+    let mut h = HeaderMap::new();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    (StatusCode::OK, h, body).into_response()
+}
+
+fn render_landing(state: &Arc<HttpState>) -> String {
+    let name = if state.server.protocol_name().is_empty() {
+        "vgi-rpc service"
+    } else {
+        state.server.protocol_name()
+    };
+    let server_id = &state.server.server_id;
+    let describe_link = if state.describe_page_enabled {
+        format!(
+            r#"<p><a href="{0}/describe">API reference</a></p>"#,
+            state.prefix
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{name}</title></head><body>\
+         <h1>{name}</h1><p>server_id: <code>{server_id}</code></p>{describe_link}\
+         </body></html>"
+    )
+}
+
+fn render_describe_page(state: &Arc<HttpState>) -> String {
+    let mut body = String::from(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>API reference</title></head><body>",
+    );
+    body.push_str(&format!(
+        "<h1>{}</h1><table><tr><th>method</th><th>type</th><th>doc</th></tr>",
+        state.server.protocol_name()
+    ));
+    let mut methods: Vec<&String> = state.server.methods().keys().collect();
+    methods.sort();
+    for name in methods {
+        let m = &state.server.methods()[name];
+        let kind = match m.method_type {
+            crate::server::MethodType::Unary => "unary",
+            _ => "stream",
+        };
+        let doc = m.doc.as_deref().unwrap_or("");
+        body.push_str(&format!(
+            "<tr><td><code>{name}</code></td><td>{kind}</td><td>{}</td></tr>",
+            html_escape(doc)
+        ));
+    }
+    body.push_str("</table></body></html>");
+    body
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn attach_cors_headers(
+    state: &Arc<HttpState>,
+    out: &mut HeaderMap,
+    req_headers: &HeaderMap,
+    is_preflight: bool,
+) {
+    let Some(origins) = state.cors_origins.as_deref() else {
+        return;
+    };
+    if let Ok(v) = HeaderValue::from_str(origins) {
+        out.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+    }
+    out.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("POST, GET, OPTIONS"),
+    );
+    let requested = req_headers
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("Content-Type, Authorization, Cookie, Accept-Encoding");
+    if let Ok(v) = HeaderValue::from_str(requested) {
+        out.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, v);
+    }
+    out.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("Content-Encoding, WWW-Authenticate"),
+    );
+    if is_preflight {
+        if let Ok(v) = HeaderValue::from_str(&state.cors_max_age.to_string()) {
+            out.insert(header::ACCESS_CONTROL_MAX_AGE, v);
+        }
+    }
 }
 
 async fn handle_oauth_metadata(State(state): State<Arc<HttpState>>) -> Response {

@@ -3,6 +3,7 @@
 //! Registers ~45 RPC methods against an [`vgi_rpc::RpcServer`] mirroring
 //! the Python canonical implementation (`vgi_rpc/conformance/_impl.py`).
 
+mod param_schemas;
 mod params;
 mod results;
 mod streams;
@@ -15,8 +16,11 @@ use vgi_rpc::RpcServer;
 
 /// Build an `RpcServer` with all conformance methods registered.
 pub fn build_server() -> RpcServer {
-    let server_id = "rust-conf-0001".to_string();
-    let mut srv = RpcServer::new(server_id);
+    let mut srv = RpcServer::builder()
+        .server_id("rust-conf-0001")
+        .protocol_name("ConformanceService")
+        .enable_describe(true)
+        .build();
     unary::register(&mut srv);
     streams::register(&mut srv);
     srv

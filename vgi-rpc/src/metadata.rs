@@ -18,6 +18,10 @@ pub const CANCEL_KEY: &str = "vgi_rpc.cancel";
 
 pub const LOCATION_KEY: &str = "vgi_rpc.location";
 pub const LOCATION_SHA256_KEY: &str = "vgi_rpc.location.sha256";
+pub const LOCATION_FETCH_MS_KEY: &str = "vgi_rpc.location.fetch_ms";
+
+pub const PROTOCOL_NAME_KEY: &str = "vgi_rpc.protocol_name";
+pub const DESCRIBE_VERSION_KEY: &str = "vgi_rpc.describe_version";
 
 pub const SHM_OFFSET_KEY: &str = "vgi_rpc.shm_offset";
 pub const SHM_LENGTH_KEY: &str = "vgi_rpc.shm_length";

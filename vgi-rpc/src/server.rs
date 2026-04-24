@@ -83,30 +83,195 @@ pub type UnaryHandler = Arc<
 pub type StreamHandler =
     Arc<dyn Fn(&Request, &CallContext) -> Result<StreamResult> + Send + Sync>;
 
-/// Registration info for one method.
+/// Fluent builder for [`RpcServer`] with describe/identity/version knobs.
+#[derive(Default)]
+pub struct RpcServerBuilder {
+    server_id: Option<String>,
+    protocol_name: Option<String>,
+    enable_describe: bool,
+}
+
+impl RpcServerBuilder {
+    pub fn server_id(mut self, id: impl Into<String>) -> Self {
+        self.server_id = Some(id.into());
+        self
+    }
+
+    pub fn protocol_name(mut self, name: impl Into<String>) -> Self {
+        self.protocol_name = Some(name.into());
+        self
+    }
+
+    pub fn enable_describe(mut self, enabled: bool) -> Self {
+        self.enable_describe = enabled;
+        self
+    }
+
+    pub fn build(self) -> RpcServer {
+        RpcServer {
+            methods: HashMap::new(),
+            server_id: self
+                .server_id
+                .unwrap_or_else(|| crate::util::short_random_id()),
+            protocol_name: self.protocol_name.unwrap_or_default(),
+            describe_enabled: self.enable_describe,
+        }
+    }
+}
+
+/// Describes one RPC method — the metadata required both for dispatch and
+/// introspection via `__describe__`.
+///
+/// Build via [`MethodInfo::unary`] / [`MethodInfo::stream`] and attach
+/// additional describe-time metadata through the builder helpers
+/// (`.doc`, `.param_type`, `.param_default`, `.param_doc`, `.header_schema`).
 pub struct MethodInfo {
     pub name: String,
     pub method_type: MethodType,
+    /// Schema of the request parameters (one row).
+    pub params_schema: SchemaRef,
+    /// Schema of the unary result; empty for streams.
     pub result_schema: SchemaRef,
+    /// For streams that emit a typed header, the header batch schema.
+    pub header_schema: Option<SchemaRef>,
+    /// Method-level docstring (the first line of Python's docstring).
+    pub doc: Option<String>,
+    /// Parameter type names in source order, matching the Python describe
+    /// wire format ("str", "int", "list[str]", "Point", "str | None").
+    pub param_types: Vec<(String, String)>,
+    /// Parameter defaults; values are anything JSON-serializable.
+    pub param_defaults: Vec<(String, serde_json::Value)>,
+    /// Per-parameter documentation (matches the Python `param_docs_json`).
+    pub param_docs: Vec<(String, String)>,
+    /// Whether the method has a non-void return. `false` for streams/void.
+    pub has_return: bool,
     pub unary: Option<UnaryHandler>,
     pub stream: Option<StreamHandler>,
+}
+
+impl MethodInfo {
+    /// Start building a unary method registration.
+    pub fn unary(
+        name: impl Into<String>,
+        params_schema: SchemaRef,
+        result_schema: SchemaRef,
+        handler: impl Fn(&Request, &CallContext) -> Result<Option<RecordBatch>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        let has_return = !result_schema.fields().is_empty();
+        Self {
+            name: name.into(),
+            method_type: MethodType::Unary,
+            params_schema,
+            result_schema,
+            header_schema: None,
+            doc: None,
+            param_types: Vec::new(),
+            param_defaults: Vec::new(),
+            param_docs: Vec::new(),
+            has_return,
+            unary: Some(Arc::new(handler)),
+            stream: None,
+        }
+    }
+
+    /// Start building a streaming method registration.
+    pub fn stream(
+        name: impl Into<String>,
+        method_type: MethodType,
+        params_schema: SchemaRef,
+        handler: impl Fn(&Request, &CallContext) -> Result<StreamResult> + Send + Sync + 'static,
+    ) -> Self {
+        assert!(
+            matches!(
+                method_type,
+                MethodType::Producer | MethodType::Exchange | MethodType::Dynamic
+            ),
+            "stream methods must be Producer / Exchange / Dynamic"
+        );
+        Self {
+            name: name.into(),
+            method_type,
+            params_schema,
+            result_schema: empty_schema(),
+            header_schema: None,
+            doc: None,
+            param_types: Vec::new(),
+            param_defaults: Vec::new(),
+            param_docs: Vec::new(),
+            has_return: false,
+            unary: None,
+            stream: Some(Arc::new(handler)),
+        }
+    }
+
+    pub fn doc(mut self, s: impl Into<String>) -> Self {
+        self.doc = Some(s.into());
+        self
+    }
+
+    pub fn param_type(mut self, param: impl Into<String>, ty: impl Into<String>) -> Self {
+        self.param_types.push((param.into(), ty.into()));
+        self
+    }
+
+    pub fn param_default(
+        mut self,
+        param: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Self {
+        self.param_defaults.push((param.into(), value));
+        self
+    }
+
+    pub fn param_doc(mut self, param: impl Into<String>, doc: impl Into<String>) -> Self {
+        self.param_docs.push((param.into(), doc.into()));
+        self
+    }
+
+    pub fn header_schema(mut self, schema: SchemaRef) -> Self {
+        self.header_schema = Some(schema);
+        self
+    }
 }
 
 /// The RPC server — holds method registrations and dispatches requests.
 pub struct RpcServer {
     methods: HashMap<String, MethodInfo>,
     pub server_id: String,
+    pub(crate) protocol_name: String,
+    pub(crate) describe_enabled: bool,
 }
 
 impl RpcServer {
+    /// Create a new `RpcServer`. For richer configuration, use [`RpcServer::builder`].
     pub fn new(server_id: impl Into<String>) -> Self {
-        Self {
-            methods: HashMap::new(),
-            server_id: server_id.into(),
-        }
+        Self::builder().server_id(server_id).build()
     }
 
-    /// Register a unary method. The handler returns `None` for void results.
+    /// Create a new builder.
+    pub fn builder() -> RpcServerBuilder {
+        RpcServerBuilder::default()
+    }
+
+    pub fn protocol_name(&self) -> &str {
+        &self.protocol_name
+    }
+
+    pub fn describe_enabled(&self) -> bool {
+        self.describe_enabled
+    }
+
+    /// Register a method described by a [`MethodInfo`].
+    pub fn register(&mut self, info: MethodInfo) {
+        self.methods.insert(info.name.clone(), info);
+    }
+
+    /// Convenience wrapper for the old positional API — equivalent to
+    /// `register(MethodInfo::unary(name, empty_schema(), result_schema, handler))`.
+    /// Prefer [`MethodInfo::unary`] + [`RpcServer::register`] for new code.
     pub fn register_unary(
         &mut self,
         name: impl Into<String>,
@@ -116,45 +281,37 @@ impl RpcServer {
             + Sync
             + 'static,
     ) {
-        let name = name.into();
-        self.methods.insert(
-            name.clone(),
-            MethodInfo {
-                name,
-                method_type: MethodType::Unary,
-                result_schema,
-                unary: Some(Arc::new(handler)),
-                stream: None,
-            },
-        );
+        self.register(MethodInfo::unary(
+            name,
+            empty_schema(),
+            result_schema,
+            handler,
+        ));
     }
 
-    /// Register a streaming method (producer, exchange, or dynamic).
+    /// Convenience wrapper for the old positional API — equivalent to
+    /// `register(MethodInfo::stream(name, method_type, empty_schema(), handler))`.
+    /// Prefer [`MethodInfo::stream`] + [`RpcServer::register`] for new code.
     pub fn register_stream(
         &mut self,
         name: impl Into<String>,
         method_type: MethodType,
         handler: impl Fn(&Request, &CallContext) -> Result<StreamResult> + Send + Sync + 'static,
     ) {
-        debug_assert!(matches!(
+        self.register(MethodInfo::stream(
+            name,
             method_type,
-            MethodType::Producer | MethodType::Exchange | MethodType::Dynamic
+            empty_schema(),
+            handler,
         ));
-        let name = name.into();
-        self.methods.insert(
-            name.clone(),
-            MethodInfo {
-                name,
-                method_type,
-                result_schema: empty_schema(),
-                unary: None,
-                stream: Some(Arc::new(handler)),
-            },
-        );
     }
 
     pub fn method(&self, name: &str) -> Option<&MethodInfo> {
         self.methods.get(name)
+    }
+
+    pub fn methods(&self) -> &HashMap<String, MethodInfo> {
+        &self.methods
     }
 
     pub fn method_names(&self) -> Vec<&str> {
@@ -199,6 +356,29 @@ impl RpcServer {
             transport_metadata: Arc::new(req.metadata.clone()),
             log_sink: Arc::new(Mutex::new(Vec::new())),
         };
+
+        // Built-in __describe__ introspection.
+        if self.describe_enabled && req.method == crate::introspect::DESCRIBE_METHOD_NAME {
+            match crate::introspect::build_describe(
+                &self.protocol_name,
+                &self.methods,
+                &self.server_id,
+            ) {
+                Ok((batch, md)) => {
+                    crate::introspect::write_describe_response(w, &batch, &md)?;
+                }
+                Err(err) => {
+                    write_error_stream(
+                        w,
+                        &empty_schema(),
+                        &err,
+                        &self.server_id,
+                        &req.request_id,
+                    )?;
+                }
+            }
+            return Ok(true);
+        }
 
         let Some(info) = self.methods.get(&req.method) else {
             let mut names = self.method_names();

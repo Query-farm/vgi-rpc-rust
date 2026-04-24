@@ -10,9 +10,10 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi_rpc::{
     server::{MethodType, Request},
     stream::{ExchangeState, OutputCollector, ProducerState, StreamResult, StreamStateKind},
-    CallContext, LogLevel, Result, RpcError, RpcServer,
+    CallContext, LogLevel, MethodInfo, Result, RpcError, RpcServer,
 };
 
+use super::param_schemas as ps;
 use super::params as p;
 use super::types;
 
@@ -320,253 +321,394 @@ impl ExchangeState for CancellableExchange {
 // ---------------------------------------------------------------------------
 
 pub fn register(srv: &mut RpcServer) {
+    let conf_hdr = ps::conformance_header_schema();
+    let rich_hdr = ps::rich_header_schema();
+
     // --- Producers ---
-    srv.register_stream("produce_n", MethodType::Producer, |req, _| {
-        let count = p::i64_col(req, "count")?;
-        Ok(StreamResult::producer(
-            counter_schema(),
-            Box::new(Counter { total: count, cur: 0 }),
-        ))
-    });
-    srv.register_stream("produce_empty", MethodType::Producer, |_req, _| {
-        Ok(StreamResult::producer(counter_schema(), Box::new(Empty)))
-    });
-    srv.register_stream("produce_single", MethodType::Producer, |_req, _| {
-        Ok(StreamResult::producer(
-            counter_schema(),
-            Box::new(Single { emitted: false }),
-        ))
-    });
-    srv.register_stream(
-        "produce_large_batches",
-        MethodType::Producer,
-        |req, _| {
-            let rows = p::i64_col(req, "rows_per_batch")?;
-            let batches = p::i64_col(req, "batch_count")?;
+    srv.register(
+        MethodInfo::stream("produce_n", MethodType::Producer, ps::count_only(), |req, _| {
+            let count = p::i64_col(req, "count")?;
             Ok(StreamResult::producer(
                 counter_schema(),
-                Box::new(Large {
-                    rows,
-                    batches,
-                    cur: 0,
-                }),
+                Box::new(Counter { total: count, cur: 0 }),
             ))
-        },
+        })
+        .doc("Produce count batches with {index, value}.")
+        .param_type("count", "int"),
     );
-    srv.register_stream("produce_with_logs", MethodType::Producer, |req, _| {
-        let count = p::i64_col(req, "count")?;
-        Ok(StreamResult::producer(
-            counter_schema(),
-            Box::new(Logging { total: count, cur: 0 }),
-        ))
-    });
-    srv.register_stream(
-        "produce_error_mid_stream",
-        MethodType::Producer,
-        |req, _| {
-            let threshold = p::i64_col(req, "emit_before_error")?;
-            Ok(StreamResult::producer(
-                counter_schema(),
-                Box::new(ErrorAfterN { threshold, cur: 0 }),
-            ))
-        },
+    srv.register(
+        MethodInfo::stream(
+            "produce_empty",
+            MethodType::Producer,
+            ps::produce_empty(),
+            |_req, _| Ok(StreamResult::producer(counter_schema(), Box::new(Empty))),
+        )
+        .doc("Produce zero batches (finish immediately)."),
     );
-    srv.register_stream(
-        "produce_error_on_init",
-        MethodType::Producer,
-        |_req, _| Err(RpcError::runtime_error("intentional init error")),
+    srv.register(
+        MethodInfo::stream(
+            "produce_single",
+            MethodType::Producer,
+            ps::produce_single(),
+            |_req, _| {
+                Ok(StreamResult::producer(
+                    counter_schema(),
+                    Box::new(Single { emitted: false }),
+                ))
+            },
+        )
+        .doc("Produce exactly one batch."),
+    );
+    srv.register(
+        MethodInfo::stream(
+            "produce_large_batches",
+            MethodType::Producer,
+            ps::produce_large_batches(),
+            |req, _| {
+                let rows = p::i64_col(req, "rows_per_batch")?;
+                let batches = p::i64_col(req, "batch_count")?;
+                Ok(StreamResult::producer(
+                    counter_schema(),
+                    Box::new(Large { rows, batches, cur: 0 }),
+                ))
+            },
+        )
+        .doc("Produce batch_count batches of rows_per_batch rows each.")
+        .param_type("rows_per_batch", "int")
+        .param_type("batch_count", "int"),
+    );
+    srv.register(
+        MethodInfo::stream(
+            "produce_with_logs",
+            MethodType::Producer,
+            ps::count_only(),
+            |req, _| {
+                let count = p::i64_col(req, "count")?;
+                Ok(StreamResult::producer(
+                    counter_schema(),
+                    Box::new(Logging { total: count, cur: 0 }),
+                ))
+            },
+        )
+        .doc("Produce batches with an INFO log before each.")
+        .param_type("count", "int"),
+    );
+    srv.register(
+        MethodInfo::stream(
+            "produce_error_mid_stream",
+            MethodType::Producer,
+            ps::produce_error_mid_stream(),
+            |req, _| {
+                let threshold = p::i64_col(req, "emit_before_error")?;
+                Ok(StreamResult::producer(
+                    counter_schema(),
+                    Box::new(ErrorAfterN { threshold, cur: 0 }),
+                ))
+            },
+        )
+        .doc("Raise after emitting emit_before_error batches.")
+        .param_type("emit_before_error", "int"),
+    );
+    srv.register(
+        MethodInfo::stream(
+            "produce_error_on_init",
+            MethodType::Producer,
+            ps::produce_empty(),
+            |_req, _| Err(RpcError::runtime_error("intentional init error")),
+        )
+        .doc("Raise during stream initialization."),
     );
 
     // --- Producers with headers ---
-    srv.register_stream("produce_with_header", MethodType::Producer, |req, _| {
-        let count = p::i64_col(req, "count")?;
-        let header = types::build_conformance_header_batch(
-            count,
-            &format!("producing {count} batches"),
-        )?;
-        Ok(StreamResult::producer(
-            counter_schema(),
-            Box::new(Counter { total: count, cur: 0 }),
+    srv.register(
+        MethodInfo::stream(
+            "produce_with_header",
+            MethodType::Producer,
+            ps::count_only(),
+            |req, _| {
+                let count = p::i64_col(req, "count")?;
+                let header = types::build_conformance_header_batch(
+                    count,
+                    &format!("producing {count} batches"),
+                )?;
+                Ok(StreamResult::producer(
+                    counter_schema(),
+                    Box::new(Counter { total: count, cur: 0 }),
+                )
+                .with_header(header))
+            },
         )
-        .with_header(header))
-    });
-    srv.register_stream(
-        "produce_with_header_and_logs",
-        MethodType::Producer,
-        |req, ctx| {
-            let count = p::i64_col(req, "count")?;
-            ctx.client_log(LogLevel::Info, "stream init log");
-            let header = types::build_conformance_header_batch(
-                count,
-                &format!("producing {count} with logs"),
-            )?;
-            Ok(StreamResult::producer(
-                counter_schema(),
-                Box::new(Counter { total: count, cur: 0 }),
-            )
-            .with_header(header))
-        },
+        .doc("Produce batches with a stream header.")
+        .param_type("count", "int")
+        .header_schema(conf_hdr.clone()),
+    );
+    srv.register(
+        MethodInfo::stream(
+            "produce_with_header_and_logs",
+            MethodType::Producer,
+            ps::count_only(),
+            |req, ctx| {
+                let count = p::i64_col(req, "count")?;
+                ctx.client_log(LogLevel::Info, "stream init log");
+                let header = types::build_conformance_header_batch(
+                    count,
+                    &format!("producing {count} with logs"),
+                )?;
+                Ok(StreamResult::producer(
+                    counter_schema(),
+                    Box::new(Counter { total: count, cur: 0 }),
+                )
+                .with_header(header))
+            },
+        )
+        .doc("Produce batches with a header and INFO logs.")
+        .param_type("count", "int")
+        .header_schema(conf_hdr.clone()),
     );
 
     // --- Producer with rich header ---
-    srv.register_stream(
-        "produce_with_rich_header",
-        MethodType::Producer,
-        |req, _| {
-            let seed = p::i64_col(req, "seed")?;
-            let count = p::i64_col(req, "count")?;
-            let header_batch = types::build_rich_header(seed).to_record_batch()?;
-            Ok(StreamResult::producer(
-                counter_schema(),
-                Box::new(Counter { total: count, cur: 0 }),
-            )
-            .with_header(header_batch))
-        },
+    srv.register(
+        MethodInfo::stream(
+            "produce_with_rich_header",
+            MethodType::Producer,
+            ps::produce_with_rich_header(),
+            |req, _| {
+                let seed = p::i64_col(req, "seed")?;
+                let count = p::i64_col(req, "count")?;
+                let header_batch = types::build_rich_header(seed).to_record_batch()?;
+                Ok(StreamResult::producer(
+                    counter_schema(),
+                    Box::new(Counter { total: count, cur: 0 }),
+                )
+                .with_header(header_batch))
+            },
+        )
+        .doc("Produce batches with a rich multi-type stream header.")
+        .param_type("seed", "int")
+        .param_type("count", "int")
+        .param_doc("seed", "Determines all header field values deterministically.")
+        .param_doc("count", "Number of {index, value} batches to produce.")
+        .header_schema(rich_hdr.clone()),
     );
 
     // --- Producer with dynamic schema ---
-    srv.register_stream(
-        "produce_dynamic_schema",
-        MethodType::Dynamic,
-        |req, _| {
-            let seed = p::i64_col(req, "seed")?;
-            let count = p::i64_col(req, "count")?;
-            let include_strings = p::bool_col(req, "include_strings")?;
-            let include_floats = p::bool_col(req, "include_floats")?;
-            let schema = types::build_dynamic_schema(include_strings, include_floats);
-            let header_batch = types::build_rich_header(seed).to_record_batch()?;
-            Ok(StreamResult::producer(
-                schema.clone(),
-                Box::new(Dynamic {
-                    schema,
-                    total: count,
-                    cur: 0,
-                    include_strings,
-                    include_floats,
-                }),
-            )
-            .with_header(header_batch))
-        },
+    srv.register(
+        MethodInfo::stream(
+            "produce_dynamic_schema",
+            MethodType::Dynamic,
+            ps::produce_dynamic_schema(),
+            |req, _| {
+                let seed = p::i64_col(req, "seed")?;
+                let count = p::i64_col(req, "count")?;
+                let include_strings = p::bool_col(req, "include_strings")?;
+                let include_floats = p::bool_col(req, "include_floats")?;
+                let schema = types::build_dynamic_schema(include_strings, include_floats);
+                let header_batch = types::build_rich_header(seed).to_record_batch()?;
+                Ok(StreamResult::producer(
+                    schema.clone(),
+                    Box::new(Dynamic {
+                        schema,
+                        total: count,
+                        cur: 0,
+                        include_strings,
+                        include_floats,
+                    }),
+                )
+                .with_header(header_batch))
+            },
+        )
+        .doc("Produce batches with a dynamic output schema and rich header.")
+        .param_type("seed", "int")
+        .param_type("count", "int")
+        .param_type("include_strings", "bool")
+        .param_type("include_floats", "bool")
+        .param_doc("seed", "Determines all header field values deterministically.")
+        .param_doc("count", "Number of batches to produce.")
+        .param_doc("include_strings", "Whether to include a ``label: utf8`` column.")
+        .param_doc("include_floats", "Whether to include a ``score: float64`` column.")
+        .header_schema(rich_hdr.clone()),
     );
 
     // --- Exchanges ---
-    srv.register_stream("exchange_scale", MethodType::Exchange, |req, _| {
-        let factor = p::f64_col(req, "factor")?;
-        Ok(StreamResult::exchange(
-            scale_schema(),
-            scale_schema(),
-            Box::new(Scale { factor }),
-        ))
-    });
-    srv.register_stream("exchange_accumulate", MethodType::Exchange, |_req, _| {
-        Ok(StreamResult::exchange(
-            accum_schema(),
-            scale_schema(),
-            Box::new(Accumulate { sum: 0.0, count: 0 }),
-        ))
-    });
-    srv.register_stream("exchange_with_logs", MethodType::Exchange, |_req, _| {
-        Ok(StreamResult::exchange(
-            scale_schema(),
-            scale_schema(),
-            Box::new(LoggingExchange),
-        ))
-    });
-    srv.register_stream(
-        "exchange_error_on_nth",
-        MethodType::Exchange,
-        |req, _| {
-            let fail_on = p::i64_col(req, "fail_on")?;
-            Ok(StreamResult::exchange(
-                scale_schema(),
-                scale_schema(),
-                Box::new(FailOnExchangeN {
-                    fail_on,
-                    count: 0,
-                }),
-            ))
-        },
+    srv.register(
+        MethodInfo::stream(
+            "exchange_scale",
+            MethodType::Exchange,
+            ps::factor_only(),
+            |req, _| {
+                let factor = p::f64_col(req, "factor")?;
+                Ok(StreamResult::exchange(
+                    scale_schema(),
+                    scale_schema(),
+                    Box::new(Scale { factor }),
+                ))
+            },
+        )
+        .doc("Multiply input values by factor.")
+        .param_type("factor", "float"),
     );
-    srv.register_stream(
-        "exchange_error_on_init",
-        MethodType::Exchange,
-        |_req, _| Err(RpcError::runtime_error("intentional exchange init error")),
+    srv.register(
+        MethodInfo::stream(
+            "exchange_accumulate",
+            MethodType::Exchange,
+            ps::exchange_accumulate(),
+            |_req, _| {
+                Ok(StreamResult::exchange(
+                    accum_schema(),
+                    scale_schema(),
+                    Box::new(Accumulate { sum: 0.0, count: 0 }),
+                ))
+            },
+        )
+        .doc("Accumulate running sum and exchange count across exchanges."),
     );
-    srv.register_stream(
-        "exchange_zero_columns",
-        MethodType::Exchange,
-        |_req, _| {
-            let empty = Arc::new(Schema::empty());
-            Ok(StreamResult::exchange(
-                empty.clone(),
-                empty,
-                Box::new(ZeroColumn),
-            ))
-        },
+    srv.register(
+        MethodInfo::stream(
+            "exchange_with_logs",
+            MethodType::Exchange,
+            ps::exchange_with_logs(),
+            |_req, _| {
+                Ok(StreamResult::exchange(
+                    scale_schema(),
+                    scale_schema(),
+                    Box::new(LoggingExchange),
+                ))
+            },
+        )
+        .doc("Exchange with INFO + DEBUG logs per exchange."),
     );
-    srv.register_stream(
-        "exchange_cast_compatible",
-        MethodType::Exchange,
-        |_req, _| {
-            Ok(StreamResult::exchange(
-                scale_schema(),
-                scale_schema(),
-                Box::new(Scale { factor: 1.0 }),
-            ))
-        },
+    srv.register(
+        MethodInfo::stream(
+            "exchange_error_on_nth",
+            MethodType::Exchange,
+            ps::exchange_error_on_nth(),
+            |req, _| {
+                let fail_on = p::i64_col(req, "fail_on")?;
+                Ok(StreamResult::exchange(
+                    scale_schema(),
+                    scale_schema(),
+                    Box::new(FailOnExchangeN { fail_on, count: 0 }),
+                ))
+            },
+        )
+        .doc("Raise on the Nth exchange (1-indexed).")
+        .param_type("fail_on", "int"),
+    );
+    srv.register(
+        MethodInfo::stream(
+            "exchange_error_on_init",
+            MethodType::Exchange,
+            ps::exchange_error_on_init(),
+            |_req, _| Err(RpcError::runtime_error("intentional exchange init error")),
+        )
+        .doc("Raise during exchange stream initialization."),
+    );
+    srv.register(
+        MethodInfo::stream(
+            "exchange_zero_columns",
+            MethodType::Exchange,
+            ps::exchange_zero_columns(),
+            |_req, _| {
+                let empty = Arc::new(Schema::empty());
+                Ok(StreamResult::exchange(empty.clone(), empty, Box::new(ZeroColumn)))
+            },
+        )
+        .doc("Exchange stream with zero-column input and output."),
+    );
+    srv.register(
+        MethodInfo::stream(
+            "exchange_cast_compatible",
+            MethodType::Exchange,
+            ps::exchange_cast_compatible(),
+            |_req, _| {
+                Ok(StreamResult::exchange(
+                    scale_schema(),
+                    scale_schema(),
+                    Box::new(Scale { factor: 1.0 }),
+                ))
+            },
+        )
+        .doc("Exchange expecting float64 input — tests server-side cast for compatible schemas."),
     );
 
     // --- Exchange with headers ---
-    srv.register_stream("exchange_with_header", MethodType::Exchange, |req, _| {
-        let factor = p::f64_col(req, "factor")?;
-        let header = types::build_conformance_header_batch(
-            0,
-            &format!("scale by {}", format_float(factor)),
-        )?;
-        Ok(StreamResult::exchange(
-            scale_schema(),
-            scale_schema(),
-            Box::new(Scale { factor }),
+    srv.register(
+        MethodInfo::stream(
+            "exchange_with_header",
+            MethodType::Exchange,
+            ps::factor_only(),
+            |req, _| {
+                let factor = p::f64_col(req, "factor")?;
+                let header = types::build_conformance_header_batch(
+                    0,
+                    &format!("scale by {}", format_float(factor)),
+                )?;
+                Ok(StreamResult::exchange(
+                    scale_schema(),
+                    scale_schema(),
+                    Box::new(Scale { factor }),
+                )
+                .with_header(header))
+            },
         )
-        .with_header(header))
-    });
-    srv.register_stream(
-        "exchange_with_rich_header",
-        MethodType::Exchange,
-        |req, _| {
-            let seed = p::i64_col(req, "seed")?;
-            let factor = p::f64_col(req, "factor")?;
-            let header_batch = types::build_rich_header(seed).to_record_batch()?;
-            Ok(StreamResult::exchange(
-                scale_schema(),
-                scale_schema(),
-                Box::new(Scale { factor }),
-            )
-            .with_header(header_batch))
-        },
+        .doc("Exchange stream with a header.")
+        .param_type("factor", "float")
+        .header_schema(conf_hdr.clone()),
+    );
+    srv.register(
+        MethodInfo::stream(
+            "exchange_with_rich_header",
+            MethodType::Exchange,
+            ps::exchange_with_rich_header(),
+            |req, _| {
+                let seed = p::i64_col(req, "seed")?;
+                let factor = p::f64_col(req, "factor")?;
+                let header_batch = types::build_rich_header(seed).to_record_batch()?;
+                Ok(StreamResult::exchange(
+                    scale_schema(),
+                    scale_schema(),
+                    Box::new(Scale { factor }),
+                )
+                .with_header(header_batch))
+            },
+        )
+        .doc("Exchange stream with a rich multi-type header.")
+        .param_type("seed", "int")
+        .param_type("factor", "float")
+        .param_doc("seed", "Determines all header field values deterministically.")
+        .param_doc("factor", "Multiplier applied to input values.")
+        .header_schema(rich_hdr.clone()),
     );
 
     // --- Cancellation ---
-    srv.register_stream(
-        "cancellable_producer",
-        MethodType::Producer,
-        |_req, _| {
-            Ok(StreamResult::producer(
-                counter_schema(),
-                Box::new(CancellableProducer { cur: 0 }),
-            ))
-        },
+    srv.register(
+        MethodInfo::stream(
+            "cancellable_producer",
+            MethodType::Producer,
+            ps::cancellable(),
+            |_req, _| {
+                Ok(StreamResult::producer(
+                    counter_schema(),
+                    Box::new(CancellableProducer { cur: 0 }),
+                ))
+            },
+        )
+        .doc("Produce one batch per tick forever — designed to be cancelled by the client."),
     );
-    srv.register_stream(
-        "cancellable_exchange",
-        MethodType::Exchange,
-        |_req, _| {
-            Ok(StreamResult::exchange(
-                scale_schema(),
-                scale_schema(),
-                Box::new(CancellableExchange),
-            ))
-        },
+    srv.register(
+        MethodInfo::stream(
+            "cancellable_exchange",
+            MethodType::Exchange,
+            ps::cancellable(),
+            |_req, _| {
+                Ok(StreamResult::exchange(
+                    scale_schema(),
+                    scale_schema(),
+                    Box::new(CancellableExchange),
+                ))
+            },
+        )
+        .doc("Echo each input batch — designed to be cancelled by the client."),
     );
 
     // quiet unused imports

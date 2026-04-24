@@ -188,3 +188,44 @@ class TestExchangeStream(TestExchangeStream):  # type: ignore[no-redef]  # noqa:
                 session = proxy.exchange_error_on_init()
                 # HTTP raises during init; pipe/subprocess raises on first exchange.
                 session.exchange(AnnotatedBatch.from_pydict({"value": [1.0]}))
+
+
+# -----------------------------------------------------------------------------
+# Live describe conformance against the actual Rust worker (pipe + http).
+# The upstream TestDescribeConformance runs in-process against a Python
+# RpcServer — which covers the protocol format but not our implementation.
+# -----------------------------------------------------------------------------
+
+from vgi_rpc.conformance import run_describe_conformance  # noqa: E402
+from vgi_rpc.introspect import introspect, DESCRIBE_METHOD_NAME, DESCRIBE_VERSION  # noqa: E402
+from vgi_rpc.http import http_introspect  # noqa: E402
+
+
+class TestRustDescribeConformance:
+    """Run the describe conformance suite against the real Rust worker."""
+
+    def test_describe_via_pipe(self, rust_transport: SubprocessTransport) -> None:
+        # Use a dedicated subprocess so we don't disturb the shared transport.
+        transport = SubprocessTransport([RUST_WORKER])
+        try:
+            desc = introspect(transport)
+        finally:
+            transport.close()
+        _assert_describe(desc)
+
+    def test_describe_via_http(self, rust_http_port: int) -> None:
+        desc = http_introspect(f"http://127.0.0.1:{rust_http_port}")
+        _assert_describe(desc)
+
+
+def _assert_describe(desc) -> None:  # type: ignore[no-untyped-def]
+    assert desc.protocol_name == "ConformanceService"
+    assert desc.describe_version == DESCRIBE_VERSION
+    assert len(desc.methods) == 52, sorted(desc.methods.keys())
+    suite = run_describe_conformance(desc)
+    if not suite.success:
+        failures = [r for r in suite.results if not r.passed]
+        details = "\n".join(f"  {r.name}: {r.error}" for r in failures)
+        raise AssertionError(
+            f"{suite.failed}/{suite.total} describe conformance tests failed:\n{details}"
+        )

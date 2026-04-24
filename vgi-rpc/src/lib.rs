@@ -5,17 +5,20 @@
 //! supplied by other languages can drive a [`RpcServer`] transparently.
 
 pub mod errors;
+pub mod introspect;
 pub mod log;
 pub mod metadata;
-pub mod probe;
+pub(crate) mod probe;
 pub mod server;
 pub mod stream;
+pub(crate) mod util;
 pub mod wire;
 
 #[cfg(feature = "http")]
 pub mod http;
 
 pub use errors::{Result, RpcError};
+pub use introspect::{DESCRIBE_METHOD_NAME, DESCRIBE_VERSION};
 pub use log::{LogLevel, LogMessage};
-pub use server::{CallContext, RpcServer};
+pub use server::{CallContext, MethodInfo, MethodType, RpcServer, RpcServerBuilder};
 pub use stream::{ExchangeState, OutputCollector, ProducerState, StreamResult};

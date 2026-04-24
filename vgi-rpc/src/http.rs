@@ -270,6 +270,26 @@ async fn handle_unary(
         }
     };
 
+    // __describe__ introspection — served as a unary call.
+    if server.describe_enabled() && method == crate::introspect::DESCRIBE_METHOD_NAME {
+        let (batch, md) = match crate::introspect::build_describe(
+            server.protocol_name(),
+            server.methods(),
+            &server.server_id,
+        ) {
+            Ok(x) => x,
+            Err(err) => {
+                return arrow_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_stream_bytes(&Schema::empty(), &err, &server.server_id, &req.request_id),
+                );
+            }
+        };
+        let mut buf = Vec::new();
+        let _ = crate::introspect::write_describe_response(&mut buf, &batch, &md);
+        return arrow_response(StatusCode::OK, buf);
+    }
+
     let Some(info) = server.method(&method).filter(|m| m.method_type == MethodType::Unary) else {
         let err = RpcError::new("AttributeError", format!("Unknown method: '{}'", method));
         return arrow_response(

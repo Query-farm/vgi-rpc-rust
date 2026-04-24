@@ -59,6 +59,11 @@ pub struct HttpState {
     token_ttl: std::time::Duration,
     max_sessions: usize,
     max_body_size: usize,
+    authenticate: Option<crate::auth::Authenticate>,
+    #[allow(dead_code)]
+    oauth_metadata: Option<Arc<crate::auth::oauth::OAuthResourceMetadata>>,
+    oauth_metadata_json: Option<Vec<u8>>,
+    www_authenticate: Option<String>,
 }
 
 /// Fluent builder for [`HttpState`].
@@ -70,6 +75,8 @@ pub struct HttpStateBuilder {
     token_ttl: Option<std::time::Duration>,
     max_sessions: Option<usize>,
     max_body_size: Option<usize>,
+    authenticate: Option<crate::auth::Authenticate>,
+    oauth_metadata: Option<Arc<crate::auth::oauth::OAuthResourceMetadata>>,
 }
 
 impl HttpStateBuilder {
@@ -117,6 +124,24 @@ impl HttpStateBuilder {
         self
     }
 
+    /// Register an authenticate callback run on every request. Not set →
+    /// anonymous for all callers (mirrors the Python `make_wsgi_app` default).
+    pub fn authenticate(mut self, cb: crate::auth::Authenticate) -> Self {
+        self.authenticate = Some(cb);
+        self
+    }
+
+    /// Attach RFC 9728 Protected Resource Metadata. When set, the server
+    /// exposes `/.well-known/oauth-protected-resource` and includes a
+    /// `WWW-Authenticate` header on 401 responses.
+    pub fn oauth_resource_metadata(
+        mut self,
+        metadata: crate::auth::oauth::OAuthResourceMetadata,
+    ) -> Self {
+        self.oauth_metadata = Some(Arc::new(metadata));
+        self
+    }
+
     pub fn build(self) -> Arc<HttpState> {
         let server = self.server.expect("HttpStateBuilder::server is required");
         let signing_key = self.signing_key.unwrap_or_else(|| {
@@ -124,6 +149,11 @@ impl HttpStateBuilder {
             rand::thread_rng().fill_bytes(&mut k);
             k
         });
+        let oauth_metadata_json = self
+            .oauth_metadata
+            .as_ref()
+            .map(|m| m.to_json().into_bytes());
+        let www_authenticate = self.oauth_metadata.as_ref().map(|m| m.www_authenticate());
         let state = Arc::new(HttpState {
             server,
             sessions: Mutex::new(HashMap::new()),
@@ -134,6 +164,10 @@ impl HttpStateBuilder {
                 .unwrap_or_else(|| std::time::Duration::from_secs(300)),
             max_sessions: self.max_sessions.unwrap_or(10_000),
             max_body_size: self.max_body_size.unwrap_or(64 * 1024 * 1024),
+            authenticate: self.authenticate,
+            oauth_metadata: self.oauth_metadata,
+            oauth_metadata_json,
+            www_authenticate,
         });
         HttpState::spawn_reaper(Arc::downgrade(&state));
         state
@@ -215,7 +249,90 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
         .route("/:method", post(handle_unary))
         .route("/:method/init", post(handle_stream_init))
         .route("/:method/exchange", post(handle_stream_exchange))
+        .route(
+            crate::auth::oauth::OAuthResourceMetadata::well_known_path(),
+            axum::routing::get(handle_oauth_metadata),
+        )
         .with_state(state)
+}
+
+async fn handle_oauth_metadata(State(state): State<Arc<HttpState>>) -> Response {
+    match state.oauth_metadata_json.as_ref() {
+        Some(body) => {
+            let mut h = HeaderMap::new();
+            h.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            h.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=60"),
+            );
+            (StatusCode::OK, h, body.clone()).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "").into_response(),
+    }
+}
+
+/// Parse a `Cookie:` header into a name→value map.
+fn parse_cookies(raw: Option<&str>) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(raw) = raw else { return out };
+    for part in raw.split(';') {
+        let part = part.trim();
+        if let Some((k, v)) = part.split_once('=') {
+            out.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    out
+}
+
+/// Copy the request headers into a `Vec<(String, String)>` for AuthRequest.
+fn headers_to_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|s| (k.as_str().to_string(), s.to_string()))
+        })
+        .collect()
+}
+
+/// Run the authenticate callback (if any); on error, build a 401 response
+/// with WWW-Authenticate attached.
+fn authenticate_request(
+    state: &Arc<HttpState>,
+    method: &str,
+    headers: &HeaderMap,
+) -> std::result::Result<crate::auth::AuthContext, Response> {
+    let Some(cb) = state.authenticate.as_ref() else {
+        return Ok(crate::auth::AuthContext::anonymous());
+    };
+    let pairs = headers_to_pairs(headers);
+    let req = crate::auth::AuthRequest {
+        method,
+        headers: &pairs,
+        peer_addr: None,
+    };
+    match (cb)(&req) {
+        Ok(ctx) => Ok(ctx),
+        Err(err) => {
+            let status = match err.error_type.as_str() {
+                "PermissionError" | "ValueError" => StatusCode::UNAUTHORIZED,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            let mut h = HeaderMap::new();
+            if status == StatusCode::UNAUTHORIZED {
+                if let Some(wa) = state.www_authenticate.as_deref() {
+                    if let Ok(hv) = HeaderValue::from_str(wa) {
+                        h.insert(header::WWW_AUTHENTICATE, hv);
+                    }
+                }
+            }
+            Err((status, h, err.message.clone()).into_response())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -295,12 +412,19 @@ fn parse_request_from_body(body: &[u8]) -> Result<Request> {
     })
 }
 
-fn build_call_ctx(server: &Arc<RpcServer>, req: &Request) -> CallContext {
+fn build_call_ctx(
+    server: &Arc<RpcServer>,
+    req: &Request,
+    auth: crate::auth::AuthContext,
+    cookies: std::collections::BTreeMap<String, String>,
+) -> CallContext {
     CallContext {
         server_id: server.server_id.clone(),
         method: req.method.clone(),
         request_id: req.request_id.clone(),
         transport_metadata: Arc::new(req.metadata.clone()),
+        auth,
+        cookies,
         log_sink: Arc::new(Mutex::new(Vec::new())),
     }
 }
@@ -386,6 +510,11 @@ async fn handle_unary(
             "need arrow content type".into(),
         );
     }
+    let auth = match authenticate_request(&state, &method, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let cookies = parse_cookies(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let server = state.server.clone();
 
     let body = match maybe_decompress(&headers, &body, state.max_body_size) {
@@ -438,16 +567,16 @@ async fn handle_unary(
         );
     };
 
-    let ctx = build_call_ctx(&server, &req);
+    let ctx = build_call_ctx(&server, &req, auth.clone(), cookies);
     let dispatch_info = crate::hooks::DispatchInfo {
         method: req.method.clone(),
         method_type: "unary",
         server_id: server.server_id.clone(),
         request_id: req.request_id.clone(),
         transport_metadata: Arc::new(req.metadata.clone()),
-        principal: String::new(),
-        auth_domain: String::new(),
-        authenticated: false,
+        principal: auth.principal.clone(),
+        auth_domain: auth.domain.clone(),
+        authenticated: auth.authenticated,
     };
     let hook = server.dispatch_hook.clone();
     let hook_token = hook.as_ref().map(|h| h.on_dispatch_start(&dispatch_info));
@@ -513,6 +642,11 @@ async fn handle_stream_init(
             "need arrow content type".into(),
         );
     }
+    let auth = match authenticate_request(&state, &method, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let cookies = parse_cookies(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let server = state.server.clone();
     let body = match maybe_decompress(&headers, &body, state.max_body_size) {
         Ok(b) => b,
@@ -547,7 +681,7 @@ async fn handle_stream_init(
         );
     };
 
-    let ctx = build_call_ctx(&server, &req);
+    let ctx = build_call_ctx(&server, &req, auth, cookies);
     let init_result = (info.stream.as_ref().unwrap())(&req, &ctx);
     let init_logs = ctx.drain_logs();
 
@@ -647,7 +781,13 @@ fn run_producer<W: std::io::Write>(
     req: &Request,
     limit: usize,
 ) -> bool {
-    let ctx = build_call_ctx(server, req);
+    // Continuation producers run without auth context (session-bound).
+    let ctx = build_call_ctx(
+        server,
+        req,
+        crate::auth::AuthContext::anonymous(),
+        std::collections::BTreeMap::new(),
+    );
     let producer = match ss {
         StreamStateKind::Producer(p) => p,
         StreamStateKind::Exchange(_) => unreachable!(),
@@ -699,7 +839,7 @@ fn run_producer<W: std::io::Write>(
 
 async fn handle_stream_exchange(
     State(state): State<Arc<HttpState>>,
-    Path(_method): Path<String>,
+    Path(method): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -708,6 +848,9 @@ async fn handle_stream_exchange(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "need arrow content type".into(),
         );
+    }
+    if let Err(resp) = authenticate_request(&state, &method, &headers) {
+        return resp;
     }
 
     let server = state.server.clone();
@@ -783,7 +926,12 @@ async fn handle_stream_exchange(
         batch: empty_batch(&Schema::empty()).unwrap(),
         metadata: metadata.clone(),
     };
-    let ctx = build_call_ctx(&server, &req);
+    let ctx = build_call_ctx(
+        &server,
+        &req,
+        crate::auth::AuthContext::anonymous(),
+        std::collections::BTreeMap::new(),
+    );
 
     let mut body_buf = Vec::new();
 

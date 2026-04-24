@@ -2,6 +2,31 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased] — Phase 2: auth surface
+
+- **Added** core auth framework: `AuthContext`, `AuthRequest`, `Authenticate`
+  callback type, `chain_authenticate` / `chain_all`. `AuthContext` is now
+  propagated on every `CallContext`, and HTTP requests carry a `cookies`
+  map into user handlers.
+- **Added** bearer-token helpers:
+  `auth::bearer::bearer_authenticate(validator)` and
+  `bearer_authenticate_static(HashMap)`.
+- **Added** mTLS via `x-forwarded-client-cert` (RFC 8705) with
+  `mtls_authenticate_fingerprint`, `mtls_authenticate_subject`, and
+  `mtls_authenticate_xfcc`; XFCC parser handles quoted values + multi-hop
+  chains.
+- **Added** OAuth 2.0 Protected Resource Metadata (RFC 9728):
+  `OAuthResourceMetadata`, auto-served at
+  `/.well-known/oauth-protected-resource`, with a pre-built
+  `WWW-Authenticate` header on 401 responses.
+- **Added** JWKS-backed JWT validation behind the `jwt` feature:
+  `jwt_authenticate_with` + `JwtConfig` + single-flight JWKS refresh.
+- **Added** OAuth2 + PKCE primitives behind `oauth-pkce`:
+  `generate_pkce_pair`, HMAC-signed state cookies, return-origin allowlist.
+- **Added** `HttpState::builder().authenticate(cb).oauth_resource_metadata(m)`.
+- **Added** 4 HTTP integration tests and 11 new unit tests covering auth
+  helpers end-to-end.
+
 ## [Unreleased] — Phase 1: production hygiene
 
 - **Added** `__describe__` introspection behind `RpcServer::builder().enable_describe(true)`.

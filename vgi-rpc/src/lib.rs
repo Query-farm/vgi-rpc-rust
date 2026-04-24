@@ -5,6 +5,7 @@
 //! supplied by other languages can drive a [`RpcServer`] transparently.
 
 pub mod access_log;
+pub mod auth;
 pub mod errors;
 pub mod hooks;
 pub mod introspect;
@@ -20,6 +21,7 @@ pub mod wire;
 pub mod http;
 
 pub use access_log::AccessLogHook;
+pub use auth::{chain_all, chain_authenticate, AuthContext, AuthRequest, AuthResult, Authenticate};
 pub use errors::{Result, RpcError};
 pub use hooks::{CallStatistics, ChainHook, DispatchHook, DispatchInfo, HookToken, SharedHook};
 pub use introspect::{DESCRIBE_METHOD_NAME, DESCRIBE_VERSION};

@@ -24,6 +24,11 @@ pub struct CallContext {
     pub method: String,
     pub request_id: String,
     pub transport_metadata: Arc<Metadata>,
+    /// Authentication state, or [`crate::AuthContext::anonymous`] when
+    /// no authenticator is configured (e.g. pipe/unix transports).
+    pub auth: crate::auth::AuthContext,
+    /// HTTP request cookies (empty for pipe/unix). Name → value.
+    pub cookies: std::collections::BTreeMap<String, String>,
     pub(crate) log_sink: Arc<Mutex<Vec<LogMessage>>>,
 }
 
@@ -355,6 +360,8 @@ impl RpcServer {
             method: req.method.clone(),
             request_id: req.request_id.clone(),
             transport_metadata: Arc::new(req.metadata.clone()),
+            auth: crate::auth::AuthContext::anonymous(),
+            cookies: std::collections::BTreeMap::new(),
             log_sink: Arc::new(Mutex::new(Vec::new())),
         };
 

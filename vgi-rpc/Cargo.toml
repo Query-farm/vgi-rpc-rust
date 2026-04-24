@@ -9,6 +9,13 @@ description = "Transport-agnostic RPC framework built on Apache Arrow IPC"
 [features]
 default = ["http"]
 http = ["dep:axum", "dep:tokio", "dep:hmac", "dep:sha2", "dep:base64", "dep:rand", "dep:bincode", "dep:zstd"]
+jwt = []
+oauth-pkce = []
+mtls-pem = []
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tokio = { workspace = true, features = ["full"] }
 
 [dependencies]
 flatbuffers = "25"

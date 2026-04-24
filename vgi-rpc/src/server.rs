@@ -181,6 +181,12 @@ impl RpcServer {
 
     /// Handle one request. Returns `Ok(true)` to continue, `Ok(false)` on EOS/EOF.
     pub fn serve_one<R: Read, W: Write>(&self, r: &mut R, w: &mut W) -> Result<bool> {
+        let result = self._serve_one(r, w);
+        let _ = w.flush();
+        result
+    }
+
+    fn _serve_one<R: Read, W: Write>(&self, r: &mut R, w: &mut W) -> Result<bool> {
         let req = match self.read_request(r)? {
             Some(rq) => rq,
             None => return Ok(false),

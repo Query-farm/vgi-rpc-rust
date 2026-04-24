@@ -361,12 +361,16 @@ impl RpcServer {
             hw.write(&header_batch, header_metadata.as_ref())?;
             hw.finish()?;
         }
+        let _ = w.flush();
+
+        // Open the output stream first — the client opens the output reader
+        // before the next tick is read back here, so we must make the schema
+        // available without waiting on input.
+        let mut out_writer = StreamWriter::new(&mut *w, output_schema.as_ref())?;
+        out_writer.flush()?;
 
         // Open the input stream (ticks for producer, real batches for exchange).
         let mut input_reader = StreamReader::new(&mut *r)?;
-
-        // Open the output stream.
-        let mut out_writer = StreamWriter::new(&mut *w, output_schema.as_ref())?;
 
         // If we didn't already write init logs into a header stream, write them now.
         if !wrote_header {
@@ -450,6 +454,9 @@ impl RpcServer {
                     }
                 }
             }
+            // The client writes a tick and then blocks reading our response;
+            // we must flush after every lockstep iteration.
+            out_writer.flush()?;
 
             if finished {
                 break;
@@ -477,6 +484,17 @@ fn cast_batch(batch: &RecordBatch, target: &Schema) -> Result<RecordBatch> {
             target.fields().len(),
             batch.num_columns()
         )));
+    }
+    let src_schema = batch.schema();
+    for (i, field) in target.fields().iter().enumerate() {
+        let src_name = src_schema.field(i).name();
+        if src_name != field.name() {
+            return Err(RpcError::type_error(format!(
+                "Input schema mismatch: expected field {:?}, got {:?}",
+                field.name(),
+                src_name
+            )));
+        }
     }
     let opts = arrow_cast::CastOptions::default();
     let mut cols = Vec::with_capacity(batch.num_columns());

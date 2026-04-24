@@ -679,12 +679,12 @@ pub fn build_rich_header(seed: i64) -> AllTypes {
 // ---------------------------------------------------------------------------
 
 pub fn build_dynamic_schema(include_strings: bool, include_floats: bool) -> SchemaRef {
-    let mut fields: Vec<Field> = vec![Field::new("index", DataType::Int64, false)];
+    let mut fields: Vec<Field> = vec![Field::new("index", DataType::Int64, true)];
     if include_strings {
-        fields.push(Field::new("label", DataType::Utf8, false));
+        fields.push(Field::new("label", DataType::Utf8, true));
     }
     if include_floats {
-        fields.push(Field::new("score", DataType::Float64, false));
+        fields.push(Field::new("score", DataType::Float64, true));
     }
     Arc::new(Schema::new(fields))
 }

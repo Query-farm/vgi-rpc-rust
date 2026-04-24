@@ -111,7 +111,14 @@ impl<W: Write> StreamWriter<W> {
         }
         self.writer.write_all(&CONTINUATION_MARKER)?;
         self.writer.write_all(&[0u8; 4])?;
+        self.writer.flush()?;
         self.finished = true;
+        Ok(())
+    }
+
+    /// Flush the underlying writer.
+    pub fn flush(&mut self) -> Result<()> {
+        self.writer.flush()?;
         Ok(())
     }
 

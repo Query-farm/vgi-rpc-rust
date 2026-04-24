@@ -89,6 +89,8 @@ pub struct RpcServerBuilder {
     protocol_name: Option<String>,
     enable_describe: bool,
     dispatch_hook: Option<Arc<dyn crate::hooks::DispatchHook>>,
+    #[cfg(feature = "http")]
+    external_config: Option<Arc<crate::external::ExternalLocationConfig>>,
 }
 
 impl RpcServerBuilder {
@@ -117,6 +119,15 @@ impl RpcServerBuilder {
         self
     }
 
+    /// Enable automatic externalization of large unary results and stream
+    /// output batches. Feature-gated on `http` (where the compression +
+    /// fetcher deps already live).
+    #[cfg(feature = "http")]
+    pub fn with_external_location(mut self, cfg: crate::external::ExternalLocationConfig) -> Self {
+        self.external_config = Some(Arc::new(cfg));
+        self
+    }
+
     pub fn build(self) -> RpcServer {
         RpcServer {
             methods: HashMap::new(),
@@ -125,6 +136,8 @@ impl RpcServerBuilder {
             protocol_name: self.protocol_name.unwrap_or_default(),
             describe_enabled: self.enable_describe,
             dispatch_hook: self.dispatch_hook,
+            #[cfg(feature = "http")]
+            external_config: self.external_config,
         }
     }
 }
@@ -248,6 +261,8 @@ pub struct RpcServer {
     pub(crate) protocol_name: String,
     pub(crate) describe_enabled: bool,
     pub(crate) dispatch_hook: Option<Arc<dyn crate::hooks::DispatchHook>>,
+    #[cfg(feature = "http")]
+    pub(crate) external_config: Option<Arc<crate::external::ExternalLocationConfig>>,
 }
 
 impl RpcServer {
@@ -271,6 +286,11 @@ impl RpcServer {
 
     pub fn server_version(&self) -> &str {
         &self.server_version
+    }
+
+    #[cfg(feature = "http")]
+    pub fn external_config(&self) -> Option<&Arc<crate::external::ExternalLocationConfig>> {
+        self.external_config.as_ref()
     }
 
     /// Register a method described by a [`MethodInfo`].
@@ -515,6 +535,16 @@ impl RpcServer {
                     s.output_batches = 1;
                     s.output_rows = out_batch.num_rows() as u64;
                 }
+                #[cfg(feature = "http")]
+                if let Some(cfg) = self.external_config.as_ref() {
+                    if let Ok(Some((ptr, md))) =
+                        crate::external::maybe_externalize_batch(&out_batch, None, cfg)
+                    {
+                        sw.write(&ptr, Some(&md))?;
+                        sw.finish()?;
+                        return Ok(());
+                    }
+                }
                 sw.write(&out_batch, None)?;
                 sw.finish()?;
             }
@@ -687,6 +717,25 @@ impl RpcServer {
                             let mut s = stats.lock().unwrap();
                             s.output_batches += 1;
                             s.output_rows += batch.num_rows() as u64;
+                        }
+                        #[cfg(feature = "http")]
+                        if let Some(cfg) = self.external_config.as_ref() {
+                            match crate::external::maybe_externalize_batch(
+                                &batch,
+                                metadata.as_ref(),
+                                cfg,
+                            ) {
+                                Ok(Some((ptr, md))) => {
+                                    out_writer.write(&ptr, Some(&md))?;
+                                    continue;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    // Externalization failed — fall through to inline write,
+                                    // but record the error on the access log via app_err.
+                                    *app_err = Some(e);
+                                }
+                            }
                         }
                         out_writer.write(&batch, metadata.as_ref())?;
                     }

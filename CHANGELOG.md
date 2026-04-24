@@ -2,6 +2,25 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased] — Phase 4: external-location batches + S3 / GCS backends
+
+- **Added** `vgi_rpc::external` module: `ExternalStorage` + `Fetcher`
+  traits, `ExternalLocationConfig` (threshold, compression, URL
+  validator), `maybe_externalize_batch`, `resolve_external_location`,
+  and an `InMemoryStorage` backend for tests/CI. Pointer batches carry
+  `vgi_rpc.location`, `vgi_rpc.location.sha256`, and an observability
+  `vgi_rpc.location.fetch_ms` claim.
+- **Added** server-side transparent externalization: oversized unary
+  results and stream output batches are uploaded and replaced with
+  zero-row pointer batches when `RpcServer::builder().with_external_location(cfg)`
+  is set.
+- **Added** `vgi-rpc-s3` crate (`PresignedS3Storage`) + `vgi-rpc-gcs`
+  crate (`SignedGcsStorage`) — lean design where users supply a
+  pre-signed PUT URL factory so the core avoids pulling the heavy
+  aws-sdk-s3 transitive tree. Shared HTTPS `HttpFetcher` lives in
+  `vgi-rpc-s3` and is re-exported from `vgi-rpc-gcs`.
+- **Added** 5 unit tests + 3 integration tests + 3 backend unit tests.
+
 ## [Unreleased] — Phase 3: observability + HTTP polish
 
 - **Added** `otel::OtelHook` (feature `otel`): per-call `tracing` events

@@ -9,6 +9,9 @@ pub mod auth;
 pub mod errors;
 pub mod retry;
 
+#[cfg(feature = "http")]
+pub mod external;
+
 #[cfg(feature = "otel")]
 pub mod otel;
 

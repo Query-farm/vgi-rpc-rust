@@ -1,10 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["vgi-rpc", "conformance-worker", "vgi-rpc-s3", "vgi-rpc-gcs"]
+members = ["vgi-rpc", "vgi-rpc-macros", "conformance-worker", "vgi-rpc-s3", "vgi-rpc-gcs"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.86"
 license = "Apache-2.0"
 repository = "https://github.com/Query-farm/vgi-rpc-rust"
 
@@ -30,6 +31,10 @@ rand = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zstd = "0.13"
+bincode = "1.3"
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
 
 [profile.release]
 opt-level = 3

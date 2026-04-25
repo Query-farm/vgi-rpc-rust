@@ -2,6 +2,7 @@
 name = "vgi-rpc"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Transport-agnostic RPC framework built on Apache Arrow IPC"
@@ -10,17 +11,22 @@ keywords = ["rpc", "arrow", "ipc", "streaming", "http"]
 categories = ["network-programming", "web-programming::http-server", "data-structures"]
 
 [features]
-default = ["http"]
+default = ["http", "macros"]
+macros = ["dep:vgi-rpc-macros"]
 http = ["dep:axum", "dep:tokio", "dep:hmac", "dep:sha2", "dep:base64", "dep:rand", "dep:bincode", "dep:zstd"]
 jwt = []
+jwt-jsonwebtoken = ["jwt", "dep:jsonwebtoken", "dep:reqwest"]
 oauth-pkce = []
-mtls-pem = []
+oauth-pkce-server = ["oauth-pkce", "http", "dep:reqwest", "dep:urlencoding"]
+mtls-pem = ["dep:x509-parser", "dep:percent-encoding", "dep:sha2"]
 otel = []
 sentry = []
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true, features = ["full"] }
+tracing-subscriber.workspace = true
+trybuild = "1"
 
 [dependencies]
 flatbuffers = "25"
@@ -43,5 +49,11 @@ hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
-bincode = { version = "1.3", optional = true }
+bincode = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
+jsonwebtoken = { version = "9.3", optional = true, default-features = false, features = ["use_pem"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }
+urlencoding = { version = "2", optional = true }
+vgi-rpc-macros = { path = "../vgi-rpc-macros", version = "0.1.0", optional = true }
+x509-parser = { version = "0.16", optional = true }
+percent-encoding = { version = "2", optional = true }

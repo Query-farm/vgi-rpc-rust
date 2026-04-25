@@ -5,6 +5,7 @@
 //! supplied by other languages can drive a [`RpcServer`] transparently.
 
 pub mod access_log;
+pub mod arrow_type;
 pub mod auth;
 pub mod errors;
 pub mod retry;
@@ -24,6 +25,8 @@ pub(crate) mod probe;
 pub mod sentry;
 pub mod server;
 pub mod stream;
+#[cfg(feature = "http")]
+pub mod stream_codec;
 pub(crate) mod util;
 pub mod wire;
 
@@ -31,6 +34,8 @@ pub mod wire;
 pub mod http;
 
 pub use access_log::AccessLogHook;
+pub use arrow_type::{Bytes, VgiArrow};
+
 pub use auth::{chain_all, chain_authenticate, AuthContext, AuthRequest, AuthResult, Authenticate};
 pub use errors::{Result, RpcError};
 pub use hooks::{CallStatistics, ChainHook, DispatchHook, DispatchInfo, HookToken, SharedHook};
@@ -39,3 +44,5 @@ pub use log::{LogLevel, LogMessage};
 pub use retry::RetryConfig;
 pub use server::{CallContext, MethodInfo, MethodType, RpcServer, RpcServerBuilder};
 pub use stream::{ExchangeState, OutputCollector, ProducerState, StreamResult};
+#[cfg(feature = "macros")]
+pub use vgi_rpc_macros::{exchange, param, producer, service, unary, StreamState, VgiArrow};

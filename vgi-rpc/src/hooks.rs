@@ -42,6 +42,28 @@ pub struct DispatchInfo {
     pub authenticated: bool,
 }
 
+impl DispatchInfo {
+    /// Build a `DispatchInfo` from the serving server + request + resolved
+    /// auth context. `method_type` is either `"unary"` or `"stream"`.
+    pub fn from_request(
+        server: &crate::server::RpcServer,
+        req: &crate::server::Request,
+        method_type: &'static str,
+        auth: &crate::auth::AuthContext,
+    ) -> Self {
+        Self {
+            method: req.method.clone(),
+            method_type,
+            server_id: server.server_id.clone(),
+            request_id: req.request_id.clone(),
+            transport_metadata: Arc::new(req.metadata.clone()),
+            principal: auth.principal.clone(),
+            auth_domain: auth.domain.clone(),
+            authenticated: auth.authenticated,
+        }
+    }
+}
+
 /// Token returned by a hook's start callback and passed back to `on_end`.
 pub type HookToken = u64;
 

@@ -2,6 +2,7 @@
 name = "vgi-rpc-gcs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "GCS-backed ExternalStorage for vgi-rpc (pluggable V4 signed URL factory)"

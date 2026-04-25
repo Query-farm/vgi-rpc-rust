@@ -70,21 +70,21 @@ pub fn verify_state_cookie(
 ) -> Result<(String, String, String), RpcError> {
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(cookie.as_bytes())
-        .map_err(|_| RpcError::new("ValueError", "malformed PKCE state cookie"))?;
+        .map_err(|_| RpcError::value_error("malformed PKCE state cookie"))?;
     let pipe = raw
         .iter()
         .rposition(|&b| b == b'|')
-        .ok_or_else(|| RpcError::new("ValueError", "malformed PKCE state cookie"))?;
+        .ok_or_else(|| RpcError::value_error("malformed PKCE state cookie"))?;
     let (payload, sig_with_pipe) = raw.split_at(pipe);
     let sig = &sig_with_pipe[1..];
 
     let mut mac = HmacSha256::new_from_slice(signing_key).expect("hmac key");
     mac.update(payload);
     mac.verify_slice(sig)
-        .map_err(|_| RpcError::new("ValueError", "PKCE state cookie signature mismatch"))?;
+        .map_err(|_| RpcError::value_error("PKCE state cookie signature mismatch"))?;
 
     let s = std::str::from_utf8(payload)
-        .map_err(|_| RpcError::new("ValueError", "malformed PKCE state cookie"))?;
+        .map_err(|_| RpcError::value_error("malformed PKCE state cookie"))?;
     let mut parts = s.splitn(3, '\n');
     let state = parts.next().unwrap_or("").to_string();
     let return_to = parts.next().unwrap_or("").to_string();

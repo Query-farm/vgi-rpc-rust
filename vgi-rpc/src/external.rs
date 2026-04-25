@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::errors::{Result, RpcError};
 use crate::metadata::{LOCATION_FETCH_MS_KEY, LOCATION_KEY, LOCATION_SHA256_KEY};
-use crate::wire::{empty_batch, md_get, Metadata, StreamReader, StreamWriter};
+use crate::wire::{bytes_to_hex, empty_batch, md_get, write_one_batch, Metadata, StreamReader};
 
 /// Optional body compression for externalized payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,14 +148,7 @@ impl ExternalLocationConfig {
 
 /// Serialize one record batch as a complete IPC stream (schema + batch + EOS).
 pub fn serialize_batch_to_ipc(batch: &RecordBatch) -> Result<Vec<u8>> {
-    let schema = batch.schema();
-    let mut buf = Vec::new();
-    {
-        let mut w = StreamWriter::new(&mut buf, schema.as_ref())?;
-        w.write(batch, None)?;
-        w.finish()?;
-    }
-    Ok(buf)
+    write_one_batch(batch, None)
 }
 
 /// Read back an IPC stream containing a single batch.
@@ -168,14 +161,7 @@ pub fn deserialize_single_batch(ipc_bytes: &[u8]) -> Result<RecordBatch> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for b in digest {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
+    bytes_to_hex(&Sha256::digest(bytes))
 }
 
 fn compress(ipc_bytes: &[u8], compression: Compression) -> Result<Vec<u8>> {

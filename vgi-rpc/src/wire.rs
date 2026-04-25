@@ -413,6 +413,30 @@ fn read_message_bytes(r: &mut impl Read) -> Result<Option<RawMessage>> {
 // Utility — build a zero-row record batch matching a given schema
 // ---------------------------------------------------------------------------
 
+/// Serialize one record batch as a complete IPC stream
+/// (schema + batch + EOS), with optional custom metadata on the batch.
+pub fn write_one_batch(batch: &RecordBatch, metadata: Option<&Metadata>) -> Result<Vec<u8>> {
+    let schema = batch.schema();
+    let mut buf = Vec::new();
+    {
+        let mut w = StreamWriter::new(&mut buf, schema.as_ref())?;
+        w.write(batch, metadata)?;
+        w.finish()?;
+    }
+    Ok(buf)
+}
+
+/// Lowercase hex encoding of a byte slice.
+pub fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
 /// Build a zero-row `RecordBatch` matching the given schema.
 pub fn empty_batch(schema: &Schema) -> Result<RecordBatch> {
     use arrow_array::array::new_empty_array;

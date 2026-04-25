@@ -45,6 +45,14 @@ impl RpcError {
     pub fn version_error(msg: impl Into<String>) -> Self {
         Self::new("VersionError", msg)
     }
+
+    pub fn permission_error(msg: impl Into<String>) -> Self {
+        Self::new("PermissionError", msg)
+    }
+
+    pub fn attribute_error(msg: impl Into<String>) -> Self {
+        Self::new("AttributeError", msg)
+    }
 }
 
 impl fmt::Display for RpcError {

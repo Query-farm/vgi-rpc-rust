@@ -15,7 +15,16 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() > 1 && args[1] == "--http" {
-        run_http(server);
+        run_http(server, false);
+        return;
+    }
+
+    if args.len() > 1 && args[1] == "--http-auth" {
+        // Run the HTTP transport with a reject-all `authenticate`
+        // callback, used by the conformance suite's TestHealth to
+        // assert that `/health` bypasses auth while RPC endpoints
+        // return 401.
+        run_http(server, true);
         return;
     }
 
@@ -86,38 +95,32 @@ fn run_unix(server: Arc<vgi_rpc::RpcServer>, path: &str) {
     }
 }
 
-fn run_http(server: Arc<vgi_rpc::RpcServer>) {
+fn run_http(server: Arc<vgi_rpc::RpcServer>, reject_all_auth: bool) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
     rt.block_on(async move {
-        let state = vgi_rpc::http::HttpState::new(server);
-        let app = vgi_rpc::http::build_router(state);
+        let mut builder = vgi_rpc::http::HttpState::builder().server(server);
+        if reject_all_auth {
+            // Reject every request with PermissionError → mapped to 401.
+            // /health bypasses authenticate_request entirely, so it stays 200.
+            builder = builder
+                .authenticate(std::sync::Arc::new(|_req| {
+                    Err(vgi_rpc::RpcError::permission_error(
+                        "auth required (conformance test fixture)",
+                    ))
+                }))
+                .prefix("/vgi");
+        }
+        let state = builder.build();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind tcp");
         let port = listener.local_addr().unwrap().port();
         println!("PORT:{port}");
         io::stdout().flush().ok();
-        let shutdown = async {
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{signal, SignalKind};
-                let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-                let mut intr = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-                tokio::select! {
-                    _ = term.recv() => {},
-                    _ = intr.recv() => {},
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        };
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown)
+        vgi_rpc::http::serve_with_shutdown(state, listener)
             .await
             .expect("axum serve");
     });

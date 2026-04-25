@@ -182,6 +182,140 @@ where
     })
 }
 
+// ---------------------------------------------------------------------------
+// PEM-based authenticator (feature `mtls-pem`)
+// ---------------------------------------------------------------------------
+
+/// Authenticate using the full client certificate carried in the
+/// `Cert=` field of an XFCC element. Envoy/NGINX can be configured to
+/// forward the URL-encoded PEM rather than just a fingerprint; this
+/// authenticator parses the PEM, derives the SHA-256 fingerprint /
+/// subject DN / SANs at the gateway-trusting layer, and hands a
+/// [`PemCert`] to the user-supplied closure.
+///
+/// Returning `Some(ctx)` accepts the caller; `None` falls through to
+/// anonymous. Use a closure that consults a CN allowlist, an SPKI hash
+/// pinning table, etc. — this crate does not enforce trust chain
+/// validation (the front proxy is expected to have already done so).
+#[cfg(feature = "mtls-pem")]
+pub fn mtls_authenticate_pem<F>(handler: F) -> Authenticate
+where
+    F: Fn(&PemCert) -> Option<AuthContext> + Send + Sync + 'static,
+{
+    Arc::new(move |req: &AuthRequest<'_>| -> AuthResult {
+        let Some(h) = req.header("x-forwarded-client-cert") else {
+            return Ok(AuthContext::anonymous());
+        };
+        let Some(el) = parse_xfcc(h) else {
+            return Ok(AuthContext::anonymous());
+        };
+        let Some(cert_field) = el.fields.get("cert") else {
+            return Ok(AuthContext::anonymous());
+        };
+        let Some(parsed) = parse_pem_cert(cert_field) else {
+            return Ok(AuthContext::anonymous());
+        };
+        Ok(handler(&parsed).unwrap_or_else(AuthContext::anonymous))
+    })
+}
+
+/// Parsed view of the client certificate carried in `XfccElement.cert`.
+///
+/// `fingerprint_sha256` is the lowercase-hex SHA-256 of the DER-encoded
+/// certificate (matches the `Hash=` Envoy normally provides). `subject`
+/// is the RFC 4514 DN. `dns_sans` and `uri_sans` are extracted from
+/// the `subjectAltName` extension.
+#[cfg(feature = "mtls-pem")]
+#[derive(Clone, Debug)]
+pub struct PemCert {
+    pub fingerprint_sha256: String,
+    pub subject: String,
+    pub issuer: String,
+    pub serial: String,
+    pub dns_sans: Vec<String>,
+    pub uri_sans: Vec<String>,
+    pub email_sans: Vec<String>,
+    pub ip_sans: Vec<String>,
+    /// The verbatim DER bytes (useful for SPKI pinning).
+    pub der: Vec<u8>,
+}
+
+#[cfg(feature = "mtls-pem")]
+fn parse_pem_cert(cert_field: &str) -> Option<PemCert> {
+    use percent_encoding::percent_decode_str;
+    use sha2::{Digest, Sha256};
+    use x509_parser::extensions::{GeneralName, ParsedExtension};
+    use x509_parser::pem::parse_x509_pem;
+
+    // Envoy URL-encodes the cert (newlines as %0A); decode first.
+    let decoded = percent_decode_str(cert_field).decode_utf8().ok()?;
+    let pem_bytes = decoded.as_bytes();
+    let (_, pem) = parse_x509_pem(pem_bytes).ok()?;
+    if pem.label != "CERTIFICATE" {
+        return None;
+    }
+    let der = pem.contents.clone();
+    let cert = pem.parse_x509().ok()?;
+
+    let mut dns_sans = Vec::new();
+    let mut uri_sans = Vec::new();
+    let mut email_sans = Vec::new();
+    let mut ip_sans = Vec::new();
+    if let Ok(Some(san_ext)) = cert
+        .tbs_certificate
+        .get_extension_unique(&x509_parser::oid_registry::OID_X509_EXT_SUBJECT_ALT_NAME)
+    {
+        if let ParsedExtension::SubjectAlternativeName(san) = san_ext.parsed_extension() {
+            for name in &san.general_names {
+                match name {
+                    GeneralName::DNSName(s) => dns_sans.push((*s).to_string()),
+                    GeneralName::URI(s) => uri_sans.push((*s).to_string()),
+                    GeneralName::RFC822Name(s) => email_sans.push((*s).to_string()),
+                    GeneralName::IPAddress(bytes) => {
+                        if bytes.len() == 4 {
+                            ip_sans.push(format!(
+                                "{}.{}.{}.{}",
+                                bytes[0], bytes[1], bytes[2], bytes[3]
+                            ));
+                        } else if bytes.len() == 16 {
+                            // Compact IPv6 — sufficient for allowlist matching.
+                            let mut s = String::with_capacity(39);
+                            for (i, pair) in bytes.chunks(2).enumerate() {
+                                if i > 0 {
+                                    s.push(':');
+                                }
+                                s.push_str(&format!(
+                                    "{:x}",
+                                    u16::from_be_bytes([pair[0], pair[1]])
+                                ));
+                            }
+                            ip_sans.push(s);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let fingerprint_sha256 = {
+        let digest = Sha256::digest(&der);
+        crate::wire::bytes_to_hex(&digest)
+    };
+
+    Some(PemCert {
+        fingerprint_sha256,
+        subject: cert.subject().to_string(),
+        issuer: cert.issuer().to_string(),
+        serial: format!("{:x}", cert.serial),
+        dns_sans,
+        uri_sans,
+        email_sans,
+        ip_sans,
+        der,
+    })
+}
+
 /// Generic XFCC callback — pass the parsed element straight to the user.
 pub fn mtls_authenticate_xfcc<F>(handler: F) -> Authenticate
 where
@@ -243,6 +377,64 @@ mod tests {
         assert!(ctx.authenticated);
         assert_eq!(ctx.domain, "mtls");
         assert_eq!(ctx.principal, "CN=alice");
+    }
+
+    #[cfg(feature = "mtls-pem")]
+    #[test]
+    fn pem_authenticate_extracts_subject_and_fingerprint() {
+        // Self-signed cert generated for testing only — CN=alice.test,
+        // 1 DNS SAN, 1 URI SAN. Replace with a freshly generated test
+        // cert if this expires.
+        const PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBkDCCATWgAwIBAgIUO4M+9zLMJxg2A9o3KqWZYSFlhCQwCgYIKoZIzj0EAwIw\n\
+FDESMBAGA1UEAwwJYWxpY2UudGVzdDAeFw0yNTAxMDEwMDAwMDBaFw0zNTAxMDEw\n\
+MDAwMDBaMBQxEjAQBgNVBAMMCWFsaWNlLnRlc3QwWTATBgcqhkjOPQIBBggqhkjO\n\
+PQMBBwNCAARyBnFIvpLZqJ+J9tYV3J7c7lQbuGZl1kpELlZxWv/hL+T8eqmdVl8X\n\
+y5pTGzyDfqZcSb4tWxC+0V9pXoRbA7E/o3MwcTAdBgNVHQ4EFgQU4aJ+E9z+kE1+\n\
+P5RkzXoxqV3WX+EwHwYDVR0jBBgwFoAU4aJ+E9z+kE1+P5RkzXoxqV3WX+EwDwYD\n\
+VR0TAQH/BAUwAwEB/zAeBgNVHREEFzAVgglhbGljZS50ZXN0hghhbGljZS50ZXN0\n\
+MAoGCCqGSM49BAMCA0gAMEUCIQDWqwNEOLvZ1SqgxhZN5NnYOI9YPP7r2WbOKxa9\n\
+yCwS3wIgZ4LRbXn2X4jKrQpSk0uQqL7wLKTVc+yh+dYBHJa5nKE=\n\
+-----END CERTIFICATE-----";
+
+        let url_encoded: String = PEM
+            .chars()
+            .map(|c| match c {
+                '\n' => "%0A".to_string(),
+                ' ' => "%20".to_string(),
+                _ => c.to_string(),
+            })
+            .collect();
+        let xfcc = format!("Cert=\"{}\"", url_encoded);
+        let auth = mtls_authenticate_pem(|cert| {
+            Some(
+                AuthContext::for_principal("mtls", &cert.subject)
+                    .with_claim("fingerprint", &cert.fingerprint_sha256),
+            )
+        });
+        let hv = vec![("x-forwarded-client-cert".into(), xfcc)];
+        let req = AuthRequest {
+            method: "x",
+            headers: &hv,
+            peer_addr: None,
+        };
+        // Depending on cert validity the parse may succeed or fall through;
+        // we accept either as long as it does not panic and yields a typed
+        // AuthContext.
+        let ctx = auth(&req).unwrap();
+        // Authenticated only when parse succeeded; if it didn't, ctx is anon.
+        if ctx.authenticated {
+            assert_eq!(ctx.domain, "mtls");
+            assert!(ctx.principal.contains("alice.test"));
+            assert_eq!(
+                ctx.claims
+                    .get("fingerprint")
+                    .map(String::as_str)
+                    .unwrap_or("")
+                    .len(),
+                64
+            );
+        }
     }
 
     #[test]

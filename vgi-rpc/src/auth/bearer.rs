@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::auth::{AuthContext, AuthRequest, AuthResult, Authenticate};
+use crate::auth::{extract_bearer, AuthContext, AuthRequest, AuthResult, Authenticate};
 
 /// Build an authenticate callback from a validator closure.
 ///
@@ -32,21 +32,6 @@ where
 /// for large token sets (linear lookup is fine up to ~10k tokens).
 pub fn bearer_authenticate_static(tokens: HashMap<String, AuthContext>) -> Authenticate {
     bearer_authenticate(move |tok| tokens.get(tok).cloned())
-}
-
-fn extract_bearer<'a>(req: &'a AuthRequest<'a>) -> Option<&'a str> {
-    let h = req.header("authorization")?;
-    let prefix = "Bearer ";
-    if h.len() > prefix.len() && h[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        let tok = h[prefix.len()..].trim();
-        if tok.is_empty() {
-            None
-        } else {
-            Some(tok)
-        }
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]

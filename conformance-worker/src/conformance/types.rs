@@ -7,12 +7,21 @@ use std::sync::Arc;
 
 use arrow_array::{
     builder::{Int64Builder, StringBuilder},
-    Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    ListArray, MapArray, RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use vgi_rpc::wire::{StreamReader, StreamWriter};
 use vgi_rpc::{Result, RpcError};
+
+/// Downcast `a` to concrete Arrow array type `A`, returning a typed
+/// `TypeError` naming the offending field instead of panicking on a
+/// malformed batch.
+fn as_array<'a, A: Array + 'static>(a: &'a dyn Array, field: &str) -> Result<&'a A> {
+    a.as_any()
+        .downcast_ref::<A>()
+        .ok_or_else(|| RpcError::type_error(format!("{field}: unexpected array type")))
+}
 
 // ---------------------------------------------------------------------------
 // Point
@@ -272,7 +281,7 @@ impl AllTypes {
         arrs.push(Arc::new(db.finish()));
 
         // nested_point
-        arrs.push(Arc::new(struct_from_point(&self.nested_point, false)?));
+        arrs.push(Arc::new(struct_from_point(&self.nested_point)?));
 
         // optional_str / optional_int
         arrs.push(Arc::new(StringArray::from(vec![self.optional_str.clone()])));
@@ -356,70 +365,35 @@ impl AllTypes {
             Ok(batch.column(idx).as_ref())
         };
 
-        let str_field = col("str_field")?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
+        let str_field = as_array::<StringArray>(col("str_field")?, "str_field")?
             .value(0)
             .to_string();
-        let bytes_field = col("bytes_field")?
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap()
+        let bytes_field = as_array::<BinaryArray>(col("bytes_field")?, "bytes_field")?
             .value(0)
             .to_vec();
-        let int_field = col("int_field")?
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(0);
-        let float_field = col("float_field")?
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        let bool_field = col("bool_field")?
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap()
-            .value(0);
+        let int_field = as_array::<Int64Array>(col("int_field")?, "int_field")?.value(0);
+        let float_field = as_array::<Float64Array>(col("float_field")?, "float_field")?.value(0);
+        let bool_field = as_array::<BooleanArray>(col("bool_field")?, "bool_field")?.value(0);
 
         let list_of_int = {
-            let la = col("list_of_int")?
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .unwrap();
+            let la = as_array::<ListArray>(col("list_of_int")?, "list_of_int")?;
             let vals = la.value(0);
-            let a = vals.as_any().downcast_ref::<Int64Array>().unwrap();
+            let a = as_array::<Int64Array>(vals.as_ref(), "list_of_int[i]")?;
             (0..a.len()).map(|i| a.value(i)).collect()
         };
 
         let list_of_str = {
-            let la = col("list_of_str")?
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .unwrap();
+            let la = as_array::<ListArray>(col("list_of_str")?, "list_of_str")?;
             let vals = la.value(0);
-            let a = vals.as_any().downcast_ref::<StringArray>().unwrap();
+            let a = as_array::<StringArray>(vals.as_ref(), "list_of_str[i]")?;
             (0..a.len()).map(|i| a.value(i).to_string()).collect()
         };
 
         let dict_field = {
-            let ma = col("dict_field")?
-                .as_any()
-                .downcast_ref::<MapArray>()
-                .unwrap();
+            let ma = as_array::<MapArray>(col("dict_field")?, "dict_field")?;
             let entry = ma.value(0);
-            let keys = entry
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let vals = entry
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let keys = as_array::<StringArray>(entry.column(0).as_ref(), "dict_field.keys")?;
+            let vals = as_array::<Int64Array>(entry.column(1).as_ref(), "dict_field.values")?;
             (0..keys.len())
                 .map(|i| (keys.value(i).to_string(), vals.value(i)))
                 .collect()
@@ -429,7 +403,8 @@ impl AllTypes {
             let ea = col("enum_field")?;
             if let Some(d) = ea.as_any().downcast_ref::<DictionaryArray<Int16Type>>() {
                 let key = d.keys().value(0);
-                let values = d.values().as_any().downcast_ref::<StringArray>().unwrap();
+                let values =
+                    as_array::<StringArray>(d.values().as_ref(), "enum_field.dict_values")?;
                 values.value(key as usize).to_string()
             } else if let Some(s) = ea.as_any().downcast_ref::<StringArray>() {
                 s.value(0).to_string()
@@ -439,18 +414,12 @@ impl AllTypes {
         };
 
         let nested_point = point_from_struct(
-            col("nested_point")?
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .unwrap(),
+            as_array::<StructArray>(col("nested_point")?, "nested_point")?,
             0,
         )?;
 
         let optional_str = {
-            let a = col("optional_str")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
+            let a = as_array::<StringArray>(col("optional_str")?, "optional_str")?;
             if a.is_null(0) {
                 None
             } else {
@@ -458,10 +427,7 @@ impl AllTypes {
             }
         };
         let optional_int = {
-            let a = col("optional_int")?
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let a = as_array::<Int64Array>(col("optional_int")?, "optional_int")?;
             if a.is_null(0) {
                 None
             } else {
@@ -469,10 +435,7 @@ impl AllTypes {
             }
         };
         let optional_nested = {
-            let s = col("optional_nested")?
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .unwrap();
+            let s = as_array::<StructArray>(col("optional_nested")?, "optional_nested")?;
             if s.is_null(0) {
                 None
             } else {
@@ -481,60 +444,37 @@ impl AllTypes {
         };
 
         let list_of_nested = {
-            let la = col("list_of_nested")?
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .unwrap();
+            let la = as_array::<ListArray>(col("list_of_nested")?, "list_of_nested")?;
             let vals = la.value(0);
-            let sa = vals.as_any().downcast_ref::<StructArray>().unwrap();
+            let sa = as_array::<StructArray>(vals.as_ref(), "list_of_nested[i]")?;
             (0..sa.len())
                 .map(|i| point_from_struct(sa, i))
                 .collect::<Result<_>>()?
         };
 
-        let annotated_int32 = col("annotated_int32")?
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .value(0);
-        let annotated_float32 = col("annotated_float32")?
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .unwrap()
-            .value(0);
+        let annotated_int32 =
+            as_array::<Int32Array>(col("annotated_int32")?, "annotated_int32")?.value(0);
+        let annotated_float32 =
+            as_array::<Float32Array>(col("annotated_float32")?, "annotated_float32")?.value(0);
 
         let nested_list = {
-            let la = col("nested_list")?
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .unwrap();
+            let la = as_array::<ListArray>(col("nested_list")?, "nested_list")?;
             let vals = la.value(0);
-            let ll = vals.as_any().downcast_ref::<ListArray>().unwrap();
+            let ll = as_array::<ListArray>(vals.as_ref(), "nested_list[i]")?;
             (0..ll.len())
                 .map(|i| {
                     let iv = ll.value(i);
-                    let ia = iv.as_any().downcast_ref::<Int64Array>().unwrap();
-                    (0..ia.len()).map(|j| ia.value(j)).collect()
+                    let ia = as_array::<Int64Array>(iv.as_ref(), "nested_list[i][j]")?;
+                    Ok((0..ia.len()).map(|j| ia.value(j)).collect())
                 })
-                .collect()
+                .collect::<Result<Vec<Vec<i64>>>>()?
         };
 
         let dict_str_str = {
-            let ma = col("dict_str_str")?
-                .as_any()
-                .downcast_ref::<MapArray>()
-                .unwrap();
+            let ma = as_array::<MapArray>(col("dict_str_str")?, "dict_str_str")?;
             let entry = ma.value(0);
-            let keys = entry
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let vals = entry
-                .column(1)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
+            let keys = as_array::<StringArray>(entry.column(0).as_ref(), "dict_str_str.keys")?;
+            let vals = as_array::<StringArray>(entry.column(1).as_ref(), "dict_str_str.values")?;
             (0..keys.len())
                 .map(|i| (keys.value(i).to_string(), vals.value(i).to_string()))
                 .collect()
@@ -563,12 +503,11 @@ impl AllTypes {
     }
 }
 
-fn struct_from_point(p: &Point, nullable: bool) -> Result<StructArray> {
+fn struct_from_point(p: &Point) -> Result<StructArray> {
     let fields = point_fields();
     let x: ArrayRef = Arc::new(Float64Array::from(vec![p.x]));
     let y: ArrayRef = Arc::new(Float64Array::from(vec![p.y]));
     let cols: Vec<(Arc<Field>, ArrayRef)> = vec![(fields[0].clone(), x), (fields[1].clone(), y)];
-    let _ = nullable;
     Ok(StructArray::from(cols))
 }
 
@@ -576,7 +515,7 @@ fn struct_from_optional_point(p: Option<&Point>) -> Result<StructArray> {
     use arrow_buffer::NullBuffer;
     let fields = point_fields();
     match p {
-        Some(pt) => Ok(struct_from_point(pt, true)?),
+        Some(pt) => Ok(struct_from_point(pt)?),
         None => {
             let x: ArrayRef = Arc::new(Float64Array::from(vec![Some(0.0)]));
             let y: ArrayRef = Arc::new(Float64Array::from(vec![Some(0.0)]));
@@ -702,8 +641,8 @@ pub fn build_dynamic_schema(include_strings: bool, include_floats: bool) -> Sche
 /// Build a BoundingBox record batch (for echo_bounding_box).
 pub fn bounding_box_batch(top: &Point, bot: &Point, label: &str) -> Result<RecordBatch> {
     let schema = bounding_box_schema();
-    let tl = struct_from_point(top, false)?;
-    let br = struct_from_point(bot, false)?;
+    let tl = struct_from_point(top)?;
+    let br = struct_from_point(bot)?;
     let arrs: Vec<ArrayRef> = vec![
         Arc::new(tl),
         Arc::new(br),
@@ -753,6 +692,3 @@ pub fn deserialize_bounding_box_ipc(bytes: &[u8]) -> Result<(Point, Point, Strin
         .ok_or_else(|| RpcError::type_error("empty BoundingBox IPC"))?;
     bounding_box_from_batch(&rb.batch)
 }
-
-/// Reference: used only to silence dead_code warnings; imported by streams.rs
-pub fn _unused(_: &Int16Array) {}

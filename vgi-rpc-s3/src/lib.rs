@@ -34,33 +34,43 @@ use std::sync::Arc;
 use vgi_rpc::external::{Compression, ExternalStorage, Fetcher, UploadResult};
 use vgi_rpc::{Result, RpcError};
 
+/// Build a `reqwest::blocking::Client` with the default 30 s timeout used
+/// by both the S3 / GCS storage backends and the shared `HttpFetcher`.
+pub fn default_blocking_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client")
+}
+
 /// User-supplied factory: given `(bucket, key)`, return a short-lived
 /// pre-signed HTTPS PUT URL.
 pub type PresignUrlFactory = Arc<dyn Fn(&str, &str) -> Result<String> + Send + Sync>;
 
-/// `ExternalStorage` implementation that PUTs objects via a pre-signed
-/// URL the caller supplies.
-pub struct PresignedS3Storage {
+/// Generic `ExternalStorage` that PUTs objects via a caller-supplied
+/// pre-signed URL factory. Shared between S3 and GCS backends — the only
+/// difference is the `label` used in error messages.
+pub struct PresignedPutStorage {
+    label: &'static str,
     bucket: String,
     prefix: String,
     factory: PresignUrlFactory,
     client: reqwest::blocking::Client,
 }
 
-impl PresignedS3Storage {
+impl PresignedPutStorage {
     pub fn new(
+        label: &'static str,
         bucket: impl Into<String>,
         prefix: impl Into<String>,
         factory: PresignUrlFactory,
     ) -> Self {
         Self {
+            label,
             bucket: bucket.into(),
             prefix: prefix.into(),
             factory,
-            client: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("reqwest client"),
+            client: default_blocking_client(),
         }
     }
 
@@ -78,7 +88,7 @@ impl PresignedS3Storage {
     }
 }
 
-impl ExternalStorage for PresignedS3Storage {
+impl ExternalStorage for PresignedPutStorage {
     fn upload(&self, ipc_bytes: &[u8], compression: Compression) -> Result<UploadResult> {
         let key = self.object_key();
         let url = (self.factory)(&self.bucket, &key)?;
@@ -90,12 +100,13 @@ impl ExternalStorage for PresignedS3Storage {
         if let Compression::Zstd(_) = compression {
             req = req.header("content-encoding", "zstd");
         }
+        let label = self.label;
         let resp = req
             .send()
-            .map_err(|e| RpcError::runtime_error(format!("s3 PUT failed: {e}")))?;
+            .map_err(|e| RpcError::runtime_error(format!("{label} PUT failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(RpcError::runtime_error(format!(
-                "s3 PUT returned {} for {url}",
+                "{label} PUT returned {} for {url}",
                 resp.status()
             )));
         }
@@ -108,6 +119,38 @@ impl ExternalStorage for PresignedS3Storage {
     }
 }
 
+/// S3-flavored alias for [`PresignedPutStorage`].
+pub struct PresignedS3Storage(PresignedPutStorage);
+
+impl PresignedS3Storage {
+    pub fn new(
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+        factory: PresignUrlFactory,
+    ) -> Self {
+        Self(PresignedPutStorage::new("s3", bucket, prefix, factory))
+    }
+
+    pub fn bucket(&self) -> &str {
+        self.0.bucket()
+    }
+
+    pub fn prefix(&self) -> &str {
+        self.0.prefix()
+    }
+
+    #[cfg(test)]
+    fn object_key(&self) -> String {
+        self.0.object_key()
+    }
+}
+
+impl ExternalStorage for PresignedS3Storage {
+    fn upload(&self, ipc_bytes: &[u8], compression: Compression) -> Result<UploadResult> {
+        self.0.upload(ipc_bytes, compression)
+    }
+}
+
 /// Shared HTTPS `Fetcher`. Reusable across S3 / GCS / any signed URL
 /// source.
 pub struct HttpFetcher {
@@ -117,10 +160,7 @@ pub struct HttpFetcher {
 impl HttpFetcher {
     pub fn new() -> Self {
         Self {
-            client: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("reqwest client"),
+            client: default_blocking_client(),
         }
     }
 }

@@ -47,6 +47,40 @@ impl CallContext {
     pub(crate) fn drain_logs(&self) -> Vec<LogMessage> {
         std::mem::take(&mut *self.log_sink.lock().unwrap())
     }
+
+    /// Build a call context for `server` serving `req`. Defaults to
+    /// anonymous auth with no cookies — callers on authenticated
+    /// transports (HTTP) override the two after construction or use
+    /// [`CallContext::with_auth_cookies`].
+    pub(crate) fn for_request(server: &RpcServer, req: &Request) -> Self {
+        Self {
+            server_id: server.server_id.clone(),
+            method: req.method.clone(),
+            request_id: req.request_id.clone(),
+            transport_metadata: Arc::new(req.metadata.clone()),
+            auth: crate::auth::AuthContext::anonymous(),
+            cookies: std::collections::BTreeMap::new(),
+            log_sink: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Build a call context with an explicit auth context + cookie map.
+    pub(crate) fn with_auth_cookies(
+        server: &RpcServer,
+        req: &Request,
+        auth: crate::auth::AuthContext,
+        cookies: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            server_id: server.server_id.clone(),
+            method: req.method.clone(),
+            request_id: req.request_id.clone(),
+            transport_metadata: Arc::new(req.metadata.clone()),
+            auth,
+            cookies,
+            log_sink: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
 }
 
 /// A request batch parsed from the wire.
@@ -61,6 +95,52 @@ impl Request {
     pub fn column(&self, name: &str) -> Option<&dyn arrow_array::Array> {
         let idx = self.batch.schema().index_of(name).ok()?;
         Some(self.batch.column(idx).as_ref())
+    }
+
+    /// Build a `Request` from an already-parsed `ReadBatch`, validating
+    /// the `vgi_rpc.method` / `vgi_rpc.request_version` metadata.
+    ///
+    /// `require_method` controls whether a missing `vgi_rpc.method` key is
+    /// an error (pipe/unix transports require it; HTTP already derives the
+    /// method from the URL path and may leave the key absent).
+    pub(crate) fn from_read_batch(rb: ReadBatch, require_method: bool) -> Result<Self> {
+        let ReadBatch { batch, metadata } = rb;
+        let method = if require_method {
+            md_get(&metadata, RPC_METHOD_KEY)
+                .ok_or_else(|| {
+                    RpcError::protocol_error(
+                        "Missing 'vgi_rpc.method' in request batch custom_metadata.",
+                    )
+                })?
+                .to_string()
+        } else {
+            md_get(&metadata, RPC_METHOD_KEY).unwrap_or("").to_string()
+        };
+        let version = md_get(&metadata, REQUEST_VERSION_KEY).ok_or_else(|| {
+            RpcError::version_error(format!(
+                "Missing 'vgi_rpc.request_version' in request batch custom_metadata. Set it to {:?}.",
+                REQUEST_VERSION
+            ))
+        })?;
+        if version != REQUEST_VERSION {
+            return Err(RpcError::version_error(format!(
+                "Unsupported request version {:?}, expected {:?}.",
+                version, REQUEST_VERSION
+            )));
+        }
+        if require_method && !batch.schema().fields().is_empty() && batch.num_rows() != 1 {
+            return Err(RpcError::protocol_error(format!(
+                "Expected 1 row in request batch, got {}",
+                batch.num_rows()
+            )));
+        }
+        let request_id = md_get(&metadata, REQUEST_ID_KEY).unwrap_or("").to_string();
+        Ok(Request {
+            method,
+            request_id,
+            batch,
+            metadata,
+        })
     }
 }
 
@@ -170,7 +250,17 @@ pub struct MethodInfo {
     pub has_return: bool,
     pub unary: Option<UnaryHandler>,
     pub stream: Option<StreamHandler>,
+    /// Decoder that reconstructs the method's `StreamStateKind` from a byte
+    /// slice produced by `ProducerState::encode_state` /
+    /// `ExchangeState::encode_state`. Required for HTTP streaming (the
+    /// stateless-worker model); `None` for unary methods and for streams
+    /// that will only ever run over pipe/unix.
+    pub state_decoder: Option<StateDecoder>,
 }
+
+/// Decoder that reconstructs a concrete streaming state from its
+/// serialized bytes, used by the HTTP transport on continuation requests.
+pub type StateDecoder = Arc<dyn Fn(&[u8]) -> Result<crate::stream::StreamStateKind> + Send + Sync>;
 
 impl MethodInfo {
     /// Start building a unary method registration.
@@ -194,10 +284,17 @@ impl MethodInfo {
             has_return,
             unary: Some(Arc::new(handler)),
             stream: None,
+            state_decoder: None,
         }
     }
 
     /// Start building a streaming method registration.
+    ///
+    /// **Note:** this form registers the method without a state decoder,
+    /// so it will work for pipe/unix transports but HTTP continuation
+    /// requests will fail. Use
+    /// [`MethodInfo::producer_with_codec`] /
+    /// [`MethodInfo::exchange_with_codec`] when HTTP is enabled.
     pub fn stream(
         name: impl Into<String>,
         method_type: MethodType,
@@ -224,7 +321,14 @@ impl MethodInfo {
             has_return: false,
             unary: None,
             stream: Some(Arc::new(handler)),
+            state_decoder: None,
         }
+    }
+
+    /// Attach a state decoder function. See [`StateDecoder`].
+    pub fn with_state_decoder(mut self, decoder: StateDecoder) -> Self {
+        self.state_decoder = Some(decoder);
+        self
     }
 
     pub fn doc(mut self, s: impl Into<String>) -> Self {
@@ -341,6 +445,12 @@ impl RpcServer {
     }
 
     pub fn method_names(&self) -> Vec<&str> {
+        self.sorted_method_names()
+    }
+
+    /// Method names sorted alphabetically. Preferred over `methods().keys()`
+    /// when order matters (introspection / describe / HTML rendering).
+    pub fn sorted_method_names(&self) -> Vec<&str> {
         let mut names: Vec<_> = self.methods.keys().map(String::as_str).collect();
         names.sort();
         names
@@ -362,6 +472,28 @@ impl RpcServer {
         }
     }
 
+    /// Like [`serve`], but checks `shutdown` between requests and exits
+    /// cleanly when it returns `true`. Useful for daemonized pipe/unix
+    /// listeners that want to drain the in-flight request before exiting
+    /// on SIGTERM. Blocking reads still must terminate via EOF/peer-close
+    /// — this is an *advisory* signal checked at request boundaries.
+    pub fn serve_with_shutdown<R, W, F>(&self, mut r: R, mut w: W, shutdown: F)
+    where
+        R: Read,
+        W: Write,
+        F: Fn() -> bool,
+    {
+        loop {
+            if shutdown() {
+                return;
+            }
+            match self.serve_one(&mut r, &mut w) {
+                Ok(true) => {}
+                _ => return,
+            }
+        }
+    }
+
     /// Handle one request. Returns `Ok(true)` to continue, `Ok(false)` on EOS/EOF.
     pub fn serve_one<R: Read, W: Write>(&self, r: &mut R, w: &mut W) -> Result<bool> {
         let result = self._serve_one(r, w);
@@ -375,15 +507,7 @@ impl RpcServer {
             None => return Ok(false),
         };
 
-        let ctx = CallContext {
-            server_id: self.server_id.clone(),
-            method: req.method.clone(),
-            request_id: req.request_id.clone(),
-            transport_metadata: Arc::new(req.metadata.clone()),
-            auth: crate::auth::AuthContext::anonymous(),
-            cookies: std::collections::BTreeMap::new(),
-            log_sink: Arc::new(Mutex::new(Vec::new())),
-        };
+        let ctx = CallContext::for_request(self, &req);
 
         let stats = Arc::new(Mutex::new(crate::hooks::CallStatistics::default()));
         // Record the unary request batch as input stats (one row).
@@ -411,8 +535,7 @@ impl RpcServer {
         }
 
         let Some(info) = self.methods.get(&req.method) else {
-            let mut names = self.method_names();
-            names.sort();
+            let names = self.sorted_method_names();
             let msg = format!(
                 "Unknown method: '{}'. Available methods: {:?}",
                 req.method, names
@@ -420,26 +543,19 @@ impl RpcServer {
             write_error_stream(
                 w,
                 &empty_schema(),
-                &RpcError::new("AttributeError", msg),
+                &RpcError::attribute_error(msg),
                 &self.server_id,
                 &req.request_id,
             )?;
             return Ok(true);
         };
 
-        let dispatch_info = crate::hooks::DispatchInfo {
-            method: req.method.clone(),
-            method_type: match info.method_type {
-                MethodType::Unary => "unary",
-                _ => "stream",
-            },
-            server_id: self.server_id.clone(),
-            request_id: req.request_id.clone(),
-            transport_metadata: Arc::new(req.metadata.clone()),
-            principal: String::new(),
-            auth_domain: String::new(),
-            authenticated: false,
+        let method_type = match info.method_type {
+            MethodType::Unary => "unary",
+            _ => "stream",
         };
+        let dispatch_info =
+            crate::hooks::DispatchInfo::from_request(self, &req, method_type, &ctx.auth);
         let hook_token = self
             .dispatch_hook
             .as_ref()
@@ -473,39 +589,12 @@ impl RpcServer {
                 return Err(e);
             }
         };
-        let ReadBatch { batch, metadata } = match reader.read_next()? {
+        let rb = match reader.read_next()? {
             Some(rb) => rb,
             None => return Ok(None),
         };
         reader.drain()?;
-        let method = md_get(&metadata, RPC_METHOD_KEY).ok_or_else(|| {
-            RpcError::protocol_error("Missing 'vgi_rpc.method' in request batch custom_metadata.")
-        })?;
-        let version = md_get(&metadata, REQUEST_VERSION_KEY).ok_or_else(|| {
-            RpcError::version_error(format!(
-                "Missing 'vgi_rpc.request_version' in request batch custom_metadata. Set it to {:?}.",
-                REQUEST_VERSION
-            ))
-        })?;
-        if version != REQUEST_VERSION {
-            return Err(RpcError::version_error(format!(
-                "Unsupported request version {:?}, expected {:?}.",
-                version, REQUEST_VERSION
-            )));
-        }
-        if !batch.schema().fields().is_empty() && batch.num_rows() != 1 {
-            return Err(RpcError::protocol_error(format!(
-                "Expected 1 row in request batch, got {}",
-                batch.num_rows()
-            )));
-        }
-        let request_id = md_get(&metadata, REQUEST_ID_KEY).unwrap_or("").to_string();
-        Ok(Some(Request {
-            method: method.to_string(),
-            request_id,
-            batch,
-            metadata,
-        }))
+        Ok(Some(Request::from_read_batch(rb, true)?))
     }
 
     fn serve_unary<W: Write>(
@@ -764,11 +853,7 @@ fn drain_input<R: Read>(r: &mut R) -> Result<()> {
     Ok(())
 }
 
-pub fn cast_batch_public(batch: &RecordBatch, target: &Schema) -> Result<RecordBatch> {
-    cast_batch(batch, target)
-}
-
-fn cast_batch(batch: &RecordBatch, target: &Schema) -> Result<RecordBatch> {
+pub fn cast_batch(batch: &RecordBatch, target: &Schema) -> Result<RecordBatch> {
     if batch.num_columns() != target.fields().len() {
         return Err(RpcError::type_error(format!(
             "Input schema mismatch: expected {} fields, got {}",
@@ -802,7 +887,7 @@ fn cast_batch(batch: &RecordBatch, target: &Schema) -> Result<RecordBatch> {
     RecordBatch::try_new(Arc::new(target.clone()), cols).map_err(RpcError::from)
 }
 
-fn build_log_metadata(msg: &LogMessage, server_id: &str, request_id: &str) -> Metadata {
+pub(crate) fn build_log_metadata(msg: &LogMessage, server_id: &str, request_id: &str) -> Metadata {
     let mut md = vec![
         (LOG_LEVEL_KEY.to_string(), msg.level.as_str().to_string()),
         (LOG_MESSAGE_KEY.to_string(), msg.message.clone()),
@@ -819,7 +904,7 @@ fn build_log_metadata(msg: &LogMessage, server_id: &str, request_id: &str) -> Me
     md
 }
 
-fn build_error_metadata(err: &RpcError, server_id: &str, request_id: &str) -> Metadata {
+pub(crate) fn build_error_metadata(err: &RpcError, server_id: &str, request_id: &str) -> Metadata {
     let extra = serde_json::json!({
         "exception_type": err.error_type,
         "exception_message": err.message,

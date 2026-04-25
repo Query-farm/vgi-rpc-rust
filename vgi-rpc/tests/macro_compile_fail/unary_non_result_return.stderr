@@ -1,0 +1,5 @@
+error: service methods must return Result<T>
+  --> tests/macro_compile_fail/unary_non_result_return.rs:10:38
+   |
+10 |     fn echo(&self, value: String) -> String {
+   |                                      ^^^^^^

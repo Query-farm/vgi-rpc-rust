@@ -5,6 +5,7 @@
 //! validator) so logs are portable across implementations.
 
 use std::io::Write;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -13,11 +14,30 @@ use serde_json::json;
 use crate::errors::RpcError;
 use crate::hooks::{CallStatistics, DispatchHook, DispatchInfo, HookToken};
 
+/// Where the hook sends formatted JSON lines.
+enum Sink {
+    /// Synchronous: dispatch thread holds the sink mutex during the write.
+    Sync(Arc<Mutex<dyn Write + Send>>),
+    /// Asynchronous: dispatch thread queues the line into a bounded
+    /// channel; a background writer thread drains it.
+    Async {
+        tx: SyncSender<Vec<u8>>,
+        dropped: Arc<std::sync::atomic::AtomicU64>,
+    },
+}
+
 /// A `DispatchHook` that writes one JSON line per call to an arbitrary
 /// `Write` sink. Entries carry the `vgi_rpc.access` logger name so the
 /// Python validator's filter (`.logger == "vgi_rpc.access"`) matches.
+///
+/// Two modes:
+/// - [`AccessLogHook::new`] / [`to_stderr`] write synchronously on the
+///   dispatch thread (acceptable for stderr or in-memory test sinks).
+/// - [`AccessLogHook::buffered`] queues into a bounded mpsc channel and
+///   drains on a background thread; on overflow it drops the entry and
+///   bumps a counter rather than blocking dispatch.
 pub struct AccessLogHook {
-    sink: Arc<Mutex<dyn Write + Send>>,
+    sink: Sink,
     server_version: String,
     /// Start instants keyed by request_id for duration tracking. For server
     /// loads where request_id is always empty, a simple monotonically
@@ -27,20 +47,72 @@ pub struct AccessLogHook {
 }
 
 impl AccessLogHook {
-    /// Create an access log hook that writes to `sink`. The sink is
-    /// wrapped in a mutex so the hook is `Sync`.
+    /// Create an access log hook that writes synchronously to `sink`.
+    /// Suitable for stderr or in-memory sinks; for production file I/O
+    /// prefer [`AccessLogHook::buffered`] to keep dispatch threads off
+    /// the disk path.
     pub fn new<W: Write + Send + 'static>(sink: W, server_version: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
-            sink: Arc::new(Mutex::new(sink)),
+            sink: Sink::Sync(Arc::new(Mutex::new(sink))),
             server_version: server_version.into(),
             starts: Mutex::new(std::collections::HashMap::new()),
             next_token: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
-    /// Convenience: write access logs to stderr (one JSON line per entry).
+    /// Create a hook that writes asynchronously: the dispatch thread
+    /// pushes a formatted line into a bounded channel of `capacity`
+    /// entries and a background thread drains it into `sink`. When the
+    /// channel is full, the entry is *dropped* (counted by
+    /// [`dropped_count`](Self::dropped_count)) instead of blocking
+    /// dispatch — this is the right tradeoff for high-throughput servers
+    /// where occasional log loss is preferable to head-of-line blocking
+    /// behind a stalled disk.
+    ///
+    /// The writer thread exits when the hook is dropped (sender closes).
+    pub fn buffered<W: Write + Send + 'static>(
+        sink: W,
+        server_version: impl Into<String>,
+        capacity: usize,
+    ) -> Arc<Self> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(capacity.max(1));
+        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut sink = sink;
+        std::thread::Builder::new()
+            .name("vgi-rpc-access-log".into())
+            .spawn(move || {
+                while let Ok(line) = rx.recv() {
+                    if sink.write_all(&line).is_err() {
+                        return;
+                    }
+                    if sink.write_all(b"\n").is_err() {
+                        return;
+                    }
+                    let _ = sink.flush();
+                }
+            })
+            .expect("spawn access-log writer thread");
+        Arc::new(Self {
+            sink: Sink::Async { tx, dropped },
+            server_version: server_version.into(),
+            starts: Mutex::new(std::collections::HashMap::new()),
+            next_token: std::sync::atomic::AtomicU64::new(1),
+        })
+    }
+
+    /// Convenience: write access logs to stderr synchronously
+    /// (one JSON line per entry).
     pub fn to_stderr(server_version: impl Into<String>) -> Arc<Self> {
         Self::new(std::io::stderr(), server_version)
+    }
+
+    /// Number of entries dropped because the async channel was full.
+    /// Always zero for synchronous hooks.
+    pub fn dropped_count(&self) -> u64 {
+        match &self.sink {
+            Sink::Async { dropped, .. } => dropped.load(std::sync::atomic::Ordering::Relaxed),
+            Sink::Sync(_) => 0,
+        }
     }
 }
 
@@ -105,9 +177,26 @@ impl DispatchHook for AccessLogHook {
         }
 
         let line = serde_json::Value::Object(rec).to_string();
-        let mut w = self.sink.lock().unwrap();
-        let _ = writeln!(w, "{line}");
-        let _ = w.flush();
+        match &self.sink {
+            Sink::Sync(m) => {
+                let mut w = m.lock().unwrap();
+                let _ = writeln!(w, "{line}");
+                let _ = w.flush();
+            }
+            Sink::Async { tx, dropped } => {
+                if let Err(e) = tx.try_send(line.into_bytes()) {
+                    match e {
+                        TrySendError::Full(_) => {
+                            dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        TrySendError::Disconnected(_) => {
+                            // Writer thread exited; treat as dropped silently.
+                            dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -151,6 +240,89 @@ mod tests {
         assert_eq!(rec["server_version"], "1.2.3");
         assert_eq!(rec["status"], "ok");
         assert_eq!(rec["authenticated"], false);
+    }
+
+    #[test]
+    fn buffered_writes_via_background_thread() {
+        // Sink that records every write; cloned across threads via Arc<Mutex>.
+        struct ChanSink(std::sync::mpsc::Sender<Vec<u8>>);
+        impl Write for ChanSink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                let _ = self.0.send(b.to_vec());
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let hook: Arc<dyn DispatchHook> = AccessLogHook::buffered(ChanSink(tx), "1.2.3", 128);
+
+        let info = DispatchInfo {
+            method: "echo_string".into(),
+            method_type: "unary",
+            server_id: "srv".into(),
+            request_id: "req-1".into(),
+            transport_metadata: Arc::new(Vec::new()),
+            principal: String::new(),
+            auth_domain: String::new(),
+            authenticated: false,
+        };
+        let tok = hook.on_dispatch_start(&info);
+        hook.on_dispatch_end(tok, &info, None, &CallStatistics::default());
+
+        // Drain the receiver until we see the JSON body. The writer thread
+        // will write the line and a trailing newline as separate writes.
+        let mut acc = Vec::new();
+        while let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            acc.extend(chunk);
+            if acc.contains(&b'\n') {
+                break;
+            }
+        }
+        let line = String::from_utf8(acc).unwrap();
+        assert!(line.contains("\"method\":\"echo_string\""), "got: {line}");
+        assert!(line.contains("\"server_version\":\"1.2.3\""), "got: {line}");
+    }
+
+    #[test]
+    fn buffered_drops_when_channel_full_instead_of_blocking() {
+        // Sink whose writes block forever — the writer thread will park
+        // on the very first entry, leaving the channel saturated.
+        struct ParkingSink;
+        impl Write for ParkingSink {
+            fn write(&mut self, _b: &[u8]) -> std::io::Result<usize> {
+                std::thread::park();
+                Ok(0)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let hook = AccessLogHook::buffered(ParkingSink, "1.2.3", 1);
+        let dyn_hook: Arc<dyn DispatchHook> = hook.clone();
+        let info = DispatchInfo {
+            method: "m".into(),
+            method_type: "unary",
+            server_id: "s".into(),
+            request_id: String::new(),
+            transport_metadata: Arc::new(Vec::new()),
+            principal: String::new(),
+            auth_domain: String::new(),
+            authenticated: false,
+        };
+        // Push enough entries that the bounded channel overflows.
+        for _ in 0..50 {
+            let tok = dyn_hook.on_dispatch_start(&info);
+            dyn_hook.on_dispatch_end(tok, &info, None, &CallStatistics::default());
+        }
+        // Some entries must have been dropped — this is the property under
+        // test (dispatch never blocked even though the sink is wedged).
+        assert!(
+            hook.dropped_count() > 0,
+            "expected drops on saturated buffered sink, got {}",
+            hook.dropped_count()
+        );
     }
 
     #[test]

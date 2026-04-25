@@ -3,9 +3,12 @@
 //! Registers ~45 RPC methods against an [`vgi_rpc::RpcServer`] mirroring
 //! the Python canonical implementation (`vgi_rpc/conformance/_impl.py`).
 
-mod param_schemas;
+// `macro_demo` builds and demonstrates the proc-macro parity, but
+// registering it would drift the describe-conformance method-set check.
+// The macro shape is exercised by `vgi-rpc/tests/macro_smoke.rs`.
+#[allow(dead_code)]
+mod macro_demo;
 mod params;
-mod results;
 mod streams;
 mod types;
 mod unary;

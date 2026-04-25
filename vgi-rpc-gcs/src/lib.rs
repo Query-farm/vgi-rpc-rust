@@ -10,19 +10,15 @@ use std::sync::Arc;
 pub use vgi_rpc_s3::HttpFetcher;
 
 use vgi_rpc::external::{Compression, ExternalStorage, UploadResult};
-use vgi_rpc::{Result, RpcError};
+use vgi_rpc::Result;
+use vgi_rpc_s3::PresignedPutStorage;
 
 /// User-supplied factory: given `(bucket, object)`, return a short-lived
 /// V4-signed HTTPS PUT URL.
 pub type SignedUrlFactory = Arc<dyn Fn(&str, &str) -> Result<String> + Send + Sync>;
 
 /// `ExternalStorage` that PUTs objects via a GCS V4-signed URL factory.
-pub struct SignedGcsStorage {
-    bucket: String,
-    prefix: String,
-    factory: SignedUrlFactory,
-    client: reqwest::blocking::Client,
-}
+pub struct SignedGcsStorage(PresignedPutStorage);
 
 impl SignedGcsStorage {
     pub fn new(
@@ -30,48 +26,13 @@ impl SignedGcsStorage {
         prefix: impl Into<String>,
         factory: SignedUrlFactory,
     ) -> Self {
-        Self {
-            bucket: bucket.into(),
-            prefix: prefix.into(),
-            factory,
-            client: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("reqwest client"),
-        }
-    }
-
-    fn object_key(&self) -> String {
-        let id = uuid::Uuid::new_v4();
-        format!("{}{id}.arrow", self.prefix)
+        Self(PresignedPutStorage::new("gcs", bucket, prefix, factory))
     }
 }
 
 impl ExternalStorage for SignedGcsStorage {
     fn upload(&self, ipc_bytes: &[u8], compression: Compression) -> Result<UploadResult> {
-        let key = self.object_key();
-        let url = (self.factory)(&self.bucket, &key)?;
-        let mut req = self
-            .client
-            .put(&url)
-            .body(ipc_bytes.to_vec())
-            .header("content-type", "application/vnd.apache.arrow.stream");
-        if let Compression::Zstd(_) = compression {
-            req = req.header("content-encoding", "zstd");
-        }
-        let resp = req
-            .send()
-            .map_err(|e| RpcError::runtime_error(format!("gcs PUT failed: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(RpcError::runtime_error(format!(
-                "gcs PUT returned {} for {url}",
-                resp.status()
-            )));
-        }
-        Ok(UploadResult {
-            url,
-            sha256: String::new(),
-        })
+        self.0.upload(ipc_bytes, compression)
     }
 }
 
@@ -80,13 +41,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn object_key_uses_prefix() {
+    fn uploads_via_factory() {
         let storage = SignedGcsStorage::new(
             "bkt",
             "tenant-a/",
             Arc::new(|_, _| Ok(String::from("https://example/"))),
         );
-        let k = storage.object_key();
-        assert!(k.starts_with("tenant-a/"));
+        let err = storage
+            .upload(&[1, 2, 3], Compression::None)
+            .expect_err("example URL won't actually accept PUT");
+        assert!(err.message.contains("gcs PUT"));
     }
 }

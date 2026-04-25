@@ -64,6 +64,32 @@ def rust_http_port() -> Iterator[int]:
         proc.wait(timeout=5)
 
 
+@pytest.fixture(scope="session")
+def conformance_http_port(rust_http_port: int) -> int:
+    """Alias of `rust_http_port` for the upstream `TestHealth` fixture."""
+    return rust_http_port
+
+
+@pytest.fixture(scope="session")
+def conformance_http_auth_port() -> Iterator[int]:
+    """Run the Rust worker with a reject-all auth callback under `/vgi/`."""
+    proc = subprocess.Popen(
+        [RUST_WORKER, "--http-auth"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+        port = int(line.split(":", 1)[1])
+        _wait_for_http(port)
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
 def _short_unix_path(name: str) -> str:
     """Return a short /tmp path for a Unix domain socket (macOS 104-byte limit)."""
     fd, path = tempfile.mkstemp(prefix=f"vgi-rust-{name}-", suffix=".sock", dir="/tmp")

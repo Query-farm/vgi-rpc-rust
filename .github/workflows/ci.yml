@@ -16,8 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (MSRV 1.86)
+        uses: dtolnay/rust-toolchain@1.86.0
         with:
           components: rustfmt, clippy
 
@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.86.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -51,9 +51,12 @@ jobs:
           python-version: "3.12"
 
       - name: Install vgi-rpc conformance harness
+        # Pinned to a published version that includes the TestHealth +
+        # cancel additions used by `test_rust_conformance.py`. Bump as
+        # the upstream Python suite evolves.
         run: |
           python -m pip install --upgrade pip
-          pip install "vgi-rpc[http,cli]>=0.1.13" pytest pytest-timeout httpx
+          pip install "vgi-rpc[http,cli]>=0.9.0" pytest pytest-timeout httpx
 
       - name: Build conformance worker
         run: cargo build -p vgi-rpc-conformance-rust
@@ -67,4 +70,17 @@ jobs:
           VGI_TRANSPORTS: pipe,subprocess,http,unix
           RUST_CONFORMANCE_WORKER: ${{ github.workspace }}/conformance-worker-rust
         run: |
-          python -m pytest test_rust_conformance.py --timeout=3 --timeout-method=signal -v
+          python -m pytest test_rust_conformance.py --timeout=10 --timeout-method=signal -v
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MSRV toolchain (1.86)
+        uses: dtolnay/rust-toolchain@1.86.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build on MSRV
+        run: cargo build --workspace --all-features

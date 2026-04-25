@@ -114,11 +114,38 @@ GET    {prefix}/health              liveness probe
 GET    {prefix}/.well-known/oauth-protected-resource   RFC 9728 JSON
 ```
 
-Stream state lives in an in-memory `HashMap<String, Session>` keyed by
-an opaque HMAC-signed token the client echoes back. Sessions have a TTL
-(default 5 min), a bounded cap (default 10 k), and are reaped by a
-tokio interval task at 30-second cadence. The signing key is random per
-process unless `HttpStateBuilder::signing_key(...)` is set.
+Streaming is **stateless on the wire**: the full `StreamStateKind` is
+serialized into an HMAC-signed token carried in the `vgi_rpc.stream_state#b64`
+metadata key. Any worker behind a load balancer with the same signing
+key can resume any continuation request. No server-side session map,
+no reaper task. The token TTL (default 5 min) is embedded in the
+signed payload as a `created_at` timestamp and checked on unpack.
+
+**Token format v3** (matches Python `vgi_rpc/http/server/_state_token.py`):
+little-endian `version=0x03 | u64 created_at | len+state_bytes |
+len+output_schema_bytes | len+input_schema_bytes | len+stream_id_bytes |
+HMAC-SHA256`, base64-encoded.
+
+**State serialization.** Each `ProducerState` / `ExchangeState` type
+implements [`vgi_rpc::stream_codec::StreamStateCodec`] (bincode-backed
+in the conformance worker; arbitrary format in principle). The method
+registration carries a `state_decoder` function that rebuilds the
+concrete state from bytes on continuation requests. See
+`MethodInfo::with_state_decoder` + the `producer_decoder::<S>()` /
+`exchange_decoder::<S>()` helpers in
+`conformance-worker/src/conformance/streams.rs`.
+
+Pipe/unix transports keep state in memory across lockstep iterations —
+`encode_state` is unused on those paths. Same state type works for
+both.
+
+**Production signing keys.** `HttpStateBuilder::signing_key(...)` accepts
+raw bytes; for deployments use `signing_key_hex(...)`,
+`signing_key_base64(...)`, or `signing_key_from_env(var)` (reads a key
+from an env var, auto-detecting base64 or hex). Without an explicit key
+the server logs a `vgi_rpc.http` warn-level line at startup and uses an
+ephemeral per-process key — tokens won't survive a restart or load
+balance across workers, so it's test-only.
 
 Response post-processing (CORS headers + zstd compression) runs as an
 axum `middleware::from_fn_with_state` layer applied at the top of
@@ -258,6 +285,36 @@ aligned so cross-referencing is easy. Python module ↔ Rust module:
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, cargo doc, and
 the Python-driven conformance job on every push.
 
+## Defining a service with the macro
+
+The `vgi-rpc-macros` crate (re-exported from `vgi-rpc` behind the
+default-on `macros` feature) lets you write services as a regular
+`impl` block instead of hand-rolling Arrow schemas + closure
+boilerplate. See `vgi-rpc-macros/README.md` for the user-facing
+reference. Quick sketch:
+
+```rust
+#[service]
+impl Calc {
+    /// Echo a string back, prefixed.
+    #[unary]
+    fn echo(&self, value: String) -> Result<String> {
+        Ok(format!("echo: {value}"))
+    }
+    #[producer(state = CountTo, output = i64)]
+    fn count_to(&self, total: i64) -> Result<CountTo> {
+        Ok(CountTo { total, cur: 0 })
+    }
+}
+let mut srv = RpcServer::builder().build();
+Calc::register_with(&mut srv, Arc::new(Calc));
+```
+
+`#[derive(VgiArrow)]` derives the trait for plain structs (mirroring
+Python's `ArrowSerializableDataclass`). `#[derive(StreamState)]`
+auto-impls `StreamStateCodec` (bincode) on stream-state types.
+Compile-fail UI tests live in `vgi-rpc/tests/macro_compile_fail/`.
+
 ## What's **not** done (deferred)
 
 These weren't gated on conformance and are candidates for a later phase:
@@ -267,13 +324,11 @@ These weren't gated on conformance and are candidates for a later phase:
   crate or module and mirror the Go port's patterns.
 - **Shared-memory transport** + subprocess pool (optional Python / Go
   feature).
-- **Full OAuth2 + PKCE browser UI pages** — the crypto primitives ship
-  in `auth::pkce` but the HTML flow (callback + logout + session cookie
-  middleware) is left to downstream apps.
-- **JWT verifier bundled** — `auth::jwt::jwt_authenticate_with` exposes
-  the scaffolding and expects the user to plug in a `jsonwebtoken` or
-  `josekit` verifier closure. A ready-made `jsonwebtoken` adapter is
-  easy to add when needed.
+- **Rust client crate** — the workspace is server-only today. A
+  client crate mirroring the Go port's structure remains a follow-up.
+- **Fuzz coverage on the wire reader.** `wire::StreamReader` parses
+  hand-crafted flatbuffer frames; only happy-path tests today. A
+  `cargo-fuzz` harness is the next robustness step.
 
 ## Common pitfalls
 

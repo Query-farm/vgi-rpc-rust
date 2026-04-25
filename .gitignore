@@ -3,3 +3,5 @@ Cargo.lock
 *.swp
 .DS_Store
 .test-run/
+__pycache__/
+*.pyc

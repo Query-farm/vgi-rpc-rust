@@ -1,0 +1,5 @@
+error: stream methods require `state = <StateType>` (the user-defined ProducerState/ExchangeState type)
+ --> tests/macro_compile_fail/producer_missing_state.rs:9:5
+  |
+9 |     #[producer(output = i64)]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,467 +1,273 @@
-//! Register all conformance unary methods with full describe metadata.
+//! Conformance unary methods, defined via `#[vgi_rpc::service]`.
+//!
+//! All 30 methods that mirror the Python `ConformanceService` unary
+//! surface, expressed declaratively. Dataclass-typed params/returns
+//! (`Point`, `BoundingBox`, `AllTypes`) round-trip through Arrow
+//! `Binary` IPC bytes (matches Python's `ArrowSerializableDataclass`
+//! wire convention) — those use `Bytes` + `param_type = "..."` to
+//! preserve the `__describe__` type names.
 
-use serde_json::json;
-use vgi_rpc::{LogLevel, LogMessage, MethodInfo, RpcError, RpcServer};
+use std::sync::Arc;
 
-use super::param_schemas as ps;
-use super::params as p;
-use super::results as r;
+use vgi_rpc::{service, Bytes, CallContext, LogLevel, LogMessage, Result, RpcError, RpcServer};
+
 use super::types;
 
-pub fn register(s: &mut RpcServer) {
+/// Stateless service handle.
+pub struct UnarySvc;
+
+#[service]
+impl UnarySvc {
     // --- Scalar echo ---
-    s.register(
-        MethodInfo::unary(
-            "echo_string",
-            ps::echo_string(),
-            r::schema_string(),
-            |req, _| {
-                let v = p::str_col(req, "value")?.to_string();
-                Ok(Some(r::unary_string(r::schema_string(), &v)?))
-            },
-        )
-        .doc("Echo a string value.")
-        .param_type("value", "str"),
-    );
-    s.register(
-        MethodInfo::unary(
-            "echo_bytes",
-            ps::echo_bytes(),
-            r::schema_bytes(),
-            |req, _| {
-                let v = p::bytes_col(req, "data")?.to_vec();
-                Ok(Some(r::unary_bytes(r::schema_bytes(), &v)?))
-            },
-        )
-        .doc("Echo a bytes value.")
-        .param_type("data", "bytes"),
-    );
-    s.register(
-        MethodInfo::unary("echo_int", ps::echo_int(), r::schema_int64(), |req, _| {
-            let v = p::i64_col(req, "value")?;
-            Ok(Some(r::unary_int64(r::schema_int64(), v)?))
-        })
-        .doc("Echo an integer value.")
-        .param_type("value", "int"),
-    );
-    s.register(
-        MethodInfo::unary(
-            "echo_float",
-            ps::echo_float(),
-            r::schema_float64(),
-            |req, _| {
-                let v = p::f64_col(req, "value")?;
-                Ok(Some(r::unary_float64(r::schema_float64(), v)?))
-            },
-        )
-        .doc("Echo a float value.")
-        .param_type("value", "float"),
-    );
-    s.register(
-        MethodInfo::unary("echo_bool", ps::echo_bool(), r::schema_bool(), |req, _| {
-            let v = p::bool_col(req, "value")?;
-            Ok(Some(r::unary_bool(r::schema_bool(), v)?))
-        })
-        .doc("Echo a boolean value.")
-        .param_type("value", "bool"),
-    );
+
+    /// Echo a string value.
+    #[unary]
+    fn echo_string(&self, value: String) -> Result<String> {
+        Ok(value)
+    }
+
+    /// Echo a bytes value.
+    #[unary]
+    #[param(name = "data")]
+    fn echo_bytes(&self, data: Bytes) -> Result<Bytes> {
+        Ok(data)
+    }
+
+    /// Echo an integer value.
+    #[unary]
+    fn echo_int(&self, value: i64) -> Result<i64> {
+        Ok(value)
+    }
+
+    /// Echo a float value.
+    #[unary]
+    fn echo_float(&self, value: f64) -> Result<f64> {
+        Ok(value)
+    }
+
+    /// Echo a boolean value.
+    #[unary]
+    fn echo_bool(&self, value: bool) -> Result<bool> {
+        Ok(value)
+    }
 
     // --- Void ---
-    s.register(
-        MethodInfo::unary(
-            "void_noop",
-            ps::void_noop(),
-            r::schema_empty(),
-            |_req, _| Ok(None),
-        )
-        .doc("No-op returning void."),
-    );
-    s.register(
-        MethodInfo::unary(
-            "void_with_param",
-            ps::void_with_param(),
-            r::schema_empty(),
-            |_req, _| Ok(None),
-        )
-        .doc("Accept a parameter, return void.")
-        .param_type("value", "int"),
-    );
+
+    /// No-op returning void.
+    #[unary]
+    fn void_noop(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Accept a parameter, return void.
+    #[unary]
+    fn void_with_param(&self, value: i64) -> Result<()> {
+        let _ = value;
+        Ok(())
+    }
 
     // --- Complex type echo ---
-    s.register(
-        MethodInfo::unary(
-            "echo_enum",
-            ps::echo_enum(),
-            r::schema_dict_enum(),
-            |req, _| {
-                let v = p::enum_str(req, "status")?;
-                Ok(Some(r::unary_enum(r::schema_dict_enum(), &v)?))
-            },
-        )
-        .doc("Echo an enum value.")
-        .param_type("status", "Status"),
-    );
-    s.register(
-        MethodInfo::unary(
-            "echo_list",
-            ps::echo_list(),
-            r::schema_list_str(),
-            |req, _| {
-                let v = p::list_str(req, "values")?;
-                Ok(Some(r::unary_list_str(r::schema_list_str(), &v)?))
-            },
-        )
-        .doc("Echo a list of strings.")
-        .param_type("values", "list[str]"),
-    );
-    s.register(
-        MethodInfo::unary(
-            "echo_dict",
-            ps::echo_dict(),
-            r::schema_map_str_int64(),
-            |req, _| {
-                let v = p::map_string_int64(req, "mapping")?;
-                Ok(Some(r::unary_map_str_int64(r::schema_map_str_int64(), &v)?))
-            },
-        )
-        .doc("Echo a dict mapping.")
-        .param_type("mapping", "dict[str, int]"),
-    );
-    s.register(
-        MethodInfo::unary(
-            "echo_nested_list",
-            ps::echo_nested_list(),
-            r::schema_nested_list_i64(),
-            |req, _| {
-                let v = p::nested_list_i64(req, "matrix")?;
-                Ok(Some(r::unary_nested_list_i64(
-                    r::schema_nested_list_i64(),
-                    &v,
-                )?))
-            },
-        )
-        .doc("Echo a nested list.")
-        .param_type("matrix", "list[list[int]]"),
-    );
+
+    /// Echo an enum value.
+    ///
+    /// The `Status` enum is carried over the wire as `Utf8`; the
+    /// describe metadata names it `"Status"` to match Python.
+    #[unary]
+    #[param(name = "status", arrow_type = "Status")]
+    fn echo_enum(&self, status: String) -> Result<String> {
+        Ok(status)
+    }
+
+    /// Echo a list of strings.
+    #[unary]
+    #[param(name = "values")]
+    fn echo_list(&self, values: Vec<String>) -> Result<Vec<String>> {
+        Ok(values)
+    }
+
+    /// Echo a dict mapping.
+    #[unary]
+    #[param(name = "mapping")]
+    fn echo_dict(&self, mapping: Vec<(String, i64)>) -> Result<Vec<(String, i64)>> {
+        Ok(mapping)
+    }
+
+    /// Echo a nested list.
+    #[unary]
+    #[param(name = "matrix")]
+    fn echo_nested_list(&self, matrix: Vec<Vec<i64>>) -> Result<Vec<Vec<i64>>> {
+        Ok(matrix)
+    }
 
     // --- Optional ---
-    s.register(
-        MethodInfo::unary(
-            "echo_optional_string",
-            ps::echo_optional_string(),
-            r::schema_opt_string(),
-            |req, _| {
-                let v = p::opt_str(req, "value")?;
-                Ok(Some(r::unary_opt_string(
-                    r::schema_opt_string(),
-                    v.as_deref(),
-                )?))
-            },
-        )
-        .doc("Echo an optional string (may be None).")
-        .param_type("value", "str | None"),
-    );
-    s.register(
-        MethodInfo::unary(
-            "echo_optional_int",
-            ps::echo_optional_int(),
-            r::schema_opt_int64(),
-            |req, _| {
-                let v = p::opt_i64(req, "value")?;
-                Ok(Some(r::unary_opt_int64(r::schema_opt_int64(), v)?))
-            },
-        )
-        .doc("Echo an optional int (may be None).")
-        .param_type("value", "int | None"),
-    );
 
-    // --- Dataclass round-trip ---
-    s.register(
-        MethodInfo::unary(
-            "echo_point",
-            ps::echo_point(),
-            r::schema_binary_dataclass(),
-            |req, _| {
-                let bytes = p::bytes_col(req, "point")?;
-                let point = types::Point::deserialize_ipc(bytes)?;
-                let ipc = point.serialize_ipc()?;
-                Ok(Some(r::unary_binary_dataclass(
-                    r::schema_binary_dataclass(),
-                    ipc,
-                )?))
-            },
-        )
-        .doc("Echo a Point dataclass.")
-        .param_type("point", "Point"),
-    );
-    s.register(
-        MethodInfo::unary(
-            "echo_all_types",
-            ps::echo_all_types(),
-            r::schema_binary_dataclass(),
-            |req, _| {
-                let bytes = p::bytes_col(req, "data")?;
-                let at = types::AllTypes::deserialize_ipc(bytes)?;
-                let ipc = at.serialize_ipc()?;
-                Ok(Some(r::unary_binary_dataclass(
-                    r::schema_binary_dataclass(),
-                    ipc,
-                )?))
-            },
-        )
-        .doc("Echo an AllTypes dataclass exercising every type mapping.")
-        .param_type("data", "AllTypes"),
-    );
-    s.register(
-        MethodInfo::unary(
-            "echo_bounding_box",
-            ps::echo_bounding_box(),
-            r::schema_binary_dataclass(),
-            |req, _| {
-                let bytes = p::bytes_col(req, "box")?;
-                let (tl, br, label) = types::deserialize_bounding_box_ipc(bytes)?;
-                let ipc = types::serialize_bounding_box_ipc(&tl, &br, &label)?;
-                Ok(Some(r::unary_binary_dataclass(
-                    r::schema_binary_dataclass(),
-                    ipc,
-                )?))
-            },
-        )
-        .doc("Echo a BoundingBox with nested Points.")
-        .param_type("box", "BoundingBox"),
-    );
+    /// Echo an optional string (may be None).
+    #[unary]
+    fn echo_optional_string(&self, value: Option<String>) -> Result<Option<String>> {
+        Ok(value)
+    }
 
-    // --- Dataclass as parameter ---
-    s.register(
-        MethodInfo::unary(
-            "inspect_point",
-            ps::inspect_point(),
-            r::schema_string(),
-            |req, _| {
-                let bytes = p::bytes_col(req, "point")?;
-                let point = types::Point::deserialize_ipc(bytes)?;
-                let txt = format!(
-                    "Point({}, {})",
-                    format_float(point.x),
-                    format_float(point.y)
-                );
-                Ok(Some(r::unary_string(r::schema_string(), &txt)?))
-            },
-        )
-        .doc("Accept a Point param (pa.binary() on wire), return formatted string.")
-        .param_type("point", "Point"),
-    );
+    /// Echo an optional int (may be None).
+    #[unary]
+    fn echo_optional_int(&self, value: Option<i64>) -> Result<Option<i64>> {
+        Ok(value)
+    }
+
+    // --- Dataclass round-trip (carried as Arrow Binary IPC bytes) ---
+
+    /// Echo a Point dataclass.
+    #[unary]
+    #[param(name = "point", arrow_type = "Point")]
+    fn echo_point(&self, point: Bytes) -> Result<Bytes> {
+        let p = types::Point::deserialize_ipc(&point.0)?;
+        Ok(Bytes(p.serialize_ipc()?))
+    }
+
+    /// Echo an AllTypes dataclass exercising every type mapping.
+    #[unary]
+    #[param(name = "data", arrow_type = "AllTypes")]
+    fn echo_all_types(&self, data: Bytes) -> Result<Bytes> {
+        let at = types::AllTypes::deserialize_ipc(&data.0)?;
+        Ok(Bytes(at.serialize_ipc()?))
+    }
+
+    /// Echo a BoundingBox with nested Points.
+    #[unary]
+    #[param(name = "box", arrow_type = "BoundingBox")]
+    fn echo_bounding_box(&self, r#box: Bytes) -> Result<Bytes> {
+        let (tl, br, label) = types::deserialize_bounding_box_ipc(&r#box.0)?;
+        Ok(Bytes(types::serialize_bounding_box_ipc(&tl, &br, &label)?))
+    }
+
+    /// Accept a Point param (`pa.binary()` on wire), return formatted string.
+    #[unary]
+    #[param(name = "point", arrow_type = "Point")]
+    fn inspect_point(&self, point: Bytes) -> Result<String> {
+        let p = types::Point::deserialize_ipc(&point.0)?;
+        Ok(format!(
+            "Point({}, {})",
+            format_float(p.x),
+            format_float(p.y)
+        ))
+    }
 
     // --- Annotated ---
-    s.register(
-        MethodInfo::unary(
-            "echo_int32",
-            ps::echo_int32(),
-            r::schema_int32(),
-            |req, _| {
-                let v = p::i64_col(req, "value")? as i32;
-                Ok(Some(r::unary_int32(r::schema_int32(), v)?))
-            },
-        )
-        .doc("Echo an int32 value.")
-        .param_type("value", "int"),
-    );
-    s.register(
-        MethodInfo::unary(
-            "echo_float32",
-            ps::echo_float32(),
-            r::schema_float32(),
-            |req, _| {
-                let v = p::f64_col(req, "value")? as f32;
-                Ok(Some(r::unary_float32(r::schema_float32(), v)?))
-            },
-        )
-        .doc("Echo a float32 value.")
-        .param_type("value", "float"),
-    );
+
+    /// Echo an int32 value.
+    ///
+    /// Wire schema is `Int32`, but Python writes `pa.int32()` from a
+    /// generic `int`, so the describe type is `"int"`.
+    #[unary]
+    #[param(name = "value", arrow_type = "int")]
+    fn echo_int32(&self, value: i32) -> Result<i32> {
+        Ok(value)
+    }
+
+    /// Echo a float32 value.
+    #[unary]
+    #[param(name = "value", arrow_type = "float")]
+    fn echo_float32(&self, value: f32) -> Result<f32> {
+        Ok(value)
+    }
 
     // --- Multi-param & defaults ---
-    s.register(
-        MethodInfo::unary(
-            "add_floats",
-            ps::add_floats(),
-            r::schema_float64(),
-            |req, _| {
-                let a = p::f64_col(req, "a")?;
-                let b = p::f64_col(req, "b")?;
-                Ok(Some(r::unary_float64(r::schema_float64(), a + b)?))
-            },
-        )
-        .doc("Add two floats.")
-        .param_type("a", "float")
-        .param_type("b", "float"),
-    );
-    s.register(
-        MethodInfo::unary(
-            "concatenate",
-            ps::concatenate(),
-            r::schema_string(),
-            |req, _| {
-                let prefix = p::str_col(req, "prefix")?.to_string();
-                let suffix = p::str_col(req, "suffix")?.to_string();
-                let sep = p::opt_str(req, "separator")?.unwrap_or_else(|| "-".to_string());
-                Ok(Some(r::unary_string(
-                    r::schema_string(),
-                    &format!("{prefix}{sep}{suffix}"),
-                )?))
-            },
-        )
-        .doc("Concatenate prefix + separator + suffix.")
-        .param_type("prefix", "str")
-        .param_type("suffix", "str")
-        .param_type("separator", "str")
-        .param_default("separator", json!("-")),
-    );
-    s.register(
-        MethodInfo::unary(
-            "with_defaults",
-            ps::with_defaults(),
-            r::schema_string(),
-            |req, _| {
-                let required = p::i64_col(req, "required")?;
-                let optional_str =
-                    p::opt_str(req, "optional_str")?.unwrap_or_else(|| "default".to_string());
-                let optional_int = p::opt_i64(req, "optional_int")?.unwrap_or(42);
-                Ok(Some(r::unary_string(
-                    r::schema_string(),
-                    &format!(
-                        "required={}, optional_str={}, optional_int={}",
-                        required, optional_str, optional_int
-                    ),
-                )?))
-            },
-        )
-        .doc("Return a formatted string showing all param values.")
-        .param_type("required", "int")
-        .param_type("optional_str", "str")
-        .param_type("optional_int", "int")
-        .param_default("optional_str", json!("default"))
-        .param_default("optional_int", json!(42)),
-    );
+
+    /// Add two floats.
+    #[unary]
+    fn add_floats(&self, a: f64, b: f64) -> Result<f64> {
+        Ok(a + b)
+    }
+
+    /// Concatenate prefix + separator + suffix.
+    #[unary]
+    #[param(name = "separator", default = "-")]
+    fn concatenate(&self, prefix: String, suffix: String, separator: String) -> Result<String> {
+        Ok(format!("{prefix}{separator}{suffix}"))
+    }
+
+    /// Return a formatted string showing all param values.
+    #[unary]
+    #[param(name = "optional_str", default = "default")]
+    #[param(name = "optional_int", default = 42)]
+    fn with_defaults(
+        &self,
+        required: i64,
+        optional_str: String,
+        optional_int: i64,
+    ) -> Result<String> {
+        Ok(format!(
+            "required={}, optional_str={}, optional_int={}",
+            required, optional_str, optional_int
+        ))
+    }
 
     // --- Error propagation ---
-    s.register(
-        MethodInfo::unary(
-            "raise_value_error",
-            ps::raise_error(),
-            r::schema_string(),
-            |req, _| {
-                let msg = p::str_col(req, "message")?.to_string();
-                Err::<Option<_>, _>(RpcError::value_error(msg))
-            },
-        )
-        .doc("Raise a ValueError with the given message.")
-        .param_type("message", "str"),
-    );
-    s.register(
-        MethodInfo::unary(
-            "raise_runtime_error",
-            ps::raise_error(),
-            r::schema_string(),
-            |req, _| {
-                let msg = p::str_col(req, "message")?.to_string();
-                Err::<Option<_>, _>(RpcError::runtime_error(msg))
-            },
-        )
-        .doc("Raise a RuntimeError with the given message.")
-        .param_type("message", "str"),
-    );
-    s.register(
-        MethodInfo::unary(
-            "raise_type_error",
-            ps::raise_error(),
-            r::schema_string(),
-            |req, _| {
-                let msg = p::str_col(req, "message")?.to_string();
-                Err::<Option<_>, _>(RpcError::type_error(msg))
-            },
-        )
-        .doc("Raise a TypeError with the given message.")
-        .param_type("message", "str"),
-    );
+
+    /// Raise a ValueError with the given message.
+    #[unary]
+    fn raise_value_error(&self, message: String) -> Result<String> {
+        Err(RpcError::value_error(message))
+    }
+
+    /// Raise a RuntimeError with the given message.
+    #[unary]
+    fn raise_runtime_error(&self, message: String) -> Result<String> {
+        Err(RpcError::runtime_error(message))
+    }
+
+    /// Raise a TypeError with the given message.
+    #[unary]
+    fn raise_type_error(&self, message: String) -> Result<String> {
+        Err(RpcError::type_error(message))
+    }
 
     // --- Client-directed logging ---
-    s.register(
-        MethodInfo::unary(
-            "echo_with_info_log",
-            ps::echo_with_value(),
-            r::schema_string(),
-            |req, ctx| {
-                let v = p::str_col(req, "value")?.to_string();
-                ctx.client_log(LogLevel::Info, format!("info: {v}"));
-                Ok(Some(r::unary_string(r::schema_string(), &v)?))
-            },
-        )
-        .doc("Echo value, emitting one INFO log.")
-        .param_type("value", "str"),
-    );
-    s.register(
-        MethodInfo::unary(
-            "echo_with_multi_logs",
-            ps::echo_with_value(),
-            r::schema_string(),
-            |req, ctx| {
-                let v = p::str_col(req, "value")?.to_string();
-                ctx.client_log(LogLevel::Debug, format!("debug: {v}"));
-                ctx.client_log(LogLevel::Info, format!("info: {v}"));
-                ctx.client_log(LogLevel::Warn, format!("warn: {v}"));
-                Ok(Some(r::unary_string(r::schema_string(), &v)?))
-            },
-        )
-        .doc("Echo value, emitting DEBUG + INFO + WARN logs.")
-        .param_type("value", "str"),
-    );
-    s.register(
-        MethodInfo::unary(
-            "echo_with_log_extras",
-            ps::echo_with_value(),
-            r::schema_string(),
-            |req, ctx| {
-                let v = p::str_col(req, "value")?.to_string();
-                let msg = LogMessage::new(LogLevel::Info, "echo_with_extras")
-                    .with_extra("source", "conformance")
-                    .with_extra("detail", &v);
-                ctx.client_log_with(msg);
-                Ok(Some(r::unary_string(r::schema_string(), &v)?))
-            },
-        )
-        .doc("Echo value, emitting an INFO log with extra key-value pairs.")
-        .param_type("value", "str"),
-    );
+
+    /// Echo value, emitting one INFO log.
+    #[unary]
+    fn echo_with_info_log(&self, ctx: &CallContext, value: String) -> Result<String> {
+        ctx.client_log(LogLevel::Info, format!("info: {value}"));
+        Ok(value)
+    }
+
+    /// Echo value, emitting DEBUG + INFO + WARN logs.
+    #[unary]
+    fn echo_with_multi_logs(&self, ctx: &CallContext, value: String) -> Result<String> {
+        ctx.client_log(LogLevel::Debug, format!("debug: {value}"));
+        ctx.client_log(LogLevel::Info, format!("info: {value}"));
+        ctx.client_log(LogLevel::Warn, format!("warn: {value}"));
+        Ok(value)
+    }
+
+    /// Echo value, emitting an INFO log with extra key-value pairs.
+    #[unary]
+    fn echo_with_log_extras(&self, ctx: &CallContext, value: String) -> Result<String> {
+        let msg = LogMessage::new(LogLevel::Info, "echo_with_extras")
+            .with_extra("source", "conformance")
+            .with_extra("detail", &value);
+        ctx.client_log_with(msg);
+        Ok(value)
+    }
 
     // --- Cancel probe ---
-    s.register(
-        MethodInfo::unary(
-            "cancel_probe_counters",
-            ps::cancel_probe_counters(),
-            r::schema_list_i64(),
-            |_req, _| {
-                let [prod, exch, canc] = super::read_cancel_probe();
-                Ok(Some(r::unary_list_i64(
-                    r::schema_list_i64(),
-                    &[prod, exch, canc],
-                )?))
-            },
-        )
-        .doc("Return ``[produce_calls, exchange_calls, on_cancel_calls]`` observed on the server."),
-    );
-    s.register(
-        MethodInfo::unary(
-            "reset_cancel_probe",
-            ps::reset_cancel_probe(),
-            r::schema_empty(),
-            |_req, _| {
-                super::reset_cancel_probe();
-                Ok(None)
-            },
-        )
-        .doc("Reset all cancel-probe counters to zero on the server."),
-    );
+
+    /// Return ``[produce_calls, exchange_calls, on_cancel_calls]`` observed on the server.
+    #[unary]
+    fn cancel_probe_counters(&self) -> Result<Vec<i64>> {
+        let [a, b, c] = super::read_cancel_probe();
+        Ok(vec![a, b, c])
+    }
+
+    /// Reset all cancel-probe counters to zero on the server.
+    #[unary]
+    fn reset_cancel_probe(&self) -> Result<()> {
+        super::reset_cancel_probe();
+        Ok(())
+    }
+}
+
+pub fn register(srv: &mut RpcServer) {
+    UnarySvc::register_with(srv, Arc::new(UnarySvc));
 }
 
 fn format_float(f: f64) -> String {

@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::auth::{AuthContext, AuthRequest, AuthResult, Authenticate};
+use crate::auth::{extract_bearer, AuthContext, AuthRequest, AuthResult, Authenticate};
 use crate::errors::RpcError;
 
 /// Configuration for a JWKS-validated JWT bearer.
@@ -119,13 +119,23 @@ struct JwksCache {
 ///   - `Ok(ctx)` with `principal` populated from the configured claim when
 ///     verification succeeds.
 ///
-/// Verification is implemented by delegating to a user-supplied
-/// `verify_with_key` closure so this crate stays agnostic to the
-/// underlying crypto library (consumers typically use `jsonwebtoken`).
-/// When you only need the scaffolding and can plug in your own verifier,
-/// call [`jwt_authenticate_with`].
+/// **Without the `jwt-jsonwebtoken` feature** this crate stays agnostic
+/// to the crypto library: the default fetcher and verifier both error,
+/// and you must call [`jwt_authenticate_with`] supplying your own.
+///
+/// **With the `jwt-jsonwebtoken` feature** the helper wires
+/// `jsonwebtoken` (RS256/RS384/RS512, ES256/ES384, EdDSA) and a
+/// blocking `reqwest` JWKS fetcher automatically; just pass a
+/// `JwtConfig` with `jwks_url` set.
 pub fn jwt_authenticate(cfg: JwtConfig) -> Authenticate {
-    jwt_authenticate_with(cfg, Arc::new(default_jwks_fetcher), no_op_verifier())
+    #[cfg(feature = "jwt-jsonwebtoken")]
+    {
+        jwt_authenticate_with(cfg, Arc::new(reqwest_jwks_fetcher), jsonwebtoken_verifier())
+    }
+    #[cfg(not(feature = "jwt-jsonwebtoken"))]
+    {
+        jwt_authenticate_with(cfg, Arc::new(default_jwks_fetcher), no_op_verifier())
+    }
 }
 
 /// Advanced variant that exposes the JWKS fetcher + verifier hooks.
@@ -153,31 +163,22 @@ pub fn jwt_authenticate_with(
 pub type Verifier =
     dyn Fn(&JwksKey, &str) -> std::result::Result<HashMap<String, String>, RpcError> + Send + Sync;
 
+#[cfg(not(feature = "jwt-jsonwebtoken"))]
 fn no_op_verifier() -> Arc<Verifier> {
     Arc::new(|_key, _tok| {
-        Err(RpcError::new(
-            "RuntimeError",
-            "jwt_authenticate requires a verifier; use jwt_authenticate_with",
+        Err(RpcError::runtime_error(
+            "jwt_authenticate requires a verifier; use jwt_authenticate_with \
+             or enable the `jwt-jsonwebtoken` feature",
         ))
     })
 }
 
+#[cfg(not(feature = "jwt-jsonwebtoken"))]
 fn default_jwks_fetcher(_url: &str) -> std::result::Result<Jwks, RpcError> {
-    Err(RpcError::new(
-        "RuntimeError",
-        "no default JWKS fetcher configured; pass one via jwt_authenticate_with",
+    Err(RpcError::runtime_error(
+        "no default JWKS fetcher configured; pass one via jwt_authenticate_with \
+         or enable the `jwt-jsonwebtoken` feature",
     ))
-}
-
-fn extract_bearer<'a>(req: &'a AuthRequest<'a>) -> Option<&'a str> {
-    let h = req.header("authorization")?;
-    let prefix = "Bearer ";
-    if h.len() > prefix.len() && h[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        let tok = h[prefix.len()..].trim();
-        (!tok.is_empty()).then_some(tok)
-    } else {
-        None
-    }
 }
 
 fn decode_unverified_kid(token: &str) -> Option<String> {
@@ -216,7 +217,7 @@ fn validate_token(
     token: &str,
 ) -> AuthResult {
     let kid = decode_unverified_kid(token)
-        .ok_or_else(|| RpcError::new("PermissionError", "JWT header missing 'kid'"))?;
+        .ok_or_else(|| RpcError::permission_error("JWT header missing 'kid'"))?;
 
     let key = {
         let key_opt = cache
@@ -233,28 +234,25 @@ fn validate_token(
                     .unwrap()
                     .as_ref()
                     .and_then(|c| c.keys.get(&kid).cloned())
-                    .ok_or_else(|| {
-                        RpcError::new("PermissionError", format!("unknown JWT kid: {kid}"))
-                    })?
+                    .ok_or_else(|| RpcError::permission_error(format!("unknown JWT kid: {kid}")))?
             }
         }
     };
 
     let claims = verifier(&key, token)
-        .map_err(|e| RpcError::new("PermissionError", format!("JWT verification failed: {e}")))?;
+        .map_err(|e| RpcError::permission_error(format!("JWT verification failed: {e}")))?;
 
     // Required issuer/audience checks (claim strings).
     if let Some(iss) = claims.get("iss") {
         if iss != &cfg.issuer {
-            return Err(RpcError::new(
-                "PermissionError",
-                format!("JWT issuer mismatch: {iss}"),
-            ));
+            return Err(RpcError::permission_error(format!(
+                "JWT issuer mismatch: {iss}"
+            )));
         }
     }
     if let Some(expected_aud) = cfg.audience.as_ref() {
         if claims.get("aud") != Some(expected_aud) {
-            return Err(RpcError::new("PermissionError", "JWT audience mismatch"));
+            return Err(RpcError::permission_error("JWT audience mismatch"));
         }
     }
 
@@ -274,9 +272,10 @@ fn refresh_jwks(
     cache: &Arc<Mutex<Option<JwksCache>>>,
     fetcher: &JwksFetcher,
 ) -> std::result::Result<(), RpcError> {
-    let url = cfg.jwks_url.as_deref().ok_or_else(|| {
-        RpcError::new("RuntimeError", "JwtConfig.jwks_url must be set to refresh")
-    })?;
+    let url = cfg
+        .jwks_url
+        .as_deref()
+        .ok_or_else(|| RpcError::runtime_error("JwtConfig.jwks_url must be set to refresh"))?;
     // Single-flight: if another thread refreshed within the refresh_interval,
     // skip the network call.
     {
@@ -299,6 +298,125 @@ fn refresh_jwks(
         last_refresh: Instant::now(),
     });
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Optional bundled verifier + fetcher (feature `jwt-jsonwebtoken`)
+// ---------------------------------------------------------------------------
+
+/// Default blocking JWKS fetcher backed by `reqwest`. Available when the
+/// `jwt-jsonwebtoken` feature is on. Performs a GET, validates JSON,
+/// returns the parsed [`Jwks`].
+#[cfg(feature = "jwt-jsonwebtoken")]
+pub fn reqwest_jwks_fetcher(url: &str) -> std::result::Result<Jwks, RpcError> {
+    let resp = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| RpcError::runtime_error(format!("jwks client: {e}")))?
+        .get(url)
+        .send()
+        .map_err(|e| RpcError::runtime_error(format!("jwks GET {url}: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RpcError::runtime_error(format!(
+            "jwks GET {url} returned {}",
+            resp.status()
+        )));
+    }
+    resp.json::<Jwks>()
+        .map_err(|e| RpcError::runtime_error(format!("jwks JSON {url}: {e}")))
+}
+
+/// Build a verifier closure backed by the `jsonwebtoken` crate.
+///
+/// Supports RS256/RS384/RS512, ES256/ES384, EdDSA — the algorithm is
+/// taken from the JWT header (`alg`) crossed-checked against the JWKS
+/// key's `alg`. Disables `jsonwebtoken`'s built-in `aud` / `iss`
+/// validation since this crate already enforces those in
+/// [`validate_token`].
+#[cfg(feature = "jwt-jsonwebtoken")]
+pub fn jsonwebtoken_verifier() -> Arc<Verifier> {
+    use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+
+    Arc::new(|key: &JwksKey, token: &str| {
+        let header = jsonwebtoken::decode_header(token)
+            .map_err(|e| RpcError::permission_error(format!("JWT header: {e}")))?;
+        let alg = header.alg;
+        if let Some(declared) = key.alg.as_deref() {
+            let declared_alg: Algorithm = declared
+                .parse()
+                .map_err(|_| RpcError::permission_error(format!("unsupported alg {declared}")))?;
+            if declared_alg != alg {
+                return Err(RpcError::permission_error(format!(
+                    "JWT alg {alg:?} mismatches JWKS alg {declared}"
+                )));
+            }
+        }
+
+        let decoding_key = match (key.key_type.as_str(), alg) {
+            ("RSA", Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512) => {
+                let n = key
+                    .n
+                    .as_deref()
+                    .ok_or_else(|| RpcError::permission_error("JWKS RSA key missing n"))?;
+                let e = key
+                    .e
+                    .as_deref()
+                    .ok_or_else(|| RpcError::permission_error("JWKS RSA key missing e"))?;
+                DecodingKey::from_rsa_components(n, e)
+                    .map_err(|err| RpcError::permission_error(format!("RSA key: {err}")))?
+            }
+            ("EC", Algorithm::ES256 | Algorithm::ES384) => {
+                let x = key
+                    .x
+                    .as_deref()
+                    .ok_or_else(|| RpcError::permission_error("JWKS EC key missing x"))?;
+                let y = key
+                    .y
+                    .as_deref()
+                    .ok_or_else(|| RpcError::permission_error("JWKS EC key missing y"))?;
+                DecodingKey::from_ec_components(x, y)
+                    .map_err(|err| RpcError::permission_error(format!("EC key: {err}")))?
+            }
+            ("OKP", Algorithm::EdDSA) => {
+                let x = key
+                    .x
+                    .as_deref()
+                    .ok_or_else(|| RpcError::permission_error("JWKS OKP key missing x"))?;
+                DecodingKey::from_ed_components(x)
+                    .map_err(|err| RpcError::permission_error(format!("Ed key: {err}")))?
+            }
+            other => {
+                return Err(RpcError::permission_error(format!(
+                    "unsupported JWKS key/alg combination: {other:?}"
+                )));
+            }
+        };
+
+        // We do our own iss/aud checks in validate_token, so disable
+        // jsonwebtoken's built-in ones.
+        let mut validation = Validation::new(alg);
+        validation.validate_aud = false;
+        validation.required_spec_claims.clear();
+
+        let data = jsonwebtoken::decode::<HashMap<String, serde_json::Value>>(
+            token,
+            &decoding_key,
+            &validation,
+        )
+        .map_err(|e| RpcError::permission_error(format!("JWT verify: {e}")))?;
+
+        // Convert claims to string-valued map matching the existing
+        // `Verifier` contract.
+        let mut out: HashMap<String, String> = HashMap::with_capacity(data.claims.len());
+        for (k, v) in data.claims {
+            let s = match v {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            };
+            out.insert(k, s);
+        }
+        Ok(out)
+    })
 }
 
 #[cfg(test)]

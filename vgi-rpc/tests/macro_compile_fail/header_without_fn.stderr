@@ -1,0 +1,5 @@
+error: `header_fn = <fn_path>` must be paired with either `header = <Type>` or `header_schema = <fn_path>`
+  --> tests/macro_compile_fail/header_without_fn.rs:23:5
+   |
+23 |     #[producer(state = St, output = i64, header = i64)]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

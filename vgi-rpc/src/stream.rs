@@ -88,6 +88,17 @@ pub trait ProducerState: Send {
 
     /// Optional cancel hook — invoked when the client signals cancellation.
     fn on_cancel(&mut self, _ctx: &CallContext) {}
+
+    /// Serialize this state for stateless HTTP continuation. The default
+    /// returns an error; override via [`crate::stream_codec::StreamStateCodec`]
+    /// for any state type that will be served over HTTP. Pipe/unix
+    /// transports never call this.
+    fn encode_state(&self) -> Result<Vec<u8>> {
+        Err(RpcError::runtime_error(
+            "producer state does not implement encode_state(); \
+             override this method or register the method via MethodInfo::stream_with_codec",
+        ))
+    }
 }
 
 /// Bidirectional exchange state — called once per client input batch.
@@ -100,6 +111,15 @@ pub trait ExchangeState: Send {
     ) -> Result<()>;
 
     fn on_cancel(&mut self, _ctx: &CallContext) {}
+
+    /// Serialize this state for stateless HTTP continuation. See
+    /// [`ProducerState::encode_state`].
+    fn encode_state(&self) -> Result<Vec<u8>> {
+        Err(RpcError::runtime_error(
+            "exchange state does not implement encode_state(); \
+             override this method or register the method via MethodInfo::stream_with_codec",
+        ))
+    }
 }
 
 /// What a streaming method returns after init: its output/input schemas,
@@ -149,6 +169,28 @@ impl StreamResult {
         self.header = Some(header);
         self
     }
+}
+
+/// Build a [`crate::server::StateDecoder`] for a `ProducerState` that
+/// also implements [`crate::stream_codec::StreamStateCodec`]. Generated
+/// code (and the macro pass) calls this so the wire layer can rehydrate
+/// state for HTTP continuation requests.
+#[cfg(feature = "http")]
+pub fn producer_decoder<S>() -> crate::server::StateDecoder
+where
+    S: ProducerState + crate::stream_codec::StreamStateCodec + 'static,
+{
+    Arc::new(|bytes: &[u8]| Ok(StreamStateKind::Producer(Box::new(S::decode(bytes)?))))
+}
+
+/// Build a [`crate::server::StateDecoder`] for an `ExchangeState`. See
+/// [`producer_decoder`].
+#[cfg(feature = "http")]
+pub fn exchange_decoder<S>() -> crate::server::StateDecoder
+where
+    S: ExchangeState + crate::stream_codec::StreamStateCodec + 'static,
+{
+    Arc::new(|bytes: &[u8]| Ok(StreamStateKind::Exchange(Box::new(S::decode(bytes)?))))
 }
 
 pub(crate) fn empty_schema() -> SchemaRef {

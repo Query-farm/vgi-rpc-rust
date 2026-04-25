@@ -24,6 +24,9 @@ pub mod jwt;
 #[cfg(feature = "oauth-pkce")]
 pub mod pkce;
 
+#[cfg(feature = "oauth-pkce-server")]
+pub mod pkce_server;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -68,7 +71,7 @@ impl AuthContext {
         if self.authenticated {
             Ok(())
         } else {
-            Err(RpcError::new("PermissionError", "authentication required"))
+            Err(RpcError::permission_error("authentication required"))
         }
     }
 
@@ -134,6 +137,21 @@ pub fn chain_authenticate(a: Authenticate, b: Authenticate) -> Authenticate {
         }
         (b)(req)
     })
+}
+
+/// Extract the opaque token from a `Authorization: Bearer <token>` header.
+///
+/// Case-insensitive prefix match. Returns `None` when the header is absent,
+/// does not start with the `Bearer ` scheme, or carries an empty token.
+pub(crate) fn extract_bearer<'a>(req: &'a AuthRequest<'a>) -> Option<&'a str> {
+    let h = req.header("authorization")?;
+    let prefix = "Bearer ";
+    if h.len() > prefix.len() && h[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        let tok = h[prefix.len()..].trim();
+        (!tok.is_empty()).then_some(tok)
+    } else {
+        None
+    }
 }
 
 /// Utility: fold an iterator of callbacks into a single chain.

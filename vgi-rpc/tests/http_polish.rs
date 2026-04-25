@@ -99,20 +99,11 @@ async fn preflight_includes_cors_headers() {
 async fn prefix_mounts_routes_under_path() {
     let state = state_with(None, Some("/v1"), None);
     let app = vgi_rpc::http::build_router(state);
-    // Health at /v1/health.
+    // /health is always at the absolute root regardless of API prefix —
+    // load balancers and orchestrators should never have to know which
+    // prefix the API is under, and the conformance suite enforces this.
     let resp = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/health")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    // /health not mounted at root.
-    let resp = app
         .oneshot(
             Request::builder()
                 .uri("/health")
@@ -121,7 +112,24 @@ async fn prefix_mounts_routes_under_path() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The prefixed path does NOT serve /health (the route lives at root).
+    // The prefix path may match the API router pattern `:method` and
+    // return 405 (Method Not Allowed for GET) rather than 404 — either
+    // is correct as long as it isn't 200.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status() != StatusCode::OK,
+        "/v1/health must NOT be the health endpoint when prefix=/v1"
+    );
 }
 
 #[tokio::test]

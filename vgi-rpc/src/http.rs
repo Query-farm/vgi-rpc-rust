@@ -3,12 +3,13 @@
 //!   `POST /{method}/init`       stream init (producer or exchange)
 //!   `POST /{method}/exchange`   stream continuation
 //!
-//! Stream state lives in an in-memory session map, keyed by an opaque
-//! HMAC-signed token the client echoes back on each request. Short-lived
-//! conformance tests don't need cross-process state serialization.
+//! Streaming is stateless on the wire: the full `StreamStateKind` is
+//! serialized into an HMAC-signed token (v3 wire format) carried in
+//! the `vgi_rpc.stream_state#b64` metadata key. Any worker with the
+//! same signing key can resume any continuation request — no
+//! server-side session map, no reaper, no cross-worker affinity.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
@@ -26,38 +27,34 @@ use rand::RngCore;
 use sha2::Sha256;
 
 use crate::errors::{Result, RpcError};
-use crate::log::LogMessage;
-use crate::metadata::{
-    CANCEL_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY, REQUEST_ID_KEY, REQUEST_VERSION,
-    REQUEST_VERSION_KEY, RPC_METHOD_KEY, SERVER_ID_KEY, STATE_KEY,
+use crate::metadata::{CANCEL_KEY, REQUEST_ID_KEY, STATE_KEY};
+use crate::server::{
+    build_error_metadata, build_log_metadata, cast_batch, CallContext, MethodType, Request,
+    RpcServer,
 };
-use crate::server::{CallContext, MethodType, Request, RpcServer};
 use crate::stream::{empty_schema, Emitted, OutputCollector, StreamResult, StreamStateKind};
-use crate::wire::{empty_batch, md_get, Metadata, ReadBatch, StreamReader, StreamWriter};
+use crate::wire::{
+    bytes_to_hex, empty_batch, md_get, Metadata, ReadBatch, StreamReader, StreamWriter,
+};
 
 pub const ARROW_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 
 type HmacSha256 = Hmac<Sha256>;
 
-struct Session {
-    output_schema: SchemaRef,
-    input_schema: Option<SchemaRef>,
-    state: StreamStateKind,
-    method: String,
-    last_access: std::time::Instant,
-}
-
 /// HTTP server state shared across all handlers.
 ///
 /// Build via [`HttpState::builder`] (preferred) or [`HttpState::new`] for a
 /// default configuration.
+///
+/// Streaming is stateless: the full `StreamStateKind` travels in every
+/// HTTP continuation request inside an HMAC-signed state token, so any
+/// worker behind a load balancer can resume any stream. No session map
+/// is held on the server.
 pub struct HttpState {
     server: Arc<RpcServer>,
-    sessions: Mutex<HashMap<String, Session>>,
     signing_key: [u8; 32],
     producer_batch_limit: usize,
     token_ttl: std::time::Duration,
-    max_sessions: usize,
     max_body_size: usize,
     authenticate: Option<crate::auth::Authenticate>,
     #[allow(dead_code)]
@@ -80,7 +77,6 @@ pub struct HttpStateBuilder {
     signing_key: Option<[u8; 32]>,
     producer_batch_limit: Option<usize>,
     token_ttl: Option<std::time::Duration>,
-    max_sessions: Option<usize>,
     max_body_size: Option<usize>,
     authenticate: Option<crate::auth::Authenticate>,
     oauth_metadata: Option<Arc<crate::auth::oauth::OAuthResourceMetadata>>,
@@ -110,6 +106,39 @@ impl HttpStateBuilder {
         self
     }
 
+    /// Set the HMAC signing key from a lowercase-hex string (64 hex chars →
+    /// 32 bytes). Panics on invalid input — intended for startup config,
+    /// not runtime callers.
+    pub fn signing_key_hex(self, hex: &str) -> Self {
+        let bytes = decode_hex_key(hex).expect("signing_key_hex: invalid hex or wrong length");
+        self.signing_key(&bytes)
+    }
+
+    /// Set the HMAC signing key from a base64-encoded string (standard
+    /// alphabet, padding optional). Panics on invalid input.
+    pub fn signing_key_base64(self, b64: &str) -> Self {
+        let bytes =
+            decode_base64_key(b64).expect("signing_key_base64: invalid base64 or wrong length");
+        self.signing_key(&bytes)
+    }
+
+    /// Read the signing key from environment variable `var`. Accepts either
+    /// base64 or lowercase-hex (auto-detected). Panics if the variable is
+    /// unset, empty, or decodes to fewer than 32 bytes. Use this for
+    /// production deployments where the key is supplied by a secret manager.
+    pub fn signing_key_from_env(self, var: &str) -> Self {
+        let raw = std::env::var(var).unwrap_or_else(|_| {
+            panic!("signing_key_from_env: env var {var} is unset or not UTF-8")
+        });
+        let trimmed = raw.trim();
+        let bytes = decode_base64_key(trimmed)
+            .or_else(|_| decode_hex_key(trimmed))
+            .unwrap_or_else(|e| {
+                panic!("signing_key_from_env: {var} is not valid base64 or hex ({e})")
+            });
+        self.signing_key(&bytes)
+    }
+
     /// Maximum data batches per producer HTTP response (0 = unbounded).
     /// Default `1` to mirror the Python/Go servers.
     pub fn producer_batch_limit(mut self, n: usize) -> Self {
@@ -117,17 +146,11 @@ impl HttpStateBuilder {
         self
     }
 
-    /// How long an HTTP stream session is kept alive between requests.
-    /// Default `5 minutes`.
+    /// Maximum age of a state token. Continuation requests with a token
+    /// older than this are rejected. Default `5 minutes`. Set to
+    /// `Duration::ZERO` to disable TTL enforcement.
     pub fn token_ttl(mut self, ttl: std::time::Duration) -> Self {
         self.token_ttl = Some(ttl);
-        self
-    }
-
-    /// Maximum number of concurrent HTTP stream sessions. New sessions are
-    /// rejected with `RuntimeError` when the cap is hit. Default `10_000`.
-    pub fn max_sessions(mut self, n: usize) -> Self {
-        self.max_sessions = Some(n);
         self
     }
 
@@ -203,6 +226,11 @@ impl HttpStateBuilder {
     pub fn build(self) -> Arc<HttpState> {
         let server = self.server.expect("HttpStateBuilder::server is required");
         let signing_key = self.signing_key.unwrap_or_else(|| {
+            tracing::warn!(
+                target: "vgi_rpc.http",
+                "no signing_key configured; using ephemeral per-process key — \
+                 state tokens will not survive restart or load-balance across workers"
+            );
             let mut k = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut k);
             k
@@ -212,15 +240,13 @@ impl HttpStateBuilder {
             .as_ref()
             .map(|m| m.to_json().into_bytes());
         let www_authenticate = self.oauth_metadata.as_ref().map(|m| m.www_authenticate());
-        let state = Arc::new(HttpState {
+        Arc::new(HttpState {
             server,
-            sessions: Mutex::new(HashMap::new()),
             signing_key,
             producer_batch_limit: self.producer_batch_limit.unwrap_or(1),
             token_ttl: self
                 .token_ttl
                 .unwrap_or_else(|| std::time::Duration::from_secs(300)),
-            max_sessions: self.max_sessions.unwrap_or(10_000),
             max_body_size: self.max_body_size.unwrap_or(64 * 1024 * 1024),
             authenticate: self.authenticate,
             oauth_metadata: self.oauth_metadata,
@@ -233,9 +259,7 @@ impl HttpStateBuilder {
             landing_page_enabled: self.landing_page_enabled.unwrap_or(true),
             describe_page_enabled: self.describe_page_enabled.unwrap_or(true),
             health_enabled: self.health_enabled.unwrap_or(true),
-        });
-        HttpState::spawn_reaper(Arc::downgrade(&state));
-        state
+        })
     }
 }
 
@@ -258,55 +282,307 @@ impl HttpState {
         self.max_body_size
     }
 
-    fn spawn_reaper(state: std::sync::Weak<HttpState>) {
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
+    /// Pack a v3 state token bound to the supplied auth identity.
+    ///
+    /// When `auth` is anonymous the binding is empty and the base signing
+    /// key is used directly (preserves wire-format compatibility with the
+    /// Python canonical for unauthenticated calls). When `auth` carries a
+    /// principal, the HMAC is computed under a principal-derived subkey so
+    /// the token cannot be replayed by a different identity.
+    pub(crate) fn pack_state_token(
+        &self,
+        auth: &crate::auth::AuthContext,
+        state_bytes: &[u8],
+        output_schema_bytes: &[u8],
+        input_schema_bytes: &[u8],
+        stream_id: &str,
+    ) -> String {
+        let binding = principal_binding(auth);
+        pack_state_token(
+            &self.signing_key,
+            &binding,
+            state_bytes,
+            output_schema_bytes,
+            input_schema_bytes,
+            stream_id,
+            current_unix_secs(),
+        )
+    }
+
+    /// Unpack a v3 state token, verifying the HMAC under the current
+    /// caller's identity and (optionally) the TTL.
+    pub(crate) fn unpack_state_token(
+        &self,
+        auth: &crate::auth::AuthContext,
+        token: &str,
+    ) -> Result<UnpackedToken> {
+        let ttl = if self.token_ttl.is_zero() {
+            None
+        } else {
+            Some(self.token_ttl)
+        };
+        let binding = principal_binding(auth);
+        unpack_state_token(&self.signing_key, &binding, token, ttl)
+    }
+}
+
+/// Identity bytes mixed into the state-token HMAC subkey. Anonymous
+/// callers contribute no binding — the base key is used directly, matching
+/// the Python canonical wire format. Authenticated callers contribute
+/// `domain || 0x00 || principal`, so a token issued under one identity
+/// cannot be replayed under another.
+fn principal_binding(auth: &crate::auth::AuthContext) -> Vec<u8> {
+    if !auth.authenticated {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(auth.domain.len() + 1 + auth.principal.len());
+    out.extend_from_slice(auth.domain.as_bytes());
+    out.push(0);
+    out.extend_from_slice(auth.principal.as_bytes());
+    out
+}
+
+/// Domain-separated label for the principal-binding subkey derivation.
+const PRINCIPAL_BINDING_LABEL: &[u8] = b"vgi_rpc.state_token.principal_binding.v1";
+
+/// Derive the effective signing key for a given identity binding. An
+/// empty binding returns the base key unchanged.
+fn derive_signing_key(base: &[u8; 32], binding: &[u8]) -> [u8; 32] {
+    if binding.is_empty() {
+        return *base;
+    }
+    let mut mac = HmacSha256::new_from_slice(base).expect("hmac key");
+    mac.update(PRINCIPAL_BINDING_LABEL);
+    mac.update(&[0u8]);
+    mac.update(binding);
+    let tag = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&tag);
+    out
+}
+
+/// Token version supported by this crate.
+pub(crate) const STATE_TOKEN_VERSION: u8 = 0x03;
+
+/// Minimum possible v3 token size (version + created_at + four length
+/// prefixes for zero-length segments + HMAC).
+const STATE_TOKEN_MIN_LEN: usize = 1 + 8 + 4 + 4 + 4 + 4 + 32;
+
+/// Decomposed contents of a v3 state token after HMAC verification.
+#[derive(Debug, Clone)]
+pub(crate) struct UnpackedToken {
+    pub state_bytes: Vec<u8>,
+    pub output_schema_bytes: Vec<u8>,
+    pub input_schema_bytes: Vec<u8>,
+    pub stream_id: String,
+    #[allow(dead_code)]
+    pub created_at: u64,
+}
+
+/// Current time as seconds since the UNIX epoch.
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Pack a signed state token (v3 wire format).
+///
+/// Layout (little-endian, concatenated):
+///
+/// ```text
+/// [1]  version = 0x03
+/// [8]  created_at (u64 seconds since epoch)
+/// [4]  len(state_bytes)           [N] state_bytes
+/// [4]  len(output_schema_bytes)   [M] output_schema_bytes
+/// [4]  len(input_schema_bytes)    [K] input_schema_bytes
+/// [4]  len(stream_id_bytes)       [L] stream_id_bytes (UTF-8)
+/// [32] HMAC-SHA256 over all above
+/// ```
+///
+/// then base64-encoded. Matches the Python canonical in
+/// `vgi_rpc/http/server/_state_token.py`.
+pub(crate) fn pack_state_token(
+    signing_key: &[u8; 32],
+    principal_binding: &[u8],
+    state_bytes: &[u8],
+    output_schema_bytes: &[u8],
+    input_schema_bytes: &[u8],
+    stream_id: &str,
+    created_at: u64,
+) -> String {
+    let key = derive_signing_key(signing_key, principal_binding);
+    let mut payload = Vec::with_capacity(
+        1 + 8
+            + 4
+            + state_bytes.len()
+            + 4
+            + output_schema_bytes.len()
+            + 4
+            + input_schema_bytes.len()
+            + 4
+            + stream_id.len(),
+    );
+    payload.push(STATE_TOKEN_VERSION);
+    payload.extend_from_slice(&created_at.to_le_bytes());
+    payload.extend_from_slice(&(state_bytes.len() as u32).to_le_bytes());
+    payload.extend_from_slice(state_bytes);
+    payload.extend_from_slice(&(output_schema_bytes.len() as u32).to_le_bytes());
+    payload.extend_from_slice(output_schema_bytes);
+    payload.extend_from_slice(&(input_schema_bytes.len() as u32).to_le_bytes());
+    payload.extend_from_slice(input_schema_bytes);
+    payload.extend_from_slice(&(stream_id.len() as u32).to_le_bytes());
+    payload.extend_from_slice(stream_id.as_bytes());
+    let mut mac = HmacSha256::new_from_slice(&key).expect("hmac key");
+    mac.update(&payload);
+    let sig = mac.finalize().into_bytes();
+    payload.extend_from_slice(&sig);
+    base64::engine::general_purpose::STANDARD.encode(payload)
+}
+
+/// Unpack and verify a v3 state token. HMAC is verified *before* any
+/// payload field is inspected (including the version byte) to avoid
+/// leaking format information via error timing.
+pub(crate) fn unpack_state_token(
+    signing_key: &[u8; 32],
+    principal_binding: &[u8],
+    token: &str,
+    token_ttl: Option<std::time::Duration>,
+) -> Result<UnpackedToken> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(token.as_bytes())
+        .map_err(|_| RpcError::runtime_error("Malformed state token"))?;
+    if raw.len() < STATE_TOKEN_MIN_LEN {
+        return Err(RpcError::runtime_error("Malformed state token"));
+    }
+
+    let payload_end = raw.len() - 32;
+    let (payload, received_mac) = raw.split_at(payload_end);
+    let key = derive_signing_key(signing_key, principal_binding);
+    let mut mac = HmacSha256::new_from_slice(&key).expect("hmac key");
+    mac.update(payload);
+    mac.verify_slice(received_mac)
+        .map_err(|_| RpcError::runtime_error("State token signature verification failed"))?;
+
+    let version = payload[0];
+    if version != STATE_TOKEN_VERSION {
+        return Err(RpcError::runtime_error(format!(
+            "Unsupported state token version {version} (expected {STATE_TOKEN_VERSION})"
+        )));
+    }
+    let created_at = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+
+    if let Some(ttl) = token_ttl {
+        let now = current_unix_secs();
+        if now > created_at && now - created_at > ttl.as_secs() {
+            return Err(RpcError::runtime_error("State token expired"));
         }
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                let Some(s) = state.upgrade() else {
-                    return;
-                };
-                let ttl = s.token_ttl;
-                let now = std::time::Instant::now();
-                let mut guard = s.sessions.lock().unwrap();
-                guard.retain(|_, sess| now.duration_since(sess.last_access) < ttl);
+    }
+
+    let mut pos = 9;
+    let state_bytes = read_segment(payload, &mut pos)?;
+    let output_schema_bytes = read_segment(payload, &mut pos)?;
+    let input_schema_bytes = read_segment(payload, &mut pos)?;
+    let stream_id_bytes = read_segment(payload, &mut pos)?;
+    if pos != payload.len() {
+        return Err(RpcError::runtime_error("Malformed state token"));
+    }
+    let stream_id = String::from_utf8(stream_id_bytes)
+        .map_err(|_| RpcError::runtime_error("Malformed state token"))?;
+
+    Ok(UnpackedToken {
+        state_bytes,
+        output_schema_bytes,
+        input_schema_bytes,
+        stream_id,
+        created_at,
+    })
+}
+
+fn read_segment(buf: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
+    if *pos + 4 > buf.len() {
+        return Err(RpcError::runtime_error("Malformed state token"));
+    }
+    let len = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap()) as usize;
+    *pos += 4;
+    if *pos + len > buf.len() {
+        return Err(RpcError::runtime_error("Malformed state token"));
+    }
+    let out = buf[*pos..*pos + len].to_vec();
+    *pos += len;
+    Ok(out)
+}
+
+/// Serialize an Arrow schema into transportable bytes — wraps it in a
+/// zero-row IPC stream since the stock writer doesn't expose a raw
+/// `Schema.serialize()` path. Round-trip via [`read_schema_bytes`].
+fn write_schema_bytes(schema: &Schema) -> Result<Vec<u8>> {
+    let empty = empty_batch(schema)?;
+    crate::wire::write_one_batch(&empty, None)
+}
+
+/// Inverse of [`write_schema_bytes`].
+fn read_schema_bytes(bytes: &[u8]) -> Result<SchemaRef> {
+    let r = StreamReader::new(bytes)?;
+    Ok(r.schema())
+}
+
+/// A future that resolves when the process receives SIGTERM or SIGINT
+/// (or a Ctrl-C event on non-Unix). Pass to [`axum::serve`]'s
+/// `with_graceful_shutdown` to stop accepting new connections, drain
+/// in-flight requests, and exit cleanly.
+///
+/// ```no_run
+/// # async fn run(state: std::sync::Arc<vgi_rpc::http::HttpState>) {
+/// let app = vgi_rpc::http::build_router(state);
+/// let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+/// axum::serve(listener, app)
+///     .with_graceful_shutdown(vgi_rpc::http::shutdown_signal())
+///     .await
+///     .unwrap();
+/// # }
+/// ```
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
             }
-        });
+        };
+        let mut intr = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => {},
+            _ = intr.recv() => {},
+        }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
 
-    fn sign_token(&self, session_id: &str) -> String {
-        let mut mac = HmacSha256::new_from_slice(&self.signing_key).expect("hmac key");
-        mac.update(session_id.as_bytes());
-        let sig = mac.finalize().into_bytes();
-        let mut raw = Vec::with_capacity(session_id.len() + 1 + sig.len());
-        raw.extend_from_slice(session_id.as_bytes());
-        raw.push(b'|');
-        raw.extend_from_slice(&sig);
-        base64::engine::general_purpose::STANDARD.encode(raw)
-    }
-
-    fn verify_token(&self, token: &str) -> Result<String> {
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(token.as_bytes())
-            .map_err(|_| RpcError::runtime_error("Malformed state token"))?;
-        let pipe = raw
-            .iter()
-            .position(|&b| b == b'|')
-            .ok_or_else(|| RpcError::runtime_error("Malformed state token"))?;
-        let session_id = std::str::from_utf8(&raw[..pipe])
-            .map_err(|_| RpcError::runtime_error("Malformed state token"))?
-            .to_string();
-        let provided_sig = &raw[pipe + 1..];
-        let mut mac = HmacSha256::new_from_slice(&self.signing_key).expect("hmac key");
-        mac.update(session_id.as_bytes());
-        mac.verify_slice(provided_sig)
-            .map_err(|_| RpcError::runtime_error("State token signature verification failed"))?;
-        Ok(session_id)
-    }
+/// Serve `state` on `listener`, terminating cleanly on SIGTERM/SIGINT.
+/// Convenience wrapper around [`build_router`] +
+/// [`axum::serve`] + [`shutdown_signal`].
+pub async fn serve_with_shutdown(
+    state: Arc<HttpState>,
+    listener: tokio::net::TcpListener,
+) -> std::io::Result<()> {
+    let app = build_router(state);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
 }
 
 pub fn build_router(state: Arc<HttpState>) -> Router {
@@ -383,9 +659,14 @@ fn build_router_inner(state: Arc<HttpState>) -> Router {
     );
 
     if state.health_enabled {
+        // Always mount `/health` at the absolute root, regardless of
+        // the API prefix. Liveness probes / load-balancer health
+        // checks should never have to know which URL prefix the API
+        // is under, and the conformance suite verifies it bypasses
+        // auth even when every RPC endpoint requires it.
         app = app.route(
-            &format!("{prefix}/health"),
-            axum::routing::get(handle_health),
+            "/health",
+            axum::routing::get(handle_health).options(handle_preflight),
         );
     }
     if state.landing_page_enabled {
@@ -412,8 +693,19 @@ async fn handle_preflight(State(state): State<Arc<HttpState>>, headers: HeaderMa
     (StatusCode::NO_CONTENT, h).into_response()
 }
 
-async fn handle_health() -> Response {
-    (StatusCode::OK, "ok\n").into_response()
+async fn handle_health(State(state): State<Arc<HttpState>>) -> Response {
+    let body = serde_json::json!({
+        "status": "ok",
+        "server_id": state.server.server_id,
+        "protocol": state.server.protocol_name(),
+    })
+    .to_string();
+    let mut h = HeaderMap::new();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    (StatusCode::OK, h, body).into_response()
 }
 
 async fn handle_landing(State(state): State<Arc<HttpState>>) -> Response {
@@ -466,9 +758,7 @@ fn render_describe_page(state: &Arc<HttpState>) -> String {
         "<h1>{}</h1><table><tr><th>method</th><th>type</th><th>doc</th></tr>",
         state.server.protocol_name()
     ));
-    let mut methods: Vec<&String> = state.server.methods().keys().collect();
-    methods.sort();
-    for name in methods {
+    for name in state.server.sorted_method_names() {
         let m = &state.server.methods()[name];
         let kind = match m.method_type {
             crate::server::MethodType::Unary => "unary",
@@ -640,99 +930,48 @@ fn maybe_decompress(headers: &HeaderMap, body: &Bytes, max_size: usize) -> Resul
             max_size
         )));
     }
-    let decoded = if enc.eq_ignore_ascii_case("zstd") {
-        zstd::decode_all(body.as_ref())
-            .map_err(|e| RpcError::runtime_error(format!("zstd decode: {e}")))?
+    if enc.eq_ignore_ascii_case("zstd") {
+        decode_zstd_bounded(body.as_ref(), max_size)
     } else {
-        body.to_vec()
-    };
-    if decoded.len() > max_size {
-        return Err(RpcError::runtime_error(format!(
-            "Decompressed body exceeds max size ({} bytes > {})",
-            decoded.len(),
-            max_size
-        )));
+        Ok(body.to_vec())
     }
-    Ok(decoded)
+}
+
+/// Stream-decode a zstd payload, aborting once the decompressed length
+/// exceeds `max_size`. Defends against zip-bomb-style oversized payloads
+/// without first allocating the full decompressed result.
+fn decode_zstd_bounded(input: &[u8], max_size: usize) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = zstd::Decoder::new(input)
+        .map_err(|e| RpcError::runtime_error(format!("zstd decode: {e}")))?;
+    let mut out = Vec::with_capacity(input.len().min(max_size).min(64 * 1024));
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let n = decoder
+            .read(&mut buf)
+            .map_err(|e| RpcError::runtime_error(format!("zstd decode: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        if out.len() + n > max_size {
+            return Err(RpcError::runtime_error(format!(
+                "Decompressed body exceeds max size ({}+ bytes > {})",
+                out.len() + n,
+                max_size
+            )));
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    Ok(out)
 }
 
 fn parse_request_from_body(body: &[u8]) -> Result<Request> {
     let mut r = StreamReader::new(body)?;
-    let ReadBatch { batch, metadata } = r
+    let rb = r
         .read_next()?
         .ok_or_else(|| RpcError::protocol_error("empty IPC stream"))?;
     r.drain()?;
-    let method = md_get(&metadata, RPC_METHOD_KEY).unwrap_or("").to_string();
-    let version = md_get(&metadata, REQUEST_VERSION_KEY).ok_or_else(|| {
-        RpcError::version_error("Missing vgi_rpc.request_version in request metadata")
-    })?;
-    if version != REQUEST_VERSION {
-        return Err(RpcError::version_error(format!(
-            "Unsupported request version {version:?}"
-        )));
-    }
-    let request_id = md_get(&metadata, REQUEST_ID_KEY).unwrap_or("").to_string();
-    Ok(Request {
-        method,
-        request_id,
-        batch,
-        metadata,
-    })
-}
-
-fn build_call_ctx(
-    server: &Arc<RpcServer>,
-    req: &Request,
-    auth: crate::auth::AuthContext,
-    cookies: std::collections::BTreeMap<String, String>,
-) -> CallContext {
-    CallContext {
-        server_id: server.server_id.clone(),
-        method: req.method.clone(),
-        request_id: req.request_id.clone(),
-        transport_metadata: Arc::new(req.metadata.clone()),
-        auth,
-        cookies,
-        log_sink: Arc::new(Mutex::new(Vec::new())),
-    }
-}
-
-fn build_log_metadata(msg: &LogMessage, server_id: &str, request_id: &str) -> Metadata {
-    let mut md = vec![
-        (LOG_LEVEL_KEY.to_string(), msg.level.as_str().to_string()),
-        (LOG_MESSAGE_KEY.to_string(), msg.message.clone()),
-    ];
-    if !msg.extras.is_empty() {
-        md.push((LOG_EXTRA_KEY.to_string(), msg.extras_json()));
-    }
-    if !server_id.is_empty() {
-        md.push((SERVER_ID_KEY.to_string(), server_id.to_string()));
-    }
-    if !request_id.is_empty() {
-        md.push((REQUEST_ID_KEY.to_string(), request_id.to_string()));
-    }
-    md
-}
-
-fn build_error_metadata(err: &RpcError, server_id: &str, request_id: &str) -> Metadata {
-    let extra = serde_json::json!({
-        "exception_type": err.error_type,
-        "exception_message": err.message,
-        "traceback": err.traceback,
-    })
-    .to_string();
-    let mut md = vec![
-        (LOG_LEVEL_KEY.to_string(), "EXCEPTION".to_string()),
-        (LOG_MESSAGE_KEY.to_string(), err.message.clone()),
-        (LOG_EXTRA_KEY.to_string(), extra),
-    ];
-    if !server_id.is_empty() {
-        md.push((SERVER_ID_KEY.to_string(), server_id.to_string()));
-    }
-    if !request_id.is_empty() {
-        md.push((REQUEST_ID_KEY.to_string(), request_id.to_string()));
-    }
-    md
+    Request::from_read_batch(rb, false)
 }
 
 fn error_stream_bytes(
@@ -750,16 +989,74 @@ fn error_stream_bytes(
     buf
 }
 
+/// Build a complete arrow-typed error response. Centralizes the
+/// `arrow_response(status, error_stream_bytes(Schema::empty(), ...))`
+/// pattern used by every error-returning branch of the HTTP handlers.
+fn arrow_error(
+    state: &Arc<HttpState>,
+    status: StatusCode,
+    err: &RpcError,
+    request_id: &str,
+) -> Response {
+    arrow_response(
+        status,
+        error_stream_bytes(&Schema::empty(), err, &state.server.server_id, request_id),
+    )
+}
+
+fn decode_hex_key(s: &str) -> std::result::Result<Vec<u8>, String> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return Err("hex length must be even".into());
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let hi = hex_nibble(pair[0])?;
+        let lo = hex_nibble(pair[1])?;
+        out.push((hi << 4) | lo);
+    }
+    if out.len() < 32 {
+        return Err(format!(
+            "signing key must be ≥ 32 bytes (got {} bytes)",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
+fn hex_nibble(c: u8) -> std::result::Result<u8, String> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(format!("invalid hex character: {:?}", c as char)),
+    }
+}
+
+fn decode_base64_key(s: &str) -> std::result::Result<Vec<u8>, String> {
+    // Accept both padded and unpadded standard base64.
+    let s = s.trim().trim_end_matches('=');
+    let mut padded = s.to_string();
+    while padded.len() % 4 != 0 {
+        padded.push('=');
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(padded.as_bytes())
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    if bytes.len() < 32 {
+        return Err(format!(
+            "signing key must be ≥ 32 bytes (got {} bytes)",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
 fn new_session_id() -> String {
     let mut b = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut b);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(32);
-    for byte in b {
-        s.push(HEX[(byte >> 4) as usize] as char);
-        s.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    s
+    bytes_to_hex(&b)
 }
 
 // ---------------------------------------------------------------------------
@@ -772,36 +1069,29 @@ async fn handle_unary(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Authenticate before any other rejection: an unauthenticated
+    // caller should always see 401, regardless of whether they sent
+    // the right content type or anything else.
+    let auth = match authenticate_request(&state, &method, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
     if !has_arrow_ct(&headers) {
         return plain_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "need arrow content type".into(),
         );
     }
-    let auth = match authenticate_request(&state, &method, &headers) {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
     let cookies = parse_cookies(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let server = state.server.clone();
 
     let body = match maybe_decompress(&headers, &body, state.max_body_size) {
         Ok(b) => b,
-        Err(e) => {
-            return arrow_response(
-                StatusCode::BAD_REQUEST,
-                error_stream_bytes(&Schema::empty(), &e, &state.server.server_id, ""),
-            );
-        }
+        Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
     };
     let req = match parse_request_from_body(&body) {
         Ok(r) => r,
-        Err(e) => {
-            return arrow_response(
-                StatusCode::BAD_REQUEST,
-                error_stream_bytes(&Schema::empty(), &e, &server.server_id, ""),
-            );
-        }
+        Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
     };
 
     // __describe__ introspection — served as a unary call.
@@ -813,9 +1103,11 @@ async fn handle_unary(
         ) {
             Ok(x) => x,
             Err(err) => {
-                return arrow_response(
+                return arrow_error(
+                    &state,
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    error_stream_bytes(&Schema::empty(), &err, &server.server_id, &req.request_id),
+                    &err,
+                    &req.request_id,
                 );
             }
         };
@@ -828,24 +1120,12 @@ async fn handle_unary(
         .method(&method)
         .filter(|m| m.method_type == MethodType::Unary)
     else {
-        let err = RpcError::new("AttributeError", format!("Unknown method: '{}'", method));
-        return arrow_response(
-            StatusCode::NOT_FOUND,
-            error_stream_bytes(&Schema::empty(), &err, &server.server_id, &req.request_id),
-        );
+        let err = RpcError::attribute_error(format!("Unknown method: '{}'", method));
+        return arrow_error(&state, StatusCode::NOT_FOUND, &err, &req.request_id);
     };
 
-    let ctx = build_call_ctx(&server, &req, auth.clone(), cookies);
-    let dispatch_info = crate::hooks::DispatchInfo {
-        method: req.method.clone(),
-        method_type: "unary",
-        server_id: server.server_id.clone(),
-        request_id: req.request_id.clone(),
-        transport_metadata: Arc::new(req.metadata.clone()),
-        principal: auth.principal.clone(),
-        auth_domain: auth.domain.clone(),
-        authenticated: auth.authenticated,
-    };
+    let ctx = CallContext::with_auth_cookies(&server, &req, auth.clone(), cookies);
+    let dispatch_info = crate::hooks::DispatchInfo::from_request(&server, &req, "unary", &auth);
     let hook = server.dispatch_hook.clone();
     let hook_token = hook.as_ref().map(|h| h.on_dispatch_start(&dispatch_info));
 
@@ -904,52 +1184,37 @@ async fn handle_stream_init(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let auth = match authenticate_request(&state, &method, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
     if !has_arrow_ct(&headers) {
         return plain_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "need arrow content type".into(),
         );
     }
-    let auth = match authenticate_request(&state, &method, &headers) {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
+    let auth_for_token = auth.clone();
     let cookies = parse_cookies(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let server = state.server.clone();
     let body = match maybe_decompress(&headers, &body, state.max_body_size) {
         Ok(b) => b,
-        Err(e) => {
-            return arrow_response(
-                StatusCode::BAD_REQUEST,
-                error_stream_bytes(&Schema::empty(), &e, &state.server.server_id, ""),
-            );
-        }
+        Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
     };
     let req = match parse_request_from_body(&body) {
         Ok(r) => r,
-        Err(e) => {
-            return arrow_response(
-                StatusCode::BAD_REQUEST,
-                error_stream_bytes(&Schema::empty(), &e, &server.server_id, ""),
-            );
-        }
+        Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
     };
 
     let Some(info) = server
         .method(&method)
         .filter(|m| m.method_type != MethodType::Unary)
     else {
-        let err = RpcError::new(
-            "AttributeError",
-            format!("Unknown stream method: '{}'", method),
-        );
-        return arrow_response(
-            StatusCode::NOT_FOUND,
-            error_stream_bytes(&Schema::empty(), &err, &server.server_id, &req.request_id),
-        );
+        let err = RpcError::attribute_error(format!("Unknown stream method: '{}'", method));
+        return arrow_error(&state, StatusCode::NOT_FOUND, &err, &req.request_id);
     };
 
-    let ctx = build_call_ctx(&server, &req, auth, cookies);
+    let ctx = CallContext::with_auth_cookies(&server, &req, auth, cookies);
     let init_result = (info.stream.as_ref().unwrap())(&req, &ctx);
     let init_logs = ctx.drain_logs();
 
@@ -986,10 +1251,10 @@ async fn handle_stream_init(
     }
 
     let is_producer = matches!(ss, StreamStateKind::Producer(_));
-    let session_id = new_session_id();
-    let token = state.sign_token(&session_id);
+    let stream_id = new_session_id();
 
     let mut finished = false;
+    let mut init_error: Option<RpcError> = None;
     {
         let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
         if header.is_none() {
@@ -1010,35 +1275,62 @@ async fn handle_stream_init(
             );
         }
         if !finished {
-            let md = vec![(STATE_KEY.to_string(), token.clone())];
-            let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+            match build_continuation_token(
+                &state,
+                &auth_for_token,
+                &ss,
+                &output_schema,
+                input_schema.as_ref(),
+                &stream_id,
+            ) {
+                Ok(token) => {
+                    let md = vec![(STATE_KEY.to_string(), token)];
+                    let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                }
+                Err(err) => {
+                    // Handler doesn't implement encode_state — emit as an
+                    // error envelope so the client sees a useful message
+                    // instead of a hung stream.
+                    let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+                    let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                    init_error = Some(err);
+                }
+            }
         }
         let _ = sw.finish();
     }
-
-    if !finished {
-        let session = Session {
-            output_schema,
-            input_schema,
-            state: ss,
-            method: method.clone(),
-            last_access: std::time::Instant::now(),
-        };
-        let mut guard = state.sessions.lock().unwrap();
-        if guard.len() >= state.max_sessions {
-            let err = RpcError::runtime_error(format!(
-                "HTTP stream session cap reached ({}); try again shortly.",
-                state.max_sessions
-            ));
-            return arrow_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                error_stream_bytes(&Schema::empty(), &err, &state.server.server_id, ""),
-            );
-        }
-        guard.insert(session_id, session);
-    }
+    let _ = init_error; // surfaced via error envelope already
 
     arrow_response(StatusCode::OK, body_buf)
+}
+
+/// Encode a `StreamStateKind` into a signed state token. The token is
+/// bound to `auth` so a different identity replaying it will fail HMAC
+/// verification on the next continuation request.
+fn build_continuation_token(
+    state: &Arc<HttpState>,
+    auth: &crate::auth::AuthContext,
+    ss: &StreamStateKind,
+    output_schema: &SchemaRef,
+    input_schema: Option<&SchemaRef>,
+    stream_id: &str,
+) -> Result<String> {
+    let state_bytes = match ss {
+        StreamStateKind::Producer(p) => p.encode_state()?,
+        StreamStateKind::Exchange(e) => e.encode_state()?,
+    };
+    let out_schema_bytes = write_schema_bytes(output_schema.as_ref())?;
+    let in_schema_bytes = match input_schema {
+        Some(s) => write_schema_bytes(s.as_ref())?,
+        None => Vec::new(),
+    };
+    Ok(state.pack_state_token(
+        auth,
+        &state_bytes,
+        &out_schema_bytes,
+        &in_schema_bytes,
+        stream_id,
+    ))
 }
 
 fn run_producer<W: std::io::Write>(
@@ -1050,12 +1342,7 @@ fn run_producer<W: std::io::Write>(
     limit: usize,
 ) -> bool {
     // Continuation producers run without auth context (session-bound).
-    let ctx = build_call_ctx(
-        server,
-        req,
-        crate::auth::AuthContext::anonymous(),
-        std::collections::BTreeMap::new(),
-    );
+    let ctx = CallContext::for_request(server, req);
     let producer = match ss {
         StreamStateKind::Producer(p) => p,
         StreamStateKind::Exchange(_) => unreachable!(),
@@ -1111,168 +1398,154 @@ async fn handle_stream_exchange(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let auth = match authenticate_request(&state, &method, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
     if !has_arrow_ct(&headers) {
         return plain_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "need arrow content type".into(),
         );
     }
-    if let Err(resp) = authenticate_request(&state, &method, &headers) {
-        return resp;
-    }
 
     let server = state.server.clone();
     let body = match maybe_decompress(&headers, &body, state.max_body_size) {
         Ok(b) => b,
-        Err(e) => {
-            return arrow_response(
-                StatusCode::BAD_REQUEST,
-                error_stream_bytes(&Schema::empty(), &e, &server.server_id, ""),
-            );
-        }
+        Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
     };
     // Parse input batch (may be empty-schema for cancel / producer continuation).
     let (batch, metadata) = match read_input_batch(&body) {
         Ok(x) => x,
-        Err(e) => {
-            return arrow_response(
-                StatusCode::BAD_REQUEST,
-                error_stream_bytes(&Schema::empty(), &e, &server.server_id, ""),
-            );
-        }
+        Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
     };
 
     let Some(token) = md_get(&metadata, STATE_KEY).map(str::to_owned) else {
         let err = RpcError::runtime_error("Missing state token in exchange request");
-        return arrow_response(
-            StatusCode::BAD_REQUEST,
-            error_stream_bytes(&Schema::empty(), &err, &server.server_id, ""),
-        );
+        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, "");
     };
     let cancelled = md_get(&metadata, CANCEL_KEY).is_some();
 
-    let session_id = match state.verify_token(&token) {
-        Ok(sid) => sid,
-        Err(err) => {
-            return arrow_response(
-                StatusCode::BAD_REQUEST,
-                error_stream_bytes(&Schema::empty(), &err, &server.server_id, ""),
-            );
+    let unpacked = match state.unpack_state_token(&auth, &token) {
+        Ok(u) => u,
+        Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
+    };
+
+    // Reconstruct schemas from token-carried IPC bytes.
+    let output_schema = match read_schema_bytes(&unpacked.output_schema_bytes) {
+        Ok(s) => s,
+        Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
+    };
+    let input_schema: Option<SchemaRef> = if unpacked.input_schema_bytes.is_empty() {
+        None
+    } else {
+        match read_schema_bytes(&unpacked.input_schema_bytes) {
+            Ok(s) => Some(s),
+            Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
         }
     };
 
-    let (removed, existed_but_expired) = {
-        let mut guard = state.sessions.lock().unwrap();
-        match guard.remove(&session_id) {
-            Some(s) => {
-                let expired =
-                    std::time::Instant::now().duration_since(s.last_access) >= state.token_ttl;
-                (Some(s), expired)
-            }
-            None => (None, false),
-        }
+    // Resolve the method's state decoder from URL path.
+    let Some(info) = server
+        .method(&method)
+        .filter(|m| m.method_type != MethodType::Unary)
+    else {
+        let err = RpcError::attribute_error(format!("Unknown stream method: '{}'", method));
+        return arrow_error(&state, StatusCode::NOT_FOUND, &err, "");
     };
-    let Some(mut session) = removed else {
-        let err = RpcError::runtime_error("State token unknown");
-        return arrow_response(
-            StatusCode::BAD_REQUEST,
-            error_stream_bytes(&Schema::empty(), &err, &server.server_id, ""),
-        );
+    let Some(decoder) = info.state_decoder.as_ref() else {
+        let err = RpcError::runtime_error(format!(
+            "Stream method '{method}' is registered without a state decoder; \
+             it cannot serve HTTP continuation requests"
+        ));
+        return arrow_error(&state, StatusCode::INTERNAL_SERVER_ERROR, &err, "");
     };
-    if existed_but_expired {
-        let err =
-            RpcError::runtime_error(format!("State token expired (ttl: {:?})", state.token_ttl));
-        return arrow_response(
-            StatusCode::BAD_REQUEST,
-            error_stream_bytes(&Schema::empty(), &err, &server.server_id, ""),
-        );
-    }
+    let mut ss = match decoder(&unpacked.state_bytes) {
+        Ok(s) => s,
+        Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
+    };
 
     let req = Request {
-        method: session.method.clone(),
+        method: method.clone(),
         request_id: md_get(&metadata, REQUEST_ID_KEY).unwrap_or("").to_string(),
         batch: empty_batch(&Schema::empty()).unwrap(),
         metadata: metadata.clone(),
     };
-    let ctx = build_call_ctx(
-        &server,
-        &req,
-        crate::auth::AuthContext::anonymous(),
-        std::collections::BTreeMap::new(),
-    );
+    let ctx = CallContext::for_request(&server, &req);
 
     let mut body_buf = Vec::new();
 
     if cancelled {
-        match &mut session.state {
+        match &mut ss {
             StreamStateKind::Producer(p) => p.on_cancel(&ctx),
             StreamStateKind::Exchange(e) => e.on_cancel(&ctx),
         }
         {
-            let mut sw = StreamWriter::new(&mut body_buf, session.output_schema.as_ref()).unwrap();
+            let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
             let _ = sw.finish();
         }
         return arrow_response(StatusCode::OK, body_buf);
     }
 
-    let output_schema = session.output_schema.clone();
-    let input_schema = session.input_schema.clone();
-
-    if matches!(session.state, StreamStateKind::Producer(_)) {
+    if matches!(ss, StreamStateKind::Producer(_)) {
         // Producer continuation.
         let finished;
         {
             let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
             finished = run_producer(
                 &mut sw,
-                &mut session.state,
+                &mut ss,
                 &output_schema,
                 &server,
                 &req,
                 state.producer_batch_limit,
             );
             if !finished {
-                let new_token = state.sign_token(&session_id);
-                let md = vec![(STATE_KEY.to_string(), new_token)];
-                let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                match build_continuation_token(
+                    &state,
+                    &auth,
+                    &ss,
+                    &output_schema,
+                    input_schema.as_ref(),
+                    &unpacked.stream_id,
+                ) {
+                    Ok(new_token) => {
+                        let md = vec![(STATE_KEY.to_string(), new_token)];
+                        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                    }
+                    Err(err) => {
+                        let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+                        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                    }
+                }
             }
             let _ = sw.finish();
         }
-        if !finished {
-            session.last_access = std::time::Instant::now();
-            state.sessions.lock().unwrap().insert(session_id, session);
-        }
-        let _ = finished;
         return arrow_response(StatusCode::OK, body_buf);
     }
 
     // Exchange continuation.
     let casted = match &input_schema {
-        Some(exp) if batch.schema() != *exp => {
-            match crate::server::cast_batch_public(&batch, exp) {
-                Ok(b) => b,
-                Err(e) => {
-                    let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
-                    let md = build_error_metadata(&e, &server.server_id, &req.request_id);
-                    let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
-                    let _ = sw.finish();
-                    drop(sw);
-                    // Session consumed (exchange errored).
-                    return arrow_response(StatusCode::OK, body_buf);
-                }
+        Some(exp) if batch.schema() != *exp => match cast_batch(&batch, exp) {
+            Ok(b) => b,
+            Err(e) => {
+                let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
+                let md = build_error_metadata(&e, &server.server_id, &req.request_id);
+                let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                let _ = sw.finish();
+                drop(sw);
+                return arrow_response(StatusCode::OK, body_buf);
             }
-        }
+        },
         _ => batch,
     };
 
     let mut out = OutputCollector::new(output_schema.clone(), false);
-    let res = match &mut session.state {
+    let res = match &mut ss {
         StreamStateKind::Exchange(e) => e.exchange(&casted, &mut out, &ctx),
         _ => unreachable!(),
     };
 
-    let new_token = state.sign_token(&session_id);
-    let mut keep_session = true;
     {
         let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
         for log in ctx.drain_logs() {
@@ -1282,8 +1555,24 @@ async fn handle_stream_exchange(
         if let Err(err) = res {
             let md = build_error_metadata(&err, &server.server_id, &req.request_id);
             let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
-            keep_session = false;
         } else {
+            let new_token = match build_continuation_token(
+                &state,
+                &auth,
+                &ss,
+                &output_schema,
+                input_schema.as_ref(),
+                &unpacked.stream_id,
+            ) {
+                Ok(t) => t,
+                Err(err) => {
+                    let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+                    let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                    let _ = sw.finish();
+                    drop(sw);
+                    return arrow_response(StatusCode::OK, body_buf);
+                }
+            };
             let mut wrote_data = false;
             for item in out.items.drain(..) {
                 match item {
@@ -1300,17 +1589,13 @@ async fn handle_stream_exchange(
                 }
             }
             if !wrote_data {
-                let md = vec![(STATE_KEY.to_string(), new_token.clone())];
+                let md = vec![(STATE_KEY.to_string(), new_token)];
                 let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
             }
         }
         let _ = sw.finish();
     }
 
-    if keep_session {
-        session.last_access = std::time::Instant::now();
-        state.sessions.lock().unwrap().insert(session_id, session);
-    }
     arrow_response(StatusCode::OK, body_buf)
 }
 
@@ -1335,34 +1620,48 @@ mod tests {
             .server(server)
             .signing_key(&[7u8; 32])
             .token_ttl(Duration::from_millis(50))
-            .max_sessions(4)
             .max_body_size(1024)
             .build()
     }
 
-    #[tokio::test]
-    async fn sign_verify_roundtrip() {
-        let s = state_with_key();
-        let token = s.sign_token("sess-abc");
-        assert_eq!(s.verify_token(&token).unwrap(), "sess-abc");
+    fn sample_schema_bytes() -> Vec<u8> {
+        use arrow_schema::{DataType, Field, Schema};
+        write_schema_bytes(&Schema::new(vec![Field::new("x", DataType::Int64, false)])).unwrap()
     }
 
     #[tokio::test]
-    async fn verify_rejects_tampered() {
+    async fn pack_unpack_roundtrip() {
         let s = state_with_key();
-        let mut token = s.sign_token("sess-abc");
-        // Flip a byte in the signature half.
-        let idx = token.len() - 2;
-        let byte = token.as_bytes()[idx];
-        let replacement = if byte == b'A' { 'B' } else { 'A' };
-        token.replace_range(idx..idx + 1, &replacement.to_string());
-        assert!(s.verify_token(&token).is_err());
+        let auth = crate::auth::AuthContext::anonymous();
+        let state_bytes = b"state-payload";
+        let out_sch = sample_schema_bytes();
+        let in_sch = sample_schema_bytes();
+        let token = s.pack_state_token(&auth, state_bytes, &out_sch, &in_sch, "sid-123");
+        let unpacked = s.unpack_state_token(&auth, &token).unwrap();
+        assert_eq!(unpacked.state_bytes, state_bytes);
+        assert_eq!(unpacked.output_schema_bytes, out_sch);
+        assert_eq!(unpacked.input_schema_bytes, in_sch);
+        assert_eq!(unpacked.stream_id, "sid-123");
     }
 
     #[tokio::test]
-    async fn verify_rejects_different_key() {
+    async fn unpack_rejects_tampered_hmac() {
+        let s = state_with_key();
+        let auth = crate::auth::AuthContext::anonymous();
+        let token = s.pack_state_token(&auth, b"s", b"o", b"i", "sid");
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(token.as_bytes())
+            .unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        let tampered = base64::engine::general_purpose::STANDARD.encode(bytes);
+        assert!(s.unpack_state_token(&auth, &tampered).is_err());
+    }
+
+    #[tokio::test]
+    async fn unpack_rejects_different_key() {
         use crate::server::RpcServer;
-        let server = Arc::new(RpcServer::builder().server_id("test").build());
+        let server = Arc::new(RpcServer::builder().server_id("t").build());
         let a = HttpState::builder()
             .server(server.clone())
             .signing_key(&[1u8; 32])
@@ -1371,8 +1670,49 @@ mod tests {
             .server(server)
             .signing_key(&[2u8; 32])
             .build();
-        let tok = a.sign_token("sess-abc");
-        assert!(b.verify_token(&tok).is_err());
+        let auth = crate::auth::AuthContext::anonymous();
+        let tok = a.pack_state_token(&auth, b"s", b"o", b"i", "sid");
+        assert!(b.unpack_state_token(&auth, &tok).is_err());
+    }
+
+    #[tokio::test]
+    async fn unpack_rejects_expired_token() {
+        let s = state_with_key(); // ttl = 50ms
+                                  // Pack a token whose created_at is far in the past.
+        let stale = pack_state_token(&[7u8; 32], &[], b"s", b"o", b"i", "sid", 0);
+        let auth = crate::auth::AuthContext::anonymous();
+        let err = s.unpack_state_token(&auth, &stale).unwrap_err();
+        assert!(err.message.contains("expired"), "got: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn unpack_rejects_different_principal() {
+        let s = state_with_key();
+        let alice = crate::auth::AuthContext::for_principal("bearer", "alice");
+        let bob = crate::auth::AuthContext::for_principal("bearer", "bob");
+        let tok = s.pack_state_token(&alice, b"s", b"o", b"i", "sid");
+        assert!(s.unpack_state_token(&alice, &tok).is_ok());
+        assert!(s.unpack_state_token(&bob, &tok).is_err());
+        let anon = crate::auth::AuthContext::anonymous();
+        assert!(s.unpack_state_token(&anon, &tok).is_err());
+    }
+
+    #[tokio::test]
+    async fn unpack_rejects_authenticated_replay_of_anonymous_token() {
+        let s = state_with_key();
+        let anon = crate::auth::AuthContext::anonymous();
+        let alice = crate::auth::AuthContext::for_principal("bearer", "alice");
+        let tok = s.pack_state_token(&anon, b"s", b"o", b"i", "sid");
+        assert!(s.unpack_state_token(&alice, &tok).is_err());
+    }
+
+    #[tokio::test]
+    async fn unpack_rejects_cross_domain_replay() {
+        let s = state_with_key();
+        let bearer_alice = crate::auth::AuthContext::for_principal("bearer", "alice");
+        let mtls_alice = crate::auth::AuthContext::for_principal("mtls", "alice");
+        let tok = s.pack_state_token(&bearer_alice, b"s", b"o", b"i", "sid");
+        assert!(s.unpack_state_token(&mtls_alice, &tok).is_err());
     }
 
     #[tokio::test]
@@ -1381,5 +1721,89 @@ mod tests {
         let body = Bytes::from(vec![0u8; 1025]);
         let err = super::maybe_decompress(&hdr, &body, 1024).unwrap_err();
         assert!(err.message.contains("exceeds max size"));
+    }
+
+    #[test]
+    fn zstd_bounded_rejects_zip_bomb_without_full_alloc() {
+        // 8 MiB of zeroes compresses to a tiny payload — small enough to
+        // pass the encoded-size check but it would blow past the limit
+        // when fully decompressed.
+        let huge = vec![0u8; 8 * 1024 * 1024];
+        let compressed = zstd::encode_all(huge.as_slice(), 1).unwrap();
+        assert!(compressed.len() < 100_000, "compressed should be tiny");
+        let err = super::decode_zstd_bounded(&compressed, 64 * 1024).unwrap_err();
+        assert!(
+            err.message.contains("exceeds max size"),
+            "expected oversize error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn zstd_bounded_passes_small_payload() {
+        let small = b"hello-world".repeat(10);
+        let compressed = zstd::encode_all(small.as_slice(), 1).unwrap();
+        let out = super::decode_zstd_bounded(&compressed, 1024).unwrap();
+        assert_eq!(out, small);
+    }
+
+    #[test]
+    fn decode_hex_key_roundtrip() {
+        let key =
+            decode_hex_key("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .unwrap();
+        assert_eq!(key.len(), 32);
+        assert_eq!(key[0], 0x00);
+        assert_eq!(key[31], 0x1f);
+    }
+
+    #[test]
+    fn decode_hex_key_rejects_short() {
+        assert!(decode_hex_key("deadbeef").is_err());
+    }
+
+    #[test]
+    fn decode_hex_key_rejects_bad_char() {
+        assert!(decode_hex_key(&"zz".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn decode_base64_key_accepts_padded() {
+        let s = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let out = decode_base64_key(&s).unwrap();
+        assert_eq!(out, vec![7u8; 32]);
+    }
+
+    #[test]
+    fn decode_base64_key_accepts_unpadded() {
+        let s = base64::engine::general_purpose::STANDARD
+            .encode([7u8; 32])
+            .trim_end_matches('=')
+            .to_string();
+        let out = decode_base64_key(&s).unwrap();
+        assert_eq!(out, vec![7u8; 32]);
+    }
+
+    #[test]
+    fn decode_base64_key_rejects_short() {
+        let s = base64::engine::general_purpose::STANDARD.encode(b"short");
+        assert!(decode_base64_key(&s).is_err());
+    }
+
+    #[tokio::test]
+    async fn signing_key_hex_round_trips_through_token() {
+        use crate::server::RpcServer;
+        let server = Arc::new(RpcServer::builder().server_id("t").build());
+        let a = HttpState::builder()
+            .server(server.clone())
+            .signing_key_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+            .build();
+        let b = HttpState::builder()
+            .server(server)
+            .signing_key_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+            .build();
+        let auth = crate::auth::AuthContext::anonymous();
+        let tok = a.pack_state_token(&auth, b"s", b"o", b"i", "sid");
+        assert_eq!(b.unpack_state_token(&auth, &tok).unwrap().stream_id, "sid");
     }
 }

@@ -6,16 +6,19 @@ name: Upstream Conformance
 # upstream rather than only when the next wheel is published.
 #
 # Triggers:
-#   schedule:           every 4 hours, in case the upstream webhook fails.
+#   schedule:           weekly safety net (Mondays 12:00 UTC).
 #   workflow_dispatch:  manual fire with an optional `upstream_ref` input.
 #   repository_dispatch (event_type: upstream-changed):
 #                       fired by the upstream repo on push-to-main; see
-#                       the `dispatch-snippet` job at the bottom of this
-#                       file for the YAML to drop into vgi-rpc-python.
+#                       the `dispatch-snippet` block at the bottom of
+#                       this file for the YAML to drop into vgi-rpc-python.
+#                       Day-to-day detection is expected to come through
+#                       this dispatch — the cron is a backstop in case
+#                       the webhook silently breaks.
 
 on:
   schedule:
-    - cron: "0 */4 * * *"
+    - cron: "0 12 * * 1"
   workflow_dispatch:
     inputs:
       upstream_ref:

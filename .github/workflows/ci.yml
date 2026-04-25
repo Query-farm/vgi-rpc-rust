@@ -28,13 +28,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --locked
 
       - name: cargo doc
-        run: cargo doc --workspace --no-deps --all-features
+        run: cargo doc --workspace --no-deps --all-features --locked
 
   conformance:
     runs-on: ubuntu-latest
@@ -48,7 +48,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Install vgi-rpc conformance harness
         # Pinned to a published version that includes the TestHealth +
@@ -59,7 +59,7 @@ jobs:
           pip install "vgi-rpc[http,cli]>=0.9.0" pytest pytest-timeout httpx
 
       - name: Build conformance worker
-        run: cargo build -p vgi-rpc-conformance-rust
+        run: cargo build -p vgi-rpc-conformance-rust --locked
 
       - name: Symlink worker
         run: |
@@ -83,4 +83,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build on MSRV
-        run: cargo build --workspace --all-features
+        run: cargo build --workspace --all-features --locked

@@ -22,6 +22,7 @@ pub const LOCATION_FETCH_MS_KEY: &str = "vgi_rpc.location.fetch_ms";
 
 pub const PROTOCOL_NAME_KEY: &str = "vgi_rpc.protocol_name";
 pub const DESCRIBE_VERSION_KEY: &str = "vgi_rpc.describe_version";
+pub const PROTOCOL_HASH_KEY: &str = "vgi_rpc.protocol_hash";
 
 pub const SHM_OFFSET_KEY: &str = "vgi_rpc.shm_offset";
 pub const SHM_LENGTH_KEY: &str = "vgi_rpc.shm_length";

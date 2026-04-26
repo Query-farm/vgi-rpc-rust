@@ -11,33 +11,33 @@ use std::sync::Arc;
 use arrow_array::builder::{BinaryBuilder, BooleanBuilder, StringBuilder};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use sha2::{Digest, Sha256};
 
 use crate::errors::{Result, RpcError};
 use crate::metadata::{
-    DESCRIBE_VERSION_KEY, PROTOCOL_NAME_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY, SERVER_ID_KEY,
+    DESCRIBE_VERSION_KEY, PROTOCOL_HASH_KEY, PROTOCOL_NAME_KEY, REQUEST_VERSION,
+    REQUEST_VERSION_KEY, SERVER_ID_KEY,
 };
 use crate::server::{MethodInfo, MethodType};
 use crate::wire::{Metadata, StreamWriter};
 
 pub const DESCRIBE_METHOD_NAME: &str = "__describe__";
-pub const DESCRIBE_VERSION: &str = "3";
+pub const DESCRIBE_VERSION: &str = "4";
 
 /// Schema of the describe response batch. Matches the Python
-/// `_DESCRIBE_FIELDS` exactly.
+/// slim `_DESCRIBE_FIELDS` for DESCRIBE_VERSION 4 — Python-flavoured
+/// columns (doc, param_types_json, param_defaults_json, param_docs_json)
+/// are not on the wire.
 pub fn describe_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
         Field::new("method_type", DataType::Utf8, false),
-        Field::new("doc", DataType::Utf8, true),
         Field::new("has_return", DataType::Boolean, false),
         Field::new("params_schema_ipc", DataType::Binary, false),
         Field::new("result_schema_ipc", DataType::Binary, false),
-        Field::new("param_types_json", DataType::Utf8, true),
-        Field::new("param_defaults_json", DataType::Utf8, true),
         Field::new("has_header", DataType::Boolean, false),
         Field::new("header_schema_ipc", DataType::Binary, true),
         Field::new("is_exchange", DataType::Boolean, true),
-        Field::new("param_docs_json", DataType::Utf8, true),
     ]))
 }
 
@@ -55,105 +55,140 @@ pub fn build_describe(
 
     let mut name_b = StringBuilder::new();
     let mut mtype_b = StringBuilder::new();
-    let mut doc_b = StringBuilder::new();
     let mut has_return_b = BooleanBuilder::new();
     let mut params_schema_b = BinaryBuilder::new();
     let mut result_schema_b = BinaryBuilder::new();
-    let mut param_types_b = StringBuilder::new();
-    let mut param_defaults_b = StringBuilder::new();
     let mut has_header_b = BooleanBuilder::new();
     let mut header_schema_b = BinaryBuilder::new();
     let mut is_exchange_b = BooleanBuilder::new();
-    let mut param_docs_b = StringBuilder::new();
+
+    // Per-row canonical inputs for the protocol_hash.
+    let mut hash_rows: Vec<HashRow> = Vec::with_capacity(names.len());
 
     for name in names {
         let m = &methods[name];
         name_b.append_value(&m.name);
 
-        // Python's MethodType is just UNARY/STREAM — collapse Producer/Exchange/Dynamic to "stream".
         let mtype_str = match m.method_type {
             MethodType::Unary => "unary",
             MethodType::Producer | MethodType::Exchange | MethodType::Dynamic => "stream",
         };
         mtype_b.append_value(mtype_str);
 
-        match &m.doc {
-            Some(d) => doc_b.append_value(d),
-            None => doc_b.append_null(),
-        }
-
         has_return_b.append_value(m.has_return);
-        params_schema_b.append_value(schema_to_ipc(&m.params_schema)?);
-        result_schema_b.append_value(schema_to_ipc(&m.result_schema)?);
+        let params_ipc = schema_to_ipc(&m.params_schema)?;
+        let result_ipc = schema_to_ipc(&m.result_schema)?;
+        params_schema_b.append_value(&params_ipc);
+        result_schema_b.append_value(&result_ipc);
 
-        if m.param_types.is_empty() {
-            param_types_b.append_null();
-        } else {
-            let mut map = serde_json::Map::new();
-            for (k, v) in &m.param_types {
-                map.insert(k.clone(), serde_json::Value::String(v.clone()));
+        let has_header = m.header_schema.is_some();
+        has_header_b.append_value(has_header);
+        let header_ipc = match &m.header_schema {
+            Some(hs) => {
+                let bytes = schema_to_ipc(hs)?;
+                header_schema_b.append_value(&bytes);
+                Some(bytes)
             }
-            param_types_b.append_value(serde_json::Value::Object(map).to_string());
-        }
-
-        if m.param_defaults.is_empty() {
-            param_defaults_b.append_null();
-        } else {
-            let mut map = serde_json::Map::new();
-            for (k, v) in &m.param_defaults {
-                map.insert(k.clone(), v.clone());
+            None => {
+                header_schema_b.append_null();
+                None
             }
-            param_defaults_b.append_value(serde_json::Value::Object(map).to_string());
-        }
+        };
 
-        has_header_b.append_value(m.header_schema.is_some());
-        match &m.header_schema {
-            Some(hs) => header_schema_b.append_value(schema_to_ipc(hs)?),
-            None => header_schema_b.append_null(),
-        }
-
-        // Python's MethodType has no Producer/Exchange distinction — Python
-        // always emits None here for STREAM methods. Match that.
+        // Rust's MethodInfo doesn't carry the producer/exchange split for
+        // dynamic streams; Python emits None for the same set. Mirror that
+        // and feed `-` into the hash.
         is_exchange_b.append_null();
 
-        if m.param_docs.is_empty() {
-            param_docs_b.append_null();
-        } else {
-            let mut map = serde_json::Map::new();
-            for (k, v) in &m.param_docs {
-                map.insert(k.clone(), serde_json::Value::String(v.clone()));
-            }
-            param_docs_b.append_value(serde_json::Value::Object(map).to_string());
-        }
+        hash_rows.push(HashRow {
+            name: m.name.clone(),
+            method_type: mtype_str.to_string(),
+            has_return: m.has_return,
+            has_header,
+            is_exchange: None,
+            params_ipc,
+            result_ipc,
+            header_ipc,
+        });
     }
 
     let arrs: Vec<ArrayRef> = vec![
         Arc::new(name_b.finish()),
         Arc::new(mtype_b.finish()),
-        Arc::new(doc_b.finish()),
         Arc::new(has_return_b.finish()),
         Arc::new(params_schema_b.finish()),
         Arc::new(result_schema_b.finish()),
-        Arc::new(param_types_b.finish()),
-        Arc::new(param_defaults_b.finish()),
         Arc::new(has_header_b.finish()),
         Arc::new(header_schema_b.finish()),
         Arc::new(is_exchange_b.finish()),
-        Arc::new(param_docs_b.finish()),
     ];
 
     let batch = RecordBatch::try_new(schema, arrs)?;
 
+    let protocol_hash = compute_protocol_hash(protocol_name, &hash_rows);
+
     let mut md = Metadata::new();
     md.insert(PROTOCOL_NAME_KEY.to_string(), protocol_name.to_string());
     md.insert(REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string());
-    md.insert(
-        DESCRIBE_VERSION_KEY.to_string(),
-        DESCRIBE_VERSION.to_string(),
-    );
+    md.insert(DESCRIBE_VERSION_KEY.to_string(), DESCRIBE_VERSION.to_string());
+    md.insert(PROTOCOL_HASH_KEY.to_string(), protocol_hash);
     md.insert(SERVER_ID_KEY.to_string(), server_id.to_string());
 
     Ok((batch, md))
+}
+
+struct HashRow {
+    name: String,
+    method_type: String,
+    has_return: bool,
+    has_header: bool,
+    is_exchange: Option<bool>,
+    params_ipc: Vec<u8>,
+    result_ipc: Vec<u8>,
+    header_ipc: Option<Vec<u8>>,
+}
+
+/// SHA-256 hex digest of the canonical describe payload. Mirrors Python's
+/// `vgi_rpc.introspect.compute_protocol_hash` byte-for-byte.
+fn compute_protocol_hash(protocol_name: &str, rows: &[HashRow]) -> String {
+    let mut h = Sha256::new();
+    h.update(b"vgi_rpc.describe.v");
+    h.update(DESCRIBE_VERSION.as_bytes());
+    h.update(b"|");
+    h.update(REQUEST_VERSION.as_bytes());
+    h.update(b"|");
+    h.update(protocol_name.as_bytes());
+    h.update(b"|");
+    for r in rows {
+        h.update([0x1f]);
+        h.update(r.name.as_bytes());
+        h.update([0x1e]);
+        h.update(r.method_type.as_bytes());
+        h.update([0x1e]);
+        h.update(if r.has_return { b"1" } else { b"0" });
+        h.update([0x1e]);
+        h.update(if r.has_header { b"1" } else { b"0" });
+        h.update([0x1e]);
+        match r.is_exchange {
+            Some(true) => h.update(b"1"),
+            Some(false) => h.update(b"0"),
+            None => h.update(b"-"),
+        }
+        h.update([0x1e]);
+        h.update(&r.params_ipc);
+        h.update([0x1e]);
+        h.update(&r.result_ipc);
+        h.update([0x1e]);
+        if let Some(hi) = &r.header_ipc {
+            h.update(hi);
+        }
+    }
+    let out = h.finalize();
+    let mut s = String::with_capacity(out.len() * 2);
+    for b in out {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }
 
 /// Serialize a `Schema` as an IPC stream (schema-only, empty body) — matches

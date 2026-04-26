@@ -33,6 +33,10 @@ pub struct DispatchInfo {
     pub server_id: String,
     /// Logical service / protocol name.
     pub protocol: String,
+    /// SHA-256 hex of the canonical __describe__ payload (always required in access log).
+    pub protocol_hash: String,
+    /// Operator-supplied free-form protocol-contract version label (optional).
+    pub protocol_version: String,
     pub request_id: String,
     /// Transport-level metadata (HTTP peer addr / pipe contextvar payload).
     pub transport_metadata: Arc<Metadata>,
@@ -68,6 +72,8 @@ impl DispatchInfo {
             method_type,
             server_id: server.server_id.clone(),
             protocol: server.protocol_name().to_string(),
+            protocol_hash: server.protocol_hash().to_string(),
+            protocol_version: server.protocol_version().to_string(),
             request_id: req.request_id.clone(),
             transport_metadata: Arc::new(req.metadata.clone()),
             principal: auth.principal.clone(),
@@ -181,6 +187,8 @@ mod tests {
             method_type: "unary",
             server_id: "test".into(),
             protocol: String::new(),
+            protocol_hash: String::new(),
+            protocol_version: String::new(),
             request_id: String::new(),
             transport_metadata: Arc::new(Default::default()),
             principal: String::new(),

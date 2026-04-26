@@ -150,6 +150,7 @@ impl DispatchHook for AccessLogHook {
         );
         rec.insert("server_id".into(), json!(info.server_id));
         rec.insert("protocol".into(), json!(info.protocol));
+        rec.insert("protocol_hash".into(), json!(info.protocol_hash));
         rec.insert("method".into(), json!(info.method));
         rec.insert("method_type".into(), json!(info.method_type));
         rec.insert("principal".into(), json!(info.principal));
@@ -171,6 +172,9 @@ impl DispatchHook for AccessLogHook {
         }
         if !self.server_version.is_empty() {
             rec.insert("server_version".into(), json!(self.server_version));
+        }
+        if !info.protocol_version.is_empty() {
+            rec.insert("protocol_version".into(), json!(info.protocol_version));
         }
         if !info.request_id.is_empty() {
             rec.insert("request_id".into(), json!(info.request_id));

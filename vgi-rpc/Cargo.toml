@@ -13,12 +13,12 @@ categories = ["network-programming", "web-programming::http-server", "data-struc
 [features]
 default = ["http", "macros"]
 macros = ["dep:vgi-rpc-macros"]
-http = ["dep:axum", "dep:tokio", "dep:hmac", "dep:sha2", "dep:base64", "dep:rand", "dep:bincode", "dep:zstd"]
+http = ["dep:axum", "dep:tokio", "dep:hmac", "dep:base64", "dep:rand", "dep:bincode", "dep:zstd"]
 jwt = []
 jwt-jsonwebtoken = ["jwt", "dep:jsonwebtoken", "dep:reqwest"]
 oauth-pkce = []
 oauth-pkce-server = ["oauth-pkce", "http", "dep:reqwest", "dep:urlencoding"]
-mtls-pem = ["dep:x509-parser", "dep:percent-encoding", "dep:sha2"]
+mtls-pem = ["dep:x509-parser", "dep:percent-encoding"]
 otel = []
 sentry = []
 shm = ["dep:libc"]
@@ -31,6 +31,7 @@ trybuild = "1"
 
 [dependencies]
 flatbuffers = "25"
+sha2.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-data.workspace = true
@@ -47,7 +48,6 @@ tracing.workspace = true
 axum = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 bincode = { workspace = true, optional = true }

@@ -213,6 +213,7 @@ pub struct RpcServerBuilder {
     server_id: Option<String>,
     server_version: Option<String>,
     protocol_name: Option<String>,
+    protocol_version: Option<String>,
     enable_describe: bool,
     dispatch_hook: Option<Arc<dyn crate::hooks::DispatchHook>>,
     #[cfg(feature = "http")]
@@ -232,6 +233,14 @@ impl RpcServerBuilder {
 
     pub fn protocol_name(mut self, name: impl Into<String>) -> Self {
         self.protocol_name = Some(name.into());
+        self
+    }
+
+    /// Operator-supplied free-form protocol-contract version label, reported
+    /// in access-log records as ``protocol_version``. Complementary to
+    /// (build) ``server_version``.
+    pub fn protocol_version(mut self, v: impl Into<String>) -> Self {
+        self.protocol_version = Some(v.into());
         self
     }
 
@@ -260,6 +269,8 @@ impl RpcServerBuilder {
             server_id: self.server_id.unwrap_or_else(crate::util::short_random_id),
             server_version: self.server_version.unwrap_or_default(),
             protocol_name: self.protocol_name.unwrap_or_default(),
+            protocol_version: self.protocol_version.unwrap_or_default(),
+            protocol_hash: std::sync::OnceLock::new(),
             describe_enabled: self.enable_describe,
             dispatch_hook: self.dispatch_hook,
             #[cfg(feature = "http")]
@@ -409,6 +420,8 @@ pub struct RpcServer {
     pub server_id: String,
     pub(crate) server_version: String,
     pub(crate) protocol_name: String,
+    pub(crate) protocol_version: String,
+    pub(crate) protocol_hash: std::sync::OnceLock<String>,
     pub(crate) describe_enabled: bool,
     pub(crate) dispatch_hook: Option<Arc<dyn crate::hooks::DispatchHook>>,
     #[cfg(feature = "http")]
@@ -436,6 +449,24 @@ impl RpcServer {
 
     pub fn server_version(&self) -> &str {
         &self.server_version
+    }
+
+    pub fn protocol_version(&self) -> &str {
+        &self.protocol_version
+    }
+
+    /// SHA-256 hex digest of the canonical __describe__ payload. Computed
+    /// lazily on first call and cached.
+    pub fn protocol_hash(&self) -> &str {
+        self.protocol_hash.get_or_init(|| {
+            match crate::introspect::build_describe(&self.protocol_name, &self.methods, &self.server_id) {
+                Ok((_, md)) => md
+                    .get(crate::metadata::PROTOCOL_HASH_KEY)
+                    .cloned()
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            }
+        })
     }
 
     #[cfg(feature = "http")]

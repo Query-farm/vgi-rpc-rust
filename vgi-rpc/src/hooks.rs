@@ -180,11 +180,17 @@ mod tests {
             method: "echo".into(),
             method_type: "unary",
             server_id: "test".into(),
+            protocol: String::new(),
             request_id: String::new(),
             transport_metadata: Arc::new(Default::default()),
             principal: String::new(),
             auth_domain: String::new(),
             authenticated: false,
+            remote_addr: String::new(),
+            http_status: 0,
+            request_data: Vec::new(),
+            stream_id: String::new(),
+            cancelled: false,
         };
         let token = chain.on_dispatch_start(&info);
         chain.on_dispatch_end(token, &info, None, &CallStatistics::default());

@@ -25,6 +25,9 @@ pub const DESCRIBE_VERSION_KEY: &str = "vgi_rpc.describe_version";
 
 pub const SHM_OFFSET_KEY: &str = "vgi_rpc.shm_offset";
 pub const SHM_LENGTH_KEY: &str = "vgi_rpc.shm_length";
+pub const SHM_SOURCE_KEY: &str = "vgi_rpc.shm_source";
+pub const SHM_SEGMENT_NAME_KEY: &str = "vgi_rpc.shm_segment_name";
+pub const SHM_SEGMENT_SIZE_KEY: &str = "vgi_rpc.shm_segment_size";
 
 pub const TRACEPARENT_KEY: &str = "traceparent";
 pub const TRACESTATE_KEY: &str = "tracestate";

@@ -14,6 +14,35 @@ use crate::metadata::{
     CANCEL_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY, REQUEST_ID_KEY, REQUEST_VERSION,
     REQUEST_VERSION_KEY, RPC_METHOD_KEY, SERVER_ID_KEY,
 };
+#[cfg(feature = "shm")]
+use crate::metadata::{SHM_SEGMENT_NAME_KEY, SHM_SEGMENT_SIZE_KEY};
+#[cfg(feature = "shm")]
+use crate::shm::{maybe_write_to_shm, resolve_shm_batch, ShmSegment};
+
+/// Feature-off stand-in so dispatch signatures stay uniform.
+#[cfg(not(feature = "shm"))]
+pub(crate) struct ShmSegment;
+
+/// Attach to a client-advertised SHM segment named in request metadata.
+/// `track = false` since the client owns the lifecycle.
+#[cfg(feature = "shm")]
+fn maybe_attach_shm(req_md: &Metadata) -> Option<ShmSegment> {
+    let name = req_md.get(SHM_SEGMENT_NAME_KEY)?;
+    let size: usize = req_md.get(SHM_SEGMENT_SIZE_KEY)?.parse().ok()?;
+    match ShmSegment::attach(name, size, false) {
+        Ok(seg) => Some(seg),
+        Err(e) => {
+            tracing::warn!(target: "vgi_rpc.shm", "ignoring malformed SHM metadata ({e})");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "shm"))]
+#[inline]
+fn maybe_attach_shm(_req_md: &Metadata) -> Option<ShmSegment> {
+    None
+}
 use crate::stream::{empty_schema, Emitted, OutputCollector, StreamResult, StreamStateKind};
 use crate::wire::{attach_md_opt, empty_batch, md_get, Metadata, StreamReader, StreamWriter};
 
@@ -588,12 +617,19 @@ impl RpcServer {
             .map(|h| h.on_dispatch_start(&dispatch_info));
 
         let mut app_err: Option<RpcError> = None;
+        let shm = maybe_attach_shm(&req.metadata);
+        let shm_ref = shm.as_ref();
         match info.method_type {
-            MethodType::Unary => self.serve_unary(w, &req, info, &ctx, &stats, &mut app_err)?,
+            MethodType::Unary => {
+                self.serve_unary(w, &req, info, &ctx, &stats, &mut app_err, shm_ref)?
+            }
             MethodType::Producer | MethodType::Exchange | MethodType::Dynamic => {
-                self.serve_stream(r, w, &req, info, &ctx, &stats, &mut app_err)?
+                self.serve_stream(r, w, &req, info, &ctx, &stats, &mut app_err, shm_ref)?
             }
         }
+        // `shm` (if any) is dropped here, releasing our mmap of the
+        // client-owned segment without unlinking it.
+        let _ = shm;
 
         if let Some(hook) = self.dispatch_hook.as_ref() {
             let token = hook_token.unwrap_or(0);
@@ -623,6 +659,7 @@ impl RpcServer {
         Ok(Some(Request::from_read_batch(batch, true)?))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn serve_unary<W: Write>(
         &self,
         w: &mut W,
@@ -631,6 +668,7 @@ impl RpcServer {
         ctx: &CallContext,
         stats: &Arc<Mutex<crate::hooks::CallStatistics>>,
         app_err: &mut Option<RpcError>,
+        #[cfg_attr(not(feature = "shm"), allow(unused_variables))] shm: Option<&ShmSegment>,
     ) -> Result<()> {
         let result = (info.unary.as_ref().unwrap())(req, ctx);
         let logs = ctx.drain_logs();
@@ -650,6 +688,18 @@ impl RpcServer {
                     s.output_batches = 1;
                     s.output_rows = out_batch.num_rows() as u64;
                 }
+                #[cfg(feature = "shm")]
+                if let Some(seg) = shm {
+                    let written = maybe_write_to_shm(out_batch.clone(), Some(seg))?;
+                    if written
+                        .custom_metadata()
+                        .contains_key(crate::metadata::SHM_OFFSET_KEY)
+                    {
+                        sw.write(&written)?;
+                        sw.finish()?;
+                        return Ok(());
+                    }
+                }
                 #[cfg(feature = "http")]
                 if let Some(cfg) = self.external_config.as_ref() {
                     if let Ok(Some((ptr, md))) =
@@ -660,6 +710,8 @@ impl RpcServer {
                         return Ok(());
                     }
                 }
+                #[cfg(not(feature = "shm"))]
+                let _ = shm;
                 sw.write(&out_batch)?;
                 sw.finish()?;
             }
@@ -679,6 +731,7 @@ impl RpcServer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn serve_stream<R: Read, W: Write>(
         &self,
         r: &mut R,
@@ -688,6 +741,7 @@ impl RpcServer {
         ctx: &CallContext,
         stats: &Arc<Mutex<crate::hooks::CallStatistics>>,
         app_err: &mut Option<RpcError>,
+        #[cfg_attr(not(feature = "shm"), allow(unused_variables))] shm: Option<&ShmSegment>,
     ) -> Result<()> {
         let init_result = (info.stream.as_ref().unwrap())(req, ctx);
         let init_logs = ctx.drain_logs();
@@ -769,6 +823,20 @@ impl RpcServer {
             let Some(input_batch) = read else {
                 break;
             };
+
+            // Resolve SHM pointer batches before anything else — the
+            // schema cast / cancel check / handler all expect the real
+            // batch. Free the region as soon as it's been deserialized
+            // (we copy on read, so no live borrow remains).
+            #[cfg(feature = "shm")]
+            let input_batch = {
+                let resolved = resolve_shm_batch(input_batch, shm)?;
+                if let (Some(off), Some(seg)) = (resolved.release_offset, shm) {
+                    let _ = seg.free(off);
+                }
+                resolved.batch
+            };
+
             let input_md = input_batch.custom_metadata().clone();
             {
                 let mut s = stats.lock().unwrap();
@@ -845,6 +913,18 @@ impl RpcServer {
                             let mut s = stats.lock().unwrap();
                             s.output_batches += 1;
                             s.output_rows += batch.num_rows() as u64;
+                        }
+                        #[cfg(feature = "shm")]
+                        if let Some(seg) = shm {
+                            let attached = attach_md_opt(batch.clone(), metadata.clone());
+                            let written = maybe_write_to_shm(attached, Some(seg))?;
+                            if written
+                                .custom_metadata()
+                                .contains_key(crate::metadata::SHM_OFFSET_KEY)
+                            {
+                                out_writer.write(&written)?;
+                                continue;
+                            }
                         }
                         #[cfg(feature = "http")]
                         if let Some(cfg) = self.external_config.as_ref() {

@@ -24,6 +24,8 @@ pub(crate) mod probe;
 #[cfg(feature = "sentry")]
 pub mod sentry;
 pub mod server;
+#[cfg(feature = "shm")]
+pub mod shm;
 pub mod stream;
 #[cfg(feature = "http")]
 pub mod stream_codec;

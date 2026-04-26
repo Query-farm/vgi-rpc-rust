@@ -66,7 +66,7 @@ def _run(args: argparse.Namespace, extras: list[str]) -> int:
 
     env = os.environ.copy()
     transports = (
-        ["pipe", "subprocess", "http", "unix", "http_externalize_always"]
+        ["pipe", "subprocess", "http", "unix", "http_externalize_always", "shm_pipe"]
         if args.transport == "all"
         else [args.transport]
     )
@@ -236,7 +236,7 @@ def main() -> int:
 
     pr = sub.add_parser("run")
     pr.add_argument("--transport", default="pipe",
-                    choices=["pipe", "subprocess", "http", "unix", "http_externalize_always", "all"])
+                    choices=["pipe", "subprocess", "http", "unix", "http_externalize_always", "shm_pipe", "all"])
     pr.add_argument("-k", help="pytest -k filter")
     pr.add_argument("-x", action="store_true", help="stop at first failure")
     pr.add_argument("--release", action="store_true", default=False,

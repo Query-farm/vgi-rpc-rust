@@ -219,8 +219,40 @@ ConnFactory = Callable[..., contextlib.AbstractContextManager[Any]]
 
 
 _TRANSPORTS = os.environ.get(
-    "VGI_TRANSPORTS", "pipe,subprocess,http,unix,http_externalize_always"
+    "VGI_TRANSPORTS", "pipe,subprocess,http,unix,http_externalize_always,shm_pipe"
 ).split(",")
+
+
+class _ShmSubprocessTransport:
+    """Adapter exposing ``.shm`` over a ``SubprocessTransport`` so the
+    Python ``_RpcClient`` advertises the segment in request metadata.
+
+    The Rust worker has no built-in ``ShmPipeTransport`` concept — it
+    attaches dynamically when it sees ``vgi_rpc.shm_segment_name`` /
+    ``vgi_rpc.shm_segment_size`` keys on the request batch, which is
+    exactly what the Python client emits when ``transport.shm`` exists.
+    """
+
+    __slots__ = ("_inner", "_shm")
+
+    def __init__(self, inner, shm) -> None:
+        self._inner = inner
+        self._shm = shm
+
+    @property
+    def reader(self):
+        return self._inner.reader
+
+    @property
+    def writer(self):
+        return self._inner.writer
+
+    @property
+    def shm(self):
+        return self._shm
+
+    def close(self) -> None:
+        self._inner.close()
 
 
 @pytest.fixture(params=_TRANSPORTS)
@@ -273,6 +305,23 @@ def conformance_conn(
                 rust_unix_path,
                 on_log=on_log,
             )
+        elif request.param == "shm_pipe":
+            from vgi_rpc.shm import ShmSegment
+
+            @contextlib.contextmanager
+            def _shm_conn() -> Iterator[_RpcProxy]:
+                shm = ShmSegment.create(4 * 1024 * 1024)
+                inner = SubprocessTransport([RUST_WORKER])
+                try:
+                    transport = _ShmSubprocessTransport(inner, shm)
+                    yield _RpcProxy(ConformanceService, transport, on_log)
+                finally:
+                    inner.close()
+                    with contextlib.suppress(BufferError):
+                        shm.close()
+                    shm.unlink()
+
+            return _shm_conn()
         else:
             # "subprocess" — shared transport
             @contextlib.contextmanager

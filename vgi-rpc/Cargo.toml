@@ -21,6 +21,7 @@ oauth-pkce-server = ["oauth-pkce", "http", "dep:reqwest", "dep:urlencoding"]
 mtls-pem = ["dep:x509-parser", "dep:percent-encoding", "dep:sha2"]
 otel = []
 sentry = []
+shm = ["dep:libc"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -57,5 +58,6 @@ urlencoding = { version = "2", optional = true }
 vgi-rpc-macros = { path = "../vgi-rpc-macros", version = "0.1.0", optional = true }
 x509-parser = { version = "0.16", optional = true }
 percent-encoding = { version = "2", optional = true }
+libc = { version = "0.2", optional = true }
 chrono.workspace = true
 rust_decimal.workspace = true

@@ -179,7 +179,10 @@ impl DispatchHook for AccessLogHook {
             rec.insert("http_status".into(), json!(info.http_status));
         }
         if !info.request_data.is_empty() {
-            rec.insert("request_data".into(), json!(base64_encode(&info.request_data)));
+            rec.insert(
+                "request_data".into(),
+                json!(base64_encode(&info.request_data)),
+            );
         }
         if info.method_type == "stream" {
             let sid = if info.stream_id.is_empty() {
@@ -270,7 +273,7 @@ pub fn rfc3339_utc_millis() -> String {
 /// stays usable without the optional `base64` crate dependency.
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(((bytes.len() + 2) / 3) * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut chunks = bytes.chunks_exact(3);
     for chunk in chunks.by_ref() {
         let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);

@@ -138,42 +138,74 @@ impl DispatchHook for AccessLogHook {
             .unwrap_or(0.0);
         let status = if error.is_some() { "error" } else { "ok" };
 
-        // Build the record as a JSON object.
+        // Build the record as a JSON object — schema-aligned with
+        // docs/access-log-spec.md in the Python reference repo.
         let mut rec = serde_json::Map::new();
+        rec.insert("timestamp".into(), json!(rfc3339_utc_millis()));
+        rec.insert("level".into(), json!("INFO"));
         rec.insert("logger".into(), json!("vgi_rpc.access"));
+        rec.insert(
+            "message".into(),
+            json!(format!("{}.{} {}", info.protocol, info.method, status)),
+        );
+        rec.insert("server_id".into(), json!(info.server_id));
+        rec.insert("protocol".into(), json!(info.protocol));
         rec.insert("method".into(), json!(info.method));
         rec.insert("method_type".into(), json!(info.method_type));
-        rec.insert("server_id".into(), json!(info.server_id));
-        rec.insert("server_version".into(), json!(self.server_version));
-        rec.insert("request_id".into(), json!(info.request_id));
-        rec.insert("status".into(), json!(status));
-        rec.insert("authenticated".into(), json!(info.authenticated));
         rec.insert("principal".into(), json!(info.principal));
         rec.insert("auth_domain".into(), json!(info.auth_domain));
+        rec.insert("authenticated".into(), json!(info.authenticated));
+        rec.insert("remote_addr".into(), json!(info.remote_addr));
         rec.insert(
             "duration_ms".into(),
             json!((duration_ms * 100.0).round() / 100.0),
         );
-        rec.insert("input_batches".into(), json!(stats.input_batches));
-        rec.insert("output_batches".into(), json!(stats.output_batches));
-        rec.insert("input_rows".into(), json!(stats.input_rows));
-        rec.insert("output_rows".into(), json!(stats.output_rows));
-        rec.insert("input_bytes".into(), json!(stats.input_bytes));
-        rec.insert("output_bytes".into(), json!(stats.output_bytes));
+        rec.insert("status".into(), json!(status));
+        rec.insert(
+            "error_type".into(),
+            json!(error.map(|e| e.error_type.clone()).unwrap_or_default()),
+        );
+
         if let Some(err) = error {
-            rec.insert("error_type".into(), json!(err.error_type));
             rec.insert("error_message".into(), json!(err.message));
         }
-        // stream methods need a stream_id; use request_id (or a derived token)
-        // when present. The hook has no built-in stream_id today; we reuse
-        // request_id when it is set and fall back to the hook token.
+        if !self.server_version.is_empty() {
+            rec.insert("server_version".into(), json!(self.server_version));
+        }
+        if !info.request_id.is_empty() {
+            rec.insert("request_id".into(), json!(info.request_id));
+        }
+        if info.http_status > 0 {
+            rec.insert("http_status".into(), json!(info.http_status));
+        }
+        if !info.request_data.is_empty() {
+            rec.insert("request_data".into(), json!(base64_encode(&info.request_data)));
+        }
         if info.method_type == "stream" {
-            let sid = if info.request_id.is_empty() {
-                format!("{token:x}")
+            let sid = if info.stream_id.is_empty() {
+                random_stream_id()
             } else {
-                info.request_id.clone()
+                info.stream_id.clone()
             };
             rec.insert("stream_id".into(), json!(sid));
+        }
+        if info.cancelled {
+            rec.insert("cancelled".into(), json!(true));
+        }
+        if stats.input_batches
+            + stats.output_batches
+            + stats.input_rows
+            + stats.output_rows
+            + stats.input_bytes
+            + stats.output_bytes
+            != 0
+        {
+            rec.insert("input_batches".into(), json!(stats.input_batches));
+            rec.insert("output_batches".into(), json!(stats.output_batches));
+            rec.insert("input_rows".into(), json!(stats.input_rows));
+            rec.insert("output_rows".into(), json!(stats.output_rows));
+            rec.insert("input_bytes".into(), json!(stats.input_bytes));
+            rec.insert("output_bytes".into(), json!(stats.output_bytes));
         }
 
         let line = serde_json::Value::Object(rec).to_string();
@@ -198,6 +230,90 @@ impl DispatchHook for AccessLogHook {
             }
         }
     }
+}
+
+/// Format the current wall-clock time as RFC 3339 UTC with millisecond
+/// precision, matching the access-log spec's `timestamp` regex.
+pub fn rfc3339_utc_millis() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_ms = dur.as_millis() as i64;
+    let secs = total_ms / 1000;
+    let millis = (total_ms % 1000) as u32;
+
+    // Civil time conversion using Howard Hinnant's algorithm.
+    let z = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400) as u32;
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    let h = sod / 3600;
+    let mi = (sod / 60) % 60;
+    let s = sod % 60;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        y, m, d, h, mi, s, millis
+    )
+}
+
+/// Standard base64 (RFC 4648, padded). Inlined here so the access-log module
+/// stays usable without the optional `base64` crate dependency.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(((bytes.len() + 2) / 3) * 4);
+    let mut chunks = bytes.chunks_exact(3);
+    for chunk in chunks.by_ref() {
+        let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+        out.push(ALPHABET[(n & 0x3F) as usize] as char);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        1 => {
+            let n = (rem[0] as u32) << 16;
+            out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
+            out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Mint a 32-character lowercase hex stream_id. Use this at the start of a
+/// stream call and reuse the same value across init and continuations.
+pub fn random_stream_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // 128 bits drawn from time + a per-process atomic counter. Not
+    // cryptographic — adequate for log correlation.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let lo = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let hi = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    format!("{:016x}{:016x}", hi ^ pid, lo)
 }
 
 #[cfg(test)]
@@ -229,6 +345,12 @@ mod tests {
             principal: String::new(),
             auth_domain: String::new(),
             authenticated: false,
+            protocol: "Test".into(),
+            remote_addr: String::new(),
+            http_status: 0,
+            request_data: Vec::new(),
+            stream_id: String::new(),
+            cancelled: false,
         };
         let tok = hook.on_dispatch_start(&info);
         hook.on_dispatch_end(tok, &info, None, &CallStatistics::default());
@@ -267,6 +389,12 @@ mod tests {
             principal: String::new(),
             auth_domain: String::new(),
             authenticated: false,
+            protocol: "Test".into(),
+            remote_addr: String::new(),
+            http_status: 0,
+            request_data: Vec::new(),
+            stream_id: String::new(),
+            cancelled: false,
         };
         let tok = hook.on_dispatch_start(&info);
         hook.on_dispatch_end(tok, &info, None, &CallStatistics::default());
@@ -310,6 +438,12 @@ mod tests {
             principal: String::new(),
             auth_domain: String::new(),
             authenticated: false,
+            protocol: "Test".into(),
+            remote_addr: String::new(),
+            http_status: 0,
+            request_data: Vec::new(),
+            stream_id: String::new(),
+            cancelled: false,
         };
         // Push enough entries that the bounded channel overflows.
         for _ in 0..50 {
@@ -348,6 +482,12 @@ mod tests {
             principal: String::new(),
             auth_domain: String::new(),
             authenticated: false,
+            protocol: "Test".into(),
+            remote_addr: String::new(),
+            http_status: 0,
+            request_data: Vec::new(),
+            stream_id: String::new(),
+            cancelled: false,
         };
         let tok = hook.on_dispatch_start(&info);
         let err = RpcError::value_error("boom");

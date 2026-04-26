@@ -17,6 +17,22 @@ use crate::metadata::{
 use crate::stream::{empty_schema, Emitted, OutputCollector, StreamResult, StreamStateKind};
 use crate::wire::{attach_md_opt, empty_batch, md_get, Metadata, StreamReader, StreamWriter};
 
+/// Serialize a parsed request batch back to a self-contained Arrow IPC
+/// stream (one schema message + one record batch + EOS) for inclusion in
+/// access-log `request_data`.
+fn serialize_request_batch(batch: &RecordBatch) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    {
+        let mut w = arrow_ipc::writer::StreamWriter::try_new(&mut buf, batch.schema_ref())
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        w.write(batch)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        w.finish()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+    }
+    Ok(buf)
+}
+
 /// Context supplied to each handler invocation.
 #[derive(Clone)]
 pub struct CallContext {
@@ -555,8 +571,17 @@ impl RpcServer {
             MethodType::Unary => "unary",
             _ => "stream",
         };
-        let dispatch_info =
+        let mut dispatch_info =
             crate::hooks::DispatchInfo::from_request(self, &req, method_type, &ctx.auth);
+        // Best-effort capture of self-contained Arrow IPC bytes of the
+        // request batch for access-log `request_data`. Failures here must
+        // not abort dispatch — observability is non-essential.
+        if let Ok(bytes) = serialize_request_batch(&req.batch) {
+            dispatch_info.request_data = bytes;
+        }
+        if method_type == "stream" {
+            dispatch_info.stream_id = crate::access_log::random_stream_id();
+        }
         let hook_token = self
             .dispatch_hook
             .as_ref()

@@ -31,6 +31,8 @@ pub struct DispatchInfo {
     pub method: String,
     pub method_type: &'static str,
     pub server_id: String,
+    /// Logical service / protocol name.
+    pub protocol: String,
     pub request_id: String,
     /// Transport-level metadata (HTTP peer addr / pipe contextvar payload).
     pub transport_metadata: Arc<Metadata>,
@@ -40,6 +42,16 @@ pub struct DispatchInfo {
     pub auth_domain: String,
     /// True when the call was authenticated.
     pub authenticated: bool,
+    /// HTTP transport: remote IP:port. Empty otherwise.
+    pub remote_addr: String,
+    /// HTTP transport: response status; 0 when not applicable.
+    pub http_status: u16,
+    /// Self-contained Arrow IPC stream of the request batch (unary + stream init only).
+    pub request_data: Vec<u8>,
+    /// Stream lifecycle identifier (32-char lowercase hex); empty on unary.
+    pub stream_id: String,
+    /// True when a stream was cancelled by the client.
+    pub cancelled: bool,
 }
 
 impl DispatchInfo {
@@ -55,11 +67,17 @@ impl DispatchInfo {
             method: req.method.clone(),
             method_type,
             server_id: server.server_id.clone(),
+            protocol: server.protocol_name().to_string(),
             request_id: req.request_id.clone(),
             transport_metadata: Arc::new(req.metadata.clone()),
             principal: auth.principal.clone(),
             auth_domain: auth.domain.clone(),
             authenticated: auth.authenticated,
+            remote_addr: String::new(),
+            http_status: 0,
+            request_data: Vec::new(),
+            stream_id: String::new(),
+            cancelled: false,
         }
     }
 }

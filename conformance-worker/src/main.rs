@@ -14,6 +14,16 @@ use std::sync::Arc;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // --access-log <path> may appear anywhere on the command line. Forward it
+    // to the existing VGI_ACCESS_LOG plumbing in conformance::build_server.
+    for i in 0..args.len().saturating_sub(1) {
+        if args[i] == "--access-log" {
+            // SAFETY: set_var is unsafe in newer std but still used; suppress with allow.
+            std::env::set_var("VGI_ACCESS_LOG", &args[i + 1]);
+            break;
+        }
+    }
+
     if args.len() > 1 && args[1] == "--http" {
         let server = Arc::new(conformance::build_server());
         run_http(server, false);

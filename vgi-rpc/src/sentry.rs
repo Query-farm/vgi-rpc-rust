@@ -114,6 +114,8 @@ mod tests {
             request_data: Vec::new(),
             stream_id: String::new(),
             cancelled: false,
+            protocol_hash: String::new(),
+            protocol_version: String::new(),
         }
     }
 

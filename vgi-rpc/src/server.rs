@@ -459,7 +459,11 @@ impl RpcServer {
     /// lazily on first call and cached.
     pub fn protocol_hash(&self) -> &str {
         self.protocol_hash.get_or_init(|| {
-            match crate::introspect::build_describe(&self.protocol_name, &self.methods, &self.server_id) {
+            match crate::introspect::build_describe(
+                &self.protocol_name,
+                &self.methods,
+                &self.server_id,
+            ) {
                 Ok((_, md)) => md
                     .get(crate::metadata::PROTOCOL_HASH_KEY)
                     .cloned()

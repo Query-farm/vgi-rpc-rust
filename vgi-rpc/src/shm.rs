@@ -43,7 +43,8 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_ipc::reader::StreamReader as IpcStreamReader;
+use arrow_buffer::Buffer;
+use arrow_ipc::reader::{BufferStreamReader, StreamReader as IpcStreamReader};
 use arrow_ipc::writer::StreamWriter as IpcStreamWriter;
 use arrow_schema::{DataType, Schema};
 
@@ -89,6 +90,45 @@ struct PosixShm {
 
 unsafe impl Send for PosixShm {}
 unsafe impl Sync for PosixShm {}
+
+// `PosixShm` carries a raw pointer (the mmap region) but the data it
+// points at is not invalidated by panics — the OS owns the page table
+// entries until `munmap`, and our drop runs only when no Arc clones
+// (including any held by an `arrow_buffer::Buffer`) remain. Marking it
+// `RefUnwindSafe` lets us hand an `Arc<PosixShm>` to
+// `Buffer::from_custom_allocation` as the owner of an aliased view.
+impl std::panic::RefUnwindSafe for PosixShm {}
+
+/// `Allocation` owner that **also** releases the allocator slot when
+/// the last buffer alias drops. Used as the owner of a zero-copy
+/// [`Buffer`] aliasing an SHM region: the slot is freed automatically
+/// when no `RecordBatch` (and no column buffer of one) is still
+/// holding a reference. This is what makes the freed slot safe to
+/// reuse without corrupting in-flight batches.
+struct ShmBatchAnchor {
+    shm: Arc<PosixShm>,
+    offset: u64,
+}
+
+impl std::panic::RefUnwindSafe for ShmBatchAnchor {}
+
+impl Drop for ShmBatchAnchor {
+    fn drop(&mut self) {
+        // Same allocator instance state lives in the segment header;
+        // re-attach is essentially free (a couple of integer reads).
+        if let Ok(allocator) = ShmAllocator::attach(self.shm.clone()) {
+            let _ = allocator.free(self.offset);
+        }
+    }
+}
+
+impl std::fmt::Debug for ShmBatchAnchor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShmBatchAnchor")
+            .field("offset", &self.offset)
+            .finish()
+    }
+}
 
 #[cfg(unix)]
 fn make_shm_name() -> String {
@@ -488,11 +528,16 @@ impl ShmSegment {
     /// Inverse of [`Self::allocate_and_write`]: read a record batch
     /// previously written into the segment.
     ///
-    /// Deserialization reads directly from the mmap region (no
-    /// intermediate copy of the SHM bytes), but the resulting batch
-    /// still owns its Arrow buffers — `arrow_ipc::reader::StreamReader`
-    /// allocates and copies into owned buffers as it parses, so the
-    /// returned batch outlives a subsequent `free` of the region.
+    /// For non-dictionary schemas this is **fully zero-copy**: the
+    /// returned [`RecordBatch`]'s column buffers alias the SHM mapping
+    /// directly via [`Buffer::from_custom_allocation`], with an
+    /// [`Arc`] of the underlying [`PosixShm`] keeping the mmap alive
+    /// as long as any column buffer references it.
+    ///
+    /// For dictionary-encoded schemas the SHM region holds only the
+    /// dictionary + record-batch messages (no schema, no EOS), so we
+    /// stitch a synthetic stream around them; that path still copies
+    /// the region into a `Vec` for the moment.
     pub fn read_batch(&self, offset: u64, length: usize, schema: &Schema) -> Result<RecordBatch> {
         let off = offset as usize;
         let end = off + length;
@@ -502,6 +547,28 @@ impl ShmSegment {
                 format!("shm region out of bounds: {off}..{end} > {}", self.shm.size),
             ));
         }
+        if !schema_has_dictionary(schema) {
+            // Zero-copy: alias the mmap region as an Arrow `Buffer`,
+            // anchored on a `ShmBatchAnchor` so the allocator slot is
+            // released exactly when the last column buffer referencing
+            // it drops. This is what lets us return ownership of the
+            // slot to the segment without invalidating live batch data.
+            let ptr = unsafe { self.shm.ptr.add(off) };
+            let nn = std::ptr::NonNull::new(ptr)
+                .ok_or_else(|| RpcError::new("ValueError", "null shm pointer"))?;
+            let anchor = Arc::new(ShmBatchAnchor {
+                shm: self.shm.clone(),
+                offset,
+            });
+            let buf = unsafe { Buffer::from_custom_allocation(nn, length, anchor) };
+            let mut r = BufferStreamReader::try_new(buf).map_err(RpcError::from)?;
+            let batch = r
+                .next()
+                .ok_or_else(|| RpcError::new("IPC", "empty SHM region"))?
+                .map_err(RpcError::from)?;
+            return Ok(batch);
+        }
+        // Dictionary path: stitch a synthetic stream and decode normally.
         let region: &[u8] = &self.shm.as_slice()[off..end];
         deserialize_from_shm(region, schema)
     }
@@ -674,9 +741,19 @@ pub fn resolve_shm_batch(batch: RecordBatch, shm: Option<&ShmSegment>) -> Result
     new_md.remove(SHM_OFFSET_KEY);
     new_md.remove(SHM_LENGTH_KEY);
     new_md.insert(SHM_SOURCE_KEY.into(), shm.name().to_string());
+    // The non-dict (zero-copy) path embeds an `Allocation` owner that
+    // frees the slot on last-buffer-drop, so the caller must NOT free
+    // explicitly — that would race the in-flight batch's column data.
+    // The dict path copies the bytes into a fresh allocation, so the
+    // slot is safe to release as soon as `read_batch` returns.
+    let release_offset = if schema_has_dictionary(batch.schema().as_ref()) {
+        Some(offset)
+    } else {
+        None
+    };
     Ok(ResolvedShm {
         batch: resolved.with_custom_metadata(new_md),
-        release_offset: Some(offset),
+        release_offset,
     })
 }
 
@@ -768,8 +845,12 @@ mod tests {
                 .map(String::as_str),
             Some(seg.name()),
         );
-        assert!(resolved.release_offset.is_some());
-        seg.free(resolved.release_offset.unwrap()).unwrap();
+        // Non-dict path is now zero-copy: the resolved batch's column
+        // buffers alias the SHM region. Freeing is deferred to the
+        // anchor's drop, so `release_offset` is None and the caller
+        // must not free explicitly. Release happens when `resolved.batch`
+        // (and any clones of its columns) drop at end-of-scope.
+        assert!(resolved.release_offset.is_none());
     }
 
     #[test]

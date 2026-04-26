@@ -358,6 +358,8 @@ mod tests {
             request_data: Vec::new(),
             stream_id: String::new(),
             cancelled: false,
+            protocol_hash: String::new(),
+            protocol_version: String::new(),
         };
         let tok = hook.on_dispatch_start(&info);
         hook.on_dispatch_end(tok, &info, None, &CallStatistics::default());
@@ -402,6 +404,8 @@ mod tests {
             request_data: Vec::new(),
             stream_id: String::new(),
             cancelled: false,
+            protocol_hash: String::new(),
+            protocol_version: String::new(),
         };
         let tok = hook.on_dispatch_start(&info);
         hook.on_dispatch_end(tok, &info, None, &CallStatistics::default());
@@ -451,6 +455,8 @@ mod tests {
             request_data: Vec::new(),
             stream_id: String::new(),
             cancelled: false,
+            protocol_hash: String::new(),
+            protocol_version: String::new(),
         };
         // Push enough entries that the bounded channel overflows.
         for _ in 0..50 {
@@ -495,6 +501,8 @@ mod tests {
             request_data: Vec::new(),
             stream_id: String::new(),
             cancelled: false,
+            protocol_hash: String::new(),
+            protocol_version: String::new(),
         };
         let tok = hook.on_dispatch_start(&info);
         let err = RpcError::value_error("boom");

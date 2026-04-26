@@ -67,11 +67,18 @@ fn main() {
     }
 
     // Default: stdio.
+    //
+    // `io::stdout().lock()` is wrapped in a `LineWriter` that flushes on
+    // any `\n` byte; in binary Arrow IPC data those bytes are common, so
+    // it triggers a write syscall every ~1 KB. Wrap explicitly with a
+    // generous `BufWriter` so the IPC writer's many small `write_all`
+    // calls coalesce into a few large writes. `stdin().lock()` already
+    // has an 8 KB buffer; bump it for symmetry on large inbound batches.
     let server = Arc::new(conformance::build_server());
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut r = stdin.lock();
-    let mut w = stdout.lock();
+    let mut r = io::BufReader::with_capacity(1024 * 1024, stdin.lock());
+    let mut w = io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
     server.serve(&mut r, &mut w);
     let _ = w.flush();
 }

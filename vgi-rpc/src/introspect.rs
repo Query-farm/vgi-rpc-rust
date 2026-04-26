@@ -130,7 +130,10 @@ pub fn build_describe(
     let mut md = Metadata::new();
     md.insert(PROTOCOL_NAME_KEY.to_string(), protocol_name.to_string());
     md.insert(REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string());
-    md.insert(DESCRIBE_VERSION_KEY.to_string(), DESCRIBE_VERSION.to_string());
+    md.insert(
+        DESCRIBE_VERSION_KEY.to_string(),
+        DESCRIBE_VERSION.to_string(),
+    );
     md.insert(PROTOCOL_HASH_KEY.to_string(), protocol_hash);
     md.insert(SERVER_ID_KEY.to_string(), server_id.to_string());
 

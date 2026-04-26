@@ -144,15 +144,14 @@ pub fn build_describe(
 
     let batch = RecordBatch::try_new(schema, arrs)?;
 
-    let md: Metadata = vec![
-        (PROTOCOL_NAME_KEY.to_string(), protocol_name.to_string()),
-        (REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string()),
-        (
-            DESCRIBE_VERSION_KEY.to_string(),
-            DESCRIBE_VERSION.to_string(),
-        ),
-        (SERVER_ID_KEY.to_string(), server_id.to_string()),
-    ];
+    let mut md = Metadata::new();
+    md.insert(PROTOCOL_NAME_KEY.to_string(), protocol_name.to_string());
+    md.insert(REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string());
+    md.insert(
+        DESCRIBE_VERSION_KEY.to_string(),
+        DESCRIBE_VERSION.to_string(),
+    );
+    md.insert(SERVER_ID_KEY.to_string(), server_id.to_string());
 
     Ok((batch, md))
 }
@@ -177,7 +176,7 @@ pub fn write_describe_response<W: std::io::Write>(
     metadata: &Metadata,
 ) -> Result<()> {
     let mut sw = StreamWriter::new(w, batch.schema().as_ref())?;
-    sw.write(batch, Some(metadata))?;
+    sw.write(&batch.clone().with_custom_metadata(metadata.clone()))?;
     sw.finish()?;
     Ok(())
 }

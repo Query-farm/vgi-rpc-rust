@@ -1,426 +1,203 @@
-//! Low-level IPC stream helpers that preserve per-batch custom metadata.
+//! Thin IPC stream wrappers around `arrow_ipc` that propagate per-batch
+//! `custom_metadata` via [`RecordBatch::custom_metadata`].
 //!
-//! The standard `arrow-ipc` `StreamWriter`/`StreamReader` do not expose
-//! per-message `custom_metadata`, but the vgi_rpc wire protocol relies on
-//! it to carry `vgi_rpc.method`, `vgi_rpc.request_version`, log keys, state
-//! tokens, etc. This module provides a thin reader/writer that parses and
-//! injects metadata on the flatbuffer `Message` wrapper while delegating
-//! record-batch encoding/decoding to `arrow_ipc`.
+//! Upstream `arrow_ipc::reader::StreamReader` / `writer::StreamWriter`
+//! handle the flatbuffer Message-level `custom_metadata` field directly:
+//! readers populate `batch.custom_metadata()` from each RecordBatch
+//! message, and writers emit it on every `write(&batch)` call. This
+//! module exists only to:
+//!
+//! - Surface our `Result` / `RpcError` shape on the boundary.
+//! - Map "empty IPC stream" / EOF into `Ok(None)` from `read_next`.
+//! - Provide schema relaxation so producers that declare non-nullable
+//!   fields but emit nulls (e.g. Python's `ArrowSerializableDataclass`)
+//!   read cleanly. The relaxation rewrites the schema and rewraps each
+//!   batch via `RecordBatch::with_schema`, which preserves
+//!   custom_metadata.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_buffer::Buffer as ArrowBuffer;
-use arrow_ipc::{
-    convert as ipc_convert, reader as ipc_reader, root_as_message, writer::write_message,
-    writer::DictionaryTracker, writer::IpcDataGenerator, writer::IpcWriteOptions,
-    Buffer as FbBuffer, FieldNode, KeyValue, KeyValueArgs, MessageBuilder, MessageHeader,
-    RecordBatchBuilder,
-};
+use arrow_ipc::reader::StreamReader as IpcStreamReader;
+use arrow_ipc::writer::StreamWriter as IpcStreamWriter;
 use arrow_schema::{Schema, SchemaRef};
-use flatbuffers::FlatBufferBuilder;
 
 use crate::errors::{Result, RpcError};
 
-/// Metadata pairs attached to a single IPC message.
-pub type Metadata = Vec<(String, String)>;
+/// Per-batch metadata pairs (HashMap-backed, mirroring
+/// `RecordBatch::custom_metadata`).
+pub type Metadata = HashMap<String, String>;
 
-/// Look up a key in a [`Metadata`] list.
+/// Look up a key in a [`Metadata`] map, returning the value as `&str`.
+#[inline]
 pub fn md_get<'a>(md: &'a Metadata, key: &str) -> Option<&'a str> {
-    md.iter()
-        .find_map(|(k, v)| (k == key).then_some(v.as_str()))
+    md.get(key).map(String::as_str)
 }
 
 // ---------------------------------------------------------------------------
 // Writer
 // ---------------------------------------------------------------------------
 
-const CONTINUATION_MARKER: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
-
-/// A streaming IPC writer that supports per-batch custom metadata.
+/// Streaming IPC writer wrapping `arrow_ipc::writer::StreamWriter`.
 ///
-/// The sequence written for a complete stream is:
-///   `SchemaMessage → [DictionaryMessage]* → [RecordBatchMessage]* → EOS(4xFF 0x00)`.
+/// Per-batch custom metadata travels via `RecordBatch::custom_metadata` —
+/// attach with [`RecordBatch::with_custom_metadata`] before calling
+/// [`StreamWriter::write`].
 pub struct StreamWriter<W: Write> {
-    writer: W,
+    inner: IpcStreamWriter<W>,
     schema: SchemaRef,
-    opts: IpcWriteOptions,
-    data_gen: IpcDataGenerator,
-    dict_tracker: DictionaryTracker,
-    finished: bool,
 }
 
 impl<W: Write> StreamWriter<W> {
     /// Create a new writer and emit the schema message.
-    pub fn new(mut writer: W, schema: &Schema) -> Result<Self> {
-        let opts = IpcWriteOptions::default();
-        let data_gen = IpcDataGenerator::default();
-        let mut dict_tracker = DictionaryTracker::new(false);
-        let encoded =
-            data_gen.schema_to_bytes_with_dictionary_tracker(schema, &mut dict_tracker, &opts);
-        write_message(&mut writer, encoded, &opts)?;
+    pub fn new(writer: W, schema: &Schema) -> Result<Self> {
+        let inner = IpcStreamWriter::try_new(writer, schema).map_err(RpcError::from)?;
         Ok(Self {
-            writer,
+            inner,
             schema: Arc::new(schema.clone()),
-            opts,
-            data_gen,
-            dict_tracker,
-            finished: false,
         })
     }
 
-    /// Write one RecordBatch with optional custom metadata.
-    pub fn write(&mut self, batch: &RecordBatch, metadata: Option<&Metadata>) -> Result<()> {
-        if self.finished {
-            return Err(RpcError::new("IOError", "writer already finished"));
-        }
-        let mut ctx = Default::default();
-        let (dicts, data) = self
-            .data_gen
-            .encode(batch, &mut self.dict_tracker, &self.opts, &mut ctx)
-            .map_err(RpcError::from)?;
-        for d in dicts {
-            write_message(&mut self.writer, d, &self.opts).map_err(RpcError::from)?;
-        }
-        if let Some(md) = metadata.filter(|m| !m.is_empty()) {
-            let new_msg = repack_record_batch_message_with_metadata(&data.ipc_message, md)?;
-            let encoded = arrow_ipc::writer::EncodedData {
-                ipc_message: new_msg,
-                arrow_data: data.arrow_data,
-            };
-            write_message(&mut self.writer, encoded, &self.opts).map_err(RpcError::from)?;
-        } else {
-            write_message(&mut self.writer, data, &self.opts).map_err(RpcError::from)?;
-        }
-        Ok(())
+    /// Write one record batch; its `custom_metadata` is emitted as the
+    /// IPC Message-level `custom_metadata`.
+    pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.inner.write(batch).map_err(RpcError::from)
     }
 
-    /// Return the schema this writer was opened with.
+    /// Schema this writer was opened with.
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
     /// Write the EOS continuation marker.
     pub fn finish(&mut self) -> Result<()> {
-        if self.finished {
-            return Ok(());
-        }
-        self.writer.write_all(&CONTINUATION_MARKER)?;
-        self.writer.write_all(&[0u8; 4])?;
-        self.writer.flush()?;
-        self.finished = true;
-        Ok(())
+        self.inner.finish().map_err(RpcError::from)
     }
 
     /// Flush the underlying writer.
     pub fn flush(&mut self) -> Result<()> {
-        self.writer.flush()?;
+        self.inner.flush()?;
         Ok(())
     }
 
     pub fn get_mut(&mut self) -> &mut W {
-        &mut self.writer
+        self.inner.get_mut()
     }
-}
-
-impl<W: Write> Drop for StreamWriter<W> {
-    fn drop(&mut self) {
-        let _ = self.finish();
-    }
-}
-
-/// Rebuild a Message flatbuffer with `custom_metadata` added, preserving
-/// the embedded RecordBatch header unchanged.
-fn repack_record_batch_message_with_metadata(
-    msg_bytes: &[u8],
-    metadata: &Metadata,
-) -> Result<Vec<u8>> {
-    let msg = root_as_message(msg_bytes)
-        .map_err(|e| RpcError::new("IPC", format!("parsing message: {e}")))?;
-    let version = msg.version();
-    let header_type = msg.header_type();
-    let body_length = msg.bodyLength();
-    if header_type != MessageHeader::RecordBatch {
-        return Err(RpcError::new(
-            "IPC",
-            format!("repack expected RecordBatch header, got {header_type:?}"),
-        ));
-    }
-    let rb = msg
-        .header_as_record_batch()
-        .ok_or_else(|| RpcError::new("IPC", "missing RecordBatch header"))?;
-
-    let mut fbb = FlatBufferBuilder::new();
-
-    let src_nodes = rb
-        .nodes()
-        .ok_or_else(|| RpcError::new("IPC", "RecordBatch missing nodes"))?;
-    let nodes: Vec<FieldNode> = src_nodes.iter().copied().collect();
-    let nodes_vec = fbb.create_vector(&nodes);
-
-    let src_buffers = rb
-        .buffers()
-        .ok_or_else(|| RpcError::new("IPC", "RecordBatch missing buffers"))?;
-    let buffers: Vec<FbBuffer> = src_buffers.iter().copied().collect();
-    let buffers_vec = fbb.create_vector(&buffers);
-
-    let variadic_vec = rb.variadicBufferCounts().map(|v| {
-        let counts: Vec<i64> = v.iter().collect();
-        fbb.create_vector(&counts)
-    });
-
-    let new_rb = {
-        let mut b = RecordBatchBuilder::new(&mut fbb);
-        b.add_length(rb.length());
-        b.add_nodes(nodes_vec);
-        b.add_buffers(buffers_vec);
-        if let Some(v) = variadic_vec {
-            b.add_variadicBufferCounts(v);
-        }
-        // Note: we don't carry compression here; the conformance server
-        // does not enable IPC batch compression, so this is safe.
-        b.finish()
-    };
-
-    // Build custom_metadata vector.
-    let kvs: Vec<_> = metadata
-        .iter()
-        .map(|(k, v)| {
-            let k_off = fbb.create_string(k);
-            let v_off = fbb.create_string(v);
-            KeyValue::create(
-                &mut fbb,
-                &KeyValueArgs {
-                    key: Some(k_off),
-                    value: Some(v_off),
-                },
-            )
-        })
-        .collect();
-    let md_vec = fbb.create_vector(&kvs);
-
-    let mut mb = MessageBuilder::new(&mut fbb);
-    mb.add_version(version);
-    mb.add_header_type(header_type);
-    mb.add_header(new_rb.as_union_value());
-    mb.add_bodyLength(body_length);
-    mb.add_custom_metadata(md_vec);
-    let m = mb.finish();
-    fbb.finish(m, None);
-    Ok(fbb.finished_data().to_vec())
 }
 
 // ---------------------------------------------------------------------------
 // Reader
 // ---------------------------------------------------------------------------
 
-/// A streaming IPC reader that surfaces per-message custom metadata.
+/// Streaming IPC reader wrapping `arrow_ipc::reader::StreamReader`.
 ///
-/// Returns batches one at a time via [`read_next`]. Dictionary and schema
-/// messages are consumed transparently.
+/// Each batch returned by [`StreamReader::read_next`] carries its
+/// per-message `custom_metadata` via `RecordBatch::custom_metadata`.
 pub struct StreamReader<R: Read> {
-    reader: R,
+    inner: IpcStreamReader<R>,
     schema: SchemaRef,
-    dictionaries: HashMap<i64, arrow_array::ArrayRef>,
-    finished: bool,
-}
-
-/// A batch returned by the reader together with the message custom metadata.
-#[derive(Debug)]
-pub struct ReadBatch {
-    pub batch: RecordBatch,
-    pub metadata: Metadata,
+    /// When `Some`, every read batch is rewrapped with this relaxed
+    /// schema before being returned to the caller.
+    relaxed_schema: Option<SchemaRef>,
 }
 
 impl<R: Read> StreamReader<R> {
     /// Create a new reader and consume the schema message.
-    pub fn new(mut reader: R) -> Result<Self> {
-        let msg = read_message_bytes(&mut reader)?
-            .ok_or_else(|| RpcError::new("IPC", "empty IPC stream (no schema)"))?;
-        let msg_fb = root_as_message(&msg.message_bytes)
-            .map_err(|e| RpcError::new("IPC", format!("parse schema message: {e}")))?;
-        if msg_fb.header_type() != MessageHeader::Schema {
-            return Err(RpcError::new(
-                "IPC",
-                format!("expected Schema, got {:?}", msg_fb.header_type()),
-            ));
-        }
-        let ipc_schema = msg_fb
-            .header_as_schema()
-            .ok_or_else(|| RpcError::new("IPC", "bad schema header"))?;
-        let schema = ipc_convert::fb_to_schema(ipc_schema);
+    pub fn new(reader: R) -> Result<Self> {
+        let inner = IpcStreamReader::try_new(reader, None).map_err(|e| {
+            // Map upstream "empty stream" to our IPC error so callers can
+            // recognize the EOF-at-request-boundary case.
+            let msg = e.to_string();
+            if msg.contains("Expected schema message, found empty stream") {
+                RpcError::new("IPC", "empty IPC stream (no schema)")
+            } else {
+                RpcError::from(e)
+            }
+        })?;
+        let schema = inner.schema();
         Ok(Self {
-            reader,
-            schema: Arc::new(schema),
-            dictionaries: HashMap::new(),
-            finished: false,
+            inner,
+            schema,
+            relaxed_schema: None,
         })
     }
 
-    /// Get the schema of the stream.
+    /// Get the schema of the stream (relaxed schema, if relaxation was
+    /// requested).
     pub fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        self.relaxed_schema
+            .clone()
+            .unwrap_or_else(|| self.schema.clone())
+    }
+
+    /// Promote every field in the stream's schema to `nullable = true`,
+    /// recursively (lists, structs, fixed-size lists). Use when a
+    /// producer declares a field non-nullable but legitimately sends
+    /// nulls — e.g. Python's `ArrowSerializableDataclass` for
+    /// `Annotated[T | None, ArrowType(...)]`.
+    ///
+    /// Also disables IPC-level validation (the columns have legitimate
+    /// null buffers; only the schema flag was a lie) so the upstream
+    /// reader doesn't reject the stream before we get a chance to
+    /// rewrap with the relaxed schema.
+    pub fn relax_nullability(self) -> Self {
+        let relaxed = Some(Arc::new(relax_schema_nullability(self.schema.as_ref())));
+        // SAFETY: The remote producer guarantees column data is valid;
+        // we are only working around an over-strict nullability flag.
+        let inner = unsafe { self.inner.with_skip_validation(true) };
+        Self {
+            inner,
+            schema: self.schema,
+            relaxed_schema: relaxed,
+        }
     }
 
     /// Read the next record batch, or `None` on end-of-stream.
-    pub fn read_next(&mut self) -> Result<Option<ReadBatch>> {
-        if self.finished {
-            return Ok(None);
-        }
-        loop {
-            let msg = match read_message_bytes(&mut self.reader)? {
-                Some(m) => m,
-                None => {
-                    self.finished = true;
-                    return Ok(None);
-                }
-            };
-            let msg_fb = root_as_message(&msg.message_bytes)
-                .map_err(|e| RpcError::new("IPC", format!("parse message: {e}")))?;
-            let version = msg_fb.version();
-            match msg_fb.header_type() {
-                MessageHeader::DictionaryBatch => {
-                    let dict = msg_fb
-                        .header_as_dictionary_batch()
-                        .ok_or_else(|| RpcError::new("IPC", "bad dictionary header"))?;
-                    let body_buf = ArrowBuffer::from_vec(msg.body);
-                    ipc_reader::read_dictionary(
-                        &body_buf,
-                        dict,
-                        self.schema.as_ref(),
-                        &mut self.dictionaries,
-                        &version,
-                    )
-                    .map_err(RpcError::from)?;
-                }
-                MessageHeader::RecordBatch => {
-                    let rb_fb = msg_fb
-                        .header_as_record_batch()
-                        .ok_or_else(|| RpcError::new("IPC", "bad record batch header"))?;
-                    let body_buf = ArrowBuffer::from_vec(msg.body);
-                    let batch = ipc_reader::read_record_batch(
-                        &body_buf,
-                        rb_fb,
-                        self.schema.clone(),
-                        &self.dictionaries,
-                        None,
-                        &version,
-                    )
-                    .map_err(RpcError::from)?;
-                    let metadata = parse_custom_metadata(&msg_fb);
-                    return Ok(Some(ReadBatch { batch, metadata }));
-                }
-                MessageHeader::Schema => {
-                    return Err(RpcError::new("IPC", "unexpected schema message mid-stream"));
-                }
-                MessageHeader::NONE => continue,
-                other => {
-                    return Err(RpcError::new(
-                        "IPC",
-                        format!("unsupported message type {other:?}"),
-                    ));
+    pub fn read_next(&mut self) -> Result<Option<RecordBatch>> {
+        match self.inner.next() {
+            None => Ok(None),
+            Some(Ok(batch)) => {
+                if let Some(relaxed) = &self.relaxed_schema {
+                    let md = batch.custom_metadata().clone();
+                    let rebatch = batch
+                        .with_schema(relaxed.clone())
+                        .map_err(RpcError::from)?
+                        .with_custom_metadata(md);
+                    Ok(Some(rebatch))
+                } else {
+                    Ok(Some(batch))
                 }
             }
+            Some(Err(e)) => Err(RpcError::from(e)),
         }
     }
 
-    /// Drain and discard any remaining messages.
+    /// Drain and discard any remaining batches.
     pub fn drain(&mut self) -> Result<()> {
         while self.read_next()?.is_some() {}
         Ok(())
     }
 
     pub fn get_mut(&mut self) -> &mut R {
-        &mut self.reader
+        self.inner.get_mut()
     }
-}
-
-fn parse_custom_metadata(msg: &arrow_ipc::Message) -> Metadata {
-    let mut out = Vec::new();
-    if let Some(md) = msg.custom_metadata() {
-        for kv in md.iter() {
-            let k = kv.key().unwrap_or("").to_string();
-            let v = kv.value().unwrap_or("").to_string();
-            out.push((k, v));
-        }
-    }
-    out
-}
-
-struct RawMessage {
-    message_bytes: Vec<u8>,
-    body: Vec<u8>,
-}
-
-fn read_exact(r: &mut impl Read, buf: &mut [u8]) -> Result<bool> {
-    let mut read = 0;
-    while read < buf.len() {
-        match r.read(&mut buf[read..]) {
-            Ok(0) => {
-                if read == 0 {
-                    return Ok(false);
-                }
-                return Err(RpcError::new("IOError", "unexpected EOF in IPC message"));
-            }
-            Ok(n) => read += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(true)
-}
-
-fn read_message_bytes(r: &mut impl Read) -> Result<Option<RawMessage>> {
-    let mut prefix = [0u8; 4];
-    if !read_exact(r, &mut prefix)? {
-        return Ok(None);
-    }
-    let size_bytes = if prefix == CONTINUATION_MARKER {
-        let mut sb = [0u8; 4];
-        if !read_exact(r, &mut sb)? {
-            return Ok(None);
-        }
-        sb
-    } else {
-        prefix
-    };
-    let size = u32::from_le_bytes(size_bytes) as usize;
-    if size == 0 {
-        // EOS
-        return Ok(None);
-    }
-    let mut message_bytes = vec![0u8; size];
-    if !read_exact(r, &mut message_bytes)? {
-        return Err(RpcError::new("IOError", "unexpected EOF in message body"));
-    }
-    // Parse to learn body length
-    let msg = root_as_message(&message_bytes)
-        .map_err(|e| RpcError::new("IPC", format!("parse message header: {e}")))?;
-    let body_length = msg.bodyLength() as usize;
-    let mut body = vec![0u8; body_length];
-    if body_length > 0 && !read_exact(r, &mut body)? {
-        return Err(RpcError::new("IOError", "unexpected EOF in message body"));
-    }
-    Ok(Some(RawMessage {
-        message_bytes,
-        body,
-    }))
 }
 
 // ---------------------------------------------------------------------------
-// Utility — build a zero-row record batch matching a given schema
+// Utilities
 // ---------------------------------------------------------------------------
 
 /// Serialize one record batch as a complete IPC stream
-/// (schema + batch + EOS), with optional custom metadata on the batch.
-pub fn write_one_batch(batch: &RecordBatch, metadata: Option<&Metadata>) -> Result<Vec<u8>> {
+/// (schema + batch + EOS). Per-batch metadata travels via
+/// `batch.custom_metadata()`.
+pub fn write_one_batch(batch: &RecordBatch) -> Result<Vec<u8>> {
     let schema = batch.schema();
     let mut buf = Vec::new();
     {
         let mut w = StreamWriter::new(&mut buf, schema.as_ref())?;
-        w.write(batch, metadata)?;
+        w.write(batch)?;
         w.finish()?;
     }
     Ok(buf)
@@ -435,6 +212,49 @@ pub fn bytes_to_hex(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+fn relax_field_nullability(f: &arrow_schema::Field) -> arrow_schema::Field {
+    use arrow_schema::DataType;
+    let dt = match f.data_type() {
+        DataType::List(inner) => DataType::List(Arc::new(relax_field_nullability(inner))),
+        DataType::LargeList(inner) => DataType::LargeList(Arc::new(relax_field_nullability(inner))),
+        DataType::FixedSizeList(inner, n) => {
+            DataType::FixedSizeList(Arc::new(relax_field_nullability(inner)), *n)
+        }
+        DataType::Struct(fields) => DataType::Struct(
+            fields
+                .iter()
+                .map(|child| Arc::new(relax_field_nullability(child)))
+                .collect(),
+        ),
+        // Map: leave the entries struct alone (Arrow requires
+        // entries/keys to be non-nullable); leaf nullability inside
+        // the values child is preserved by the original schema.
+        other => other.clone(),
+    };
+    #[allow(deprecated)]
+    let new_field = if let DataType::Dictionary(_, _) = f.data_type() {
+        arrow_schema::Field::new_dict(
+            f.name(),
+            dt,
+            true,
+            f.dict_id().unwrap_or(0),
+            f.dict_is_ordered().unwrap_or(false),
+        )
+    } else {
+        arrow_schema::Field::new(f.name(), dt, true)
+    };
+    new_field.with_metadata(f.metadata().clone())
+}
+
+fn relax_schema_nullability(s: &Schema) -> Schema {
+    let new_fields: Vec<arrow_schema::Field> = s
+        .fields()
+        .iter()
+        .map(|f| relax_field_nullability(f))
+        .collect();
+    Schema::new_with_metadata(new_fields, s.metadata().clone())
 }
 
 /// Build a zero-row `RecordBatch` matching the given schema.
@@ -452,6 +272,23 @@ pub fn empty_batch(schema: &Schema) -> Result<RecordBatch> {
         &RecordBatchOptions::new().with_row_count(Some(0)),
     )
     .map_err(RpcError::from)
+}
+
+/// Convenience: attach `metadata` to `batch` via
+/// [`RecordBatch::with_custom_metadata`]. Equivalent to a direct call
+/// but reads more naturally at sites that mostly speak in `Metadata`.
+#[inline]
+pub fn batch_with_md(batch: RecordBatch, metadata: Metadata) -> RecordBatch {
+    batch.with_custom_metadata(metadata)
+}
+
+/// Like [`batch_with_md`] but a no-op when `metadata` is `None`.
+#[inline]
+pub fn attach_md_opt(batch: RecordBatch, metadata: Option<Metadata>) -> RecordBatch {
+    match metadata {
+        Some(m) => batch.with_custom_metadata(m),
+        None => batch,
+    }
 }
 
 #[cfg(test)]
@@ -474,19 +311,24 @@ mod tests {
             ],
         )
         .unwrap();
+        let mut md: Metadata = HashMap::new();
+        md.insert("vgi_rpc.method".into(), "echo_string".into());
+        let batch = batch.with_custom_metadata(md);
 
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut w = StreamWriter::new(&mut buf, &schema).unwrap();
-            let md = vec![("vgi_rpc.method".to_string(), "echo_string".to_string())];
-            w.write(&batch, Some(&md)).unwrap();
+            w.write(&batch).unwrap();
             w.finish().unwrap();
         }
 
         let mut r = StreamReader::new(buf.as_slice()).unwrap();
         let rb = r.read_next().unwrap().expect("batch");
-        assert_eq!(rb.batch.num_rows(), 3);
-        assert_eq!(md_get(&rb.metadata, "vgi_rpc.method"), Some("echo_string"));
+        assert_eq!(rb.num_rows(), 3);
+        assert_eq!(
+            md_get(rb.custom_metadata(), "vgi_rpc.method"),
+            Some("echo_string")
+        );
         assert!(r.read_next().unwrap().is_none());
     }
 
@@ -494,17 +336,22 @@ mod tests {
     fn zero_row_metadata_only() {
         let schema = Schema::empty();
         let batch = empty_batch(&schema).unwrap();
+        let mut md: Metadata = HashMap::new();
+        md.insert("vgi_rpc.log_level".into(), "INFO".into());
+        let batch = batch.with_custom_metadata(md);
 
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut w = StreamWriter::new(&mut buf, &schema).unwrap();
-            let md = vec![("vgi_rpc.log_level".into(), "INFO".into())];
-            w.write(&batch, Some(&md)).unwrap();
+            w.write(&batch).unwrap();
             w.finish().unwrap();
         }
         let mut r = StreamReader::new(buf.as_slice()).unwrap();
         let rb = r.read_next().unwrap().expect("batch");
-        assert_eq!(rb.batch.num_rows(), 0);
-        assert_eq!(md_get(&rb.metadata, "vgi_rpc.log_level"), Some("INFO"));
+        assert_eq!(rb.num_rows(), 0);
+        assert_eq!(
+            md_get(rb.custom_metadata(), "vgi_rpc.log_level"),
+            Some("INFO")
+        );
     }
 }

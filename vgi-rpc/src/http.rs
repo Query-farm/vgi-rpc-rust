@@ -34,7 +34,7 @@ use crate::server::{
 };
 use crate::stream::{empty_schema, Emitted, OutputCollector, StreamResult, StreamStateKind};
 use crate::wire::{
-    bytes_to_hex, empty_batch, md_get, Metadata, ReadBatch, StreamReader, StreamWriter,
+    attach_md_opt, bytes_to_hex, empty_batch, md_get, Metadata, StreamReader, StreamWriter,
 };
 
 pub const ARROW_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
@@ -68,6 +68,9 @@ pub struct HttpState {
     landing_page_enabled: bool,
     describe_page_enabled: bool,
     health_enabled: bool,
+    max_request_bytes: Option<usize>,
+    max_upload_bytes: Option<usize>,
+    upload_url_provider: Option<Arc<dyn crate::external::UploadUrlProvider>>,
 }
 
 /// Fluent builder for [`HttpState`].
@@ -87,6 +90,9 @@ pub struct HttpStateBuilder {
     landing_page_enabled: Option<bool>,
     describe_page_enabled: Option<bool>,
     health_enabled: Option<bool>,
+    max_request_bytes: Option<usize>,
+    max_upload_bytes: Option<usize>,
+    upload_url_provider: Option<Arc<dyn crate::external::UploadUrlProvider>>,
 }
 
 impl HttpStateBuilder {
@@ -223,6 +229,35 @@ impl HttpStateBuilder {
         self
     }
 
+    /// Maximum inline-request body size advertised via the
+    /// `VGI-Max-Request-Bytes` capability header and enforced server-side
+    /// (413 Payload Too Large for non-exempt routes). When set together
+    /// with [`Self::upload_url_provider`], clients can externalize
+    /// oversize requests via `__upload_url__/init` + a pointer batch.
+    pub fn max_request_bytes(mut self, n: usize) -> Self {
+        self.max_request_bytes = Some(n);
+        self
+    }
+
+    /// Advertised upper bound on the size of any single client-vended
+    /// upload (header `VGI-Max-Upload-Bytes`). Advertisement only — no
+    /// server-side enforcement.
+    pub fn max_upload_bytes(mut self, n: usize) -> Self {
+        self.max_upload_bytes = Some(n);
+        self
+    }
+
+    /// Install an [`UploadUrlProvider`](crate::external::UploadUrlProvider).
+    /// When set, the server exposes `POST /__upload_url__/init` and
+    /// advertises `VGI-Upload-URL-Support: true`.
+    pub fn upload_url_provider(
+        mut self,
+        provider: Arc<dyn crate::external::UploadUrlProvider>,
+    ) -> Self {
+        self.upload_url_provider = Some(provider);
+        self
+    }
+
     pub fn build(self) -> Arc<HttpState> {
         let server = self.server.expect("HttpStateBuilder::server is required");
         let signing_key = self.signing_key.unwrap_or_else(|| {
@@ -259,6 +294,9 @@ impl HttpStateBuilder {
             landing_page_enabled: self.landing_page_enabled.unwrap_or(true),
             describe_page_enabled: self.describe_page_enabled.unwrap_or(true),
             health_enabled: self.health_enabled.unwrap_or(true),
+            max_request_bytes: self.max_request_bytes,
+            max_upload_bytes: self.max_upload_bytes,
+            upload_url_provider: self.upload_url_provider,
         })
     }
 }
@@ -519,7 +557,7 @@ fn read_segment(buf: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
 /// `Schema.serialize()` path. Round-trip via [`read_schema_bytes`].
 fn write_schema_bytes(schema: &Schema) -> Result<Vec<u8>> {
     let empty = empty_batch(schema)?;
-    crate::wire::write_one_batch(&empty, None)
+    crate::wire::write_one_batch(&empty)
 }
 
 /// Inverse of [`write_schema_bytes`].
@@ -599,6 +637,44 @@ async fn postprocess_middleware(
 ) -> Response {
     use axum::body::to_bytes;
     let req_headers = req.headers().clone();
+    let req_method = req.method().clone();
+    let req_path = req.uri().path().to_string();
+
+    // Enforce server-advertised max_request_bytes before invoking the
+    // handler. Exempt the upload-URL flow itself and `/health` so
+    // clients can still discover capabilities and request URLs even if
+    // their next request would exceed the limit.
+    if let Some(limit) = state.max_request_bytes {
+        let exempt = req_path.ends_with("/__upload_url__/init")
+            || req_path.contains("/__upload_url__/")
+            || req_path == "/health"
+            || req_path.ends_with("/health");
+        if !exempt {
+            if let Some(cl) = req
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                if cl > limit {
+                    let mut h = HeaderMap::new();
+                    attach_capability_headers(&state, &mut h, &req_method);
+                    attach_cors_headers(&state, &mut h, &req_headers, false);
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        h,
+                        format!(
+                            "Request body of {cl} bytes exceeds advertised \
+                             max_request_bytes={limit}. Use the upload-URL \
+                             flow (__upload_url__/init) to externalize."
+                        ),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     let resp = next.run(req).await;
     let (mut parts, body) = resp.into_parts();
     let bytes = to_bytes(body, usize::MAX).await.unwrap_or_default();
@@ -627,7 +703,42 @@ async fn postprocess_middleware(
         }
     }
     attach_cors_headers(&state, &mut parts.headers, &req_headers, false);
+    attach_capability_headers(&state, &mut parts.headers, &req_method);
     Response::from_parts(parts, axum::body::Body::from(bytes))
+}
+
+/// Attach `VGI-Max-Request-Bytes`, `VGI-Upload-URL-Support`,
+/// `VGI-Max-Upload-Bytes` capability headers when configured. On
+/// `OPTIONS` responses also stamp `Cache-Control: public, max-age=300`
+/// so clients cache discovery results, mirroring the Python
+/// `_CapabilitiesMiddleware`.
+fn attach_capability_headers(
+    state: &Arc<HttpState>,
+    out: &mut HeaderMap,
+    method: &axum::http::Method,
+) {
+    let mut any = false;
+    if let Some(n) = state.max_request_bytes {
+        if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
+            out.insert("vgi-max-request-bytes", v);
+            any = true;
+        }
+    }
+    if state.upload_url_provider.is_some() {
+        out.insert("vgi-upload-url-support", HeaderValue::from_static("true"));
+        any = true;
+        if let Some(n) = state.max_upload_bytes {
+            if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
+                out.insert("vgi-max-upload-bytes", v);
+            }
+        }
+    }
+    if any && method == axum::http::Method::OPTIONS {
+        out.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=300"),
+        );
+    }
 }
 
 fn build_router_inner(state: Arc<HttpState>) -> Router {
@@ -642,6 +753,15 @@ fn build_router_inner(state: Arc<HttpState>) -> Router {
             "/:method/exchange",
             post(handle_stream_exchange).options(handle_preflight),
         );
+
+    let api = if state.upload_url_provider.is_some() {
+        api.route(
+            "/__upload_url__/init",
+            post(handle_upload_url).options(handle_preflight),
+        )
+    } else {
+        api
+    };
 
     let mut app = if prefix.is_empty() {
         api
@@ -967,11 +1087,11 @@ fn decode_zstd_bounded(input: &[u8], max_size: usize) -> Result<Vec<u8>> {
 
 fn parse_request_from_body(body: &[u8]) -> Result<Request> {
     let mut r = StreamReader::new(body)?;
-    let rb = r
+    let batch = r
         .read_next()?
         .ok_or_else(|| RpcError::protocol_error("empty IPC stream"))?;
     r.drain()?;
-    Request::from_read_batch(rb, false)
+    Request::from_read_batch(batch, false)
 }
 
 fn error_stream_bytes(
@@ -983,7 +1103,11 @@ fn error_stream_bytes(
     let mut buf = Vec::new();
     let mut w = StreamWriter::new(&mut buf, schema).unwrap();
     let md = build_error_metadata(err, server_id, request_id);
-    let _ = w.write(&empty_batch(schema).unwrap(), Some(&md));
+    let _ = w.write(
+        &empty_batch(schema)
+            .unwrap()
+            .with_custom_metadata(md.clone()),
+    );
     let _ = w.finish();
     drop(w);
     buf
@@ -1060,6 +1184,154 @@ fn new_session_id() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Upload-URL endpoint
+// ---------------------------------------------------------------------------
+
+const UPLOAD_URL_METHOD: &str = "__upload_url__";
+const MAX_UPLOAD_URL_COUNT: i64 = 100;
+
+fn upload_url_response_schema() -> Schema {
+    use arrow_schema::{DataType, Field, TimeUnit};
+    Schema::new(vec![
+        Field::new("upload_url", DataType::Utf8, false),
+        Field::new("download_url", DataType::Utf8, false),
+        Field::new(
+            "expires_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ])
+}
+
+async fn handle_upload_url(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let auth = match authenticate_request(&state, UPLOAD_URL_METHOD, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let _ = auth;
+    if !has_arrow_ct(&headers) {
+        return plain_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "need arrow content type".into(),
+        );
+    }
+    let provider = match state.upload_url_provider.as_ref() {
+        Some(p) => p.clone(),
+        None => return plain_error(StatusCode::NOT_FOUND, "upload-url not enabled".into()),
+    };
+
+    let body = match maybe_decompress(&headers, &body, state.max_body_size) {
+        Ok(b) => b,
+        Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
+    };
+    let req = match parse_request_from_body(&body) {
+        Ok(r) => r,
+        Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
+    };
+    if !req.method.is_empty() && req.method != UPLOAD_URL_METHOD {
+        let err = RpcError::protocol_error(format!(
+            "Method mismatch: expected '{UPLOAD_URL_METHOD}', got '{}'",
+            req.method
+        ));
+        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+    }
+    // Pull `count` from the int64 column (default 1, clamped to [1, MAX]).
+    let mut count: i64 = 1;
+    if let Some(arr) = req.column("count") {
+        use arrow_array::Array;
+        if let Some(c) = arr.as_any().downcast_ref::<arrow_array::Int64Array>() {
+            if !c.is_empty() && !Array::is_null(c, 0) {
+                count = c.value(0);
+            }
+        }
+    }
+    count = count.clamp(1, MAX_UPLOAD_URL_COUNT);
+
+    // Generate URLs (provider may block on HTTP — same caveat as
+    // ExternalStorage::upload, hence block_in_place).
+    let urls_res = tokio::task::block_in_place(|| {
+        let mut out = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            out.push(provider.generate_upload_url()?);
+        }
+        Ok::<_, RpcError>(out)
+    });
+
+    let schema = upload_url_response_schema();
+    let mut body_buf = Vec::new();
+    {
+        let mut sw = match StreamWriter::new(&mut body_buf, &schema) {
+            Ok(w) => w,
+            Err(e) => {
+                return arrow_error(
+                    &state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &e,
+                    &req.request_id,
+                )
+            }
+        };
+        match urls_res {
+            Ok(urls) => {
+                use arrow_array::{StringArray, TimestampMicrosecondArray};
+                let upload_arr = StringArray::from(
+                    urls.iter()
+                        .map(|u| u.upload_url.clone())
+                        .collect::<Vec<_>>(),
+                );
+                let download_arr = StringArray::from(
+                    urls.iter()
+                        .map(|u| u.download_url.clone())
+                        .collect::<Vec<_>>(),
+                );
+                let expires_arr = TimestampMicrosecondArray::from(
+                    urls.iter().map(|u| u.expires_at_micros).collect::<Vec<_>>(),
+                )
+                .with_timezone("UTC");
+                let batch = match RecordBatch::try_new(
+                    Arc::new(schema.clone()),
+                    vec![
+                        Arc::new(upload_arr),
+                        Arc::new(download_arr),
+                        Arc::new(expires_arr),
+                    ],
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let err = RpcError::runtime_error(format!("upload-url batch: {e}"));
+                        let md =
+                            build_error_metadata(&err, &state.server.server_id, &req.request_id);
+                        let _ = sw.write(
+                            &empty_batch(&schema)
+                                .unwrap()
+                                .with_custom_metadata(md.clone()),
+                        );
+                        let _ = sw.finish();
+                        drop(sw);
+                        return arrow_response(StatusCode::OK, body_buf);
+                    }
+                };
+                let _ = sw.write(&batch);
+            }
+            Err(err) => {
+                let md = build_error_metadata(&err, &state.server.server_id, &req.request_id);
+                let _ = sw.write(
+                    &empty_batch(&schema)
+                        .unwrap()
+                        .with_custom_metadata(md.clone()),
+                );
+            }
+        }
+        let _ = sw.finish();
+    }
+    arrow_response(StatusCode::OK, body_buf)
+}
+
+// ---------------------------------------------------------------------------
 // Unary
 // ---------------------------------------------------------------------------
 
@@ -1089,10 +1361,32 @@ async fn handle_unary(
         Ok(b) => b,
         Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
     };
-    let req = match parse_request_from_body(&body) {
+    let mut req = match parse_request_from_body(&body) {
         Ok(r) => r,
         Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
     };
+
+    // If the request batch is an external-location pointer (zero rows +
+    // `vgi_rpc.location` metadata), fetch the referenced bytes and use
+    // the inner batch's columns for parameter extraction. Dispatch
+    // metadata (method, request_id) is taken from the outer batch.
+    if md_get(&req.metadata, crate::metadata::LOCATION_KEY).is_some() {
+        if let Some(cfg) = server.external_config().as_ref() {
+            let outer_md = req.metadata.clone();
+            let outer_batch = req.batch.clone();
+            let resolved = tokio::task::block_in_place(|| {
+                crate::external::resolve_external_location(&outer_batch, &outer_md, cfg)
+            });
+            match resolved {
+                Ok((inner_batch, _user_md)) => {
+                    req.batch = inner_batch;
+                }
+                Err(err) => {
+                    return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+                }
+            }
+        }
+    }
 
     // __describe__ introspection — served as a unary call.
     if server.describe_enabled() && method == crate::introspect::DESCRIBE_METHOD_NAME {
@@ -1144,7 +1438,11 @@ async fn handle_unary(
         let mut sw = StreamWriter::new(&mut buf, &info.result_schema).unwrap();
         for log in &logs {
             let md = build_log_metadata(log, &server.server_id, &req.request_id);
-            let _ = sw.write(&empty_batch(&info.result_schema).unwrap(), Some(&md));
+            let _ = sw.write(
+                &empty_batch(&info.result_schema)
+                    .unwrap()
+                    .with_custom_metadata(md.clone()),
+            );
         }
         match result {
             Ok(batch_opt) => {
@@ -1152,11 +1450,42 @@ async fn handle_unary(
                     batch_opt.unwrap_or_else(|| empty_batch(&info.result_schema).unwrap());
                 stats.output_batches = 1;
                 stats.output_rows = out_batch.num_rows() as u64;
-                let _ = sw.write(&out_batch, None);
+                if let Some(cfg) = server.external_config().as_ref() {
+                    // `maybe_externalize_batch` may invoke a blocking
+                    // upload (e.g. reqwest::blocking). Allow blocking
+                    // in this async handler so the inner client's
+                    // tokio runtime can drop without panicking.
+                    let externalized = tokio::task::block_in_place(|| {
+                        crate::external::maybe_externalize_batch(&out_batch, None, cfg)
+                    });
+                    match externalized {
+                        Ok(Some((ptr, md))) => {
+                            let _ = sw.write(&ptr.with_custom_metadata(md.clone()));
+                        }
+                        Ok(None) => {
+                            let _ = sw.write(&out_batch);
+                        }
+                        Err(err) => {
+                            let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+                            let _ = sw.write(
+                                &empty_batch(&info.result_schema)
+                                    .unwrap()
+                                    .with_custom_metadata(md.clone()),
+                            );
+                            app_err = Some(err);
+                        }
+                    }
+                } else {
+                    let _ = sw.write(&out_batch);
+                }
             }
             Err(err) => {
                 let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-                let _ = sw.write(&empty_batch(&info.result_schema).unwrap(), Some(&md));
+                let _ = sw.write(
+                    &empty_batch(&info.result_schema)
+                        .unwrap()
+                        .with_custom_metadata(md.clone()),
+                );
                 app_err = Some(err);
             }
         }
@@ -1244,9 +1573,16 @@ async fn handle_stream_init(
         let mut hw = StreamWriter::new(&mut body_buf, hdr_schema.as_ref()).unwrap();
         for log in &init_logs {
             let md = build_log_metadata(log, &server.server_id, &req.request_id);
-            let _ = hw.write(&empty_batch(hdr_schema.as_ref()).unwrap(), Some(&md));
+            let _ = hw.write(
+                &empty_batch(hdr_schema.as_ref())
+                    .unwrap()
+                    .with_custom_metadata(md.clone()),
+            );
         }
-        let _ = hw.write(header_batch, header_metadata.as_ref());
+        let _ = hw.write(&attach_md_opt(
+            header_batch.clone(),
+            header_metadata.clone(),
+        ));
         let _ = hw.finish();
     }
 
@@ -1260,7 +1596,11 @@ async fn handle_stream_init(
         if header.is_none() {
             for log in &init_logs {
                 let md = build_log_metadata(log, &server.server_id, &req.request_id);
-                let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                let _ = sw.write(
+                    &empty_batch(output_schema.as_ref())
+                        .unwrap()
+                        .with_custom_metadata(md.clone()),
+                );
             }
         }
         let _ = header_metadata;
@@ -1284,15 +1624,23 @@ async fn handle_stream_init(
                 &stream_id,
             ) {
                 Ok(token) => {
-                    let md = vec![(STATE_KEY.to_string(), token)];
-                    let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                    let md = Metadata::from([(STATE_KEY.to_string(), token)]);
+                    let _ = sw.write(
+                        &empty_batch(output_schema.as_ref())
+                            .unwrap()
+                            .with_custom_metadata(md.clone()),
+                    );
                 }
                 Err(err) => {
                     // Handler doesn't implement encode_state — emit as an
                     // error envelope so the client sees a useful message
                     // instead of a hung stream.
                     let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-                    let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                    let _ = sw.write(
+                        &empty_batch(output_schema.as_ref())
+                            .unwrap()
+                            .with_custom_metadata(md.clone()),
+                    );
                     init_error = Some(err);
                 }
             }
@@ -1353,11 +1701,19 @@ fn run_producer<W: std::io::Write>(
         let result = producer.produce(&mut out, &ctx);
         for log in ctx.drain_logs() {
             let md = build_log_metadata(&log, &server.server_id, &req.request_id);
-            let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+            let _ = sw.write(
+                &empty_batch(output_schema.as_ref())
+                    .unwrap()
+                    .with_custom_metadata(md.clone()),
+            );
         }
         if let Err(err) = result {
             let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-            let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+            let _ = sw.write(
+                &empty_batch(output_schema.as_ref())
+                    .unwrap()
+                    .with_custom_metadata(md.clone()),
+            );
             return true;
         }
         let finished = out.finished();
@@ -1366,10 +1722,14 @@ fn run_producer<W: std::io::Write>(
             match item {
                 Emitted::Log(log) => {
                     let md = build_log_metadata(&log, &server.server_id, &req.request_id);
-                    let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                    let _ = sw.write(
+                        &empty_batch(output_schema.as_ref())
+                            .unwrap()
+                            .with_custom_metadata(md.clone()),
+                    );
                 }
                 Emitted::Batch { batch, metadata } => {
-                    let _ = sw.write(&batch, metadata.as_ref());
+                    let _ = sw.write(&attach_md_opt(batch, metadata));
                     emitted_data = true;
                 }
             }
@@ -1510,12 +1870,20 @@ async fn handle_stream_exchange(
                     &unpacked.stream_id,
                 ) {
                     Ok(new_token) => {
-                        let md = vec![(STATE_KEY.to_string(), new_token)];
-                        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                        let md = Metadata::from([(STATE_KEY.to_string(), new_token)]);
+                        let _ = sw.write(
+                            &empty_batch(output_schema.as_ref())
+                                .unwrap()
+                                .with_custom_metadata(md.clone()),
+                        );
                     }
                     Err(err) => {
                         let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-                        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                        let _ = sw.write(
+                            &empty_batch(output_schema.as_ref())
+                                .unwrap()
+                                .with_custom_metadata(md.clone()),
+                        );
                     }
                 }
             }
@@ -1531,7 +1899,11 @@ async fn handle_stream_exchange(
             Err(e) => {
                 let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
                 let md = build_error_metadata(&e, &server.server_id, &req.request_id);
-                let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                let _ = sw.write(
+                    &empty_batch(output_schema.as_ref())
+                        .unwrap()
+                        .with_custom_metadata(md.clone()),
+                );
                 let _ = sw.finish();
                 drop(sw);
                 return arrow_response(StatusCode::OK, body_buf);
@@ -1550,11 +1922,19 @@ async fn handle_stream_exchange(
         let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
         for log in ctx.drain_logs() {
             let md = build_log_metadata(&log, &server.server_id, &req.request_id);
-            let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+            let _ = sw.write(
+                &empty_batch(output_schema.as_ref())
+                    .unwrap()
+                    .with_custom_metadata(md.clone()),
+            );
         }
         if let Err(err) = res {
             let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-            let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+            let _ = sw.write(
+                &empty_batch(output_schema.as_ref())
+                    .unwrap()
+                    .with_custom_metadata(md.clone()),
+            );
         } else {
             let new_token = match build_continuation_token(
                 &state,
@@ -1567,7 +1947,11 @@ async fn handle_stream_exchange(
                 Ok(t) => t,
                 Err(err) => {
                     let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-                    let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                    let _ = sw.write(
+                        &empty_batch(output_schema.as_ref())
+                            .unwrap()
+                            .with_custom_metadata(md.clone()),
+                    );
                     let _ = sw.finish();
                     drop(sw);
                     return arrow_response(StatusCode::OK, body_buf);
@@ -1578,19 +1962,27 @@ async fn handle_stream_exchange(
                 match item {
                     Emitted::Log(log) => {
                         let md = build_log_metadata(&log, &server.server_id, &req.request_id);
-                        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                        let _ = sw.write(
+                            &empty_batch(output_schema.as_ref())
+                                .unwrap()
+                                .with_custom_metadata(md.clone()),
+                        );
                     }
                     Emitted::Batch { batch, metadata } => {
                         let mut md = metadata.unwrap_or_default();
-                        md.push((STATE_KEY.to_string(), new_token.clone()));
-                        let _ = sw.write(&batch, Some(&md));
+                        md.insert(STATE_KEY.to_string(), new_token.clone());
+                        let _ = sw.write(&batch.clone().with_custom_metadata(md.clone()));
                         wrote_data = true;
                     }
                 }
             }
             if !wrote_data {
-                let md = vec![(STATE_KEY.to_string(), new_token)];
-                let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                let md = Metadata::from([(STATE_KEY.to_string(), new_token)]);
+                let _ = sw.write(
+                    &empty_batch(output_schema.as_ref())
+                        .unwrap()
+                        .with_custom_metadata(md.clone()),
+                );
             }
         }
         let _ = sw.finish();
@@ -1601,10 +1993,11 @@ async fn handle_stream_exchange(
 
 fn read_input_batch(body: &[u8]) -> Result<(RecordBatch, Metadata)> {
     let mut r = StreamReader::new(body)?;
-    let ReadBatch { batch, metadata } = r
+    let batch = r
         .read_next()?
         .ok_or_else(|| RpcError::runtime_error("no batch in exchange request"))?;
     r.drain()?;
+    let metadata = batch.custom_metadata().clone();
     Ok((batch, metadata))
 }
 

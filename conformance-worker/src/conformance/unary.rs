@@ -9,9 +9,16 @@
 
 use std::sync::Arc;
 
-use vgi_rpc::{service, Bytes, CallContext, LogLevel, LogMessage, Result, RpcError, RpcServer};
+use vgi_rpc::{
+    service, Bytes, CallContext, Decimal20_4, DictString, FixedBinary, LargeBytes, LargeString,
+    LogLevel, LogMessage, Result, RpcError, RpcServer, UtcTimestamp,
+};
 
 use super::types;
+use super::wide_types::{
+    dataclass_deserialize_ipc, dataclass_serialize_ipc, ContainerWideTypes, DeepNested,
+    EmbeddedArrow, WideTypes,
+};
 
 /// Stateless service handle.
 pub struct UnarySvc;
@@ -64,6 +71,104 @@ impl UnarySvc {
     fn void_with_param(&self, value: i64) -> Result<()> {
         let _ = value;
         Ok(())
+    }
+
+    // --- Wide Arrow primitives ---
+
+    /// Echo an int8 value.
+    #[unary]
+    fn echo_int8(&self, value: i8) -> Result<i8> {
+        Ok(value)
+    }
+
+    /// Echo an int16 value.
+    #[unary]
+    fn echo_int16(&self, value: i16) -> Result<i16> {
+        Ok(value)
+    }
+
+    /// Echo a uint8 value.
+    #[unary]
+    fn echo_uint8(&self, value: u8) -> Result<u8> {
+        Ok(value)
+    }
+
+    /// Echo a uint16 value.
+    #[unary]
+    fn echo_uint16(&self, value: u16) -> Result<u16> {
+        Ok(value)
+    }
+
+    /// Echo a uint32 value.
+    #[unary]
+    fn echo_uint32(&self, value: u32) -> Result<u32> {
+        Ok(value)
+    }
+
+    /// Echo a uint64 value.
+    #[unary]
+    fn echo_uint64(&self, value: u64) -> Result<u64> {
+        Ok(value)
+    }
+
+    /// Echo a date value.
+    #[unary]
+    fn echo_date(&self, value: chrono::NaiveDate) -> Result<chrono::NaiveDate> {
+        Ok(value)
+    }
+
+    /// Echo a naive timestamp.
+    #[unary]
+    fn echo_timestamp(&self, value: chrono::NaiveDateTime) -> Result<chrono::NaiveDateTime> {
+        Ok(value)
+    }
+
+    /// Echo a UTC timestamp.
+    #[unary]
+    fn echo_timestamp_utc(&self, value: UtcTimestamp) -> Result<UtcTimestamp> {
+        Ok(value)
+    }
+
+    /// Echo a time-of-day value.
+    #[unary]
+    fn echo_time(&self, value: chrono::NaiveTime) -> Result<chrono::NaiveTime> {
+        Ok(value)
+    }
+
+    /// Echo a duration.
+    #[unary]
+    fn echo_duration(&self, value: chrono::Duration) -> Result<chrono::Duration> {
+        Ok(value)
+    }
+
+    /// Echo a decimal value (precision 20, scale 4 — matches the conformance schema).
+    #[unary]
+    fn echo_decimal(&self, value: Decimal20_4) -> Result<Decimal20_4> {
+        Ok(value)
+    }
+
+    /// Echo a large_string value.
+    #[unary]
+    fn echo_large_string(&self, value: LargeString) -> Result<LargeString> {
+        Ok(value)
+    }
+
+    /// Echo a large_binary value.
+    #[unary]
+    fn echo_large_binary(&self, value: LargeBytes) -> Result<LargeBytes> {
+        Ok(value)
+    }
+
+    /// Echo a fixed_size_binary(8) value.
+    #[unary]
+    fn echo_fixed_binary(&self, value: FixedBinary<8>) -> Result<FixedBinary<8>> {
+        Ok(value)
+    }
+
+    /// Echo a dictionary-encoded string.
+    #[unary]
+    fn echo_dict_encoded_string(&self, value: DictString) -> Result<DictString> {
+        Ok(value)
     }
 
     // --- Complex type echo ---
@@ -137,6 +242,38 @@ impl UnarySvc {
     fn echo_bounding_box(&self, r#box: Bytes) -> Result<Bytes> {
         let (tl, br, label) = types::deserialize_bounding_box_ipc(&r#box.0)?;
         Ok(Bytes(types::serialize_bounding_box_ipc(&tl, &br, &label)?))
+    }
+
+    /// Echo a WideTypes dataclass exercising every wide-Arrow primitive.
+    #[unary]
+    #[param(name = "data", arrow_type = "WideTypes")]
+    fn echo_wide_types(&self, data: Bytes) -> Result<Bytes> {
+        let w: WideTypes = dataclass_deserialize_ipc(&data.0)?;
+        Ok(Bytes(dataclass_serialize_ipc(w)?))
+    }
+
+    /// Echo a ContainerWideTypes dataclass (wide types inside list/dict/optional).
+    #[unary]
+    #[param(name = "data", arrow_type = "ContainerWideTypes")]
+    fn echo_container_wide_types(&self, data: Bytes) -> Result<Bytes> {
+        let c: ContainerWideTypes = dataclass_deserialize_ipc(&data.0)?;
+        Ok(Bytes(dataclass_serialize_ipc(c)?))
+    }
+
+    /// Echo a DeepNested dataclass (deep container nesting + dict-encoded strings).
+    #[unary]
+    #[param(name = "data", arrow_type = "DeepNested")]
+    fn echo_deep_nested(&self, data: Bytes) -> Result<Bytes> {
+        let d: DeepNested = dataclass_deserialize_ipc(&data.0)?;
+        Ok(Bytes(dataclass_serialize_ipc(d)?))
+    }
+
+    /// Echo an EmbeddedArrow dataclass (RecordBatch + Schema as nested IPC bytes).
+    #[unary]
+    #[param(name = "data", arrow_type = "EmbeddedArrow")]
+    fn echo_embedded_arrow(&self, data: Bytes) -> Result<Bytes> {
+        let e: EmbeddedArrow = dataclass_deserialize_ipc(&data.0)?;
+        Ok(Bytes(dataclass_serialize_ipc(e)?))
     }
 
     /// Accept a Point param (`pa.binary()` on wire), return formatted string.
@@ -246,6 +383,21 @@ impl UnarySvc {
             .with_extra("source", "conformance")
             .with_extra("detail", &value);
         ctx.client_log_with(msg);
+        Ok(value)
+    }
+
+    /// Echo value, emitting one log per non-EXCEPTION level (TRACE..ERROR).
+    #[unary]
+    fn echo_with_all_log_levels(&self, ctx: &CallContext, value: String) -> Result<String> {
+        for (level, label) in [
+            (LogLevel::Trace, "trace"),
+            (LogLevel::Debug, "debug"),
+            (LogLevel::Info, "info"),
+            (LogLevel::Warn, "warn"),
+            (LogLevel::Error, "error"),
+        ] {
+            ctx.client_log(level, format!("{label}: {value}"));
+        }
         Ok(value)
     }
 

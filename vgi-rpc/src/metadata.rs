@@ -35,10 +35,10 @@ pub fn md_entry(k: &str, v: impl Into<String>) -> (String, String) {
     (k.to_string(), v.into())
 }
 
-/// Fluent builder for a `Metadata` list.
+/// Fluent builder for a `Metadata` map.
 #[derive(Default, Debug)]
 pub struct MetadataBuilder {
-    entries: Vec<(String, String)>,
+    entries: std::collections::HashMap<String, String>,
 }
 
 impl MetadataBuilder {
@@ -46,17 +46,17 @@ impl MetadataBuilder {
         Self::default()
     }
 
-    /// Push `(k, v)`.
+    /// Insert `(k, v)`.
     pub fn push(mut self, k: &str, v: impl Into<String>) -> Self {
-        self.entries.push((k.to_string(), v.into()));
+        self.entries.insert(k.to_string(), v.into());
         self
     }
 
-    /// Push `(k, v)` only when `v` is non-empty.
+    /// Insert `(k, v)` only when `v` is non-empty.
     pub fn push_if_non_empty(mut self, k: &str, v: impl Into<String>) -> Self {
         let s = v.into();
         if !s.is_empty() {
-            self.entries.push((k.to_string(), s));
+            self.entries.insert(k.to_string(), s);
         }
         self
     }
@@ -70,7 +70,7 @@ impl MetadataBuilder {
         self
     }
 
-    pub fn build(self) -> Vec<(String, String)> {
+    pub fn build(self) -> std::collections::HashMap<String, String> {
         self.entries
     }
 }

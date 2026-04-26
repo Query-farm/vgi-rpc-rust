@@ -78,14 +78,15 @@ fn body_one<T: VgiArrow>(method: &str, name: &str, value: T) -> Vec<u8> {
         T::nullable(),
     )]));
     let batch = RecordBatch::try_new(schema.clone(), vec![arr]).unwrap();
-    let md = vec![
+    let md = std::collections::HashMap::<String, String>::from([
         (RPC_METHOD_KEY.to_string(), method.to_string()),
         (REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string()),
-    ];
+    ]);
     let mut buf = Vec::new();
     {
         let mut w = StreamWriter::new(&mut buf, schema.as_ref()).unwrap();
-        w.write(&batch, Some(&md)).unwrap();
+        w.write(&batch.clone().with_custom_metadata(md.clone()))
+            .unwrap();
         w.finish().unwrap();
     }
     buf
@@ -115,7 +116,6 @@ async fn async_unary_round_trips() {
     let mut r = StreamReader::new(resp.as_ref()).unwrap();
     let rb = r.read_next().unwrap().expect("response batch");
     let col = rb
-        .batch
         .column_by_name("result")
         .unwrap()
         .as_any()
@@ -132,13 +132,8 @@ async fn async_producer_emits_first_batch() {
     let mut r = StreamReader::new(resp.as_ref()).unwrap();
     let mut data: Vec<i64> = Vec::new();
     while let Some(rb) = r.read_next().unwrap() {
-        if rb.batch.num_rows() > 0 {
-            let col = rb
-                .batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+        if rb.num_rows() > 0 {
+            let col = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
             for i in 0..col.len() {
                 data.push(col.value(i));
             }

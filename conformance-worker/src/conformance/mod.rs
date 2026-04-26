@@ -12,6 +12,7 @@ mod params;
 mod streams;
 mod types;
 mod unary;
+mod wide_types;
 
 use std::sync::Arc;
 
@@ -19,11 +20,23 @@ use vgi_rpc::RpcServer;
 
 /// Build an `RpcServer` with all conformance methods registered.
 pub fn build_server() -> RpcServer {
+    build_server_with_external(None)
+}
+
+/// Build an `RpcServer` with all conformance methods registered, optionally
+/// wired to an external-location config (used by `TestExternalLocation`).
+pub fn build_server_with_external(
+    external: Option<vgi_rpc::external::ExternalLocationConfig>,
+) -> RpcServer {
     let mut builder = RpcServer::builder()
         .server_id("rust-conf-0001")
         .protocol_name("ConformanceService")
         .server_version("rust-conformance-0.2.0")
         .enable_describe(true);
+
+    if let Some(cfg) = external {
+        builder = builder.with_external_location(cfg);
+    }
 
     // When VGI_ACCESS_LOG is set, emit JSON-per-call access records to that
     // file. Used for manual validation against vgi_rpc.access_log_conformance.

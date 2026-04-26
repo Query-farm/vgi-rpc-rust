@@ -88,7 +88,9 @@ impl OtelHook {
     /// Extract `traceparent` + `tracestate` headers/metadata keys so
     /// callers can propagate them when constructing downstream spans.
     /// Returns `(traceparent, tracestate)`.
-    pub fn extract_w3c_context(metadata: &[(String, String)]) -> (Option<String>, Option<String>) {
+    pub fn extract_w3c_context(
+        metadata: &std::collections::HashMap<String, String>,
+    ) -> (Option<String>, Option<String>) {
         let mut tp = None;
         let mut ts = None;
         for (k, v) in metadata {
@@ -186,7 +188,10 @@ mod tests {
             method_type: "unary",
             server_id: "srv".into(),
             request_id: String::new(),
-            transport_metadata: Arc::new(vec![("traceparent".into(), "00-aaaa-bbbb-01".into())]),
+            transport_metadata: Arc::new(std::collections::HashMap::from([(
+                "traceparent".into(),
+                "00-aaaa-bbbb-01".into(),
+            )])),
             principal: String::new(),
             auth_domain: String::new(),
             authenticated: false,
@@ -214,10 +219,10 @@ mod tests {
 
     #[test]
     fn extracts_traceparent() {
-        let md = vec![
-            ("Traceparent".into(), "00-xxxx-01".into()),
-            ("Tracestate".into(), "vendor=yyyy".into()),
-        ];
+        let md = std::collections::HashMap::from([
+            ("Traceparent".to_string(), "00-xxxx-01".to_string()),
+            ("Tracestate".to_string(), "vendor=yyyy".to_string()),
+        ]);
         let (tp, ts) = OtelHook::extract_w3c_context(&md);
         assert_eq!(tp.as_deref(), Some("00-xxxx-01"));
         assert_eq!(ts.as_deref(), Some("vendor=yyyy"));

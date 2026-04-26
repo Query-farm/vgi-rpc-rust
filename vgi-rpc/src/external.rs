@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use crate::errors::{Result, RpcError};
 use crate::metadata::{LOCATION_FETCH_MS_KEY, LOCATION_KEY, LOCATION_SHA256_KEY};
 use crate::wire::{bytes_to_hex, empty_batch, md_get, write_one_batch, Metadata, StreamReader};
+use std::collections::HashMap;
 
 /// Optional body compression for externalized payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +53,27 @@ pub struct UploadResult {
 /// thread pool.
 pub trait ExternalStorage: Send + Sync {
     fn upload(&self, ipc_bytes: &[u8], compression: Compression) -> Result<UploadResult>;
+}
+
+/// Pre-signed URL pair for client-side data upload.
+///
+/// `expires_at` is a Unix-epoch microseconds timestamp (UTC). Mirrors
+/// `vgi_rpc.external.UploadUrl`.
+#[derive(Clone, Debug)]
+pub struct UploadUrl {
+    pub upload_url: String,
+    pub download_url: String,
+    /// Expiration time as microseconds since the Unix epoch (UTC).
+    pub expires_at_micros: i64,
+}
+
+/// Generates pre-signed upload URL pairs for client-vended uploads.
+///
+/// Mirror of Python `vgi_rpc.external.UploadUrlProvider`. Implementations
+/// must be thread-safe — `generate_upload_url()` may be called concurrently
+/// from different request handlers.
+pub trait UploadUrlProvider: Send + Sync {
+    fn generate_upload_url(&self) -> Result<UploadUrl>;
 }
 
 /// Callback verifying an external location URL. Called on both the
@@ -148,16 +170,19 @@ impl ExternalLocationConfig {
 
 /// Serialize one record batch as a complete IPC stream (schema + batch + EOS).
 pub fn serialize_batch_to_ipc(batch: &RecordBatch) -> Result<Vec<u8>> {
-    write_one_batch(batch, None)
+    // Strip any custom metadata: external payloads carry the raw data
+    // only; the pointer batch on the outside owns the metadata.
+    let stripped = batch.clone().with_custom_metadata(HashMap::new());
+    write_one_batch(&stripped)
 }
 
 /// Read back an IPC stream containing a single batch.
 pub fn deserialize_single_batch(ipc_bytes: &[u8]) -> Result<RecordBatch> {
     let mut r = StreamReader::new(ipc_bytes)?;
-    let rb = r
+    let batch = r
         .read_next()?
         .ok_or_else(|| RpcError::runtime_error("external batch stream is empty"))?;
-    Ok(rb.batch)
+    Ok(batch)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -167,8 +192,18 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn compress(ipc_bytes: &[u8], compression: Compression) -> Result<Vec<u8>> {
     match compression {
         Compression::None => Ok(ipc_bytes.to_vec()),
-        Compression::Zstd(level) => zstd::encode_all(std::io::Cursor::new(ipc_bytes), level)
-            .map_err(|e| RpcError::runtime_error(format!("zstd encode: {e}"))),
+        Compression::Zstd(level) => {
+            // Use the bulk API and explicitly include the decompressed
+            // size in the frame header. Python's `zstandard.ZstdDecompressor`
+            // requires `Content-Size` to be present when decompressing
+            // a single frame in one shot.
+            let mut enc = zstd::bulk::Compressor::new(level)
+                .map_err(|e| RpcError::runtime_error(format!("zstd encoder: {e}")))?;
+            enc.set_parameter(zstd::stream::raw::CParameter::ContentSizeFlag(true))
+                .map_err(|e| RpcError::runtime_error(format!("zstd contentsize: {e}")))?;
+            enc.compress(ipc_bytes)
+                .map_err(|e| RpcError::runtime_error(format!("zstd encode: {e}")))
+        }
     }
 }
 
@@ -217,11 +252,16 @@ pub fn maybe_externalize_batch(
 
     // Build pointer metadata, merging the caller-supplied metadata first.
     let mut md: Metadata = inline_metadata.cloned().unwrap_or_default();
-    md.retain(|(k, _)| k != LOCATION_KEY && k != LOCATION_SHA256_KEY && k != LOCATION_FETCH_MS_KEY);
-    md.push((LOCATION_KEY.to_string(), upload.url));
-    md.push((LOCATION_SHA256_KEY.to_string(), sha));
+    md.remove(LOCATION_KEY);
+    md.remove(LOCATION_SHA256_KEY);
+    md.remove(LOCATION_FETCH_MS_KEY);
+    md.insert(LOCATION_KEY.to_string(), upload.url);
+    md.insert(LOCATION_SHA256_KEY.to_string(), sha);
 
-    let ptr = empty_batch(&Schema::empty())?;
+    // Pointer batch: zero-row but matching the input batch's schema,
+    // matching Python's `make_external_location_batch` shape so the
+    // client's IPC reader sees a consistent column count.
+    let ptr = empty_batch(batch.schema().as_ref())?;
     Ok(Some((ptr, md)))
 }
 
@@ -266,14 +306,14 @@ pub fn resolve_external_location(
     let mut user_md: Metadata = metadata
         .iter()
         .filter(|(k, _)| {
-            k != LOCATION_KEY && k != LOCATION_SHA256_KEY && k != LOCATION_FETCH_MS_KEY
+            *k != LOCATION_KEY && *k != LOCATION_SHA256_KEY && *k != LOCATION_FETCH_MS_KEY
         })
-        .cloned()
+        .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    user_md.push((
+    user_md.insert(
         LOCATION_FETCH_MS_KEY.to_string(),
         format!("{:.2}", fetch_ms),
-    ));
+    );
     Ok((resolved, user_md))
 }
 
@@ -388,7 +428,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ptr.num_rows(), 0);
-        assert_eq!(ptr.schema().fields().len(), 0);
+        // Pointer batch carries the original schema (zero-row); cross-language
+        // clients expect the column count to match the result schema.
+        assert_eq!(ptr.schema().fields().len(), batch.schema().fields().len());
         assert!(md_get(&md, LOCATION_KEY).unwrap().starts_with("https://"));
         assert_eq!(storage.len(), 1);
 
@@ -418,7 +460,8 @@ mod tests {
         let cfg = ExternalLocationConfig::new(s, f).with_threshold_bytes(0);
         // In-memory URL is https, so build a forged metadata entry.
         let batch = big_batch(1);
-        let bogus_md = vec![("vgi_rpc.location".into(), "http://not-secure/x".into())];
+        let mut bogus_md = Metadata::new();
+        bogus_md.insert("vgi_rpc.location".into(), "http://not-secure/x".into());
         let err = resolve_external_location(&batch, &bogus_md, &cfg).unwrap_err();
         assert!(err.message.contains("https://"));
     }
@@ -432,10 +475,8 @@ mod tests {
             .unwrap()
             .unwrap();
         // Corrupt the recorded hash.
-        for (k, v) in md.iter_mut() {
-            if k == LOCATION_SHA256_KEY {
-                *v = "deadbeef".into();
-            }
+        if let Some(v) = md.get_mut(LOCATION_SHA256_KEY) {
+            *v = "deadbeef".into();
         }
         let err = resolve_external_location(&ptr, &md, &cfg).unwrap_err();
         assert!(err.message.contains("SHA-256 mismatch"));

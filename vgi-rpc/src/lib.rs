@@ -34,7 +34,9 @@ pub mod wire;
 pub mod http;
 
 pub use access_log::AccessLogHook;
-pub use arrow_type::{Bytes, VgiArrow};
+pub use arrow_type::{
+    Bytes, Decimal20_4, DictString, FixedBinary, LargeBytes, LargeString, UtcTimestamp, VgiArrow,
+};
 
 pub use auth::{chain_all, chain_authenticate, AuthContext, AuthRequest, AuthResult, Authenticate};
 pub use errors::{Result, RpcError};

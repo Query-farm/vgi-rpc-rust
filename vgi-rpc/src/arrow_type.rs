@@ -15,8 +15,10 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    builder::BinaryBuilder, Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array,
-    Int32Array, Int64Array, ListArray, MapArray, StringArray,
+    builder::BinaryBuilder, Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
+    LargeStringArray, ListArray, MapArray, StringArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
 };
 use arrow_schema::{DataType, Field};
 
@@ -145,6 +147,34 @@ impl VgiArrow for i32 {
     }
 }
 
+// Smaller / unsigned integer widths. Python's `Annotated[int, ArrowType(pa.int8())]`
+// shows up on the wire as `Int8` etc.; we expose them as the matching
+// Rust primitive so user signatures are natural.
+macro_rules! impl_int_vgi {
+    ($t:ty, $arr:ty, $dt:expr) => {
+        impl VgiArrow for $t {
+            fn arrow_data_type() -> DataType {
+                $dt
+            }
+            fn describe_name() -> String {
+                "int".into()
+            }
+            fn read(arr: &dyn Array, idx: usize) -> Result<Self> {
+                Ok(as_array::<$arr>(arr, stringify!($t))?.value(idx))
+            }
+            fn build_singleton(value: Self) -> Result<ArrayRef> {
+                Ok(Arc::new(<$arr>::from(vec![value])))
+            }
+        }
+    };
+}
+impl_int_vgi!(i8, Int8Array, DataType::Int8);
+impl_int_vgi!(i16, Int16Array, DataType::Int16);
+impl_int_vgi!(u8, UInt8Array, DataType::UInt8);
+impl_int_vgi!(u16, UInt16Array, DataType::UInt16);
+impl_int_vgi!(u32, UInt32Array, DataType::UInt32);
+impl_int_vgi!(u64, UInt64Array, DataType::UInt64);
+
 impl VgiArrow for f64 {
     fn arrow_data_type() -> DataType {
         DataType::Float64
@@ -244,6 +274,317 @@ impl VgiArrow for Bytes {
         let mut b = BinaryBuilder::new();
         b.append_value(value.0);
         Ok(Arc::new(b.finish()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wide-binary / wide-string newtypes.
+// ---------------------------------------------------------------------------
+
+/// `LargeUtf8` (64-bit-offset string array) wire type. Stored as a
+/// regular `String` in user code; the wrapper just tags the wire shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LargeString(pub String);
+
+impl From<String> for LargeString {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+impl From<LargeString> for String {
+    fn from(s: LargeString) -> Self {
+        s.0
+    }
+}
+
+impl VgiArrow for LargeString {
+    fn arrow_data_type() -> DataType {
+        DataType::LargeUtf8
+    }
+    fn describe_name() -> String {
+        "str".into()
+    }
+    fn read(arr: &dyn Array, idx: usize) -> Result<Self> {
+        Ok(LargeString(
+            as_array::<LargeStringArray>(arr, "LargeUtf8")?
+                .value(idx)
+                .to_string(),
+        ))
+    }
+    fn build_singleton(value: Self) -> Result<ArrayRef> {
+        Ok(Arc::new(LargeStringArray::from(vec![value.0])))
+    }
+}
+
+/// `LargeBinary` wire type. See [`LargeString`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LargeBytes(pub Vec<u8>);
+
+impl From<Vec<u8>> for LargeBytes {
+    fn from(v: Vec<u8>) -> Self {
+        Self(v)
+    }
+}
+impl From<LargeBytes> for Vec<u8> {
+    fn from(b: LargeBytes) -> Self {
+        b.0
+    }
+}
+
+impl VgiArrow for LargeBytes {
+    fn arrow_data_type() -> DataType {
+        DataType::LargeBinary
+    }
+    fn describe_name() -> String {
+        "bytes".into()
+    }
+    fn read(arr: &dyn Array, idx: usize) -> Result<Self> {
+        Ok(LargeBytes(
+            as_array::<LargeBinaryArray>(arr, "LargeBinary")?
+                .value(idx)
+                .to_vec(),
+        ))
+    }
+    fn build_singleton(value: Self) -> Result<ArrayRef> {
+        let arr = LargeBinaryArray::from_iter_values([value.0.as_slice()]);
+        Ok(Arc::new(arr))
+    }
+}
+
+/// `FixedSizeBinary(N)` wire type carried as `[u8; N]`. The const
+/// generic encodes the width so the schema is fully determined.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixedBinary<const N: usize>(pub [u8; N]);
+
+impl<const N: usize> From<[u8; N]> for FixedBinary<N> {
+    fn from(b: [u8; N]) -> Self {
+        Self(b)
+    }
+}
+
+impl<const N: usize> VgiArrow for FixedBinary<N> {
+    fn arrow_data_type() -> DataType {
+        DataType::FixedSizeBinary(N as i32)
+    }
+    fn describe_name() -> String {
+        "bytes".into()
+    }
+    fn read(arr: &dyn Array, idx: usize) -> Result<Self> {
+        let a = as_array::<FixedSizeBinaryArray>(arr, "FixedSizeBinary")?;
+        let raw = a.value(idx);
+        if raw.len() != N {
+            return Err(RpcError::type_error(format!(
+                "FixedSizeBinary width mismatch: expected {N}, got {}",
+                raw.len()
+            )));
+        }
+        let mut out = [0u8; N];
+        out.copy_from_slice(raw);
+        Ok(FixedBinary(out))
+    }
+    fn build_singleton(value: Self) -> Result<ArrayRef> {
+        let arr = FixedSizeBinaryArray::try_from_iter([value.0.as_slice()].into_iter())
+            .map_err(RpcError::from)?;
+        Ok(Arc::new(arr))
+    }
+}
+
+/// Dictionary-encoded `Utf8` (`Dictionary(Int16, Utf8)`) wire type.
+/// On the user-facing side it's just a `String`; the newtype controls
+/// the schema choice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DictString(pub String);
+
+impl From<String> for DictString {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+impl From<DictString> for String {
+    fn from(s: DictString) -> Self {
+        s.0
+    }
+}
+
+impl VgiArrow for DictString {
+    fn arrow_data_type() -> DataType {
+        DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8))
+    }
+    fn describe_name() -> String {
+        "str".into()
+    }
+    fn read(arr: &dyn Array, idx: usize) -> Result<Self> {
+        // Reuse the `String` reader which already accepts both plain
+        // Utf8 and DictionaryArray<Int16|Int32, Utf8>.
+        Ok(DictString(<String as VgiArrow>::read(arr, idx)?))
+    }
+    fn build_singleton(value: Self) -> Result<ArrayRef> {
+        use arrow_array::builder::StringDictionaryBuilder;
+        use arrow_array::types::Int16Type;
+        let mut b = StringDictionaryBuilder::<Int16Type>::new();
+        b.append_value(&value.0);
+        Ok(Arc::new(b.finish()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Date / time / duration / decimal — chrono + rust_decimal backed.
+// ---------------------------------------------------------------------------
+
+use arrow_array::{
+    Date32Array, Decimal128Array, DurationMicrosecondArray, Time64MicrosecondArray,
+    TimestampMicrosecondArray,
+};
+
+const DATE32_EPOCH: chrono::NaiveDate = match chrono::NaiveDate::from_ymd_opt(1970, 1, 1) {
+    Some(d) => d,
+    None => panic!("epoch"),
+};
+
+impl VgiArrow for chrono::NaiveDate {
+    fn arrow_data_type() -> DataType {
+        DataType::Date32
+    }
+    fn describe_name() -> String {
+        "date".into()
+    }
+    fn read(arr: &dyn Array, idx: usize) -> Result<Self> {
+        let days = as_array::<Date32Array>(arr, "Date32")?.value(idx);
+        DATE32_EPOCH
+            .checked_add_signed(chrono::Duration::days(days as i64))
+            .ok_or_else(|| RpcError::value_error("date32 out of range"))
+    }
+    fn build_singleton(value: Self) -> Result<ArrayRef> {
+        let days = (value - DATE32_EPOCH).num_days() as i32;
+        Ok(Arc::new(Date32Array::from(vec![days])))
+    }
+}
+
+impl VgiArrow for chrono::NaiveDateTime {
+    fn arrow_data_type() -> DataType {
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+    }
+    fn describe_name() -> String {
+        "datetime".into()
+    }
+    fn read(arr: &dyn Array, idx: usize) -> Result<Self> {
+        let micros = as_array::<TimestampMicrosecondArray>(arr, "Timestamp(us)")?.value(idx);
+        chrono::DateTime::from_timestamp_micros(micros)
+            .map(|dt| dt.naive_utc())
+            .ok_or_else(|| RpcError::value_error("timestamp out of range"))
+    }
+    fn build_singleton(value: Self) -> Result<ArrayRef> {
+        let micros = value.and_utc().timestamp_micros();
+        Ok(Arc::new(TimestampMicrosecondArray::from(vec![micros])))
+    }
+}
+
+/// UTC-tagged timestamp wire type (`Timestamp(us, tz="UTC")`). User
+/// holds a `chrono::DateTime<Utc>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UtcTimestamp(pub chrono::DateTime<chrono::Utc>);
+
+impl From<chrono::DateTime<chrono::Utc>> for UtcTimestamp {
+    fn from(d: chrono::DateTime<chrono::Utc>) -> Self {
+        Self(d)
+    }
+}
+
+impl VgiArrow for UtcTimestamp {
+    fn arrow_data_type() -> DataType {
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
+    }
+    fn describe_name() -> String {
+        "datetime".into()
+    }
+    fn read(arr: &dyn Array, idx: usize) -> Result<Self> {
+        let micros = as_array::<TimestampMicrosecondArray>(arr, "Timestamp(us, UTC)")?.value(idx);
+        chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros)
+            .map(UtcTimestamp)
+            .ok_or_else(|| RpcError::value_error("UTC timestamp out of range"))
+    }
+    fn build_singleton(value: Self) -> Result<ArrayRef> {
+        let micros = value.0.timestamp_micros();
+        let arr = TimestampMicrosecondArray::from(vec![micros]).with_timezone("UTC");
+        Ok(Arc::new(arr))
+    }
+}
+
+impl VgiArrow for chrono::NaiveTime {
+    fn arrow_data_type() -> DataType {
+        DataType::Time64(arrow_schema::TimeUnit::Microsecond)
+    }
+    fn describe_name() -> String {
+        "time".into()
+    }
+    fn read(arr: &dyn Array, idx: usize) -> Result<Self> {
+        let micros = as_array::<Time64MicrosecondArray>(arr, "Time64(us)")?.value(idx);
+        let secs = (micros / 1_000_000) as u32;
+        let nanos = ((micros % 1_000_000) * 1_000) as u32;
+        chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
+            .ok_or_else(|| RpcError::value_error("time-of-day out of range"))
+    }
+    fn build_singleton(value: Self) -> Result<ArrayRef> {
+        use chrono::Timelike;
+        let micros = (value.num_seconds_from_midnight() as i64) * 1_000_000
+            + (value.nanosecond() as i64) / 1_000;
+        Ok(Arc::new(Time64MicrosecondArray::from(vec![micros])))
+    }
+}
+
+impl VgiArrow for chrono::Duration {
+    fn arrow_data_type() -> DataType {
+        DataType::Duration(arrow_schema::TimeUnit::Microsecond)
+    }
+    fn describe_name() -> String {
+        "duration".into()
+    }
+    fn read(arr: &dyn Array, idx: usize) -> Result<Self> {
+        let micros = as_array::<DurationMicrosecondArray>(arr, "Duration(us)")?.value(idx);
+        Ok(chrono::Duration::microseconds(micros))
+    }
+    fn build_singleton(value: Self) -> Result<ArrayRef> {
+        let micros = value.num_microseconds().ok_or_else(|| {
+            RpcError::value_error("duration overflows microsecond representation")
+        })?;
+        Ok(Arc::new(DurationMicrosecondArray::from(vec![micros])))
+    }
+}
+
+/// Decimal128 with precision 20, scale 4 — matches the conformance
+/// schema. Other (precision, scale) combinations use additional
+/// newtypes if needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Decimal20_4(pub rust_decimal::Decimal);
+
+impl From<rust_decimal::Decimal> for Decimal20_4 {
+    fn from(d: rust_decimal::Decimal) -> Self {
+        Self(d)
+    }
+}
+
+impl VgiArrow for Decimal20_4 {
+    fn arrow_data_type() -> DataType {
+        DataType::Decimal128(20, 4)
+    }
+    fn describe_name() -> String {
+        "Decimal".into()
+    }
+    fn read(arr: &dyn Array, idx: usize) -> Result<Self> {
+        let raw = as_array::<Decimal128Array>(arr, "Decimal128")?.value(idx);
+        // Decimal128 carries the unscaled integer; scale is in the type.
+        let mut d = rust_decimal::Decimal::from_i128_with_scale(raw, 4);
+        d.normalize_assign();
+        Ok(Decimal20_4(d))
+    }
+    fn build_singleton(value: Self) -> Result<ArrayRef> {
+        let mut d = value.0;
+        d.rescale(4);
+        let raw = d.mantissa();
+        let arr = Decimal128Array::from(vec![raw])
+            .with_precision_and_scale(20, 4)
+            .map_err(RpcError::from)?;
+        Ok(Arc::new(arr))
     }
 }
 

@@ -6,15 +6,16 @@
 //! SIGTERM / SIGINT trigger graceful shutdown of HTTP and unix listeners.
 
 mod conformance;
+mod fake_storage;
 
 use std::io::{self, Write};
 use std::sync::Arc;
 
 fn main() {
-    let server = Arc::new(conformance::build_server());
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() > 1 && args[1] == "--http" {
+        let server = Arc::new(conformance::build_server());
         run_http(server, false);
         return;
     }
@@ -24,22 +25,68 @@ fn main() {
         // callback, used by the conformance suite's TestHealth to
         // assert that `/health` bypasses auth while RPC endpoints
         // return 401.
+        let server = Arc::new(conformance::build_server());
         run_http(server, true);
         return;
     }
 
+    // `--http-with-storage <base_url> [--zstd] [--externalize-threshold N]
+    //  [--max-request-bytes N]` wires the conformance worker against the
+    // external-location feature for the upstream TestExternalLocation suite,
+    // and (with threshold=1, max-request-bytes=1MiB) the
+    // ``http_externalize_always`` transport variant that re-runs the entire
+    // conformance suite forcing every non-empty response batch to externalize.
+    // `<base_url>` is the `vgi_rpc.conformance.fake_storage` HTTP service.
+    if args.len() > 2 && args[1] == "--http-with-storage" {
+        let storage_url = args[2].clone();
+        let zstd = args.iter().any(|a| a == "--zstd");
+        let threshold = parse_usize_flag(&args, "--externalize-threshold").unwrap_or(16 * 1024);
+        // Inline-request cap is independent of the externalize threshold so
+        // the ``externalize-always`` mode (threshold=1, cap=1MiB) keeps
+        // normal-sized request bodies flowing inline. Defaults to 4096 to
+        // preserve the previous fixed cap for the existing storage tests.
+        let max_req = parse_usize_flag(&args, "--max-request-bytes").unwrap_or(4096);
+        run_http_with_storage(&storage_url, zstd, threshold, max_req);
+        return;
+    }
+
     if args.len() > 2 && args[1] == "--unix" {
+        let server = Arc::new(conformance::build_server());
         run_unix(server, &args[2]);
         return;
     }
 
     // Default: stdio.
+    let server = Arc::new(conformance::build_server());
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut r = stdin.lock();
     let mut w = stdout.lock();
     server.serve(&mut r, &mut w);
     let _ = w.flush();
+}
+
+#[allow(dead_code)]
+fn build_server_with_storage(storage_url: &str, zstd: bool) -> vgi_rpc::RpcServer {
+    use std::sync::Arc as StdArc;
+    use vgi_rpc::external::{Compression, ExternalLocationConfig};
+    let storage = StdArc::new(fake_storage::FakeStorage::new(storage_url));
+    let fetcher = StdArc::new(vgi_rpc_s3::HttpFetcher::new());
+    let mut cfg = ExternalLocationConfig::new(storage, fetcher)
+        .with_threshold_bytes(16 * 1024)
+        .with_url_validator(vgi_rpc::external::any_url_validator());
+    if zstd {
+        cfg = cfg.with_compression(Compression::Zstd(0));
+    }
+    conformance::build_server_with_external(Some(cfg))
+}
+
+/// Borrow the shared `FakeStorage` instance, used both as the
+/// `ExternalStorage` (response externalization) and the
+/// `UploadUrlProvider` (client-vended uploads). Constructed once per
+/// `--http-with-storage` invocation in [`run_http_with_storage`].
+fn build_shared_storage(storage_url: &str) -> std::sync::Arc<fake_storage::FakeStorage> {
+    std::sync::Arc::new(fake_storage::FakeStorage::new(storage_url))
 }
 
 fn run_unix(server: Arc<vgi_rpc::RpcServer>, path: &str) {
@@ -93,6 +140,60 @@ fn run_unix(server: Arc<vgi_rpc::RpcServer>, path: &str) {
         }
         let _ = t.join();
     }
+}
+
+/// Parse `--flag <N>` from a positional argv slice. Returns None if the
+/// flag is absent or has no numeric value following it.
+fn parse_usize_flag(args: &[String], flag: &str) -> Option<usize> {
+    let idx = args.iter().position(|a| a == flag)?;
+    let raw = args.get(idx + 1)?;
+    raw.parse::<usize>().ok()
+}
+
+fn run_http_with_storage(
+    storage_url: &str,
+    zstd: bool,
+    threshold: usize,
+    max_request_bytes: usize,
+) {
+    use std::sync::Arc as StdArc;
+    use vgi_rpc::external::{Compression, ExternalLocationConfig};
+
+    let storage = build_shared_storage(storage_url);
+    let fetcher = StdArc::new(vgi_rpc_s3::HttpFetcher::new());
+    // Same instance fronts both ExternalStorage (response uploads) and
+    // UploadUrlProvider (client-vended request uploads).
+    let storage_as_ext: StdArc<dyn vgi_rpc::external::ExternalStorage> = storage.clone();
+    let upload_provider: StdArc<dyn vgi_rpc::external::UploadUrlProvider> = storage.clone();
+    let mut cfg = ExternalLocationConfig::new(storage_as_ext, fetcher)
+        .with_threshold_bytes(threshold)
+        .with_url_validator(vgi_rpc::external::any_url_validator());
+    if zstd {
+        cfg = cfg.with_compression(Compression::Zstd(0));
+    }
+    let server = Arc::new(conformance::build_server_with_external(Some(cfg)));
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async move {
+        let state = vgi_rpc::http::HttpState::builder()
+            .server(server)
+            .upload_url_provider(upload_provider)
+            .max_request_bytes(max_request_bytes)
+            .max_upload_bytes(64 * 1024 * 1024)
+            .build();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tcp");
+        let port = listener.local_addr().unwrap().port();
+        println!("PORT:{port}");
+        io::stdout().flush().ok();
+        vgi_rpc::http::serve_with_shutdown(state, listener)
+            .await
+            .expect("axum serve");
+    });
 }
 
 fn run_http(server: Arc<vgi_rpc::RpcServer>, reject_all_auth: bool) {

@@ -49,17 +49,13 @@ fn round_trip_5mb_uncompressed() {
     assert_eq!(ptr.num_rows(), 0);
     assert_eq!(storage.len(), 1);
     // Pointer metadata carries the location + sha256.
-    let url = md
-        .iter()
-        .find(|(k, _)| k == LOCATION_KEY)
-        .map(|(_, v)| v.clone())
-        .unwrap();
+    let url = md.get(LOCATION_KEY).cloned().unwrap();
     assert!(url.starts_with("https://inmem.test/"));
 
     let (resolved, user_md) = resolve_external_location(&ptr, &md, &cfg).unwrap();
     assert_eq!(resolved.num_rows(), 1_000_000);
     // fetch_ms gets appended for observability.
-    assert!(user_md.iter().any(|(k, _)| k == LOCATION_FETCH_MS_KEY));
+    assert!(user_md.contains_key(LOCATION_FETCH_MS_KEY));
 }
 
 #[test]
@@ -79,7 +75,10 @@ fn caller_metadata_preserved_through_externalization() {
     let storage = InMemoryStorage::new();
     let cfg = cfg_from(storage, 1024, Compression::None);
     let batch = make_batch(50_000);
-    let caller_md = vec![("x-custom".to_string(), "value".to_string())];
+    let caller_md = std::collections::HashMap::<String, String>::from([(
+        "x-custom".to_string(),
+        "value".to_string(),
+    )]);
     let (ptr, md) = maybe_externalize_batch(&batch, Some(&caller_md), &cfg)
         .unwrap()
         .unwrap();

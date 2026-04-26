@@ -5,6 +5,7 @@ use serde_json::json;
 /// Log severity level. Matches the Python `vgi_rpc.log.Level` values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
+    Trace,
     Debug,
     Info,
     Warn,
@@ -15,6 +16,7 @@ pub enum LogLevel {
 impl LogLevel {
     pub fn as_str(self) -> &'static str {
         match self {
+            LogLevel::Trace => "TRACE",
             LogLevel::Debug => "DEBUG",
             LogLevel::Info => "INFO",
             LogLevel::Warn => "WARN",

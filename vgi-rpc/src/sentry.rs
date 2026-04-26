@@ -104,7 +104,7 @@ mod tests {
             method_type: "unary",
             server_id: "srv".into(),
             request_id: String::new(),
-            transport_metadata: Arc::new(Vec::new()),
+            transport_metadata: Arc::new(Default::default()),
             principal: String::new(),
             auth_domain: String::new(),
             authenticated: false,

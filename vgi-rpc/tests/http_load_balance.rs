@@ -117,15 +117,16 @@ fn init_body(total: i64) -> Vec<u8> {
         vec![Arc::new(Int64Array::from(vec![total]))],
     )
     .unwrap();
-    let md = vec![
+    let md = std::collections::HashMap::<String, String>::from([
         (RPC_METHOD_KEY.to_string(), "counter".to_string()),
         (REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string()),
         (REQUEST_ID_KEY.to_string(), "lb-req".to_string()),
-    ];
+    ]);
     let mut buf = Vec::new();
     {
         let mut w = StreamWriter::new(&mut buf, params_schema().as_ref()).unwrap();
-        w.write(&batch, Some(&md)).unwrap();
+        w.write(&batch.clone().with_custom_metadata(md.clone()))
+            .unwrap();
         w.finish().unwrap();
     }
     buf
@@ -134,12 +135,12 @@ fn init_body(total: i64) -> Vec<u8> {
 /// Build a producer-continuation body: empty batch carrying the state token.
 fn exchange_body(token: &str) -> Vec<u8> {
     let empty = empty_batch(&Schema::empty()).unwrap();
-    let md = vec![
+    let md = std::collections::HashMap::<String, String>::from([
         (STATE_KEY.to_string(), token.to_string()),
         (REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string()),
         (REQUEST_ID_KEY.to_string(), "lb-cont".to_string()),
-    ];
-    write_one_batch(&empty, Some(&md)).unwrap()
+    ]);
+    write_one_batch(&empty.with_custom_metadata(md)).unwrap()
 }
 
 /// Extract (data_values, state_token_or_none) from an arrow response body.
@@ -148,11 +149,11 @@ fn parse_response(body: &[u8]) -> (Vec<i64>, Option<String>) {
     let mut values = Vec::new();
     let mut token: Option<String> = None;
     while let Some(rb) = r.read_next().unwrap() {
-        if rb.batch.num_rows() == 0 {
-            if let Some(t) = md_get(&rb.metadata, STATE_KEY) {
+        if rb.num_rows() == 0 {
+            if let Some(t) = md_get(rb.custom_metadata(), STATE_KEY) {
                 token = Some(t.to_string());
             }
-        } else if let Some(col) = rb.batch.column(0).as_any().downcast_ref::<Int64Array>() {
+        } else if let Some(col) = rb.column(0).as_any().downcast_ref::<Int64Array>() {
             for i in 0..col.len() {
                 values.push(col.value(i));
             }

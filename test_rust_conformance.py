@@ -71,6 +71,87 @@ def conformance_http_port(rust_http_port: int) -> int:
 
 
 @pytest.fixture(scope="session")
+def conformance_fake_storage() -> Iterator[str]:
+    """Run the in-memory ``vgi_rpc.conformance.fake_storage`` HTTP service."""
+    from vgi_rpc.conformance.fake_storage import serve_in_thread
+
+    base_url, shutdown = serve_in_thread()
+    try:
+        yield base_url
+    finally:
+        shutdown()
+
+
+def _start_rust_http_with_storage(
+    storage_url: str,
+    zstd: bool,
+    *,
+    externalize_threshold: int | None = None,
+    max_request_bytes: int | None = None,
+) -> tuple[subprocess.Popen, int]:
+    args = [RUST_WORKER, "--http-with-storage", storage_url]
+    if zstd:
+        args.append("--zstd")
+    if externalize_threshold is not None:
+        args += ["--externalize-threshold", str(externalize_threshold)]
+    if max_request_bytes is not None:
+        args += ["--max-request-bytes", str(max_request_bytes)]
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdout is not None
+    line = proc.stdout.readline().decode().strip()
+    assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+    port = int(line.split(":", 1)[1])
+    _wait_for_http(port)
+    return proc, port
+
+
+@pytest.fixture(scope="session")
+def conformance_http_with_storage_port(conformance_fake_storage: str) -> Iterator[int]:
+    """Run the Rust worker wired to fake storage (no compression)."""
+    proc, port = _start_rust_http_with_storage(conformance_fake_storage, zstd=False)
+    try:
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def conformance_http_with_zstd_storage_port(conformance_fake_storage: str) -> Iterator[int]:
+    """Run the Rust worker wired to fake storage with zstd compression."""
+    proc, port = _start_rust_http_with_storage(conformance_fake_storage, zstd=True)
+    try:
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def conformance_http_externalize_always_port(conformance_fake_storage: str) -> Iterator[int]:
+    """Run the Rust worker forcing externalization of EVERY non-empty response batch.
+
+    Threshold=1 byte makes every data-bearing batch externalize via the
+    upload-URL pointer flow; the inline-request cap stays at 1 MiB so
+    normal-sized client requests still flow inline. Used as a transport
+    variant in ``conformance_conn`` to double-check that externalization
+    is observationally indistinguishable from inline transmission across
+    the entire conformance method matrix.
+    """
+    proc, port = _start_rust_http_with_storage(
+        conformance_fake_storage,
+        zstd=False,
+        externalize_threshold=1,
+        max_request_bytes=1024 * 1024,
+    )
+    try:
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
 def conformance_http_auth_port() -> Iterator[int]:
     """Run the Rust worker with a reject-all auth callback under `/vgi/`."""
     proc = subprocess.Popen(
@@ -137,7 +218,9 @@ def rust_unix_path() -> Iterator[str]:
 ConnFactory = Callable[..., contextlib.AbstractContextManager[Any]]
 
 
-_TRANSPORTS = os.environ.get("VGI_TRANSPORTS", "pipe,subprocess,http,unix").split(",")
+_TRANSPORTS = os.environ.get(
+    "VGI_TRANSPORTS", "pipe,subprocess,http,unix,http_externalize_always"
+).split(",")
 
 
 @pytest.fixture(params=_TRANSPORTS)
@@ -147,6 +230,11 @@ def conformance_conn(
 ) -> ConnFactory:
     rust_http_port = request.getfixturevalue("rust_http_port") if request.param == "http" else None
     rust_unix_path = request.getfixturevalue("rust_unix_path") if request.param == "unix" else None
+    ext_always_port = (
+        request.getfixturevalue("conformance_http_externalize_always_port")
+        if request.param == "http_externalize_always"
+        else None
+    )
     def factory(
         on_log: Callable[[Message], None] | None = None,
     ) -> contextlib.AbstractContextManager[Any]:
@@ -166,6 +254,18 @@ def conformance_conn(
                 ConformanceService,
                 f"http://127.0.0.1:{rust_http_port}",
                 on_log=on_log,
+            )
+        elif request.param == "http_externalize_always":
+            from vgi_rpc.external import ExternalLocationConfig
+
+            return http_connect(
+                ConformanceService,
+                f"http://127.0.0.1:{ext_always_port}",
+                on_log=on_log,
+                # The Rust worker's fake storage vends http:// download URLs;
+                # disable the default HTTPS-only validator so the client
+                # accepts them.
+                external_location=ExternalLocationConfig(url_validator=None),
             )
         elif request.param == "unix":
             return unix_connect(
@@ -247,7 +347,7 @@ class TestRustDescribeConformance:
 def _assert_describe(desc) -> None:  # type: ignore[no-untyped-def]
     assert desc.protocol_name == "ConformanceService"
     assert desc.describe_version == DESCRIBE_VERSION
-    assert len(desc.methods) == 52, sorted(desc.methods.keys())
+    assert len(desc.methods) == 73, sorted(desc.methods.keys())
     suite = run_describe_conformance(desc)
     if not suite.success:
         failures = [r for r in suite.results if not r.passed]

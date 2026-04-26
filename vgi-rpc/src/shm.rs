@@ -487,6 +487,12 @@ impl ShmSegment {
 
     /// Inverse of [`Self::allocate_and_write`]: read a record batch
     /// previously written into the segment.
+    ///
+    /// Deserialization reads directly from the mmap region (no
+    /// intermediate copy of the SHM bytes), but the resulting batch
+    /// still owns its Arrow buffers — `arrow_ipc::reader::StreamReader`
+    /// allocates and copies into owned buffers as it parses, so the
+    /// returned batch outlives a subsequent `free` of the region.
     pub fn read_batch(&self, offset: u64, length: usize, schema: &Schema) -> Result<RecordBatch> {
         let off = offset as usize;
         let end = off + length;
@@ -496,7 +502,7 @@ impl ShmSegment {
                 format!("shm region out of bounds: {off}..{end} > {}", self.shm.size),
             ));
         }
-        let region = &self.shm.as_slice()[off..end];
+        let region: &[u8] = &self.shm.as_slice()[off..end];
         deserialize_from_shm(region, schema)
     }
 

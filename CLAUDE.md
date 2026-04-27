@@ -172,13 +172,25 @@ or `"ValueError"` become HTTP 401 with a `WWW-Authenticate` header
 ### Introspection — `vgi-rpc/src/introspect.rs`
 
 `build_describe(...)` emits a record batch whose columns match the
-Python `_DESCRIBE_FIELDS`. `DESCRIBE_VERSION = "3"`. The describe batch
-attaches `vgi_rpc.protocol_name`, `vgi_rpc.request_version`,
-`vgi_rpc.describe_version`, `vgi_rpc.server_id` as custom metadata.
-Conformance: register every method with `.doc()`, `.param_type()`,
-`.param_default()`, `.param_doc()` (where applicable), and
-`.header_schema()` — the Python `run_describe_conformance` suite matches
-on exact counts and strings.
+Python `_DESCRIBE_FIELDS` slim schema for `DESCRIBE_VERSION = "4"`:
+`name`, `method_type`, `has_return`, `params_schema_ipc`,
+`result_schema_ipc`, `has_header`, `header_schema_ipc`, `is_exchange`.
+Python-flavoured columns (`doc`, `param_types_json`,
+`param_defaults_json`, `param_docs_json`) are not on the wire — the
+Protocol class is the source of truth for human-readable type info.
+
+The response batch's custom metadata carries `vgi_rpc.protocol_name`,
+`vgi_rpc.request_version`, `vgi_rpc.describe_version`,
+`vgi_rpc.protocol_hash`, and `vgi_rpc.server_id`. `protocol_hash` is a
+SHA-256 hex digest computed by `compute_protocol_hash` to mirror the
+Python algorithm byte-for-byte; it's exposed via `RpcServer::protocol_hash()`
+and threaded into every `DispatchInfo`. Within-port stable; cross-port
+byte equality is *not* guaranteed because Arrow IPC schema bytes vary
+across language Arrow libraries.
+
+Conformance: register every method with `.header_schema()` where
+applicable. The describe-conformance suite matches on schema/method
+counts and the `protocol_hash` format.
 
 ### Hooks — `vgi-rpc/src/hooks.rs`
 
@@ -189,7 +201,7 @@ implementations:
 
 | hook | module | feature | purpose |
 |------|--------|:-:|---------|
-| `AccessLogHook`  | `access_log` | — | JSON-per-call access records (validated by Python's `vgi_rpc.access_log_conformance`). |
+| `AccessLogHook`  | `access_log` | — | JSON-per-call access records (validated by Python's `vgi_rpc.access_log_conformance` and the `vgi_rpc/access_log.schema.json` JSON Schema). Records include `protocol_hash` always and `protocol_version` when set on the server. Configure via `RpcServerBuilder::protocol_version(...)`. |
 | `OtelHook`       | `otel`       | `otel`   | `tracing::info!(target: "vgi_rpc.otel", ...)` spans + in-memory counters. |
 | `SentryHook`     | `sentry`     | `sentry` | `tracing::error!(target: "vgi_rpc.sentry", ...)` on handler errors. |
 

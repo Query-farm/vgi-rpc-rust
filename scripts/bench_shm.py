@@ -104,6 +104,12 @@ def main() -> None:
     ))
     p.add_argument("--python-worker", action="store_true",
                    help="Bench against the Python conformance worker for comparison")
+    p.add_argument("--go-worker", action="store_true",
+                   help="Bench against the Go conformance worker (built into /tmp)")
+    p.add_argument("--java-worker", action="store_true",
+                   help="Bench against the Java conformance worker")
+    p.add_argument("--no-shm", action="store_true",
+                   help="Skip the shm_pipe variant (for workers without SHM support)")
     args = p.parse_args()
     sizes = args.rows or [1_000, 16_000, 256_000, 1_000_000]
     if args.python_worker:
@@ -112,6 +118,14 @@ def main() -> None:
             Path(__file__).resolve().parent.parent.parent / "vgi-rpc" / "tests" / "serve_conformance_pipe.py"
         )]
         worker_label = "py-worker"
+    elif args.go_worker:
+        worker_cmd = ["/tmp/vgi-rpc-conformance-go"]
+        worker_label = "go-worker"
+    elif args.java_worker:
+        worker_cmd = [str(Path.home()
+            / "Development" / "vgi-rpc-java" / "conformance-worker" / "build"
+            / "install" / "conformance-worker" / "bin" / "conformance-worker")]
+        worker_label = "java-worker"
     else:
         worker_cmd = [args.worker]
         worker_label = "rust-worker"
@@ -120,8 +134,9 @@ def main() -> None:
     print(f"{'rows':>8} {'transport':>10} {'iters':>6} "
           f"{'med_ms':>8} {'p10_ms':>8} {'p90_ms':>8} "
           f"{'M_rows/s':>10} {'MB/s':>10}")
+    transports = (False,) if args.no_shm else (False, True)
     for rows in sizes:
-        for use_shm in (False, True):
+        for use_shm in transports:
             r = run(worker_cmd=worker_cmd, rows=rows, iters=args.iters,
                     use_shm=use_shm, shm_size_mb=args.shm_size_mb)
             print(f"{r['rows']:>8} {r['transport']:>10} {r['iters']:>6} "

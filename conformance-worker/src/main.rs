@@ -26,7 +26,10 @@ fn main() {
 
     if args.len() > 1 && args[1] == "--http" {
         let server = Arc::new(conformance::build_server());
-        run_http(server, false);
+        let strict = args.iter().any(|a| a == "--strict");
+        let max_resp = parse_usize_flag(&args, "--max-response-bytes");
+        let max_ext = parse_usize_flag(&args, "--max-externalized-response-bytes");
+        run_http(server, false, strict, max_resp, max_ext);
         return;
     }
 
@@ -36,7 +39,7 @@ fn main() {
         // assert that `/health` bypasses auth while RPC endpoints
         // return 401.
         let server = Arc::new(conformance::build_server());
-        run_http(server, true);
+        run_http(server, true, false, None, None);
         return;
     }
 
@@ -213,7 +216,13 @@ fn run_http_with_storage(
     });
 }
 
-fn run_http(server: Arc<vgi_rpc::RpcServer>, reject_all_auth: bool) {
+fn run_http(
+    server: Arc<vgi_rpc::RpcServer>,
+    reject_all_auth: bool,
+    strict: bool,
+    max_response_bytes_arg: Option<usize>,
+    max_externalized_response_bytes_arg: Option<usize>,
+) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -230,6 +239,20 @@ fn run_http(server: Arc<vgi_rpc::RpcServer>, reject_all_auth: bool) {
                     ))
                 }))
                 .prefix("/vgi");
+        }
+        // Strict-cap mode: tight body + external caps so the
+        // http_response_cap.* conformance tests can deliberately
+        // overshoot. Defaults match Python's
+        // tests/serve_conformance_http_strict.py (1 MiB).
+        let strict_default = 1024 * 1024usize;
+        let max_resp = max_response_bytes_arg.or(if strict { Some(strict_default) } else { None });
+        let max_ext = max_externalized_response_bytes_arg
+            .or(if strict { Some(strict_default) } else { None });
+        if let Some(n) = max_resp {
+            builder = builder.max_response_bytes(n);
+        }
+        if let Some(n) = max_ext {
+            builder = builder.max_externalized_response_bytes(n);
         }
         let state = builder.build();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

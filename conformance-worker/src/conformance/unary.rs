@@ -40,6 +40,16 @@ impl UnarySvc {
         Ok(data)
     }
 
+    /// Return a bytes payload of approximately ``target_bytes`` bytes.
+    /// Used by the HTTP-only `http_response_cap.unary_strict_fail` test.
+    #[unary]
+    fn oversized_unary(&self, target_bytes: i64) -> Result<Bytes> {
+        if target_bytes < 0 {
+            return Err(RpcError::value_error("target_bytes must be non-negative"));
+        }
+        Ok(Bytes(vec![0u8; target_bytes as usize]))
+    }
+
     /// Echo an integer value.
     #[unary]
     fn echo_int(&self, value: i64) -> Result<i64> {

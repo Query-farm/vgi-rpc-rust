@@ -70,6 +70,15 @@ pub struct HttpState {
     health_enabled: bool,
     max_request_bytes: Option<usize>,
     max_upload_bytes: Option<usize>,
+    /// Hard cap on the HTTP body size for unary and stream-exchange
+    /// responses (advertised via `VGI-Max-Response-Bytes`).  `None` =
+    /// unbounded.  Externalised payloads do not count toward this — they
+    /// leave only tiny pointer batches on the wire.
+    max_response_bytes: Option<usize>,
+    /// Hard cap on bytes uploaded to external storage during one HTTP
+    /// response (advertised via `VGI-Max-Externalized-Response-Bytes`).
+    /// Always hard — externalised uploads have no escape valve.
+    max_externalized_response_bytes: Option<usize>,
     upload_url_provider: Option<Arc<dyn crate::external::UploadUrlProvider>>,
 }
 
@@ -92,6 +101,8 @@ pub struct HttpStateBuilder {
     health_enabled: Option<bool>,
     max_request_bytes: Option<usize>,
     max_upload_bytes: Option<usize>,
+    max_response_bytes: Option<usize>,
+    max_externalized_response_bytes: Option<usize>,
     upload_url_provider: Option<Arc<dyn crate::external::UploadUrlProvider>>,
 }
 
@@ -247,6 +258,24 @@ impl HttpStateBuilder {
         self
     }
 
+    /// HTTP body cap (header `VGI-Max-Response-Bytes`). Hard for unary
+    /// and stream-exchange — overshoot replaces the response with a
+    /// fresh EXCEPTION-only IPC stream surfaced via 200 +
+    /// `X-VGI-RPC-Error: true`. Externalised payloads do not count
+    /// toward this cap.
+    pub fn max_response_bytes(mut self, n: usize) -> Self {
+        self.max_response_bytes = Some(n);
+        self
+    }
+
+    /// Cap on bytes uploaded to external storage during one HTTP
+    /// response (header `VGI-Max-Externalized-Response-Bytes`).  Always
+    /// hard — externalised uploads have no escape valve.
+    pub fn max_externalized_response_bytes(mut self, n: usize) -> Self {
+        self.max_externalized_response_bytes = Some(n);
+        self
+    }
+
     /// Install an [`UploadUrlProvider`](crate::external::UploadUrlProvider).
     /// When set, the server exposes `POST /__upload_url__/init` and
     /// advertises `VGI-Upload-URL-Support: true`.
@@ -296,6 +325,8 @@ impl HttpStateBuilder {
             health_enabled: self.health_enabled.unwrap_or(true),
             max_request_bytes: self.max_request_bytes,
             max_upload_bytes: self.max_upload_bytes,
+            max_response_bytes: self.max_response_bytes,
+            max_externalized_response_bytes: self.max_externalized_response_bytes,
             upload_url_provider: self.upload_url_provider,
         })
     }
@@ -724,6 +755,28 @@ fn attach_capability_headers(
             any = true;
         }
     }
+    if let Some(n) = state.max_response_bytes {
+        if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
+            out.insert("vgi-max-response-bytes", v);
+            any = true;
+        }
+    }
+    if let Some(n) = state.max_externalized_response_bytes {
+        if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
+            out.insert("vgi-max-externalized-response-bytes", v);
+            any = true;
+        }
+    }
+    // Always present so capability-aware clients can decide whether to
+    // expect externalised payloads.
+    out.insert(
+        "vgi-externalization-enabled",
+        HeaderValue::from_static(if state.server.external_config().is_some() {
+            "true"
+        } else {
+            "false"
+        }),
+    );
     if state.upload_url_provider.is_some() {
         out.insert("vgi-upload-url-support", HeaderValue::from_static("true"));
         any = true;
@@ -1024,6 +1077,62 @@ fn arrow_response(status: StatusCode, body: Vec<u8>) -> Response {
         HeaderValue::from_static(ARROW_CONTENT_TYPE),
     );
     (status, headers, body).into_response()
+}
+
+/// Hard wire-cap enforcement helper for stream-exchange responses.
+/// Returns the original 200 response when within budget; otherwise
+/// rebuilds the response as an EXCEPTION-only IPC stream surfaced via
+/// 200 + `X-VGI-RPC-Error: true`.
+fn enforce_response_body_cap(
+    state: &Arc<HttpState>,
+    schema: &arrow_schema::Schema,
+    body: Vec<u8>,
+    method: &str,
+    server_id: &str,
+    request_id: &str,
+) -> Response {
+    if let Some(limit) = state.max_response_bytes {
+        if body.len() > limit {
+            let err = RpcError::runtime_error(format!(
+                "HTTP body exceeds max_response_bytes ({} > {}) for method {:?}",
+                body.len(),
+                limit,
+                method
+            ));
+            return cap_error_response(schema, &err, server_id, request_id);
+        }
+    }
+    arrow_response(StatusCode::OK, body)
+}
+
+/// Build a fresh IPC stream containing only an EXCEPTION batch and emit
+/// it as 200 + `X-VGI-RPC-Error: true` so RPC clients see the message
+/// as `RpcError`, not a transport failure. Used by the response-cap
+/// strict-fail path.
+fn cap_error_response(
+    schema: &arrow_schema::Schema,
+    err: &RpcError,
+    server_id: &str,
+    request_id: &str,
+) -> Response {
+    let mut buf = Vec::new();
+    {
+        let mut sw = StreamWriter::new(&mut buf, schema).unwrap();
+        let md = build_error_metadata(err, server_id, request_id);
+        let _ = sw.write(
+            &empty_batch(schema)
+                .unwrap()
+                .with_custom_metadata(md),
+        );
+        let _ = sw.finish();
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(ARROW_CONTENT_TYPE),
+    );
+    headers.insert("x-vgi-rpc-error", HeaderValue::from_static("true"));
+    (StatusCode::OK, headers, buf).into_response()
 }
 
 fn plain_error(status: StatusCode, msg: String) -> Response {
@@ -1499,6 +1608,27 @@ async fn handle_unary(
             app_err.as_ref(),
             &stats,
         );
+    }
+    // Operator-facing wire body cap.  Hard for unary — overshoot
+    // replaces the response with an EXCEPTION-only IPC stream surfaced
+    // via 200 + `X-VGI-RPC-Error: true`.  Mirrors Python's strict-fail
+    // contract; the literal `max_response_bytes` token in the message
+    // is what the cross-language conformance suite asserts on.
+    if let Some(limit) = state.max_response_bytes {
+        if buf.len() > limit {
+            let err = RpcError::runtime_error(format!(
+                "HTTP body exceeds max_response_bytes ({} > {}) for method {:?}",
+                buf.len(),
+                limit,
+                method
+            ));
+            return cap_error_response(
+                &info.result_schema,
+                &err,
+                &server.server_id,
+                &req.request_id,
+            );
+        }
     }
     arrow_response(StatusCode::OK, buf)
 }
@@ -1988,7 +2118,14 @@ async fn handle_stream_exchange(
         let _ = sw.finish();
     }
 
-    arrow_response(StatusCode::OK, body_buf)
+    enforce_response_body_cap(
+        &state,
+        output_schema.as_ref(),
+        body_buf,
+        &method,
+        &server.server_id,
+        "",
+    )
 }
 
 fn read_input_batch(body: &[u8]) -> Result<(RecordBatch, Metadata)> {

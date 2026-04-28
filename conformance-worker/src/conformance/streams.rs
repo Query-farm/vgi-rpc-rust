@@ -117,6 +117,50 @@ impl ProducerState for Empty {
     }
 }
 
+/// Emit one big batch of `rows` int64 rows, then finish.  Used by HTTP-only
+/// conformance tests to overshoot the operator response cap in a single
+/// producer iteration.
+#[derive(Serialize, Deserialize)]
+struct OversizedBatch {
+    rows: i64,
+    emitted: bool,
+}
+impl_bincode_codec!(OversizedBatch);
+impl ProducerState for OversizedBatch {
+    fn produce(&mut self, out: &mut OutputCollector, _ctx: &CallContext) -> Result<()> {
+        if self.emitted {
+            out.finish();
+            return Ok(());
+        }
+        self.emitted = true;
+        out.emit(counter_batch_range(0, self.rows)?)
+    }
+    fn encode_state(&self) -> Result<Vec<u8>> {
+        StreamStateCodec::encode(self)
+    }
+}
+
+/// Companion to `OversizedBatch` for the lockstep exchange path — emits a
+/// fixed-size oversized output for any input.
+#[derive(Serialize, Deserialize)]
+struct OversizedExchange {
+    rows: i64,
+}
+impl_bincode_codec!(OversizedExchange);
+impl ExchangeState for OversizedExchange {
+    fn exchange(
+        &mut self,
+        _input: &RecordBatch,
+        out: &mut OutputCollector,
+        _ctx: &CallContext,
+    ) -> Result<()> {
+        out.emit(counter_batch_range(0, self.rows)?)
+    }
+    fn encode_state(&self) -> Result<Vec<u8>> {
+        StreamStateCodec::encode(self)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Single {
     emitted: bool,
@@ -545,6 +589,15 @@ impl StreamSvc {
         Err(RpcError::runtime_error("intentional init error"))
     }
 
+    /// Emit one batch of `rows_per_batch` int64 rows, then finish.
+    #[producer(state = OversizedBatch, output_schema = counter_schema_fn)]
+    fn produce_oversized_batch(&self, rows_per_batch: i64) -> Result<OversizedBatch> {
+        Ok(OversizedBatch {
+            rows: rows_per_batch,
+            emitted: false,
+        })
+    }
+
     /// Produce batches with a stream header.
     #[producer(
         state = Counter,
@@ -681,6 +734,18 @@ impl StreamSvc {
     )]
     fn exchange_error_on_init(&self) -> Result<Scale> {
         Err(RpcError::runtime_error("intentional exchange init error"))
+    }
+
+    /// Exchange that emits an oversized output batch for any input.
+    #[exchange(
+        state = OversizedExchange,
+        input_schema = scale_schema_fn,
+        output_schema = counter_schema_fn
+    )]
+    fn exchange_oversized(&self, rows_per_batch: i64) -> Result<OversizedExchange> {
+        Ok(OversizedExchange {
+            rows: rows_per_batch,
+        })
     }
 
     /// Exchange stream with zero-column input and output.

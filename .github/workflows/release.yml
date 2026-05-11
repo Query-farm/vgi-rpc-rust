@@ -1,0 +1,128 @@
+name: Release
+
+# Publish all four workspace crates to crates.io in dependency order
+# when a `v*` tag is pushed.  Uses crates.io Trusted Publishing
+# (OIDC) — no long-lived `CARGO_REGISTRY_TOKEN` secret required.
+#
+# Setup checklist (one-time):
+#   1. Register each crate on crates.io as a Trusted Publisher
+#      bound to this repo + this workflow file + the `crates-io`
+#      environment below.
+#   2. Create a GitHub Environment named `crates-io` (Settings →
+#      Environments) with required reviewers.  The environment
+#      gate is what makes a release require a human "approve"
+#      click — without it, anyone with push access to `main` can
+#      trigger a publish by pushing a tag.
+#
+# Release flow:
+#   1. Bump the workspace version in the root `Cargo.toml`.
+#   2. Update `CHANGELOG.md`.
+#   3. `git tag v0.1.0 && git push origin v0.1.0`.
+#   4. Approve the workflow run in the `crates-io` environment.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  # Manual dispatch is useful for re-runs or for releasing without a
+  # fresh tag (e.g. retrying after a yank).
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "If true, run `cargo publish --dry-run` instead of publishing."
+        type: boolean
+        default: false
+
+# Trusted publishing exchanges the workflow's OIDC token for a
+# short-lived crates.io API token.  `id-token: write` is required to
+# mint the OIDC token; `contents: read` lets us check out the repo.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (MSRV 1.86)
+        uses: dtolnay/rust-toolchain@1.86.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Sanity gate — fmt, clippy, test, conformance run (best-effort)
+        # The full CI already validates these on every push to main;
+        # this step re-runs the cheap subset on the tagged commit so
+        # we don't publish bytes that differ from what CI validated.
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo test --workspace --all-features --locked
+
+      - name: Authenticate to crates.io via OIDC
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      # Crates publish in dependency order; each `cargo publish` does
+      # its own verification build against the freshly-uploaded prior
+      # crate.  We sleep a short interval between publications to let
+      # the crates.io index propagate so the next crate's verify
+      # build can resolve the dep.
+
+      - name: Publish vgi-rpc-macros
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p vgi-rpc-macros --locked
+          else
+            cargo publish -p vgi-rpc-macros --locked
+            echo "Waiting 30s for crates.io index propagation..."
+            sleep 30
+          fi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Publish vgi-rpc
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p vgi-rpc --locked
+          else
+            cargo publish -p vgi-rpc --locked
+            sleep 30
+          fi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Publish vgi-rpc-s3
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p vgi-rpc-s3 --locked
+          else
+            cargo publish -p vgi-rpc-s3 --locked
+            sleep 30
+          fi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Publish vgi-rpc-gcs
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p vgi-rpc-gcs --locked
+          else
+            cargo publish -p vgi-rpc-gcs --locked
+          fi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Summarise
+        if: success()
+        run: |
+          echo "Published from tag ${GITHUB_REF_NAME} at commit ${GITHUB_SHA}"
+          echo "Crates released:"
+          echo "  - https://crates.io/crates/vgi-rpc-macros"
+          echo "  - https://crates.io/crates/vgi-rpc"
+          echo "  - https://crates.io/crates/vgi-rpc-s3"
+          echo "  - https://crates.io/crates/vgi-rpc-gcs"

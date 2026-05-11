@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Proc-macros for vgi-rpc: #[service], #[unary], #[producer], #[exchange], #[derive(VgiArrow)], #[derive(StreamState)]"
+readme = "README.md"
+keywords = ["vgi-rpc", "rpc", "arrow", "macros"]
+categories = ["network-programming", "development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true

@@ -282,7 +282,7 @@ impl DispatchHook for AccessLogHook {
 
 /// Format the current wall-clock time as RFC 3339 UTC with millisecond
 /// precision, matching the access-log spec's `timestamp` regex.
-pub fn rfc3339_utc_millis() -> String {
+pub(crate) fn rfc3339_utc_millis() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -350,7 +350,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 /// Mint a 32-character lowercase hex stream_id. Use this at the start of a
 /// stream call and reuse the same value across init and continuations.
-pub fn random_stream_id() -> String {
+pub(crate) fn random_stream_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     // 128 bits drawn from time + a per-process atomic counter. Not
     // cryptographic — adequate for log correlation.

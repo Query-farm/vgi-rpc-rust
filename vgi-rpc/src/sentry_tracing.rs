@@ -1,9 +1,9 @@
-//! Sentry-style dispatch hook.
+//! Lightweight, tracing-based Sentry dispatch hook.
 //!
-//! Enabled by the `sentry` feature. The hook is library-agnostic — it
+//! Enabled by the `sentry-tracing` feature. The hook is library-agnostic — it
 //! emits structured `tracing::error!` events tagged `vgi_rpc.sentry` on
 //! each handler error, plus a counter mirroring Python's
-//! `SentryConfig.record_exceptions` behavior. A user wiring the real
+//! `TracingSentryConfig.record_exceptions` behavior. A user wiring the real
 //! `sentry` crate layers `sentry-tracing` on top of the `tracing`
 //! subscriber and the user / tag / transaction fields below propagate
 //! automatically — matching the Python `sentry.py` integration's
@@ -16,8 +16,8 @@
 //! The hook understands the same JWT-claim mapping Python's `2d93987`
 //! introduced — `sub`/`email`/`name` claims become the Sentry user
 //! id/email/username, and operator-selected extra claims become tags.
-//! Configure via [`SentryConfig::with_user_claims`] and
-//! [`SentryConfig::with_tag_claims`].
+//! Configure via [`TracingSentryConfig::with_user_claims`] and
+//! [`TracingSentryConfig::with_tag_claims`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use crate::hooks::{CallStatistics, DispatchHook, DispatchInfo, HookToken};
 
 /// Default mapping from JWT claim name → Sentry user field. Mirrors
 /// Python's defaults: `sub` → `id`, `email` → `email`, `name` →
-/// `username`. Used when [`SentryConfig::user_claims`] is empty.
+/// `username`. Used when [`TracingSentryConfig::user_claims`] is empty.
 fn default_user_claim_map() -> Vec<(String, String)> {
     vec![
         ("sub".into(), "id".into()),
@@ -38,7 +38,7 @@ fn default_user_claim_map() -> Vec<(String, String)> {
 
 /// Configuration for the Sentry hook.
 #[derive(Clone, Debug)]
-pub struct SentryConfig {
+pub struct TracingSentryConfig {
     /// Logical service name attached as a tag.
     pub service_name: String,
     /// Record full exception messages. Set to `false` for public servers
@@ -57,7 +57,7 @@ pub struct SentryConfig {
     pub tag_claims: Vec<String>,
 }
 
-impl Default for SentryConfig {
+impl Default for TracingSentryConfig {
     fn default() -> Self {
         Self {
             service_name: "vgi-rpc".into(),
@@ -68,7 +68,7 @@ impl Default for SentryConfig {
     }
 }
 
-impl SentryConfig {
+impl TracingSentryConfig {
     /// Override the JWT claim → Sentry user field map. Pass an empty
     /// iterator to disable user enrichment.
     pub fn with_user_claims<I, A, B>(mut self, pairs: I) -> Self
@@ -102,13 +102,13 @@ impl SentryConfig {
 /// can capture as Sentry events. Successful calls additionally emit a
 /// `tracing::info!` event tagged with `transaction = info.method` so
 /// the same layer can associate a transaction with each RPC method.
-pub struct SentryHook {
-    cfg: SentryConfig,
+pub struct TracingSentryHook {
+    cfg: TracingSentryConfig,
     errors: AtomicU64,
 }
 
-impl SentryHook {
-    pub fn new(cfg: SentryConfig) -> Arc<Self> {
+impl TracingSentryHook {
+    pub fn new(cfg: TracingSentryConfig) -> Arc<Self> {
         Arc::new(Self {
             cfg,
             errors: AtomicU64::new(0),
@@ -170,7 +170,7 @@ struct UserFields {
     username: String,
 }
 
-impl DispatchHook for SentryHook {
+impl DispatchHook for TracingSentryHook {
     fn on_dispatch_start(&self, info: &DispatchInfo) -> HookToken {
         let user = self.resolve_user(&info.claims);
         tracing::info!(
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn counts_only_errors() {
-        let hook = SentryHook::new(SentryConfig::default());
+        let hook = TracingSentryHook::new(TracingSentryConfig::default());
         let t = hook.on_dispatch_start(&info());
         hook.on_dispatch_end(t, &info(), None, &CallStatistics::default());
         assert_eq!(hook.errors_observed(), 0);
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn default_user_claim_map_maps_sub_email_name() {
-        let hook = SentryHook::new(SentryConfig::default());
+        let hook = TracingSentryHook::new(TracingSentryConfig::default());
         let info = info_with_claims(&[
             ("sub", "user-42"),
             ("email", "a@b.c"),
@@ -297,8 +297,8 @@ mod tests {
 
     #[test]
     fn custom_user_claim_map_overrides_defaults() {
-        let cfg = SentryConfig::default().with_user_claims([("https://x.example/id", "id")]);
-        let hook = SentryHook::new(cfg);
+        let cfg = TracingSentryConfig::default().with_user_claims([("https://x.example/id", "id")]);
+        let hook = TracingSentryHook::new(cfg);
         let info = info_with_claims(&[
             ("sub", "ignored-default-mapping"),
             ("https://x.example/id", "auth0|abc"),
@@ -312,8 +312,8 @@ mod tests {
 
     #[test]
     fn tag_claims_round_trip_through_json_field() {
-        let cfg = SentryConfig::default().with_tag_claims(["org_id", "tenant"]);
-        let hook = SentryHook::new(cfg);
+        let cfg = TracingSentryConfig::default().with_tag_claims(["org_id", "tenant"]);
+        let hook = TracingSentryHook::new(cfg);
         let info = info_with_claims(&[("org_id", "org-7"), ("ignored", "x")]);
         let s = hook.tag_claims_json(&info.claims);
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();

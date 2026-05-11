@@ -1077,7 +1077,7 @@ fn drain_input<R: Read>(r: &mut R) -> Result<()> {
     Ok(())
 }
 
-pub fn cast_batch(batch: &RecordBatch, target: &Schema) -> Result<RecordBatch> {
+pub(crate) fn cast_batch(batch: &RecordBatch, target: &Schema) -> Result<RecordBatch> {
     if batch.num_columns() != target.fields().len() {
         return Err(RpcError::type_error(format!(
             "Input schema mismatch: expected {} fields, got {}",
@@ -1148,7 +1148,7 @@ pub(crate) fn build_error_metadata(err: &RpcError, server_id: &str, request_id: 
 }
 
 /// Write an error as a complete single-batch IPC stream.
-pub fn write_error_stream<W: Write>(
+pub(crate) fn write_error_stream<W: Write>(
     w: &mut W,
     schema: &Schema,
     err: &RpcError,

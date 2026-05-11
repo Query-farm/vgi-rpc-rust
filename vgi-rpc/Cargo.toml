@@ -20,15 +20,19 @@ oauth-pkce = []
 oauth-pkce-server = ["oauth-pkce", "http", "dep:reqwest", "dep:urlencoding"]
 mtls-pem = ["dep:x509-parser", "dep:percent-encoding"]
 otel = []
-# Lightweight tracing-only Sentry hook. No extra deps; consumers wire
-# `sentry-tracing` themselves on top if they want real Sentry capture.
-sentry = []
+# Lightweight, tracing-only Sentry hook. No extra deps; consumers wire
+# `sentry-tracing` themselves on the subscriber side if they want real
+# Sentry capture.
+sentry-tracing = []
 # Real Sentry SDK integration. Per-RPC scopes, transactions, user
-# enrichment from JWT claims, capture_event on errors. Pulls in the
-# `sentry` crate (heavier dep tree). Coexists with the `sentry`
-# feature — same crate exposes both `SentryHook` and `SentrySdkHook`.
-sentry-sdk = ["sentry", "dep:sentry"]
+# enrichment from JWT claims, `capture_event` on errors. Pulls in the
+# `sentry` crate. Coexists with `sentry-tracing` — different modules,
+# different hooks; pick one (or both) for your deployment.
+sentry-sdk = ["dep:sentry"]
 shm = ["dep:libc"]
+# Test fixtures (e.g. `external::InMemoryStorage`) exposed for
+# downstream integration tests. Not for production use.
+test-utils = []
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -36,6 +40,12 @@ tokio = { workspace = true, features = ["full"] }
 tracing-subscriber.workspace = true
 trybuild = "1"
 proptest = "1"
+
+# `external_integration` uses `InMemoryStorage`, which is gated on
+# `test-utils` so it doesn't leak into the public crate surface.
+[[test]]
+name = "external_integration"
+required-features = ["test-utils"]
 
 [dependencies]
 flatbuffers = "25"

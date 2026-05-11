@@ -26,13 +26,18 @@ pub trait StreamStateCodec: Sized {
 
 /// Encode a `serde::Serialize` value with bincode.
 ///
-/// Suitable as the body of a manual `StreamStateCodec` impl for state
-/// types that are plain serde structs (the common case).
+/// **Internal:** used by `#[derive(StreamState)]` expansion. Most
+/// users should implement [`StreamStateCodec`] manually or via the
+/// derive macro rather than calling this directly.
+#[doc(hidden)]
 pub fn bincode_encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     bincode::serialize(value).map_err(|e| RpcError::runtime_error(format!("bincode encode: {e}")))
 }
 
 /// Decode bytes produced by [`bincode_encode`].
+///
+/// **Internal:** used by `#[derive(StreamState)]` expansion.
+#[doc(hidden)]
 pub fn bincode_decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     bincode::deserialize(bytes).map_err(|e| RpcError::runtime_error(format!("bincode decode: {e}")))
 }

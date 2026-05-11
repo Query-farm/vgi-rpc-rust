@@ -172,10 +172,12 @@ impl StreamResult {
 }
 
 /// Build a [`crate::server::StateDecoder`] for a `ProducerState` that
-/// also implements [`crate::stream_codec::StreamStateCodec`]. Generated
-/// code (and the macro pass) calls this so the wire layer can rehydrate
-/// state for HTTP continuation requests.
+/// also implements [`crate::stream_codec::StreamStateCodec`].
+///
+/// **Internal:** invoked by the `#[producer]` macro expansion; user
+/// code should not call this directly.
 #[cfg(feature = "http")]
+#[doc(hidden)]
 pub fn producer_decoder<S>() -> crate::server::StateDecoder
 where
     S: ProducerState + crate::stream_codec::StreamStateCodec + 'static,
@@ -185,7 +187,10 @@ where
 
 /// Build a [`crate::server::StateDecoder`] for an `ExchangeState`. See
 /// [`producer_decoder`].
+///
+/// **Internal:** invoked by the `#[exchange]` macro expansion.
 #[cfg(feature = "http")]
+#[doc(hidden)]
 pub fn exchange_decoder<S>() -> crate::server::StateDecoder
 where
     S: ExchangeState + crate::stream_codec::StreamStateCodec + 'static,

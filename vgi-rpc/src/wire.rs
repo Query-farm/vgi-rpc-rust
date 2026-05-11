@@ -533,8 +533,9 @@ pub fn write_one_batch(batch: &RecordBatch, metadata: Option<&Metadata>) -> Resu
     Ok(buf)
 }
 
-/// Lowercase hex encoding of a byte slice.
-pub fn bytes_to_hex(bytes: &[u8]) -> String {
+/// Lowercase hex encoding of a byte slice. Internal helper — use the
+/// `hex` crate from your application code.
+pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {

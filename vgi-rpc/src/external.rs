@@ -366,15 +366,22 @@ pub fn resolve_external_location(
 // ---------------------------------------------------------------------------
 // In-memory test backend
 // ---------------------------------------------------------------------------
+//
+// Gated behind the `test-utils` feature so it doesn't show up on
+// crates.io / docs.rs for normal users. Internal tests + the
+// `external_integration` integration test enable the feature
+// transitively via the workspace.
 
 /// In-memory storage backend + fetcher pair; used by tests and CI.
-/// Thread-safe, no I/O.
+/// Thread-safe, no I/O. **Not for production use.**
+#[cfg(any(test, feature = "test-utils"))]
 pub struct InMemoryStorage {
     map: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
     next_id: std::sync::atomic::AtomicU64,
     base_url: String,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl InMemoryStorage {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -393,6 +400,7 @@ impl InMemoryStorage {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl ExternalStorage for InMemoryStorage {
     fn upload(&self, ipc_bytes: &[u8], _compression: Compression) -> Result<UploadResult> {
         let id = self
@@ -415,6 +423,7 @@ impl ExternalStorage for InMemoryStorage {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl Fetcher for InMemoryStorage {
     fn fetch(&self, url: &str, _compression: Compression) -> Result<Vec<u8>> {
         self.map

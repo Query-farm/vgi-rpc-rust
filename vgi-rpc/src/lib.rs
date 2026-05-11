@@ -23,6 +23,8 @@ pub mod metadata;
 pub(crate) mod probe;
 #[cfg(feature = "sentry")]
 pub mod sentry;
+#[cfg(feature = "sentry-sdk")]
+pub mod sentry_sdk;
 pub mod server;
 #[cfg(feature = "shm")]
 pub mod shm;

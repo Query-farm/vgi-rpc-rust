@@ -95,18 +95,90 @@ impl<W: Write> StreamWriter<W> {
 ///
 /// Each batch returned by [`StreamReader::read_next`] carries its
 /// per-message `custom_metadata` via `RecordBatch::custom_metadata`.
+///
+/// The inner arrow-ipc reader is parameterised over
+/// [`std::io::Chain`] so [`StreamReader::new`] can peek the
+/// schema-message length prefix, validate it against
+/// [`MAX_IPC_SCHEMA_BYTES`], and chain the consumed bytes back into
+/// the stream before handing off. This neutralises the
+/// `[0x1A, 0x2C, 0xF5, 0x2C]` OOM the fuzz harness discovered.
 pub struct StreamReader<R: Read> {
-    inner: IpcStreamReader<R>,
+    inner: IpcStreamReader<std::io::Chain<std::io::Cursor<Vec<u8>>, R>>,
     schema: SchemaRef,
     /// When `Some`, every read batch is rewrapped with this relaxed
     /// schema before being returned to the caller.
     relaxed_schema: Option<SchemaRef>,
 }
 
+/// Maximum permitted size, in bytes, of the schema-message flatbuffer
+/// at the head of an IPC stream. Schemas are typically tens to
+/// hundreds of bytes; 16 MiB is gracious headroom that still rejects
+/// the crafted 4-byte input `[0x1A, 0x2C, 0xF5, 0x2C]` that
+/// `fuzz/wire_stream_reader` discovered would OOM the process by
+/// claiming a ~720 MB schema.
+///
+/// Upstream `arrow_ipc::reader::StreamReader::try_new` trusts the
+/// length prefix unconditionally and pre-allocates a buffer of that
+/// size; without this guard a single 4-byte payload from an
+/// untrusted client can exhaust the server's heap. The cap is
+/// applied to the *schema* message only; per-message gating for
+/// subsequent batches is a known follow-up (requires either a
+/// patched arrow-ipc with a message-size cap or a custom framed
+/// reader).
+const MAX_IPC_SCHEMA_BYTES: usize = 16 * 1024 * 1024;
+
 impl<R: Read> StreamReader<R> {
     /// Create a new reader and consume the schema message.
-    pub fn new(reader: R) -> Result<Self> {
-        let inner = IpcStreamReader::try_new(reader, None).map_err(|e| {
+    ///
+    /// The schema-message length prefix is validated against
+    /// [`MAX_IPC_SCHEMA_BYTES`] *before* arrow-ipc allocates the
+    /// message buffer; an oversized claim is rejected as
+    /// `RpcError::ipc(...)` rather than triggering a multi-gigabyte
+    /// `Vec::with_capacity` and OOM.
+    pub fn new(mut reader: R) -> Result<Self> {
+        // Peek the framing header so we can reject pathological
+        // length claims up front. Arrow IPC schema messages start
+        // with either:
+        //   - legacy: `[length: i32 LE][flatbuffer]`, or
+        //   - continuation: `[0xFFFFFFFF][length: i32 LE][flatbuffer]`.
+        // We read up to 8 bytes, parse, then chain the bytes back
+        // into the reader so arrow-ipc still sees the full stream.
+        let mut head = [0u8; 8];
+        let mut total = 0;
+        while total < head.len() {
+            match reader.read(&mut head[total..]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) => return Err(RpcError::from(e)),
+            }
+        }
+        if total < 4 {
+            return Err(RpcError::new("IPC", "empty IPC stream (no schema)"));
+        }
+        let len = if total >= 8 && head[..4] == [0xFF, 0xFF, 0xFF, 0xFF] {
+            i32::from_le_bytes(head[4..8].try_into().unwrap())
+        } else {
+            i32::from_le_bytes(head[..4].try_into().unwrap())
+        };
+        if len < 0 {
+            return Err(RpcError::new(
+                "IPC",
+                format!("IPC schema message has negative length ({len})"),
+            ));
+        }
+        if (len as usize) > MAX_IPC_SCHEMA_BYTES {
+            return Err(RpcError::new(
+                "IPC",
+                format!(
+                    "IPC schema message length {len} bytes exceeds \
+                     MAX_IPC_SCHEMA_BYTES={MAX_IPC_SCHEMA_BYTES} — \
+                     refusing to allocate before parsing"
+                ),
+            ));
+        }
+        let chained = std::io::Read::chain(std::io::Cursor::new(head[..total].to_vec()), reader);
+
+        let inner = IpcStreamReader::try_new(chained, None).map_err(|e| {
             // Map upstream "empty stream" to our IPC error so callers can
             // recognize the EOF-at-request-boundary case.
             let msg = e.to_string();
@@ -178,10 +250,6 @@ impl<R: Read> StreamReader<R> {
     pub fn drain(&mut self) -> Result<()> {
         while self.read_next()?.is_some() {}
         Ok(())
-    }
-
-    pub fn get_mut(&mut self) -> &mut R {
-        self.inner.get_mut()
     }
 }
 
@@ -330,6 +398,42 @@ mod tests {
             Some("echo_string")
         );
         assert!(r.read_next().unwrap().is_none());
+    }
+
+    /// Regression test for the OOM the cargo-fuzz harness found:
+    /// 4 bytes `[0x1A, 0x2C, 0xF5, 0x2C]` parsed as a legacy IPC
+    /// length prefix (little-endian) = ~720 MB, which arrow-ipc
+    /// pre-allocates eagerly. The pre-validate gate in
+    /// [`StreamReader::new`] must reject before any allocation.
+    #[test]
+    fn rejects_oversize_schema_length_prefix() {
+        let bomb: &[u8] = &[0x1A, 0x2C, 0xF5, 0x2C];
+        let err = StreamReader::new(bomb).err().expect("must reject");
+        assert!(
+            err.message.contains("MAX_IPC_SCHEMA_BYTES") || err.message.contains("exceeds"),
+            "unexpected error message: {err:?}",
+        );
+    }
+
+    /// Continuation-marker variant of the same attack:
+    /// `[0xFF, 0xFF, 0xFF, 0xFF]` followed by a huge length.
+    #[test]
+    fn rejects_oversize_continuation_length_prefix() {
+        let mut bomb = vec![0xFF, 0xFF, 0xFF, 0xFF];
+        bomb.extend_from_slice(&i32::MAX.to_le_bytes());
+        let err = StreamReader::new(bomb.as_slice())
+            .err()
+            .expect("must reject");
+        assert!(err.message.contains("MAX_IPC_SCHEMA_BYTES") || err.message.contains("exceeds"));
+    }
+
+    #[test]
+    fn rejects_negative_schema_length() {
+        let bytes = (-1i32).to_le_bytes();
+        let err = StreamReader::new(bytes.as_slice())
+            .err()
+            .expect("must reject");
+        assert!(err.message.contains("negative"));
     }
 
     #[test]

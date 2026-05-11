@@ -20,7 +20,14 @@ oauth-pkce = []
 oauth-pkce-server = ["oauth-pkce", "http", "dep:reqwest", "dep:urlencoding"]
 mtls-pem = ["dep:x509-parser", "dep:percent-encoding"]
 otel = []
+# Lightweight tracing-only Sentry hook. No extra deps; consumers wire
+# `sentry-tracing` themselves on top if they want real Sentry capture.
 sentry = []
+# Real Sentry SDK integration. Per-RPC scopes, transactions, user
+# enrichment from JWT claims, capture_event on errors. Pulls in the
+# `sentry` crate (heavier dep tree). Coexists with the `sentry`
+# feature — same crate exposes both `SentryHook` and `SentrySdkHook`.
+sentry-sdk = ["sentry", "dep:sentry"]
 shm = ["dep:libc"]
 
 [dev-dependencies]
@@ -60,5 +67,13 @@ vgi-rpc-macros = { path = "../vgi-rpc-macros", version = "0.1.0", optional = tru
 x509-parser = { version = "0.16", optional = true }
 percent-encoding = { version = "2", optional = true }
 libc = { version = "0.2", optional = true }
+# Real Sentry SDK — gated by the `sentry-sdk` feature. Default
+# features pull in tokio/reqwest transports; we strip them and let
+# operators bring their own runtime. `backtrace` + `contexts` are the
+# minimum surface needed for useful error events.
+# sentry 0.46 is the last release compatible with our 1.86 MSRV;
+# 0.47+ require rustc 1.88.  Bump together with the workspace MSRV
+# bump when it happens.
+sentry = { version = "0.46", default-features = false, features = ["backtrace", "contexts"], optional = true }
 chrono.workspace = true
 rust_decimal.workspace = true

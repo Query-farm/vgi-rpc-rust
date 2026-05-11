@@ -683,7 +683,7 @@ mod tests {
         let schema = Schema::new(vec![Field::new("v", DataType::Int64, false)]);
         let mut buf: Vec<u8> = Vec::new();
         {
-            let mut w = StreamWriter::new(&mut buf, &schema).unwrap();
+            let w = StreamWriter::new(&mut buf, &schema).unwrap();
             // Don't write any batches; we'll append a hand-crafted
             // malicious message below.
             // Drop without finish so EOS is not written.
@@ -718,7 +718,7 @@ mod tests {
         // No body — but we never get that far; the cap rejects first.
 
         let mut r = StreamReader::new(buf.as_slice()).unwrap();
-        let err = r.read_next().err().expect("must reject");
+        let err = r.read_next().expect_err("must reject");
         assert!(
             err.message.contains("bodyLength") && err.message.contains("exceeds cap"),
             "unexpected error: {err:?}"

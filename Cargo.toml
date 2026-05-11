@@ -7,6 +7,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.86"
 license = "Apache-2.0"
+authors = ["Query Farm LLC <hello@query.farm>"]
+homepage = "https://query.farm"
 repository = "https://github.com/Query-farm/vgi-rpc-rust"
 
 [workspace.dependencies]

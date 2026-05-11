@@ -65,7 +65,9 @@ jobs:
         # the upstream Python suite evolves.
         run: |
           python -m pip install --upgrade pip
-          pip install "vgi-rpc[http,cli]>=0.9.0" pytest pytest-timeout httpx
+          # `external` extra pulls in aiohttp, required by the
+          # external_fetch path the upstream test suite exercises.
+          pip install "vgi-rpc[http,cli,external]>=0.9.0" pytest pytest-timeout httpx
 
       - name: Build conformance worker
         run: cargo build -p vgi-rpc-conformance-rust --locked

@@ -85,8 +85,7 @@ fn body_one<T: VgiArrow>(method: &str, name: &str, value: T) -> Vec<u8> {
     let mut buf = Vec::new();
     {
         let mut w = StreamWriter::new(&mut buf, schema.as_ref()).unwrap();
-        w.write(&batch.clone().with_custom_metadata(md.clone()))
-            .unwrap();
+        w.write(&batch, Some(&md)).unwrap();
         w.finish().unwrap();
     }
     buf
@@ -114,7 +113,7 @@ async fn async_unary_round_trips() {
     let body = body_one("slow_echo", "value", "hello".to_string());
     let resp = post(app, "/slow_echo", body).await;
     let mut r = StreamReader::new(resp.as_ref()).unwrap();
-    let rb = r.read_next().unwrap().expect("response batch");
+    let (rb, _md) = r.read_next().unwrap().expect("response batch");
     let col = rb
         .column_by_name("result")
         .unwrap()
@@ -131,7 +130,7 @@ async fn async_producer_emits_first_batch() {
     let resp = post(app, "/async_producer/init", body).await;
     let mut r = StreamReader::new(resp.as_ref()).unwrap();
     let mut data: Vec<i64> = Vec::new();
-    while let Some(rb) = r.read_next().unwrap() {
+    while let Some((rb, _md)) = r.read_next().unwrap() {
         if rb.num_rows() > 0 {
             let col = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
             for i in 0..col.len() {

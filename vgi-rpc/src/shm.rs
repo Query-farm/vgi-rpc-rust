@@ -43,8 +43,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_buffer::Buffer;
-use arrow_ipc::reader::{BufferStreamReader, StreamReader as IpcStreamReader};
+use arrow_ipc::reader::StreamReader as IpcStreamReader;
 use arrow_ipc::writer::StreamWriter as IpcStreamWriter;
 use arrow_schema::{DataType, Schema};
 
@@ -94,41 +93,8 @@ unsafe impl Sync for PosixShm {}
 // `PosixShm` carries a raw pointer (the mmap region) but the data it
 // points at is not invalidated by panics — the OS owns the page table
 // entries until `munmap`, and our drop runs only when no Arc clones
-// (including any held by an `arrow_buffer::Buffer`) remain. Marking it
-// `RefUnwindSafe` lets us hand an `Arc<PosixShm>` to
-// `Buffer::from_custom_allocation` as the owner of an aliased view.
+// remain.
 impl std::panic::RefUnwindSafe for PosixShm {}
-
-/// `Allocation` owner that **also** releases the allocator slot when
-/// the last buffer alias drops. Used as the owner of a zero-copy
-/// [`Buffer`] aliasing an SHM region: the slot is freed automatically
-/// when no `RecordBatch` (and no column buffer of one) is still
-/// holding a reference. This is what makes the freed slot safe to
-/// reuse without corrupting in-flight batches.
-struct ShmBatchAnchor {
-    shm: Arc<PosixShm>,
-    offset: u64,
-}
-
-impl std::panic::RefUnwindSafe for ShmBatchAnchor {}
-
-impl Drop for ShmBatchAnchor {
-    fn drop(&mut self) {
-        // Same allocator instance state lives in the segment header;
-        // re-attach is essentially free (a couple of integer reads).
-        if let Ok(allocator) = ShmAllocator::attach(self.shm.clone()) {
-            let _ = allocator.free(self.offset);
-        }
-    }
-}
-
-impl std::fmt::Debug for ShmBatchAnchor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ShmBatchAnchor")
-            .field("offset", &self.offset)
-            .finish()
-    }
-}
 
 #[cfg(unix)]
 fn make_shm_name() -> String {
@@ -675,28 +641,15 @@ impl ShmSegment {
                 format!("shm region out of bounds: {off}..{end} > {}", self.shm.size),
             ));
         }
-        if !schema_has_dictionary(schema) {
-            // Zero-copy: alias the mmap region as an Arrow `Buffer`,
-            // anchored on a `ShmBatchAnchor` so the allocator slot is
-            // released exactly when the last column buffer referencing
-            // it drops. This is what lets us return ownership of the
-            // slot to the segment without invalidating live batch data.
-            let ptr = unsafe { self.shm.ptr.add(off) };
-            let nn = std::ptr::NonNull::new(ptr)
-                .ok_or_else(|| RpcError::new("ValueError", "null shm pointer"))?;
-            let anchor = Arc::new(ShmBatchAnchor {
-                shm: self.shm.clone(),
-                offset,
-            });
-            let buf = unsafe { Buffer::from_custom_allocation(nn, length, anchor) };
-            let mut r = BufferStreamReader::try_new(buf).map_err(RpcError::from)?;
-            let batch = r
-                .next()
-                .ok_or_else(|| RpcError::new("IPC", "empty SHM region"))?
-                .map_err(RpcError::from)?;
-            return Ok(batch);
-        }
-        // Dictionary path: stitch a synthetic stream and decode normally.
+        // Both the no-dict and dict paths read through
+        // `deserialize_from_shm`, which copies the region bytes into a
+        // synthetic IPC stream and decodes via upstream arrow-ipc.
+        // Earlier revisions kept a zero-copy fast path via
+        // `arrow_ipc::reader::BufferStreamReader`, but that type only
+        // exists on `rustyconover/arrow-rs feat/custom-metadata-and-buffer-reader`;
+        // dropping the patch for crates.io publication trades one
+        // extra mmap-to-Vec copy on the SHM read path for the ability
+        // to publish.
         let region: &[u8] = &self.shm.as_slice()[off..end];
         deserialize_from_shm(region, schema)
     }
@@ -810,21 +763,27 @@ fn strip_trailing_eos(buf: &[u8]) -> Result<&[u8]> {
 // ---------------------------------------------------------------------------
 
 /// Build a zero-row pointer batch carrying `(offset, length)` metadata.
-pub fn make_shm_pointer_batch(schema: &Schema, offset: u64, length: usize) -> Result<RecordBatch> {
+/// Returns `(batch, metadata)` — metadata is passed alongside the batch
+/// on the wire layer rather than embedded in the `RecordBatch`.
+pub fn make_shm_pointer_batch(
+    schema: &Schema,
+    offset: u64,
+    length: usize,
+) -> Result<(RecordBatch, Metadata)> {
     let batch = wire::empty_batch(schema)?;
     let mut md: Metadata = std::collections::HashMap::new();
     md.insert(SHM_OFFSET_KEY.into(), offset.to_string());
     md.insert(SHM_LENGTH_KEY.into(), length.to_string());
-    Ok(batch.with_custom_metadata(md))
+    Ok((batch, md))
 }
 
-/// True if `batch` is an SHM pointer batch (zero rows + offset key,
-/// without a log level — log batches share the zero-row shape).
-pub fn is_shm_pointer_batch(batch: &RecordBatch) -> bool {
+/// True if `(batch, md)` together describe an SHM pointer batch
+/// (zero rows + offset key, without a log level — log batches share
+/// the zero-row shape).
+pub fn is_shm_pointer_batch(batch: &RecordBatch, md: &Metadata) -> bool {
     if batch.num_rows() != 0 {
         return false;
     }
-    let md = batch.custom_metadata();
     md.contains_key(SHM_OFFSET_KEY) && !md.contains_key(LOG_LEVEL_KEY)
 }
 
@@ -834,6 +793,11 @@ pub struct ResolvedShm {
     /// `vgi_rpc.shm_source` tag added). When the input wasn't a pointer
     /// batch this is the input unchanged.
     pub batch: RecordBatch,
+    /// The metadata that accompanies `batch`, with SHM pointer keys
+    /// removed when the input was a pointer batch (and `shm_source`
+    /// added). When the input wasn't a pointer batch this is the input
+    /// `md` unchanged.
+    pub metadata: Metadata,
     /// Offset of the resolved region, when the input *was* a pointer
     /// batch. Use [`ShmSegment::free`] to release it after the handler
     /// is done with `batch`.
@@ -842,20 +806,25 @@ pub struct ResolvedShm {
 
 /// Resolve a pointer batch through `shm`, or return it unchanged when
 /// the input isn't a pointer batch (or no segment is available).
-pub fn resolve_shm_batch(batch: RecordBatch, shm: Option<&ShmSegment>) -> Result<ResolvedShm> {
+pub fn resolve_shm_batch(
+    batch: RecordBatch,
+    md: Metadata,
+    shm: Option<&ShmSegment>,
+) -> Result<ResolvedShm> {
     let Some(shm) = shm else {
         return Ok(ResolvedShm {
             batch,
+            metadata: md,
             release_offset: None,
         });
     };
-    if !is_shm_pointer_batch(&batch) {
+    if !is_shm_pointer_batch(&batch, &md) {
         return Ok(ResolvedShm {
             batch,
+            metadata: md,
             release_offset: None,
         });
     }
-    let md = batch.custom_metadata();
     let offset: u64 = md
         .get(SHM_OFFSET_KEY)
         .and_then(|s| s.parse().ok())
@@ -869,44 +838,44 @@ pub fn resolve_shm_batch(batch: RecordBatch, shm: Option<&ShmSegment>) -> Result
     new_md.remove(SHM_OFFSET_KEY);
     new_md.remove(SHM_LENGTH_KEY);
     new_md.insert(SHM_SOURCE_KEY.into(), shm.name().to_string());
-    // The non-dict (zero-copy) path embeds an `Allocation` owner that
-    // frees the slot on last-buffer-drop, so the caller must NOT free
-    // explicitly — that would race the in-flight batch's column data.
-    // The dict path copies the bytes into a fresh allocation, so the
-    // slot is safe to release as soon as `read_batch` returns.
-    let release_offset = if schema_has_dictionary(batch.schema().as_ref()) {
-        Some(offset)
-    } else {
-        None
-    };
+    // Both paths copy the SHM region bytes out of the segment (the
+    // earlier zero-copy fast-path via `BufferStreamReader` is gone —
+    // see the comment in `read_batch`). The resolved batch no longer
+    // references the segment, so the caller may release the slot
+    // immediately on return.
     Ok(ResolvedShm {
-        batch: resolved.with_custom_metadata(new_md),
-        release_offset,
+        batch: resolved,
+        metadata: new_md,
+        release_offset: Some(offset),
     })
 }
 
 /// Try to write `batch` into `shm`; on success return a pointer batch
 /// (preserving any pre-existing custom metadata other than the SHM
 /// keys). On failure (no segment, zero rows, doesn't fit) return `batch`
-/// unchanged.
-pub fn maybe_write_to_shm(batch: RecordBatch, shm: Option<&ShmSegment>) -> Result<RecordBatch> {
+/// unchanged. Returns `(batch, metadata)` — metadata carries the SHM
+/// pointer keys when written, or `batch_md` unchanged otherwise.
+pub fn maybe_write_to_shm(
+    batch: RecordBatch,
+    batch_md: Metadata,
+    shm: Option<&ShmSegment>,
+) -> Result<(RecordBatch, Metadata)> {
     let Some(shm) = shm else {
-        return Ok(batch);
+        return Ok((batch, batch_md));
     };
     if batch.num_rows() == 0 {
-        return Ok(batch);
+        return Ok((batch, batch_md));
     }
     let Some((offset, length)) = shm.allocate_and_write(&batch)? else {
-        return Ok(batch);
+        return Ok((batch, batch_md));
     };
-    let mut pointer = make_shm_pointer_batch(batch.schema().as_ref(), offset, length)?;
-    let mut merged = batch.custom_metadata().clone();
+    let (pointer, pointer_md) = make_shm_pointer_batch(batch.schema().as_ref(), offset, length)?;
+    let mut merged = batch_md;
     // Pointer keys win over any (unlikely) collision on the input.
-    for (k, v) in pointer.custom_metadata().iter() {
-        merged.insert(k.clone(), v.clone());
+    for (k, v) in pointer_md.into_iter() {
+        merged.insert(k, v);
     }
-    pointer = pointer.with_custom_metadata(merged);
-    Ok(pointer)
+    Ok((pointer, merged))
 }
 
 #[cfg(test)]
@@ -998,25 +967,23 @@ mod tests {
             ],
         )
         .unwrap();
-        let pointer = maybe_write_to_shm(batch.clone(), Some(&seg)).unwrap();
-        assert!(is_shm_pointer_batch(&pointer));
-        let resolved = resolve_shm_batch(pointer, Some(&seg)).unwrap();
+        let (pointer, pointer_md) =
+            maybe_write_to_shm(batch.clone(), Metadata::new(), Some(&seg)).unwrap();
+        assert!(is_shm_pointer_batch(&pointer, &pointer_md));
+        let resolved = resolve_shm_batch(pointer, pointer_md, Some(&seg)).unwrap();
         assert_eq!(resolved.batch.num_rows(), 3);
         assert_eq!(resolved.batch.schema(), batch.schema());
         assert_eq!(
-            resolved
-                .batch
-                .custom_metadata()
-                .get(SHM_SOURCE_KEY)
-                .map(String::as_str),
+            resolved.metadata.get(SHM_SOURCE_KEY).map(String::as_str),
             Some(seg.name()),
         );
-        // Non-dict path is now zero-copy: the resolved batch's column
-        // buffers alias the SHM region. Freeing is deferred to the
-        // anchor's drop, so `release_offset` is None and the caller
-        // must not free explicitly. Release happens when `resolved.batch`
-        // (and any clones of its columns) drop at end-of-scope.
-        assert!(resolved.release_offset.is_none());
+        // Both the dict and non-dict paths now copy the SHM region
+        // bytes into a fresh allocation (the upstream-stock arrow-ipc
+        // doesn't expose the buffer-aliasing reader the fork used).
+        // `release_offset` is therefore always set and the caller
+        // must free the slot.
+        let off = resolved.release_offset.expect("release_offset must be set");
+        let _ = seg.allocator().free(off);
     }
 
     #[test]
@@ -1028,9 +995,10 @@ mod tests {
         let keys = arrow_array::Int32Array::from(vec![0, 1, 0, 1, 0]);
         let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap();
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dict)]).unwrap();
-        let pointer = maybe_write_to_shm(batch.clone(), Some(&seg)).unwrap();
-        assert!(is_shm_pointer_batch(&pointer));
-        let resolved = resolve_shm_batch(pointer, Some(&seg)).unwrap();
+        let (pointer, pointer_md) =
+            maybe_write_to_shm(batch.clone(), Metadata::new(), Some(&seg)).unwrap();
+        assert!(is_shm_pointer_batch(&pointer, &pointer_md));
+        let resolved = resolve_shm_batch(pointer, pointer_md, Some(&seg)).unwrap();
         assert_eq!(resolved.batch.num_rows(), 5);
         assert_eq!(resolved.batch.schema(), batch.schema());
     }
@@ -1041,8 +1009,8 @@ mod tests {
         let mut md: Metadata = std::collections::HashMap::new();
         md.insert(SHM_OFFSET_KEY.into(), "0".into());
         md.insert(LOG_LEVEL_KEY.into(), "INFO".into());
-        let log_batch = wire::empty_batch(&schema).unwrap().with_custom_metadata(md);
-        assert!(!is_shm_pointer_batch(&log_batch));
+        let log_batch = wire::empty_batch(&schema).unwrap();
+        assert!(!is_shm_pointer_batch(&log_batch, &md));
     }
 
     #[test]
@@ -1191,16 +1159,17 @@ mod tests {
             vec![Arc::new(Int64Array::from_iter_values(0..1024))],
         )
         .unwrap();
-        let pointer = maybe_write_to_shm(batch.clone(), Some(&seg)).unwrap();
-        assert!(is_shm_pointer_batch(&pointer));
+        let (pointer, pointer_md) =
+            maybe_write_to_shm(batch.clone(), Metadata::new(), Some(&seg)).unwrap();
+        assert!(is_shm_pointer_batch(&pointer, &pointer_md));
         assert_eq!(seg.allocator().num_allocs(), 1);
-        let resolved = resolve_shm_batch(pointer, Some(&seg)).unwrap();
+        let resolved = resolve_shm_batch(pointer, pointer_md, Some(&seg)).unwrap();
         assert_eq!(resolved.batch.num_rows(), 1024);
-        // Non-dict: anchor owns the free; nothing for the caller to do.
-        assert!(resolved.release_offset.is_none());
+        // Both paths now require explicit free (the zero-copy anchor
+        // was tied to the dropped fork API).
+        let off = resolved.release_offset.expect("release_offset must be set");
         drop(resolved);
-        // After the resolved batch (and its column buffers) drop, the
-        // ShmBatchAnchor's Drop runs, which frees the slot.
+        seg.allocator().free(off).unwrap();
         assert_eq!(seg.allocator().num_allocs(), 0);
     }
 
@@ -1214,10 +1183,8 @@ mod tests {
         let mut md: Metadata = std::collections::HashMap::new();
         md.insert(SHM_OFFSET_KEY.into(), seg.size().to_string());
         md.insert(SHM_LENGTH_KEY.into(), "1024".into());
-        let bogus = wire::empty_batch(schema.as_ref())
-            .unwrap()
-            .with_custom_metadata(md);
-        let err = match resolve_shm_batch(bogus, Some(&seg)) {
+        let bogus = wire::empty_batch(schema.as_ref()).unwrap();
+        let err = match resolve_shm_batch(bogus, md, Some(&seg)) {
             Err(e) => e,
             Ok(_) => panic!("must reject"),
         };
@@ -1231,10 +1198,8 @@ mod tests {
         let mut md: Metadata = std::collections::HashMap::new();
         md.insert(SHM_OFFSET_KEY.into(), "not-a-number".into());
         md.insert(SHM_LENGTH_KEY.into(), "100".into());
-        let bogus = wire::empty_batch(schema.as_ref())
-            .unwrap()
-            .with_custom_metadata(md);
-        let err = match resolve_shm_batch(bogus, Some(&seg)) {
+        let bogus = wire::empty_batch(schema.as_ref()).unwrap();
+        let err = match resolve_shm_batch(bogus, md, Some(&seg)) {
             Err(e) => e,
             Ok(_) => panic!("must reject"),
         };

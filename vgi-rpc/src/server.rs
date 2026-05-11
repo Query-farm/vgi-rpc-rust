@@ -44,7 +44,7 @@ fn maybe_attach_shm(_req_md: &Metadata) -> Option<ShmSegment> {
     None
 }
 use crate::stream::{empty_schema, Emitted, OutputCollector, StreamResult, StreamStateKind};
-use crate::wire::{attach_md_opt, empty_batch, md_get, Metadata, StreamReader, StreamWriter};
+use crate::wire::{empty_batch, md_get, Metadata, StreamReader, StreamWriter};
 
 /// Serialize a parsed request batch back to a self-contained Arrow IPC
 /// stream (one schema message + one record batch + EOS) for inclusion in
@@ -155,8 +155,11 @@ impl Request {
     /// `require_method` controls whether a missing `vgi_rpc.method` key is
     /// an error (pipe/unix transports require it; HTTP already derives the
     /// method from the URL path and may leave the key absent).
-    pub(crate) fn from_read_batch(batch: RecordBatch, require_method: bool) -> Result<Self> {
-        let metadata: Metadata = batch.custom_metadata().clone();
+    pub(crate) fn from_read_batch(
+        batch: RecordBatch,
+        metadata: Metadata,
+        require_method: bool,
+    ) -> Result<Self> {
         let method = if require_method {
             md_get(&metadata, RPC_METHOD_KEY)
                 .ok_or_else(|| {
@@ -774,12 +777,12 @@ impl RpcServer {
                 return Err(e);
             }
         };
-        let batch = match reader.read_next()? {
+        let (batch, metadata) = match reader.read_next()? {
             Some(b) => b,
             None => return Ok(None),
         };
         reader.drain()?;
-        Ok(Some(Request::from_read_batch(batch, true)?))
+        Ok(Some(Request::from_read_batch(batch, metadata, true)?))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -800,7 +803,7 @@ impl RpcServer {
                 let mut sw = StreamWriter::new(w, &info.result_schema)?;
                 for log in logs {
                     let md = build_log_metadata(&log, &self.server_id, &req.request_id);
-                    sw.write(&empty_batch(&info.result_schema)?.with_custom_metadata(md.clone()))?;
+                    sw.write(&empty_batch(&info.result_schema)?, Some(&md))?;
                 }
                 let out_batch = match maybe_batch {
                     Some(b) => b,
@@ -813,12 +816,10 @@ impl RpcServer {
                 }
                 #[cfg(feature = "shm")]
                 if let Some(seg) = shm {
-                    let written = maybe_write_to_shm(out_batch.clone(), Some(seg))?;
-                    if written
-                        .custom_metadata()
-                        .contains_key(crate::metadata::SHM_OFFSET_KEY)
-                    {
-                        sw.write(&written)?;
+                    let (written, written_md) =
+                        maybe_write_to_shm(out_batch.clone(), Metadata::new(), Some(seg))?;
+                    if written_md.contains_key(crate::metadata::SHM_OFFSET_KEY) {
+                        sw.write(&written, Some(&written_md))?;
                         sw.finish()?;
                         return Ok(());
                     }
@@ -828,24 +829,24 @@ impl RpcServer {
                     if let Ok(Some((ptr, md))) =
                         crate::external::maybe_externalize_batch(&out_batch, None, cfg)
                     {
-                        sw.write(&ptr.with_custom_metadata(md.clone()))?;
+                        sw.write(&ptr, Some(&md))?;
                         sw.finish()?;
                         return Ok(());
                     }
                 }
                 #[cfg(not(feature = "shm"))]
                 let _ = shm;
-                sw.write(&out_batch)?;
+                sw.write(&out_batch, None)?;
                 sw.finish()?;
             }
             Err(err) => {
                 let mut sw = StreamWriter::new(w, &info.result_schema)?;
                 for log in logs {
                     let md = build_log_metadata(&log, &self.server_id, &req.request_id);
-                    sw.write(&empty_batch(&info.result_schema)?.with_custom_metadata(md.clone()))?;
+                    sw.write(&empty_batch(&info.result_schema)?, Some(&md))?;
                 }
                 let md = build_error_metadata(&err, &self.server_id, &req.request_id);
-                sw.write(&empty_batch(&info.result_schema)?.with_custom_metadata(md.clone()))?;
+                sw.write(&empty_batch(&info.result_schema)?, Some(&md))?;
                 sw.finish()?;
                 *app_err = Some(err);
             }
@@ -876,10 +877,10 @@ impl RpcServer {
                 let mut sw = StreamWriter::new(w, &output_schema)?;
                 for log in init_logs {
                     let md = build_log_metadata(&log, &self.server_id, &req.request_id);
-                    sw.write(&empty_batch(&output_schema)?.with_custom_metadata(md.clone()))?;
+                    sw.write(&empty_batch(&output_schema)?, Some(&md))?;
                 }
                 let md = build_error_metadata(&err, &self.server_id, &req.request_id);
-                sw.write(&empty_batch(&output_schema)?.with_custom_metadata(md.clone()))?;
+                sw.write(&empty_batch(&output_schema)?, Some(&md))?;
                 sw.finish()?;
                 // Drain any client input (ticks / exchange batches) so the transport
                 // is clean for the next request.
@@ -903,14 +904,9 @@ impl RpcServer {
             let mut hw = StreamWriter::new(&mut *w, header_batch.schema().as_ref())?;
             for log in &init_logs {
                 let md = build_log_metadata(log, &self.server_id, &req.request_id);
-                hw.write(
-                    &empty_batch(header_batch.schema().as_ref())?.with_custom_metadata(md.clone()),
-                )?;
+                hw.write(&empty_batch(header_batch.schema().as_ref())?, Some(&md))?;
             }
-            hw.write(&attach_md_opt(
-                header_batch.clone(),
-                header_metadata.clone(),
-            ))?;
+            hw.write(&header_batch, header_metadata.as_ref())?;
             hw.finish()?;
         }
         let _ = w.flush();
@@ -928,9 +924,7 @@ impl RpcServer {
         if !wrote_header {
             for log in &init_logs {
                 let md = build_log_metadata(log, &self.server_id, &req.request_id);
-                out_writer.write(
-                    &empty_batch(output_schema.as_ref())?.with_custom_metadata(md.clone()),
-                )?;
+                out_writer.write(&empty_batch(output_schema.as_ref())?, Some(&md))?;
             }
         }
         let _ = header_metadata;
@@ -943,7 +937,7 @@ impl RpcServer {
                 Ok(x) => x,
                 Err(_) => break,
             };
-            let Some(input_batch) = read else {
+            let Some((input_batch, input_md)) = read else {
                 break;
             };
 
@@ -952,15 +946,14 @@ impl RpcServer {
             // batch. Free the region as soon as it's been deserialized
             // (we copy on read, so no live borrow remains).
             #[cfg(feature = "shm")]
-            let input_batch = {
-                let resolved = resolve_shm_batch(input_batch, shm)?;
+            let (input_batch, input_md) = {
+                let resolved = resolve_shm_batch(input_batch, input_md, shm)?;
                 if let (Some(off), Some(seg)) = (resolved.release_offset, shm) {
                     let _ = seg.free(off);
                 }
-                resolved.batch
+                (resolved.batch, resolved.metadata)
             };
 
-            let input_md = input_batch.custom_metadata().clone();
             {
                 let mut s = stats.lock().unwrap();
                 s.input_batches += 1;
@@ -984,10 +977,7 @@ impl RpcServer {
                         Ok(b) => b,
                         Err(e) => {
                             let md = build_error_metadata(&e, &self.server_id, &req.request_id);
-                            out_writer.write(
-                                &empty_batch(output_schema.as_ref())?
-                                    .with_custom_metadata(md.clone()),
-                            )?;
+                            out_writer.write(&empty_batch(output_schema.as_ref())?, Some(&md))?;
                             break 'lockstep;
                         }
                     }
@@ -1006,16 +996,12 @@ impl RpcServer {
             let iter_logs = ctx.drain_logs();
             for log in iter_logs {
                 let md = build_log_metadata(&log, &self.server_id, &req.request_id);
-                out_writer.write(
-                    &empty_batch(output_schema.as_ref())?.with_custom_metadata(md.clone()),
-                )?;
+                out_writer.write(&empty_batch(output_schema.as_ref())?, Some(&md))?;
             }
 
             if let Err(err) = iter_result {
                 let md = build_error_metadata(&err, &self.server_id, &req.request_id);
-                out_writer.write(
-                    &empty_batch(output_schema.as_ref())?.with_custom_metadata(md.clone()),
-                )?;
+                out_writer.write(&empty_batch(output_schema.as_ref())?, Some(&md))?;
                 *app_err = Some(err);
                 break;
             }
@@ -1027,9 +1013,7 @@ impl RpcServer {
                 match item {
                     Emitted::Log(log) => {
                         let md = build_log_metadata(&log, &self.server_id, &req.request_id);
-                        out_writer.write(
-                            &empty_batch(output_schema.as_ref())?.with_custom_metadata(md.clone()),
-                        )?;
+                        out_writer.write(&empty_batch(output_schema.as_ref())?, Some(&md))?;
                     }
                     Emitted::Batch { batch, metadata } => {
                         {
@@ -1039,13 +1023,11 @@ impl RpcServer {
                         }
                         #[cfg(feature = "shm")]
                         if let Some(seg) = shm {
-                            let attached = attach_md_opt(batch.clone(), metadata.clone());
-                            let written = maybe_write_to_shm(attached, Some(seg))?;
-                            if written
-                                .custom_metadata()
-                                .contains_key(crate::metadata::SHM_OFFSET_KEY)
-                            {
-                                out_writer.write(&written)?;
+                            let md_in = metadata.clone().unwrap_or_default();
+                            let (written, written_md) =
+                                maybe_write_to_shm(batch.clone(), md_in, Some(seg))?;
+                            if written_md.contains_key(crate::metadata::SHM_OFFSET_KEY) {
+                                out_writer.write(&written, Some(&written_md))?;
                                 continue;
                             }
                         }
@@ -1057,7 +1039,7 @@ impl RpcServer {
                                 cfg,
                             ) {
                                 Ok(Some((ptr, md))) => {
-                                    out_writer.write(&ptr.with_custom_metadata(md.clone()))?;
+                                    out_writer.write(&ptr, Some(&md))?;
                                     continue;
                                 }
                                 Ok(None) => {}
@@ -1068,7 +1050,7 @@ impl RpcServer {
                                 }
                             }
                         }
-                        out_writer.write(&attach_md_opt(batch.clone(), metadata.clone()))?;
+                        out_writer.write(&batch, metadata.as_ref())?;
                     }
                 }
             }
@@ -1175,7 +1157,7 @@ pub fn write_error_stream<W: Write>(
 ) -> Result<()> {
     let mut sw = StreamWriter::new(w, schema)?;
     let md = build_error_metadata(err, server_id, request_id);
-    sw.write(&empty_batch(schema)?.with_custom_metadata(md.clone()))?;
+    sw.write(&empty_batch(schema)?, Some(&md))?;
     sw.finish()?;
     Ok(())
 }

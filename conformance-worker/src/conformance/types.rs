@@ -57,7 +57,7 @@ impl Point {
         let mut buf = Vec::new();
         {
             let mut w = StreamWriter::new(&mut buf, &schema)?;
-            w.write(&batch)?;
+            w.write(&batch, None)?;
             w.finish()?;
         }
         Ok(buf)
@@ -65,7 +65,7 @@ impl Point {
 
     pub fn deserialize_ipc(bytes: &[u8]) -> Result<Self> {
         let mut r = StreamReader::new(bytes)?;
-        let batch = r
+        let (batch, _md) = r
             .read_next()?
             .ok_or_else(|| RpcError::type_error("empty Point IPC stream"))?;
         let schema = batch.schema();
@@ -337,7 +337,7 @@ impl AllTypes {
         let mut buf = Vec::new();
         {
             let mut w = StreamWriter::new(&mut buf, &all_types_schema())?;
-            w.write(&batch)?;
+            w.write(&batch, None)?;
             w.finish()?;
         }
         Ok(buf)
@@ -345,7 +345,7 @@ impl AllTypes {
 
     pub fn deserialize_ipc(bytes: &[u8]) -> Result<Self> {
         let mut r = StreamReader::new(bytes)?;
-        let batch = r
+        let (batch, _md) = r
             .read_next()?
             .ok_or_else(|| RpcError::type_error("empty AllTypes IPC"))?;
         AllTypes::from_record_batch(&batch)
@@ -677,7 +677,7 @@ pub fn serialize_bounding_box_ipc(top: &Point, bot: &Point, label: &str) -> Resu
     let mut buf = Vec::new();
     {
         let mut w = StreamWriter::new(&mut buf, &schema)?;
-        w.write(&batch)?;
+        w.write(&batch, None)?;
         w.finish()?;
     }
     Ok(buf)
@@ -685,7 +685,7 @@ pub fn serialize_bounding_box_ipc(top: &Point, bot: &Point, label: &str) -> Resu
 
 pub fn deserialize_bounding_box_ipc(bytes: &[u8]) -> Result<(Point, Point, String)> {
     let mut r = StreamReader::new(bytes)?;
-    let rb = r
+    let (rb, _md) = r
         .read_next()?
         .ok_or_else(|| RpcError::type_error("empty BoundingBox IPC"))?;
     bounding_box_from_batch(&rb)

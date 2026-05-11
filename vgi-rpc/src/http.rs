@@ -33,9 +33,7 @@ use crate::server::{
     RpcServer,
 };
 use crate::stream::{empty_schema, Emitted, OutputCollector, StreamResult, StreamStateKind};
-use crate::wire::{
-    attach_md_opt, bytes_to_hex, empty_batch, md_get, Metadata, StreamReader, StreamWriter,
-};
+use crate::wire::{bytes_to_hex, empty_batch, md_get, Metadata, StreamReader, StreamWriter};
 
 pub const ARROW_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 
@@ -588,7 +586,7 @@ fn read_segment(buf: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
 /// `Schema.serialize()` path. Round-trip via [`read_schema_bytes`].
 fn write_schema_bytes(schema: &Schema) -> Result<Vec<u8>> {
     let empty = empty_batch(schema)?;
-    crate::wire::write_one_batch(&empty)
+    crate::wire::write_one_batch(&empty, None)
 }
 
 /// Inverse of [`write_schema_bytes`].
@@ -1126,7 +1124,7 @@ fn cap_error_response(
     {
         let mut sw = StreamWriter::new(&mut buf, schema).unwrap();
         let md = build_error_metadata(err, server_id, request_id);
-        let _ = sw.write(&empty_batch(schema).unwrap().with_custom_metadata(md));
+        let _ = sw.write(&empty_batch(schema).unwrap(), Some(&md));
         let _ = sw.finish();
     }
     let mut headers = HeaderMap::new();
@@ -1199,11 +1197,11 @@ fn decode_zstd_bounded(input: &[u8], max_size: usize) -> Result<Vec<u8>> {
 
 fn parse_request_from_body(body: &[u8]) -> Result<Request> {
     let mut r = StreamReader::new(body)?;
-    let batch = r
+    let (batch, metadata) = r
         .read_next()?
         .ok_or_else(|| RpcError::protocol_error("empty IPC stream"))?;
     r.drain()?;
-    Request::from_read_batch(batch, false)
+    Request::from_read_batch(batch, metadata, false)
 }
 
 fn error_stream_bytes(
@@ -1215,11 +1213,7 @@ fn error_stream_bytes(
     let mut buf = Vec::new();
     let mut w = StreamWriter::new(&mut buf, schema).unwrap();
     let md = build_error_metadata(err, server_id, request_id);
-    let _ = w.write(
-        &empty_batch(schema)
-            .unwrap()
-            .with_custom_metadata(md.clone()),
-    );
+    let _ = w.write(&empty_batch(schema).unwrap(), Some(&md));
     let _ = w.finish();
     drop(w);
     buf
@@ -1417,25 +1411,17 @@ async fn handle_upload_url(
                         let err = RpcError::runtime_error(format!("upload-url batch: {e}"));
                         let md =
                             build_error_metadata(&err, &state.server.server_id, &req.request_id);
-                        let _ = sw.write(
-                            &empty_batch(&schema)
-                                .unwrap()
-                                .with_custom_metadata(md.clone()),
-                        );
+                        let _ = sw.write(&empty_batch(&schema).unwrap(), Some(&md));
                         let _ = sw.finish();
                         drop(sw);
                         return arrow_response(StatusCode::OK, body_buf);
                     }
                 };
-                let _ = sw.write(&batch);
+                let _ = sw.write(&batch, None);
             }
             Err(err) => {
                 let md = build_error_metadata(&err, &state.server.server_id, &req.request_id);
-                let _ = sw.write(
-                    &empty_batch(&schema)
-                        .unwrap()
-                        .with_custom_metadata(md.clone()),
-                );
+                let _ = sw.write(&empty_batch(&schema).unwrap(), Some(&md));
             }
         }
         let _ = sw.finish();
@@ -1550,11 +1536,7 @@ async fn handle_unary(
         let mut sw = StreamWriter::new(&mut buf, &info.result_schema).unwrap();
         for log in &logs {
             let md = build_log_metadata(log, &server.server_id, &req.request_id);
-            let _ = sw.write(
-                &empty_batch(&info.result_schema)
-                    .unwrap()
-                    .with_custom_metadata(md.clone()),
-            );
+            let _ = sw.write(&empty_batch(&info.result_schema).unwrap(), Some(&md));
         }
         match result {
             Ok(batch_opt) => {
@@ -1572,32 +1554,24 @@ async fn handle_unary(
                     });
                     match externalized {
                         Ok(Some((ptr, md))) => {
-                            let _ = sw.write(&ptr.with_custom_metadata(md.clone()));
+                            let _ = sw.write(&ptr, Some(&md));
                         }
                         Ok(None) => {
-                            let _ = sw.write(&out_batch);
+                            let _ = sw.write(&out_batch, None);
                         }
                         Err(err) => {
                             let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-                            let _ = sw.write(
-                                &empty_batch(&info.result_schema)
-                                    .unwrap()
-                                    .with_custom_metadata(md.clone()),
-                            );
+                            let _ = sw.write(&empty_batch(&info.result_schema).unwrap(), Some(&md));
                             app_err = Some(err);
                         }
                     }
                 } else {
-                    let _ = sw.write(&out_batch);
+                    let _ = sw.write(&out_batch, None);
                 }
             }
             Err(err) => {
                 let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-                let _ = sw.write(
-                    &empty_batch(&info.result_schema)
-                        .unwrap()
-                        .with_custom_metadata(md.clone()),
-                );
+                let _ = sw.write(&empty_batch(&info.result_schema).unwrap(), Some(&md));
                 app_err = Some(err);
             }
         }
@@ -1706,16 +1680,9 @@ async fn handle_stream_init(
         let mut hw = StreamWriter::new(&mut body_buf, hdr_schema.as_ref()).unwrap();
         for log in &init_logs {
             let md = build_log_metadata(log, &server.server_id, &req.request_id);
-            let _ = hw.write(
-                &empty_batch(hdr_schema.as_ref())
-                    .unwrap()
-                    .with_custom_metadata(md.clone()),
-            );
+            let _ = hw.write(&empty_batch(hdr_schema.as_ref()).unwrap(), Some(&md));
         }
-        let _ = hw.write(&attach_md_opt(
-            header_batch.clone(),
-            header_metadata.clone(),
-        ));
+        let _ = hw.write(header_batch, header_metadata.as_ref());
         let _ = hw.finish();
     }
 
@@ -1729,11 +1696,7 @@ async fn handle_stream_init(
         if header.is_none() {
             for log in &init_logs {
                 let md = build_log_metadata(log, &server.server_id, &req.request_id);
-                let _ = sw.write(
-                    &empty_batch(output_schema.as_ref())
-                        .unwrap()
-                        .with_custom_metadata(md.clone()),
-                );
+                let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
             }
         }
         let _ = header_metadata;
@@ -1758,22 +1721,14 @@ async fn handle_stream_init(
             ) {
                 Ok(token) => {
                     let md = Metadata::from([(STATE_KEY.to_string(), token)]);
-                    let _ = sw.write(
-                        &empty_batch(output_schema.as_ref())
-                            .unwrap()
-                            .with_custom_metadata(md.clone()),
-                    );
+                    let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                 }
                 Err(err) => {
                     // Handler doesn't implement encode_state — emit as an
                     // error envelope so the client sees a useful message
                     // instead of a hung stream.
                     let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-                    let _ = sw.write(
-                        &empty_batch(output_schema.as_ref())
-                            .unwrap()
-                            .with_custom_metadata(md.clone()),
-                    );
+                    let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                     init_error = Some(err);
                 }
             }
@@ -1834,19 +1789,11 @@ fn run_producer<W: std::io::Write>(
         let result = producer.produce(&mut out, &ctx);
         for log in ctx.drain_logs() {
             let md = build_log_metadata(&log, &server.server_id, &req.request_id);
-            let _ = sw.write(
-                &empty_batch(output_schema.as_ref())
-                    .unwrap()
-                    .with_custom_metadata(md.clone()),
-            );
+            let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
         }
         if let Err(err) = result {
             let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-            let _ = sw.write(
-                &empty_batch(output_schema.as_ref())
-                    .unwrap()
-                    .with_custom_metadata(md.clone()),
-            );
+            let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
             return true;
         }
         let finished = out.finished();
@@ -1855,14 +1802,10 @@ fn run_producer<W: std::io::Write>(
             match item {
                 Emitted::Log(log) => {
                     let md = build_log_metadata(&log, &server.server_id, &req.request_id);
-                    let _ = sw.write(
-                        &empty_batch(output_schema.as_ref())
-                            .unwrap()
-                            .with_custom_metadata(md.clone()),
-                    );
+                    let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                 }
                 Emitted::Batch { batch, metadata } => {
-                    let _ = sw.write(&attach_md_opt(batch, metadata));
+                    let _ = sw.write(&batch, metadata.as_ref());
                     emitted_data = true;
                 }
             }
@@ -2004,19 +1947,11 @@ async fn handle_stream_exchange(
                 ) {
                     Ok(new_token) => {
                         let md = Metadata::from([(STATE_KEY.to_string(), new_token)]);
-                        let _ = sw.write(
-                            &empty_batch(output_schema.as_ref())
-                                .unwrap()
-                                .with_custom_metadata(md.clone()),
-                        );
+                        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                     }
                     Err(err) => {
                         let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-                        let _ = sw.write(
-                            &empty_batch(output_schema.as_ref())
-                                .unwrap()
-                                .with_custom_metadata(md.clone()),
-                        );
+                        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                     }
                 }
             }
@@ -2032,11 +1967,7 @@ async fn handle_stream_exchange(
             Err(e) => {
                 let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
                 let md = build_error_metadata(&e, &server.server_id, &req.request_id);
-                let _ = sw.write(
-                    &empty_batch(output_schema.as_ref())
-                        .unwrap()
-                        .with_custom_metadata(md.clone()),
-                );
+                let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                 let _ = sw.finish();
                 drop(sw);
                 return arrow_response(StatusCode::OK, body_buf);
@@ -2055,19 +1986,11 @@ async fn handle_stream_exchange(
         let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
         for log in ctx.drain_logs() {
             let md = build_log_metadata(&log, &server.server_id, &req.request_id);
-            let _ = sw.write(
-                &empty_batch(output_schema.as_ref())
-                    .unwrap()
-                    .with_custom_metadata(md.clone()),
-            );
+            let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
         }
         if let Err(err) = res {
             let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-            let _ = sw.write(
-                &empty_batch(output_schema.as_ref())
-                    .unwrap()
-                    .with_custom_metadata(md.clone()),
-            );
+            let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
         } else {
             let new_token = match build_continuation_token(
                 &state,
@@ -2080,11 +2003,7 @@ async fn handle_stream_exchange(
                 Ok(t) => t,
                 Err(err) => {
                     let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-                    let _ = sw.write(
-                        &empty_batch(output_schema.as_ref())
-                            .unwrap()
-                            .with_custom_metadata(md.clone()),
-                    );
+                    let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                     let _ = sw.finish();
                     drop(sw);
                     return arrow_response(StatusCode::OK, body_buf);
@@ -2095,27 +2014,19 @@ async fn handle_stream_exchange(
                 match item {
                     Emitted::Log(log) => {
                         let md = build_log_metadata(&log, &server.server_id, &req.request_id);
-                        let _ = sw.write(
-                            &empty_batch(output_schema.as_ref())
-                                .unwrap()
-                                .with_custom_metadata(md.clone()),
-                        );
+                        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                     }
                     Emitted::Batch { batch, metadata } => {
                         let mut md = metadata.unwrap_or_default();
                         md.insert(STATE_KEY.to_string(), new_token.clone());
-                        let _ = sw.write(&batch.clone().with_custom_metadata(md.clone()));
+                        let _ = sw.write(&batch, Some(&md));
                         wrote_data = true;
                     }
                 }
             }
             if !wrote_data {
                 let md = Metadata::from([(STATE_KEY.to_string(), new_token)]);
-                let _ = sw.write(
-                    &empty_batch(output_schema.as_ref())
-                        .unwrap()
-                        .with_custom_metadata(md.clone()),
-                );
+                let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
             }
         }
         let _ = sw.finish();
@@ -2133,11 +2044,10 @@ async fn handle_stream_exchange(
 
 fn read_input_batch(body: &[u8]) -> Result<(RecordBatch, Metadata)> {
     let mut r = StreamReader::new(body)?;
-    let batch = r
+    let (batch, metadata) = r
         .read_next()?
         .ok_or_else(|| RpcError::runtime_error("no batch in exchange request"))?;
     r.drain()?;
-    let metadata = batch.custom_metadata().clone();
     Ok((batch, metadata))
 }
 

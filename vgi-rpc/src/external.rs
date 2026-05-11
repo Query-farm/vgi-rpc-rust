@@ -26,7 +26,6 @@ use sha2::{Digest, Sha256};
 use crate::errors::{Result, RpcError};
 use crate::metadata::{LOCATION_FETCH_MS_KEY, LOCATION_KEY, LOCATION_SHA256_KEY};
 use crate::wire::{bytes_to_hex, empty_batch, md_get, write_one_batch, Metadata, StreamReader};
-use std::collections::HashMap;
 
 /// Optional body compression for externalized payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,16 +184,16 @@ impl ExternalLocationConfig {
 
 /// Serialize one record batch as a complete IPC stream (schema + batch + EOS).
 pub fn serialize_batch_to_ipc(batch: &RecordBatch) -> Result<Vec<u8>> {
-    // Strip any custom metadata: external payloads carry the raw data
-    // only; the pointer batch on the outside owns the metadata.
-    let stripped = batch.clone().with_custom_metadata(HashMap::new());
-    write_one_batch(&stripped)
+    // External payloads carry the raw data only; the pointer batch on
+    // the outside owns the metadata. Pass `None` to omit any
+    // `custom_metadata` field on the wire.
+    write_one_batch(batch, None)
 }
 
 /// Read back an IPC stream containing a single batch.
 pub fn deserialize_single_batch(ipc_bytes: &[u8]) -> Result<RecordBatch> {
     let mut r = StreamReader::new(ipc_bytes)?;
-    let batch = r
+    let (batch, _md) = r
         .read_next()?
         .ok_or_else(|| RpcError::runtime_error("external batch stream is empty"))?;
     Ok(batch)

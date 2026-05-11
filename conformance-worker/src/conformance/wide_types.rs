@@ -91,7 +91,7 @@ pub fn dataclass_serialize_ipc<T: VgiArrow>(value: T) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     {
         let mut w = StreamWriter::new(&mut buf, &schema)?;
-        w.write(&batch)?;
+        w.write(&batch, None)?;
         w.finish()?;
     }
     Ok(buf)
@@ -106,7 +106,7 @@ pub fn dataclass_deserialize_ipc<T: VgiArrow>(bytes: &[u8]) -> Result<T> {
     // nullability on read so arrow-rs's RecordBatch validation accepts
     // those payloads.
     let mut r = r.relax_nullability();
-    let rb = r
+    let (rb, _md) = r
         .read_next()?
         .ok_or_else(|| RpcError::type_error("empty dataclass IPC"))?;
     let s: StructArray = rb.into();

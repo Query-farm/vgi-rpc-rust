@@ -38,15 +38,6 @@ proc-macro2 = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 rust_decimal = { version = "1", default-features = false }
 
-[patch.crates-io]
-arrow-array = { git = "https://github.com/rustyconover/arrow-rs.git", branch = "feat/custom-metadata-and-buffer-reader" }
-arrow-buffer = { git = "https://github.com/rustyconover/arrow-rs.git", branch = "feat/custom-metadata-and-buffer-reader" }
-arrow-data = { git = "https://github.com/rustyconover/arrow-rs.git", branch = "feat/custom-metadata-and-buffer-reader" }
-arrow-ipc = { git = "https://github.com/rustyconover/arrow-rs.git", branch = "feat/custom-metadata-and-buffer-reader" }
-arrow-schema = { git = "https://github.com/rustyconover/arrow-rs.git", branch = "feat/custom-metadata-and-buffer-reader" }
-arrow-select = { git = "https://github.com/rustyconover/arrow-rs.git", branch = "feat/custom-metadata-and-buffer-reader" }
-arrow-cast = { git = "https://github.com/rustyconover/arrow-rs.git", branch = "feat/custom-metadata-and-buffer-reader" }
-
 [profile.release]
 opt-level = 3
 lto = "thin"

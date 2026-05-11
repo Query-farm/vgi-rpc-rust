@@ -214,7 +214,7 @@ pub fn write_describe_response<W: std::io::Write>(
     metadata: &Metadata,
 ) -> Result<()> {
     let mut sw = StreamWriter::new(w, batch.schema().as_ref())?;
-    sw.write(&batch.clone().with_custom_metadata(metadata.clone()))?;
+    sw.write(batch, Some(metadata))?;
     sw.finish()?;
     Ok(())
 }

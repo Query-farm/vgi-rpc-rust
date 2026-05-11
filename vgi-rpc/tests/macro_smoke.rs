@@ -200,8 +200,7 @@ fn build_unary_body<T: VgiArrow>(method: &str, params: Vec<(&str, T)>) -> Vec<u8
     let mut buf = Vec::new();
     {
         let mut w = StreamWriter::new(&mut buf, schema.as_ref()).unwrap();
-        w.write(&batch.clone().with_custom_metadata(md.clone()))
-            .unwrap();
+        w.write(&batch, Some(&md)).unwrap();
         w.finish().unwrap();
     }
     buf
@@ -225,8 +224,7 @@ fn build_empty_params_body(method: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     {
         let mut w = StreamWriter::new(&mut buf, schema.as_ref()).unwrap();
-        w.write(&batch.clone().with_custom_metadata(md.clone()))
-            .unwrap();
+        w.write(&batch, Some(&md)).unwrap();
         w.finish().unwrap();
     }
     buf
@@ -255,7 +253,7 @@ async fn unary_echo_string_round_trips() {
     let resp = post_arrow(app, "/echo_string", body).await;
 
     let mut r = StreamReader::new(resp.as_ref()).unwrap();
-    let rb = r.read_next().unwrap().expect("response batch");
+    let (rb, _md) = r.read_next().unwrap().expect("response batch");
     let col = rb
         .column_by_name("result")
         .expect("result column")
@@ -289,14 +287,13 @@ async fn unary_add_returns_sum() {
     let mut buf = Vec::new();
     {
         let mut w = StreamWriter::new(&mut buf, schema.as_ref()).unwrap();
-        w.write(&batch.clone().with_custom_metadata(md.clone()))
-            .unwrap();
+        w.write(&batch, Some(&md)).unwrap();
         w.finish().unwrap();
     }
     let resp = post_arrow(app, "/add", buf).await;
 
     let mut r = StreamReader::new(resp.as_ref()).unwrap();
-    let rb = r.read_next().unwrap().expect("response batch");
+    let (rb, _md) = r.read_next().unwrap().expect("response batch");
     let col = rb
         .column_by_name("result")
         .expect("result column")
@@ -327,9 +324,9 @@ async fn producer_emits_first_batch_and_state_token() {
     let mut r = StreamReader::new(resp.as_ref()).unwrap();
     let mut data_values: Vec<i64> = Vec::new();
     let mut got_token = false;
-    while let Some(rb) = r.read_next().unwrap() {
+    while let Some((rb, md)) = r.read_next().unwrap() {
         if rb.num_rows() == 0 {
-            for k in rb.custom_metadata().keys() {
+            for k in md.keys() {
                 if k == "vgi_rpc.stream_state#b64" {
                     got_token = true;
                 }
@@ -357,7 +354,7 @@ async fn producer_with_header_emits_header_then_data() {
     // Header stream: a single i64 column "value".
     let mut hr = StreamReader::new(&mut cursor).unwrap();
     let mut got_header_value: Option<i64> = None;
-    while let Some(rb) = hr.read_next().unwrap() {
+    while let Some((rb, _md)) = hr.read_next().unwrap() {
         if rb.num_rows() > 0 {
             let col = rb
                 .column_by_name("value")
@@ -373,7 +370,7 @@ async fn producer_with_header_emits_header_then_data() {
     // Output stream: first data batch + state token.
     let mut or_ = StreamReader::new(cursor).unwrap();
     let mut data: Vec<i64> = Vec::new();
-    while let Some(rb) = or_.read_next().unwrap() {
+    while let Some((rb, _md)) = or_.read_next().unwrap() {
         if rb.num_rows() > 0 {
             let col = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
             for i in 0..col.len() {
@@ -408,8 +405,7 @@ async fn dynamic_producer_uses_runtime_schema() {
     let mut buf = Vec::new();
     {
         let mut w = StreamWriter::new(&mut buf, schema.as_ref()).unwrap();
-        w.write(&batch.clone().with_custom_metadata(md.clone()))
-            .unwrap();
+        w.write(&batch, Some(&md)).unwrap();
         w.finish().unwrap();
     }
     let resp = post_arrow(app, "/count_dynamic/init", buf).await;
@@ -428,8 +424,8 @@ async fn exchange_init_returns_token() {
 
     let mut r = StreamReader::new(resp.as_ref()).unwrap();
     let mut got_token = false;
-    while let Some(rb) = r.read_next().unwrap() {
-        for k in rb.custom_metadata().keys() {
+    while let Some((_rb, md)) = r.read_next().unwrap() {
+        for k in md.keys() {
             if k == "vgi_rpc.stream_state#b64" {
                 got_token = true;
             }

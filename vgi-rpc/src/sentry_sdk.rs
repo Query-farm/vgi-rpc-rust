@@ -422,6 +422,21 @@ impl DispatchHook for SentrySdkHook {
     }
 }
 
+// Re-export a focused convenience helper so users don't have to
+// rummage in the `sentry` crate for the init call. Optional — they
+// can just call `sentry::init` directly.
+pub use sentry::init as init_sdk;
+
+/// Convenience: build [`ClientOptions`] from a DSN string. Same as
+/// `ClientOptions { dsn: Some(dsn.parse().ok()?), ..Default::default() }`
+/// but lets callers chain via the standard `ClientOptions` builders.
+pub fn client_options_from_dsn(dsn: &str) -> ClientOptions {
+    ClientOptions {
+        dsn: dsn.parse().ok(),
+        ..ClientOptions::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,20 +540,5 @@ mod tests {
         }
         // Inflight map should be drained.
         assert!(hook.inflight.lock().unwrap().is_empty());
-    }
-}
-
-// Re-export a focused convenience helper so users don't have to
-// rummage in the `sentry` crate for the init call. Optional — they
-// can just call `sentry::init` directly.
-pub use sentry::init as init_sdk;
-
-/// Convenience: build [`ClientOptions`] from a DSN string. Same as
-/// `ClientOptions { dsn: Some(dsn.parse().ok()?), ..Default::default() }`
-/// but lets callers chain via the standard `ClientOptions` builders.
-pub fn client_options_from_dsn(dsn: &str) -> ClientOptions {
-    ClientOptions {
-        dsn: dsn.parse().ok(),
-        ..ClientOptions::default()
     }
 }

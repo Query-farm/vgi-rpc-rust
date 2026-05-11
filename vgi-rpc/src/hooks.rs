@@ -56,6 +56,12 @@ pub struct DispatchInfo {
     pub stream_id: String,
     /// True when a stream was cancelled by the client.
     pub cancelled: bool,
+    /// Authentication claims — e.g. decoded JWT claims, X.509 cert
+    /// extensions, OAuth introspection fields. Cloned from
+    /// [`AuthContext::claims`](crate::auth::AuthContext::claims) at
+    /// dispatch start. Used by the Sentry hook to enrich user / tag
+    /// fields per Python `2d93987`.
+    pub claims: std::collections::BTreeMap<String, String>,
 }
 
 impl DispatchInfo {
@@ -84,6 +90,7 @@ impl DispatchInfo {
             request_data: Vec::new(),
             stream_id: String::new(),
             cancelled: false,
+            claims: auth.claims.clone(),
         }
     }
 }
@@ -199,6 +206,7 @@ mod tests {
             request_data: Vec::new(),
             stream_id: String::new(),
             cancelled: false,
+            claims: std::collections::BTreeMap::new(),
         };
         let token = chain.on_dispatch_start(&info);
         chain.on_dispatch_end(token, &info, None, &CallStatistics::default());

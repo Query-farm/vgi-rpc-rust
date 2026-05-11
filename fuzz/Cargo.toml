@@ -1,0 +1,38 @@
+[package]
+name = "vgi-rpc-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Excluded from the main workspace: cargo-fuzz manages its own build
+# graph and substitutes a libFuzzer-flavoured `rustc`. Mixing that
+# into a normal `cargo build` of the workspace breaks under stable
+# toolchains. Run with: `cargo +nightly fuzz run wire_stream_reader`.
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+vgi-rpc = { path = "../vgi-rpc", default-features = false }
+
+[[bin]]
+name = "wire_stream_reader"
+path = "fuzz_targets/wire_stream_reader.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+# Standalone workspace — see top-of-file comment.
+
+# Same arrow-rs fork as the parent workspace; required for the
+# `RecordBatch::custom_metadata` / `BufferStreamReader` APIs that
+# `vgi-rpc` depends on.
+[patch.crates-io]
+arrow-array = { git = "https://github.com/rustyconover/arrow-rs.git", branch = "feat/custom-metadata-and-buffer-reader" }
+arrow-buffer = { git = "https://github.com/rustyconover/arrow-rs.git", branch = "feat/custom-metadata-and-buffer-reader" }
+arrow-data = { git = "https://github.com/rustyconover/arrow-rs.git", branch = "feat/custom-metadata-and-buffer-reader" }
+arrow-ipc = { git = "https://github.com/rustyconover/arrow-rs.git", branch = "feat/custom-metadata-and-buffer-reader" }
+arrow-schema = { git = "https://github.com/rustyconover/arrow-rs.git", branch = "feat/custom-metadata-and-buffer-reader" }
+arrow-select = { git = "https://github.com/rustyconover/arrow-rs.git", branch = "feat/custom-metadata-and-buffer-reader" }
+arrow-cast = { git = "https://github.com/rustyconover/arrow-rs.git", branch = "feat/custom-metadata-and-buffer-reader" }

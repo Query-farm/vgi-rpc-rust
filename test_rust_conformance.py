@@ -152,6 +152,32 @@ def conformance_http_externalize_always_port(conformance_fake_storage: str) -> I
 
 
 @pytest.fixture(scope="session")
+def conformance_http_strict_cap_port() -> Iterator[int]:
+    """Run the Rust worker with strict body + externalised response caps.
+
+    Used by `TestHttpResponseCap` / `TestHttpResponseCapSoftWire` to
+    deliberately overshoot the cap on unary / exchange / producer paths.
+    Defaults mirror the Python `serve_conformance_http_strict.py`
+    fixture: 1 MiB inline + 1 MiB externalised.
+    """
+    proc = subprocess.Popen(
+        [RUST_WORKER, "--http", "--strict"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+        port = int(line.split(":", 1)[1])
+        _wait_for_http(port)
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
 def conformance_http_auth_port() -> Iterator[int]:
     """Run the Rust worker with a reject-all auth callback under `/vgi/`."""
     proc = subprocess.Popen(
@@ -396,7 +422,7 @@ class TestRustDescribeConformance:
 def _assert_describe(desc) -> None:  # type: ignore[no-untyped-def]
     assert desc.protocol_name == "ConformanceService"
     assert desc.describe_version == DESCRIBE_VERSION
-    assert len(desc.methods) == 73, sorted(desc.methods.keys())
+    assert len(desc.methods) == 76, sorted(desc.methods.keys())
     suite = run_describe_conformance(desc)
     if not suite.success:
         failures = [r for r in suite.results if not r.passed]

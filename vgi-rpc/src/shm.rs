@@ -963,7 +963,10 @@ mod tests {
         // that would slice past `total`.
         if let Some(off) = seg.allocator().allocate(total) {
             assert!(
-                (off as usize).checked_add(total).map(|e| e <= total).unwrap_or(false),
+                (off as usize)
+                    .checked_add(total)
+                    .map(|e| e <= total)
+                    .unwrap_or(false),
                 "allocator returned out-of-bounds offset {off} for size {total} (segment {total})",
             );
         }

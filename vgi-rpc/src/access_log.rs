@@ -39,6 +39,13 @@ enum Sink {
 pub struct AccessLogHook {
     sink: Sink,
     server_version: String,
+    /// When true, emit the full base64-encoded request batch as
+    /// `request_data` (DEBUG-equivalent — see [`Self::verbose`]).
+    /// When false (default), emit `original_request_bytes` +
+    /// `truncated: true` instead so the access-log schema's
+    /// "unary requires request_data unless truncated" invariant
+    /// still holds without ballooning every record by 8+ KiB.
+    verbose: bool,
     /// Start instants keyed by request_id for duration tracking. For server
     /// loads where request_id is always empty, a simple monotonically
     /// increasing counter token is used instead.
@@ -55,6 +62,32 @@ impl AccessLogHook {
         Arc::new(Self {
             sink: Sink::Sync(Arc::new(Mutex::new(sink))),
             server_version: server_version.into(),
+            verbose: false,
+            starts: Mutex::new(std::collections::HashMap::new()),
+            next_token: std::sync::atomic::AtomicU64::new(1),
+        })
+    }
+
+    /// Return a new `Arc<AccessLogHook>` with verbose request-data
+    /// emission enabled. Mirrors Python's
+    /// `_access_logger.isEnabledFor(logging.DEBUG)` behaviour where
+    /// the full base64-encoded request batch is included verbatim
+    /// rather than being elided via `truncated: true`.
+    pub fn with_verbose(self: Arc<Self>, verbose: bool) -> Arc<Self> {
+        if self.verbose == verbose {
+            return self;
+        }
+        let sink = match &self.sink {
+            Sink::Sync(m) => Sink::Sync(m.clone()),
+            Sink::Async { tx, dropped } => Sink::Async {
+                tx: tx.clone(),
+                dropped: dropped.clone(),
+            },
+        };
+        Arc::new(Self {
+            sink,
+            server_version: self.server_version.clone(),
+            verbose,
             starts: Mutex::new(std::collections::HashMap::new()),
             next_token: std::sync::atomic::AtomicU64::new(1),
         })
@@ -95,6 +128,7 @@ impl AccessLogHook {
         Arc::new(Self {
             sink: Sink::Async { tx, dropped },
             server_version: server_version.into(),
+            verbose: false,
             starts: Mutex::new(std::collections::HashMap::new()),
             next_token: std::sync::atomic::AtomicU64::new(1),
         })
@@ -183,10 +217,17 @@ impl DispatchHook for AccessLogHook {
             rec.insert("http_status".into(), json!(info.http_status));
         }
         if !info.request_data.is_empty() {
-            rec.insert(
-                "request_data".into(),
-                json!(base64_encode(&info.request_data)),
-            );
+            let encoded = base64_encode(&info.request_data);
+            if self.verbose {
+                rec.insert("request_data".into(), json!(encoded));
+            } else {
+                // INFO-level default: omit the full payload but keep the
+                // schema invariant via `original_request_bytes` +
+                // `truncated: true`. Mirrors Python's
+                // `_access_logger.isEnabledFor(logging.DEBUG)` gate.
+                rec.insert("original_request_bytes".into(), json!(encoded.len()));
+                rec.insert("truncated".into(), json!(true));
+            }
         }
         if info.method_type == "stream" {
             let sid = if info.stream_id.is_empty() {
@@ -358,6 +399,7 @@ mod tests {
             request_data: Vec::new(),
             stream_id: String::new(),
             cancelled: false,
+            claims: std::collections::BTreeMap::new(),
             protocol_hash: String::new(),
             protocol_version: String::new(),
         };
@@ -404,6 +446,7 @@ mod tests {
             request_data: Vec::new(),
             stream_id: String::new(),
             cancelled: false,
+            claims: std::collections::BTreeMap::new(),
             protocol_hash: String::new(),
             protocol_version: String::new(),
         };
@@ -455,6 +498,7 @@ mod tests {
             request_data: Vec::new(),
             stream_id: String::new(),
             cancelled: false,
+            claims: std::collections::BTreeMap::new(),
             protocol_hash: String::new(),
             protocol_version: String::new(),
         };
@@ -501,6 +545,7 @@ mod tests {
             request_data: Vec::new(),
             stream_id: String::new(),
             cancelled: false,
+            claims: std::collections::BTreeMap::new(),
             protocol_hash: String::new(),
             protocol_version: String::new(),
         };

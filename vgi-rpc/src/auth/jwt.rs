@@ -276,16 +276,29 @@ fn refresh_jwks(
         .jwks_url
         .as_deref()
         .ok_or_else(|| RpcError::runtime_error("JwtConfig.jwks_url must be set to refresh"))?;
-    // Single-flight: if another thread refreshed within the refresh_interval,
-    // skip the network call.
-    {
-        let guard = cache.lock().unwrap();
-        if let Some(c) = guard.as_ref() {
-            if Instant::now().duration_since(c.last_refresh) < cfg.refresh_interval {
-                return Ok(());
-            }
+    // Snapshot the cache's `last_refresh` *before* taking the lock so
+    // late-arriving threads notice when a peer refreshed while they
+    // were waiting and skip the network call.  Without this, N
+    // concurrent calls hitting an unknown `kid` during a key rotation
+    // would each race past the interval check, drop the lock to call
+    // the fetcher, and stampede the JWKS endpoint with N back-to-back
+    // GETs — exactly when the service should be recovering.
+    let seen_last_refresh = cache.lock().unwrap().as_ref().map(|c| c.last_refresh);
+    let mut guard = cache.lock().unwrap();
+    if let Some(c) = guard.as_ref() {
+        // Another thread refreshed while we were waiting on the lock.
+        if Some(c.last_refresh) != seen_last_refresh {
+            return Ok(());
+        }
+        // Within the configured refresh interval — peer (or earlier
+        // call from this thread) already covers us.
+        if Instant::now().duration_since(c.last_refresh) < cfg.refresh_interval {
+            return Ok(());
         }
     }
+    // Hold the lock across the fetch so only one thread issues the
+    // JWKS GET; peers parked on the lock will observe the freshly
+    // populated cache when they wake.
     let doc = fetcher(url)?;
     let mut keys = HashMap::new();
     for k in doc.keys {
@@ -293,7 +306,7 @@ fn refresh_jwks(
             keys.insert(kid, k);
         }
     }
-    *cache.lock().unwrap() = Some(JwksCache {
+    *guard = Some(JwksCache {
         keys,
         last_refresh: Instant::now(),
     });

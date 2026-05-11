@@ -1,10 +1,21 @@
 //! OpenTelemetry-compatible dispatch hook.
 //!
-//! Enabled by the `otel` feature. The hook opens a `tracing` span per RPC
-//! dispatch, attaches method/principal/auth_domain/status fields, and
-//! records statistics at end. Users wanting exporters (OTLP, Jaeger,
-//! Tempo) wire a `tracing-opentelemetry` subscriber at their leisure —
-//! this crate stays agnostic to the export pipeline.
+//! Enabled by the `otel` feature. The hook opens a real `tracing::Span`
+//! per RPC dispatch — created on `on_dispatch_start` and dropped on
+//! `on_dispatch_end` — and records method / principal / auth_domain /
+//! status / duration / batch-counts as span fields. A
+//! `tracing-opentelemetry` `Layer` installed by the user converts the
+//! span into a real OpenTelemetry span (with start/end times, status,
+//! attributes) for export via OTLP, Jaeger, Tempo, etc.
+//!
+//! That layered design keeps `vgi-rpc` free of the heavy
+//! `opentelemetry`/`opentelemetry-sdk` dependency tree: users opt into
+//! the exporter pipeline they want, and the hook produces span data
+//! that any `tracing-opentelemetry` layer picks up automatically.
+//!
+//! W3C trace context (`traceparent` / `tracestate`) carried by the
+//! request's `transport_metadata` is surfaced as span fields so
+//! `tracing-opentelemetry` can use them as the parent context.
 //!
 //! The hook also exposes a tiny counter + latency histogram updated in
 //! memory, queryable for test assertions and scrape-style pulls.
@@ -62,12 +73,23 @@ impl OtelMetrics {
     }
 }
 
-/// OTel-style dispatch hook. Records span-equivalent `tracing` events
-/// and bumps [`OtelMetrics`] counters.
+/// Span state retained between `on_dispatch_start` and
+/// `on_dispatch_end` for one RPC call.
+struct InflightSpan {
+    started: Instant,
+    /// Live `tracing::Span` recorded at start; dropped at end so
+    /// `tracing-opentelemetry` sees a complete span lifetime
+    /// (`new_span` → `close`) and produces an exported OTel span.
+    span: tracing::Span,
+}
+
+/// OTel-style dispatch hook. Records a real `tracing::Span` per call
+/// (consumed by `tracing-opentelemetry` as an OTel span) and bumps
+/// [`OtelMetrics`] counters.
 pub struct OtelHook {
     cfg: OtelConfig,
     metrics: Arc<OtelMetrics>,
-    starts: Mutex<HashMap<HookToken, Instant>>,
+    starts: Mutex<HashMap<HookToken, InflightSpan>>,
     next_token: AtomicU64,
 }
 
@@ -107,18 +129,43 @@ impl OtelHook {
 impl DispatchHook for OtelHook {
     fn on_dispatch_start(&self, info: &DispatchInfo) -> HookToken {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
-        self.starts.lock().unwrap().insert(token, Instant::now());
-        let (traceparent, _) = Self::extract_w3c_context(&info.transport_metadata);
-        tracing::info!(
+        let (traceparent, tracestate) = Self::extract_w3c_context(&info.transport_metadata);
+        // Span name follows OTel RPC semantic conventions
+        // (`rpc.system / rpc.service / rpc.method`); the
+        // tracing-opentelemetry layer maps the span fields to OTel
+        // attributes verbatim. Status / duration / error_* are
+        // recorded at end via `Span::record`.
+        let span = tracing::info_span!(
             target: "vgi_rpc.otel",
+            "rpc.call",
             service = %self.cfg.service_name,
+            rpc.system = "vgi_rpc",
+            rpc.service = %info.protocol,
+            rpc.method = %info.method,
             method = %info.method,
             method_type = info.method_type,
+            server_id = %info.server_id,
             principal = %info.principal,
             auth_domain = %info.auth_domain,
             authenticated = info.authenticated,
             traceparent = traceparent.as_deref().unwrap_or(""),
-            "rpc.start"
+            tracestate = tracestate.as_deref().unwrap_or(""),
+            // Declared up front so `Span::record` at end can populate.
+            status = tracing::field::Empty,
+            error_type = tracing::field::Empty,
+            error_message = tracing::field::Empty,
+            duration_ms = tracing::field::Empty,
+            input_batches = tracing::field::Empty,
+            output_batches = tracing::field::Empty,
+            input_rows = tracing::field::Empty,
+            output_rows = tracing::field::Empty,
+        );
+        self.starts.lock().unwrap().insert(
+            token,
+            InflightSpan {
+                started: Instant::now(),
+                span,
+            },
         );
         token
     }
@@ -130,12 +177,10 @@ impl DispatchHook for OtelHook {
         error: Option<&RpcError>,
         stats: &CallStatistics,
     ) {
-        let elapsed = self
-            .starts
-            .lock()
-            .unwrap()
-            .remove(&token)
-            .map(|t| t.elapsed())
+        let inflight = self.starts.lock().unwrap().remove(&token);
+        let elapsed = inflight
+            .as_ref()
+            .map(|i| i.started.elapsed())
             .unwrap_or_default();
         let elapsed_ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
 
@@ -161,20 +206,26 @@ impl DispatchHook for OtelHook {
         } else {
             ""
         };
-        tracing::info!(
-            target: "vgi_rpc.otel",
-            service = %self.cfg.service_name,
-            method = %info.method,
-            status = status,
-            error_type = error_type,
-            error_message = error_message,
-            duration_ms = elapsed.as_secs_f64() * 1000.0,
-            input_batches = stats.input_batches,
-            output_batches = stats.output_batches,
-            input_rows = stats.input_rows,
-            output_rows = stats.output_rows,
-            "rpc.end"
-        );
+
+        if let Some(inflight) = inflight {
+            // Populate the closing fields on the span. Dropping the
+            // `InflightSpan` (and its `tracing::Span`) afterwards is
+            // what signals the tracing-opentelemetry layer to close
+            // and export the OTel span. The drop runs unconditionally
+            // here even if an exporter inside the layer panics —
+            // that's the Rust equivalent of Python's
+            // `try/finally: otel_context.detach()` from `3d31a21`.
+            inflight.span.record("status", status);
+            inflight.span.record("error_type", error_type);
+            inflight.span.record("error_message", error_message);
+            inflight
+                .span
+                .record("duration_ms", elapsed.as_secs_f64() * 1000.0);
+            inflight.span.record("input_batches", stats.input_batches);
+            inflight.span.record("output_batches", stats.output_batches);
+            inflight.span.record("input_rows", stats.input_rows);
+            inflight.span.record("output_rows", stats.output_rows);
+        }
     }
 }
 
@@ -201,6 +252,7 @@ mod tests {
             request_data: Vec::new(),
             stream_id: String::new(),
             cancelled: false,
+            claims: std::collections::BTreeMap::new(),
             protocol_hash: String::new(),
             protocol_version: String::new(),
         }

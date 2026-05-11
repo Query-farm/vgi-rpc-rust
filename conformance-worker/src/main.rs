@@ -65,6 +65,10 @@ fn main() {
 
     if args.len() > 2 && args[1] == "--unix" {
         let server = Arc::new(conformance::build_server());
+        server.notify_transport(
+            vgi_rpc::TransportKind::Unix,
+            vgi_rpc::TransportCapabilities::none(),
+        );
         run_unix(server, &args[2]);
         return;
     }
@@ -78,6 +82,12 @@ fn main() {
     // calls coalesce into a few large writes. `stdin().lock()` already
     // has an 8 KB buffer; bump it for symmetry on large inbound batches.
     let server = Arc::new(conformance::build_server());
+    // SHM is opportunistic per-request; the worker is built against
+    // `vgi-rpc[shm]` so the capability is always present here.
+    server.notify_transport(
+        vgi_rpc::TransportKind::Pipe,
+        vgi_rpc::TransportCapabilities::shm(),
+    );
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut r = io::BufReader::with_capacity(1024 * 1024, stdin.lock());
@@ -246,8 +256,11 @@ fn run_http(
         // tests/serve_conformance_http_strict.py (1 MiB).
         let strict_default = 1024 * 1024usize;
         let max_resp = max_response_bytes_arg.or(if strict { Some(strict_default) } else { None });
-        let max_ext = max_externalized_response_bytes_arg
-            .or(if strict { Some(strict_default) } else { None });
+        let max_ext = max_externalized_response_bytes_arg.or(if strict {
+            Some(strict_default)
+        } else {
+            None
+        });
         if let Some(n) = max_resp {
             builder = builder.max_response_bytes(n);
         }

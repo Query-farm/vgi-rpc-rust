@@ -108,6 +108,13 @@ pub struct ExternalLocationConfig {
     /// [`https_only`](Self::https_only) is set to `false`. Reject the
     /// URL by returning `Err`.
     pub url_validator: UrlValidator,
+    /// Hard ceiling on the post-decompression size of a fetched
+    /// payload. Zstd frames carry their decompressed size in the
+    /// header and `zstd::decode_all` would otherwise trust it
+    /// eagerly — a small malicious payload claiming gigabytes of
+    /// output would OOM the client. Default 1 GiB. Set to `usize::MAX`
+    /// to disable.
+    pub max_decompressed_bytes: usize,
 }
 
 impl std::fmt::Debug for ExternalLocationConfig {
@@ -145,6 +152,7 @@ impl ExternalLocationConfig {
             storage,
             fetcher,
             url_validator: https_only_validator(),
+            max_decompressed_bytes: 1024 * 1024 * 1024,
         }
     }
 
@@ -160,6 +168,13 @@ impl ExternalLocationConfig {
 
     pub fn with_url_validator(mut self, v: UrlValidator) -> Self {
         self.url_validator = v;
+        self
+    }
+
+    /// Override the hard ceiling on post-decompression payload size.
+    /// Pass `usize::MAX` to disable. Default is 1 GiB.
+    pub fn with_max_decompressed_bytes(mut self, n: usize) -> Self {
+        self.max_decompressed_bytes = n;
         self
     }
 }
@@ -207,11 +222,43 @@ fn compress(ipc_bytes: &[u8], compression: Compression) -> Result<Vec<u8>> {
     }
 }
 
-fn decompress(bytes: &[u8], compression: Compression) -> Result<Vec<u8>> {
+fn decompress(bytes: &[u8], compression: Compression, max_size: usize) -> Result<Vec<u8>> {
     match compression {
-        Compression::None => Ok(bytes.to_vec()),
-        Compression::Zstd(_) => zstd::decode_all(bytes)
-            .map_err(|e| RpcError::runtime_error(format!("zstd decode: {e}"))),
+        Compression::None => {
+            if bytes.len() > max_size {
+                return Err(RpcError::runtime_error(format!(
+                    "external payload {} bytes exceeds max_decompressed_bytes={max_size}",
+                    bytes.len()
+                )));
+            }
+            Ok(bytes.to_vec())
+        }
+        // Stream-decode and stop if we exceed the cap. Avoids trusting
+        // the zstd frame header's declared decompressed size (which
+        // `decode_all` would otherwise allocate eagerly), blocking a
+        // remote OOM via a tiny payload claiming gigabytes of output.
+        Compression::Zstd(_) => {
+            use std::io::Read;
+            let mut decoder = zstd::Decoder::new(bytes)
+                .map_err(|e| RpcError::runtime_error(format!("zstd decode: {e}")))?;
+            let mut out = Vec::new();
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = decoder
+                    .read(&mut buf)
+                    .map_err(|e| RpcError::runtime_error(format!("zstd decode: {e}")))?;
+                if n == 0 {
+                    break;
+                }
+                if out.len() + n > max_size {
+                    return Err(RpcError::runtime_error(format!(
+                        "zstd decode: output exceeds max_decompressed_bytes={max_size}"
+                    )));
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -289,7 +336,7 @@ pub fn resolve_external_location(
 
     let start = std::time::Instant::now();
     let compressed = cfg.fetcher.fetch(url, cfg.compression)?;
-    let ipc_bytes = decompress(&compressed, cfg.compression)?;
+    let ipc_bytes = decompress(&compressed, cfg.compression, cfg.max_decompressed_bytes)?;
 
     // Integrity check.
     if let Some(expected) = md_get(metadata, LOCATION_SHA256_KEY) {

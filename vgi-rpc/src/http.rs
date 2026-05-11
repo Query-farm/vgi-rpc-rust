@@ -667,6 +667,13 @@ async fn postprocess_middleware(
     next: axum::middleware::Next,
 ) -> Response {
     use axum::body::to_bytes;
+    // Bind the server to the HTTP transport on first request. Idempotent
+    // for the (kind, caps) pair so calling it per-request is cheap;
+    // fork-safe for pre-fork deployments because each child fires once.
+    state.server.notify_transport(
+        crate::transport::TransportKind::Http,
+        crate::transport::TransportCapabilities::none(),
+    );
     let req_headers = req.headers().clone();
     let req_method = req.method().clone();
     let req_path = req.uri().path().to_string();
@@ -1119,11 +1126,7 @@ fn cap_error_response(
     {
         let mut sw = StreamWriter::new(&mut buf, schema).unwrap();
         let md = build_error_metadata(err, server_id, request_id);
-        let _ = sw.write(
-            &empty_batch(schema)
-                .unwrap()
-                .with_custom_metadata(md),
-        );
+        let _ = sw.write(&empty_batch(schema).unwrap().with_custom_metadata(md));
         let _ = sw.finish();
     }
     let mut headers = HeaderMap::new();

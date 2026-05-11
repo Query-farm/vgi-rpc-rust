@@ -30,8 +30,47 @@ where
 ///
 /// Convenience for test servers and simple bearer deployments. Not intended
 /// for large token sets (linear lookup is fine up to ~10k tokens).
+///
+/// The lookup performs a constant-time comparison against *every* known
+/// entry rather than a `HashMap::get` — the underlying string equality
+/// would short-circuit on the first mismatching byte and let a remote
+/// attacker brute-force a valid token byte-by-byte through response
+/// timing. Mirrors Python's `bearer_authenticate_static` (uses
+/// `hmac.compare_digest`).
 pub fn bearer_authenticate_static(tokens: HashMap<String, AuthContext>) -> Authenticate {
-    bearer_authenticate(move |tok| tokens.get(tok).cloned())
+    // Pre-encode known tokens once so the hot path only does compare.
+    let encoded: Vec<(Vec<u8>, AuthContext)> = tokens
+        .into_iter()
+        .map(|(k, v)| (k.into_bytes(), v))
+        .collect();
+    bearer_authenticate(move |tok| {
+        let needle = tok.as_bytes();
+        let mut found: Option<AuthContext> = None;
+        for (known, ctx) in &encoded {
+            // Always run the compare for every entry — short-circuiting
+            // on the first hit reintroduces the timing side channel.
+            if constant_time_eq(needle, known) && found.is_none() {
+                found = Some(ctx.clone());
+            }
+        }
+        found
+    })
+}
+
+/// Constant-time byte-slice equality. Returns `false` immediately when
+/// the lengths differ (parity with Python's `hmac.compare_digest`,
+/// which also leaks length); otherwise OR's per-byte XOR so the loop's
+/// runtime is independent of where (or whether) the slices match.
+#[inline]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]

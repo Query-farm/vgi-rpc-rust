@@ -29,6 +29,7 @@ pub mod shm;
 pub mod stream;
 #[cfg(feature = "http")]
 pub mod stream_codec;
+pub mod transport;
 pub(crate) mod util;
 pub mod wire;
 
@@ -48,5 +49,6 @@ pub use log::{LogLevel, LogMessage};
 pub use retry::RetryConfig;
 pub use server::{CallContext, MethodInfo, MethodType, RpcServer, RpcServerBuilder};
 pub use stream::{ExchangeState, OutputCollector, ProducerState, StreamResult};
+pub use transport::{ServeStartHook, TransportCapabilities, TransportKind};
 #[cfg(feature = "macros")]
 pub use vgi_rpc_macros::{exchange, param, producer, service, unary, StreamState, VgiArrow};

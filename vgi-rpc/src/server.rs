@@ -74,6 +74,10 @@ pub struct CallContext {
     pub auth: crate::auth::AuthContext,
     /// HTTP request cookies (empty for pipe/unix). Name → value.
     pub cookies: std::collections::BTreeMap<String, String>,
+    /// Coarse identifier of the bound transport. `None` until the
+    /// framework has observed the transport (i.e. before the first
+    /// [`RpcServer::notify_transport`] call).
+    pub kind: Option<crate::transport::TransportKind>,
     pub(crate) log_sink: Arc<Mutex<Vec<LogMessage>>>,
 }
 
@@ -105,6 +109,7 @@ impl CallContext {
             transport_metadata: Arc::new(req.metadata.clone()),
             auth: crate::auth::AuthContext::anonymous(),
             cookies: std::collections::BTreeMap::new(),
+            kind: server.transport_kind(),
             log_sink: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -123,6 +128,7 @@ impl CallContext {
             transport_metadata: Arc::new(req.metadata.clone()),
             auth,
             cookies,
+            kind: server.transport_kind(),
             log_sink: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -216,6 +222,7 @@ pub struct RpcServerBuilder {
     protocol_version: Option<String>,
     enable_describe: bool,
     dispatch_hook: Option<Arc<dyn crate::hooks::DispatchHook>>,
+    on_serve_start: Option<crate::transport::ServeStartHook>,
     #[cfg(feature = "http")]
     external_config: Option<Arc<crate::external::ExternalLocationConfig>>,
 }
@@ -254,6 +261,20 @@ impl RpcServerBuilder {
         self
     }
 
+    /// Register a one-shot lifecycle hook fired before the first
+    /// request is dispatched on each (kind, capabilities) combination.
+    /// Mirrors Python's `on_serve_start` duck-typed protocol.
+    ///
+    /// The hook runs synchronously on the thread that first observes
+    /// the transport binding. Subsequent calls to
+    /// [`RpcServer::notify_transport`] with the same `(kind, caps)`
+    /// are no-ops; calls with a different combination re-fire the hook
+    /// (matches Python's behaviour for test paths that re-bind).
+    pub fn on_serve_start(mut self, hook: crate::transport::ServeStartHook) -> Self {
+        self.on_serve_start = Some(hook);
+        self
+    }
+
     /// Enable automatic externalization of large unary results and stream
     /// output batches. Feature-gated on `http` (where the compression +
     /// fetcher deps already live).
@@ -273,6 +294,8 @@ impl RpcServerBuilder {
             protocol_hash: std::sync::OnceLock::new(),
             describe_enabled: self.enable_describe,
             dispatch_hook: self.dispatch_hook,
+            on_serve_start: self.on_serve_start,
+            transport_state: Mutex::new(None),
             #[cfg(feature = "http")]
             external_config: self.external_config,
         }
@@ -424,6 +447,17 @@ pub struct RpcServer {
     pub(crate) protocol_hash: std::sync::OnceLock<String>,
     pub(crate) describe_enabled: bool,
     pub(crate) dispatch_hook: Option<Arc<dyn crate::hooks::DispatchHook>>,
+    /// Optional one-shot lifecycle hook fired on the first
+    /// [`notify_transport`](Self::notify_transport) per (kind, caps).
+    on_serve_start: Option<crate::transport::ServeStartHook>,
+    /// Coarse identifier of the bound transport, populated by
+    /// [`notify_transport`](Self::notify_transport).
+    transport_state: Mutex<
+        Option<(
+            crate::transport::TransportKind,
+            crate::transport::TransportCapabilities,
+        )>,
+    >,
     #[cfg(feature = "http")]
     pub(crate) external_config: Option<Arc<crate::external::ExternalLocationConfig>>,
 }
@@ -476,6 +510,60 @@ impl RpcServer {
     #[cfg(feature = "http")]
     pub fn external_config(&self) -> Option<&Arc<crate::external::ExternalLocationConfig>> {
         self.external_config.as_ref()
+    }
+
+    /// Currently-bound [`TransportKind`](crate::transport::TransportKind),
+    /// or `None` before the framework has observed a transport. Set by
+    /// [`notify_transport`](Self::notify_transport).
+    pub fn transport_kind(&self) -> Option<crate::transport::TransportKind> {
+        self.transport_state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(k, _)| *k)
+    }
+
+    /// Currently-advertised [`TransportCapabilities`](crate::transport::TransportCapabilities).
+    /// Empty (all-false) before a transport is bound and for transports
+    /// without extra capabilities.
+    pub fn transport_capabilities(&self) -> crate::transport::TransportCapabilities {
+        self.transport_state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, c)| *c)
+            .unwrap_or_default()
+    }
+
+    /// Bind the server to a transport, firing `on_serve_start` once per
+    /// `(kind, caps)` combination. Subsequent calls with the same
+    /// combination are cheap no-ops (the common case where transport
+    /// glue invokes this on every request). A different combination
+    /// updates the bound state and re-fires the hook — matches the
+    /// Python `_notify_transport` contract.
+    ///
+    /// Call this from each transport entry point:
+    /// - stdio / pipe `main`: once before [`serve`](Self::serve)
+    /// - Unix accept loop: once per process
+    /// - HTTP request handler: every request (idempotent)
+    pub fn notify_transport(
+        &self,
+        kind: crate::transport::TransportKind,
+        caps: crate::transport::TransportCapabilities,
+    ) {
+        let hook = {
+            let mut guard = self.transport_state.lock().unwrap();
+            if let Some((cur_kind, cur_caps)) = guard.as_ref() {
+                if *cur_kind == kind && *cur_caps == caps {
+                    return;
+                }
+            }
+            *guard = Some((kind, caps));
+            self.on_serve_start.clone()
+        };
+        if let Some(h) = hook {
+            h(kind, &caps);
+        }
     }
 
     /// Register a method described by a [`MethodInfo`].

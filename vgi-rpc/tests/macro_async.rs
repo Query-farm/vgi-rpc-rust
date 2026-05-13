@@ -65,7 +65,7 @@ fn build_app() -> axum::Router {
     SlowSvc::register_with(&mut srv, Arc::new(SlowSvc));
     let state = HttpState::builder()
         .server(Arc::new(srv))
-        .signing_key(&[7u8; 32])
+        .token_key(&[7u8; 32])
         .build();
     vgi_rpc::http::build_router(state)
 }

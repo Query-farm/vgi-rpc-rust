@@ -47,7 +47,7 @@ async fn main() -> std::io::Result<()> {
 
     let state = HttpState::builder()
         .server(Arc::new(server))
-        .signing_key(&[0xau8; 32]) // dev-only — use signing_key_from_env in prod
+        .token_key(&[0xau8; 32]) // dev-only — use token_key_from_env in prod
         .cors_origins("*")
         .build();
 

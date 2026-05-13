@@ -105,7 +105,7 @@ fn build_server() -> Arc<RpcServer> {
 fn state_with_shared_key(key: &[u8; 32], server: Arc<RpcServer>) -> Arc<HttpState> {
     HttpState::builder()
         .server(server)
-        .signing_key(key)
+        .token_key(key)
         .producer_batch_limit(1)
         .build()
 }

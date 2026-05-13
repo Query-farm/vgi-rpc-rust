@@ -115,16 +115,20 @@ GET    {prefix}/.well-known/oauth-protected-resource   RFC 9728 JSON
 ```
 
 Streaming is **stateless on the wire**: the full `StreamStateKind` is
-serialized into an HMAC-signed token carried in the `vgi_rpc.stream_state#b64`
-metadata key. Any worker behind a load balancer with the same signing
-key can resume any continuation request. No server-side session map,
-no reaper task. The token TTL (default 5 min) is embedded in the
-signed payload as a `created_at` timestamp and checked on unpack.
+sealed into an XChaCha20-Poly1305 AEAD token carried in the
+`vgi_rpc.stream_state#b64` metadata key. Any worker behind a load
+balancer with the same `token_key` can resume any continuation request.
+No server-side session map, no reaper task. The token TTL (default 5
+min) is embedded in the encrypted payload as a `created_at` timestamp
+and checked after decryption.
 
-**Token format v3** (matches Python `vgi_rpc/http/server/_state_token.py`):
-little-endian `version=0x03 | u64 created_at | len+state_bytes |
-len+output_schema_bytes | len+input_schema_bytes | len+stream_id_bytes |
-HMAC-SHA256`, base64-encoded.
+**Token format v4** (matches Python `vgi_rpc/http/server/_state_token.py`):
+`version=0x04 | nonce(24B) | ciphertext+tag`, base64-encoded. The
+plaintext payload — `u64 created_at | len+state_bytes | len+output_schema_bytes |
+len+input_schema_bytes | len+stream_id_bytes` — is hidden from anything
+between client and server.  `(domain, principal)` are bound via AEAD
+associated data so a token minted for one identity fails decryption when
+presented by another.
 
 **State serialization.** Each `ProducerState` / `ExchangeState` type
 implements [`vgi_rpc::stream_codec::StreamStateCodec`] (bincode-backed
@@ -139,11 +143,11 @@ Pipe/unix transports keep state in memory across lockstep iterations —
 `encode_state` is unused on those paths. Same state type works for
 both.
 
-**Production signing keys.** `HttpStateBuilder::signing_key(...)` accepts
-raw bytes; for deployments use `signing_key_hex(...)`,
-`signing_key_base64(...)`, or `signing_key_from_env(var)` (reads a key
-from an env var, auto-detecting base64 or hex). Without an explicit key
-the server logs a `vgi_rpc.http` warn-level line at startup and uses an
+**Production token keys.** `HttpStateBuilder::token_key(...)` accepts
+raw bytes; for deployments use `token_key_hex(...)`,
+`token_key_base64(...)`, or `token_key_from_env(var)` (reads a key from
+an env var, auto-detecting base64 or hex). Without an explicit key the
+server logs a `vgi_rpc.http` warn-level line at startup and uses an
 ephemeral per-process key — tokens won't survive a restart or load
 balance across workers, so it's test-only.
 

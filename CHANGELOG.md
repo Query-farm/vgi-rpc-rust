@@ -2,6 +2,27 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased] — AEAD-sealed state tokens (token format v4)
+
+- **Breaking** Stream-state tokens are now sealed with XChaCha20-Poly1305
+  (`chacha20poly1305 = "0.10"`) instead of HMAC-SHA256-signed. The
+  on-wire layout is `version=0x04 | nonce(24B) | ciphertext+tag`,
+  base64-encoded; the `created_at` timestamp moves inside the
+  ciphertext and TTL is enforced after authenticity. State contents
+  are now confidential to anything between client and server.
+- **Breaking** `HttpStateBuilder` rename: `signing_key` → `token_key`,
+  `signing_key_hex` → `token_key_hex`, `signing_key_base64` →
+  `token_key_base64`, `signing_key_from_env` → `token_key_from_env`.
+  Examples, integration tests, and the conformance worker have been
+  updated.
+- **Changed** principal binding switches from a per-(domain, principal)
+  HKDF-derived HMAC subkey to a single master key with the identity
+  carried in AEAD associated data. Cross-principal and cross-domain
+  replay still fail (now via AAD mismatch); key rotation is simpler
+  with a single key to roll.
+- **Added** new token-format tests: tampered-ciphertext, tampered-nonce,
+  unknown-version, malformed-base64.
+
 ## [Unreleased] — Phase 4: external-location batches + S3 / GCS backends
 
 - **Added** `vgi_rpc::external` module: `ExternalStorage` + `Fetcher`

@@ -93,7 +93,7 @@ async fn main() -> std::io::Result<()> {
 
     let state = HttpState::builder()
         .server(Arc::new(server))
-        .signing_key(&[0xau8; 32])
+        .token_key(&[0xau8; 32])
         .cors_origins("*")
         .build();
 

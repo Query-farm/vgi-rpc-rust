@@ -4,10 +4,12 @@
 //!   `POST /{method}/exchange`   stream continuation
 //!
 //! Streaming is stateless on the wire: the full `StreamStateKind` is
-//! serialized into an HMAC-signed token (v3 wire format) carried in
-//! the `vgi_rpc.stream_state#b64` metadata key. Any worker with the
-//! same signing key can resume any continuation request — no
-//! server-side session map, no reaper, no cross-worker affinity.
+//! sealed into an XChaCha20-Poly1305 AEAD token (v4 wire format) carried
+//! in the `vgi_rpc.stream_state#b64` metadata key. Any worker with the
+//! same token key can resume any continuation request — no server-side
+//! session map, no reaper, no cross-worker affinity. The token contents
+//! are confidential as well as authenticated: only the server can read
+//! the serialized state.
 
 use std::sync::Arc;
 
@@ -22,9 +24,11 @@ use axum::{
     Router,
 };
 use base64::Engine;
-use hmac::{Hmac, Mac};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    Key, XChaCha20Poly1305, XNonce,
+};
 use rand::RngCore;
-use sha2::Sha256;
 
 use crate::errors::{Result, RpcError};
 use crate::metadata::{CANCEL_KEY, REQUEST_ID_KEY, STATE_KEY};
@@ -37,20 +41,18 @@ use crate::wire::{bytes_to_hex, empty_batch, md_get, Metadata, StreamReader, Str
 
 pub const ARROW_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 
-type HmacSha256 = Hmac<Sha256>;
-
 /// HTTP server state shared across all handlers.
 ///
 /// Build via [`HttpState::builder`] (preferred) or [`HttpState::new`] for a
 /// default configuration.
 ///
 /// Streaming is stateless: the full `StreamStateKind` travels in every
-/// HTTP continuation request inside an HMAC-signed state token, so any
+/// HTTP continuation request inside an AEAD-sealed state token, so any
 /// worker behind a load balancer can resume any stream. No session map
 /// is held on the server.
 pub struct HttpState {
     server: Arc<RpcServer>,
-    signing_key: [u8; 32],
+    token_key: [u8; 32],
     producer_batch_limit: usize,
     token_ttl: std::time::Duration,
     max_body_size: usize,
@@ -84,7 +86,7 @@ pub struct HttpState {
 #[derive(Default)]
 pub struct HttpStateBuilder {
     server: Option<Arc<RpcServer>>,
-    signing_key: Option<[u8; 32]>,
+    token_key: Option<[u8; 32]>,
     producer_batch_limit: Option<usize>,
     token_ttl: Option<std::time::Duration>,
     max_body_size: Option<usize>,
@@ -110,48 +112,47 @@ impl HttpStateBuilder {
         self
     }
 
-    /// HMAC signing key used for state tokens. Must be ≥16 bytes; when the
-    /// slice is longer, only the first 32 bytes are used. When not set, a
-    /// random 32-byte key is generated at `build()` time.
-    pub fn signing_key(mut self, key: &[u8]) -> Self {
+    /// AEAD master key used to seal state tokens. Must be ≥16 bytes; when
+    /// the slice is longer, only the first 32 bytes are used. When not
+    /// set, a random 32-byte key is generated at `build()` time.
+    pub fn token_key(mut self, key: &[u8]) -> Self {
         let mut k = [0u8; 32];
         let n = key.len().min(32);
         k[..n].copy_from_slice(&key[..n]);
-        self.signing_key = Some(k);
+        self.token_key = Some(k);
         self
     }
 
-    /// Set the HMAC signing key from a lowercase-hex string (64 hex chars →
+    /// Set the token key from a lowercase-hex string (64 hex chars →
     /// 32 bytes). Panics on invalid input — intended for startup config,
     /// not runtime callers.
-    pub fn signing_key_hex(self, hex: &str) -> Self {
-        let bytes = decode_hex_key(hex).expect("signing_key_hex: invalid hex or wrong length");
-        self.signing_key(&bytes)
+    pub fn token_key_hex(self, hex: &str) -> Self {
+        let bytes = decode_hex_key(hex).expect("token_key_hex: invalid hex or wrong length");
+        self.token_key(&bytes)
     }
 
-    /// Set the HMAC signing key from a base64-encoded string (standard
-    /// alphabet, padding optional). Panics on invalid input.
-    pub fn signing_key_base64(self, b64: &str) -> Self {
+    /// Set the token key from a base64-encoded string (standard alphabet,
+    /// padding optional). Panics on invalid input.
+    pub fn token_key_base64(self, b64: &str) -> Self {
         let bytes =
-            decode_base64_key(b64).expect("signing_key_base64: invalid base64 or wrong length");
-        self.signing_key(&bytes)
+            decode_base64_key(b64).expect("token_key_base64: invalid base64 or wrong length");
+        self.token_key(&bytes)
     }
 
-    /// Read the signing key from environment variable `var`. Accepts either
+    /// Read the token key from environment variable `var`. Accepts either
     /// base64 or lowercase-hex (auto-detected). Panics if the variable is
     /// unset, empty, or decodes to fewer than 32 bytes. Use this for
     /// production deployments where the key is supplied by a secret manager.
-    pub fn signing_key_from_env(self, var: &str) -> Self {
-        let raw = std::env::var(var).unwrap_or_else(|_| {
-            panic!("signing_key_from_env: env var {var} is unset or not UTF-8")
-        });
+    pub fn token_key_from_env(self, var: &str) -> Self {
+        let raw = std::env::var(var)
+            .unwrap_or_else(|_| panic!("token_key_from_env: env var {var} is unset or not UTF-8"));
         let trimmed = raw.trim();
         let bytes = decode_base64_key(trimmed)
             .or_else(|_| decode_hex_key(trimmed))
             .unwrap_or_else(|e| {
-                panic!("signing_key_from_env: {var} is not valid base64 or hex ({e})")
+                panic!("token_key_from_env: {var} is not valid base64 or hex ({e})")
             });
-        self.signing_key(&bytes)
+        self.token_key(&bytes)
     }
 
     /// Maximum data batches per producer HTTP response (0 = unbounded).
@@ -287,10 +288,10 @@ impl HttpStateBuilder {
 
     pub fn build(self) -> Arc<HttpState> {
         let server = self.server.expect("HttpStateBuilder::server is required");
-        let signing_key = self.signing_key.unwrap_or_else(|| {
+        let token_key = self.token_key.unwrap_or_else(|| {
             tracing::warn!(
                 target: "vgi_rpc.http",
-                "no signing_key configured; using ephemeral per-process key — \
+                "no token_key configured; using ephemeral per-process AEAD key — \
                  state tokens will not survive restart or load-balance across workers"
             );
             let mut k = [0u8; 32];
@@ -304,7 +305,7 @@ impl HttpStateBuilder {
         let www_authenticate = self.oauth_metadata.as_ref().map(|m| m.www_authenticate());
         Arc::new(HttpState {
             server,
-            signing_key,
+            token_key,
             producer_batch_limit: self.producer_batch_limit.unwrap_or(1),
             token_ttl: self
                 .token_ttl
@@ -349,13 +350,12 @@ impl HttpState {
         self.max_body_size
     }
 
-    /// Pack a v3 state token bound to the supplied auth identity.
+    /// Seal a v4 state token bound to the supplied auth identity.
     ///
-    /// When `auth` is anonymous the binding is empty and the base signing
-    /// key is used directly (preserves wire-format compatibility with the
-    /// Python canonical for unauthenticated calls). When `auth` carries a
-    /// principal, the HMAC is computed under a principal-derived subkey so
-    /// the token cannot be replayed by a different identity.
+    /// `(domain, principal)` are carried as AEAD associated data, so a
+    /// token issued under one identity fails decryption when presented
+    /// by another — same anti-replay guarantee as the prior HMAC subkey
+    /// derivation, expressed via AAD instead of key derivation.
     pub(crate) fn pack_state_token(
         &self,
         auth: &crate::auth::AuthContext,
@@ -364,10 +364,10 @@ impl HttpState {
         input_schema_bytes: &[u8],
         stream_id: &str,
     ) -> String {
-        let binding = principal_binding(auth);
+        let aad = compute_aad(auth);
         pack_state_token(
-            &self.signing_key,
-            &binding,
+            &self.token_key,
+            &aad,
             state_bytes,
             output_schema_bytes,
             input_schema_bytes,
@@ -376,8 +376,8 @@ impl HttpState {
         )
     }
 
-    /// Unpack a v3 state token, verifying the HMAC under the current
-    /// caller's identity and (optionally) the TTL.
+    /// Open a v4 state token, decrypting under the current caller's
+    /// identity-derived AAD and enforcing TTL after authenticity.
     pub(crate) fn unpack_state_token(
         &self,
         auth: &crate::auth::AuthContext,
@@ -388,54 +388,49 @@ impl HttpState {
         } else {
             Some(self.token_ttl)
         };
-        let binding = principal_binding(auth);
-        unpack_state_token(&self.signing_key, &binding, token, ttl)
+        let aad = compute_aad(auth);
+        unpack_state_token(&self.token_key, &aad, token, ttl)
     }
 }
 
-/// Identity bytes mixed into the state-token HMAC subkey. Anonymous
-/// callers contribute no binding — the base key is used directly, matching
-/// the Python canonical wire format. Authenticated callers contribute
-/// `domain || 0x00 || principal`, so a token issued under one identity
-/// cannot be replayed under another.
-fn principal_binding(auth: &crate::auth::AuthContext) -> Vec<u8> {
+/// Build the AEAD associated data that binds a state token to the
+/// authenticated identity of its issuer. Anonymous and authenticated
+/// callers produce distinct AAD strings so a token minted in one
+/// context cannot be opened in another. Mirrors Python's `_compute_aad`.
+fn compute_aad(auth: &crate::auth::AuthContext) -> Vec<u8> {
+    let prefix = b"vgi_rpc.state.v4\x00";
     if !auth.authenticated {
-        return Vec::new();
+        let mut out = Vec::with_capacity(prefix.len() + b"\x00anonymous".len());
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(b"\x00anonymous");
+        return out;
     }
-    let mut out = Vec::with_capacity(auth.domain.len() + 1 + auth.principal.len());
+    let mut out =
+        Vec::with_capacity(prefix.len() + 1 + auth.domain.len() + 1 + auth.principal.len());
+    out.extend_from_slice(prefix);
+    out.push(0x01);
     out.extend_from_slice(auth.domain.as_bytes());
     out.push(0);
     out.extend_from_slice(auth.principal.as_bytes());
     out
 }
 
-/// Domain-separated label for the principal-binding subkey derivation.
-const PRINCIPAL_BINDING_LABEL: &[u8] = b"vgi_rpc.state_token.principal_binding.v1";
-
-/// Derive the effective signing key for a given identity binding. An
-/// empty binding returns the base key unchanged.
-fn derive_signing_key(base: &[u8; 32], binding: &[u8]) -> [u8; 32] {
-    if binding.is_empty() {
-        return *base;
-    }
-    let mut mac = HmacSha256::new_from_slice(base).expect("hmac key");
-    mac.update(PRINCIPAL_BINDING_LABEL);
-    mac.update(&[0u8]);
-    mac.update(binding);
-    let tag = mac.finalize().into_bytes();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&tag);
-    out
-}
-
 /// Token version supported by this crate.
-pub(crate) const STATE_TOKEN_VERSION: u8 = 0x03;
+pub(crate) const STATE_TOKEN_VERSION: u8 = 0x04;
 
-/// Minimum possible v3 token size (version + created_at + four length
-/// prefixes for zero-length segments + HMAC).
-const STATE_TOKEN_MIN_LEN: usize = 1 + 8 + 4 + 4 + 4 + 4 + 32;
+/// XChaCha20-Poly1305 nonce length (192 bits — random collision risk
+/// is negligible at any practical message volume).
+const STATE_TOKEN_NONCE_LEN: usize = 24;
 
-/// Decomposed contents of a v3 state token after HMAC verification.
+/// Poly1305 authentication-tag length appended by the AEAD construction.
+const STATE_TOKEN_TAG_LEN: usize = 16;
+
+/// Minimum possible v4 token size (version byte + nonce + empty ciphertext
+/// plus tag). A real token's plaintext adds at least the timestamp + four
+/// length prefixes, but the on-wire check stays size-only at this stage.
+const STATE_TOKEN_MIN_LEN: usize = 1 + STATE_TOKEN_NONCE_LEN + STATE_TOKEN_TAG_LEN;
+
+/// Decomposed contents of a v4 state token after AEAD authentication.
 #[derive(Debug, Clone)]
 pub(crate) struct UnpackedToken {
     pub state_bytes: Vec<u8>,
@@ -454,35 +449,39 @@ fn current_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Pack a signed state token (v3 wire format).
+/// Seal a state token (v4 wire format).
 ///
-/// Layout (little-endian, concatenated):
+/// On-wire layout (base64-encoded):
 ///
 /// ```text
-/// [1]  version = 0x03
-/// [8]  created_at (u64 seconds since epoch)
-/// [4]  len(state_bytes)           [N] state_bytes
-/// [4]  len(output_schema_bytes)   [M] output_schema_bytes
-/// [4]  len(input_schema_bytes)    [K] input_schema_bytes
-/// [4]  len(stream_id_bytes)       [L] stream_id_bytes (UTF-8)
-/// [32] HMAC-SHA256 over all above
+/// [1]    version = 0x04
+/// [24]   XChaCha20-Poly1305 nonce (random)
+/// [..]   ciphertext = XChaCha20-Poly1305-Seal(plaintext, aad, nonce, key)
+///        plaintext (little-endian):
+///          [8]  created_at (u64 seconds since epoch)
+///          [4]  len(state_bytes)           [N] state_bytes
+///          [4]  len(output_schema_bytes)   [M] output_schema_bytes
+///          [4]  len(input_schema_bytes)    [K] input_schema_bytes
+///          [4]  len(stream_id_bytes)       [L] stream_id_bytes (UTF-8)
+///        [16]   Poly1305 tag (appended by AEAD construction)
 /// ```
 ///
-/// then base64-encoded. Matches the Python canonical in
-/// `vgi_rpc/http/server/_state_token.py`.
+/// `created_at` lives inside the ciphertext so TTL enforcement runs
+/// after authenticity is established. The version byte is not part of
+/// the AAD — it acts as a format selector; a tampered version byte still
+/// fails decryption because we use the matching algorithm for that
+/// version.
 pub(crate) fn pack_state_token(
-    signing_key: &[u8; 32],
-    principal_binding: &[u8],
+    token_key: &[u8; 32],
+    aad: &[u8],
     state_bytes: &[u8],
     output_schema_bytes: &[u8],
     input_schema_bytes: &[u8],
     stream_id: &str,
     created_at: u64,
 ) -> String {
-    let key = derive_signing_key(signing_key, principal_binding);
-    let mut payload = Vec::with_capacity(
-        1 + 8
-            + 4
+    let mut plaintext = Vec::with_capacity(
+        8 + 4
             + state_bytes.len()
             + 4
             + output_schema_bytes.len()
@@ -491,29 +490,44 @@ pub(crate) fn pack_state_token(
             + 4
             + stream_id.len(),
     );
-    payload.push(STATE_TOKEN_VERSION);
-    payload.extend_from_slice(&created_at.to_le_bytes());
-    payload.extend_from_slice(&(state_bytes.len() as u32).to_le_bytes());
-    payload.extend_from_slice(state_bytes);
-    payload.extend_from_slice(&(output_schema_bytes.len() as u32).to_le_bytes());
-    payload.extend_from_slice(output_schema_bytes);
-    payload.extend_from_slice(&(input_schema_bytes.len() as u32).to_le_bytes());
-    payload.extend_from_slice(input_schema_bytes);
-    payload.extend_from_slice(&(stream_id.len() as u32).to_le_bytes());
-    payload.extend_from_slice(stream_id.as_bytes());
-    let mut mac = HmacSha256::new_from_slice(&key).expect("hmac key");
-    mac.update(&payload);
-    let sig = mac.finalize().into_bytes();
-    payload.extend_from_slice(&sig);
-    base64::engine::general_purpose::STANDARD.encode(payload)
+    plaintext.extend_from_slice(&created_at.to_le_bytes());
+    plaintext.extend_from_slice(&(state_bytes.len() as u32).to_le_bytes());
+    plaintext.extend_from_slice(state_bytes);
+    plaintext.extend_from_slice(&(output_schema_bytes.len() as u32).to_le_bytes());
+    plaintext.extend_from_slice(output_schema_bytes);
+    plaintext.extend_from_slice(&(input_schema_bytes.len() as u32).to_le_bytes());
+    plaintext.extend_from_slice(input_schema_bytes);
+    plaintext.extend_from_slice(&(stream_id.len() as u32).to_le_bytes());
+    plaintext.extend_from_slice(stream_id.as_bytes());
+
+    let mut nonce_bytes = [0u8; STATE_TOKEN_NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(token_key));
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: &plaintext,
+                aad,
+            },
+        )
+        .expect("XChaCha20-Poly1305 encrypt cannot fail for in-memory plaintext");
+
+    let mut wire = Vec::with_capacity(1 + STATE_TOKEN_NONCE_LEN + ciphertext.len());
+    wire.push(STATE_TOKEN_VERSION);
+    wire.extend_from_slice(&nonce_bytes);
+    wire.extend_from_slice(&ciphertext);
+    base64::engine::general_purpose::STANDARD.encode(wire)
 }
 
-/// Unpack and verify a v3 state token. HMAC is verified *before* any
-/// payload field is inspected (including the version byte) to avoid
-/// leaking format information via error timing.
+/// Open and verify a v4 state token. Decryption (which checks the
+/// Poly1305 tag) authenticates the payload; any tampering, wrong key, or
+/// AAD mismatch (e.g. cross-principal replay) surfaces as a uniform
+/// signature-verification error so callers cannot distinguish failure
+/// modes via timing or message content.
 pub(crate) fn unpack_state_token(
-    signing_key: &[u8; 32],
-    principal_binding: &[u8],
+    token_key: &[u8; 32],
+    aad: &[u8],
     token: &str,
     token_ttl: Option<std::time::Duration>,
 ) -> Result<UnpackedToken> {
@@ -524,21 +538,30 @@ pub(crate) fn unpack_state_token(
         return Err(RpcError::runtime_error("Malformed state token"));
     }
 
-    let payload_end = raw.len() - 32;
-    let (payload, received_mac) = raw.split_at(payload_end);
-    let key = derive_signing_key(signing_key, principal_binding);
-    let mut mac = HmacSha256::new_from_slice(&key).expect("hmac key");
-    mac.update(payload);
-    mac.verify_slice(received_mac)
-        .map_err(|_| RpcError::runtime_error("State token signature verification failed"))?;
-
-    let version = payload[0];
+    let version = raw[0];
     if version != STATE_TOKEN_VERSION {
         return Err(RpcError::runtime_error(format!(
             "Unsupported state token version {version} (expected {STATE_TOKEN_VERSION})"
         )));
     }
-    let created_at = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+
+    let nonce = &raw[1..1 + STATE_TOKEN_NONCE_LEN];
+    let ciphertext = &raw[1 + STATE_TOKEN_NONCE_LEN..];
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(token_key));
+    let plaintext = cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| RpcError::runtime_error("State token signature verification failed"))?;
+
+    if plaintext.len() < 8 {
+        return Err(RpcError::runtime_error("Malformed state token"));
+    }
+    let created_at = u64::from_le_bytes(plaintext[0..8].try_into().unwrap());
 
     if let Some(ttl) = token_ttl {
         let now = current_unix_secs();
@@ -547,12 +570,12 @@ pub(crate) fn unpack_state_token(
         }
     }
 
-    let mut pos = 9;
-    let state_bytes = read_segment(payload, &mut pos)?;
-    let output_schema_bytes = read_segment(payload, &mut pos)?;
-    let input_schema_bytes = read_segment(payload, &mut pos)?;
-    let stream_id_bytes = read_segment(payload, &mut pos)?;
-    if pos != payload.len() {
+    let mut pos = 8;
+    let state_bytes = read_segment(&plaintext, &mut pos)?;
+    let output_schema_bytes = read_segment(&plaintext, &mut pos)?;
+    let input_schema_bytes = read_segment(&plaintext, &mut pos)?;
+    let stream_id_bytes = read_segment(&plaintext, &mut pos)?;
+    if pos != plaintext.len() {
         return Err(RpcError::runtime_error("Malformed state token"));
     }
     let stream_id = String::from_utf8(stream_id_bytes)
@@ -2061,7 +2084,7 @@ mod tests {
         let server = Arc::new(RpcServer::builder().server_id("test").build());
         HttpState::builder()
             .server(server)
-            .signing_key(&[7u8; 32])
+            .token_key(&[7u8; 32])
             .token_ttl(Duration::from_millis(50))
             .max_body_size(1024)
             .build()
@@ -2088,17 +2111,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unpack_rejects_tampered_hmac() {
+    async fn unpack_rejects_tampered_ciphertext() {
         let s = state_with_key();
         let auth = crate::auth::AuthContext::anonymous();
         let token = s.pack_state_token(&auth, b"s", b"o", b"i", "sid");
         let mut bytes = base64::engine::general_purpose::STANDARD
             .decode(token.as_bytes())
             .unwrap();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0x01;
+        // Flip a bit inside the ciphertext (past the version+nonce header).
+        let cipher_idx = 1 + STATE_TOKEN_NONCE_LEN;
+        bytes[cipher_idx] ^= 0x01;
         let tampered = base64::engine::general_purpose::STANDARD.encode(bytes);
         assert!(s.unpack_state_token(&auth, &tampered).is_err());
+    }
+
+    #[tokio::test]
+    async fn unpack_rejects_tampered_nonce() {
+        let s = state_with_key();
+        let auth = crate::auth::AuthContext::anonymous();
+        let token = s.pack_state_token(&auth, b"s", b"o", b"i", "sid");
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(token.as_bytes())
+            .unwrap();
+        // Flip the first nonce byte; AEAD decryption must reject.
+        bytes[1] ^= 0x01;
+        let tampered = base64::engine::general_purpose::STANDARD.encode(bytes);
+        assert!(s.unpack_state_token(&auth, &tampered).is_err());
+    }
+
+    #[tokio::test]
+    async fn unpack_rejects_unknown_version() {
+        let s = state_with_key();
+        let auth = crate::auth::AuthContext::anonymous();
+        let token = s.pack_state_token(&auth, b"s", b"o", b"i", "sid");
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(token.as_bytes())
+            .unwrap();
+        bytes[0] = 0x99;
+        let tampered = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let err = s.unpack_state_token(&auth, &tampered).unwrap_err();
+        assert!(err.message.contains("Unsupported state token version"));
+    }
+
+    #[tokio::test]
+    async fn unpack_rejects_malformed_base64() {
+        let s = state_with_key();
+        let auth = crate::auth::AuthContext::anonymous();
+        let err = s.unpack_state_token(&auth, "not!base64!").unwrap_err();
+        assert!(err.message.contains("Malformed"));
     }
 
     #[tokio::test]
@@ -2107,11 +2167,11 @@ mod tests {
         let server = Arc::new(RpcServer::builder().server_id("t").build());
         let a = HttpState::builder()
             .server(server.clone())
-            .signing_key(&[1u8; 32])
+            .token_key(&[1u8; 32])
             .build();
         let b = HttpState::builder()
             .server(server)
-            .signing_key(&[2u8; 32])
+            .token_key(&[2u8; 32])
             .build();
         let auth = crate::auth::AuthContext::anonymous();
         let tok = a.pack_state_token(&auth, b"s", b"o", b"i", "sid");
@@ -2121,9 +2181,11 @@ mod tests {
     #[tokio::test]
     async fn unpack_rejects_expired_token() {
         let s = state_with_key(); // ttl = 50ms
-                                  // Pack a token whose created_at is far in the past.
-        let stale = pack_state_token(&[7u8; 32], &[], b"s", b"o", b"i", "sid", 0);
         let auth = crate::auth::AuthContext::anonymous();
+        // Pack a token whose created_at is far in the past, using the
+        // same AAD the server will reconstruct for an anonymous caller.
+        let aad = compute_aad(&auth);
+        let stale = pack_state_token(&[7u8; 32], &aad, b"s", b"o", b"i", "sid", 0);
         let err = s.unpack_state_token(&auth, &stale).unwrap_err();
         assert!(err.message.contains("expired"), "got: {}", err.message);
     }
@@ -2234,16 +2296,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signing_key_hex_round_trips_through_token() {
+    async fn token_key_hex_round_trips_through_token() {
         use crate::server::RpcServer;
         let server = Arc::new(RpcServer::builder().server_id("t").build());
         let a = HttpState::builder()
             .server(server.clone())
-            .signing_key_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+            .token_key_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
             .build();
         let b = HttpState::builder()
             .server(server)
-            .signing_key_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+            .token_key_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
             .build();
         let auth = crate::auth::AuthContext::anonymous();
         let tok = a.pack_state_token(&auth, b"s", b"o", b"i", "sid");

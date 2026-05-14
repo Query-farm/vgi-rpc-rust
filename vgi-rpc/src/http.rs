@@ -24,10 +24,6 @@ use axum::{
     Router,
 };
 use base64::Engine;
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    Key, XChaCha20Poly1305, XNonce,
-};
 use rand::RngCore;
 
 use crate::errors::{Result, RpcError};
@@ -418,18 +414,6 @@ fn compute_aad(auth: &crate::auth::AuthContext) -> Vec<u8> {
 /// Token version supported by this crate.
 pub(crate) const STATE_TOKEN_VERSION: u8 = 0x04;
 
-/// XChaCha20-Poly1305 nonce length (192 bits — random collision risk
-/// is negligible at any practical message volume).
-const STATE_TOKEN_NONCE_LEN: usize = 24;
-
-/// Poly1305 authentication-tag length appended by the AEAD construction.
-const STATE_TOKEN_TAG_LEN: usize = 16;
-
-/// Minimum possible v4 token size (version byte + nonce + empty ciphertext
-/// plus tag). A real token's plaintext adds at least the timestamp + four
-/// length prefixes, but the on-wire check stays size-only at this stage.
-const STATE_TOKEN_MIN_LEN: usize = 1 + STATE_TOKEN_NONCE_LEN + STATE_TOKEN_TAG_LEN;
-
 /// Decomposed contents of a v4 state token after AEAD authentication.
 #[derive(Debug, Clone)]
 pub(crate) struct UnpackedToken {
@@ -469,8 +453,12 @@ fn current_unix_secs() -> u64 {
 /// `created_at` lives inside the ciphertext so TTL enforcement runs
 /// after authenticity is established. The version byte is not part of
 /// the AAD — it acts as a format selector; a tampered version byte still
-/// fails decryption because we use the matching algorithm for that
-/// version.
+/// fails decryption because [`crypto::open_bytes`] rejects it before
+/// touching the cipher.
+///
+/// The AEAD envelope (version byte + nonce + ciphertext+tag) is owned by
+/// [`crypto`]; only the *plaintext* framing inside the ciphertext is this
+/// function's concern.
 pub(crate) fn pack_state_token(
     token_key: &[u8; 32],
     aad: &[u8],
@@ -500,31 +488,16 @@ pub(crate) fn pack_state_token(
     plaintext.extend_from_slice(&(stream_id.len() as u32).to_le_bytes());
     plaintext.extend_from_slice(stream_id.as_bytes());
 
-    let mut nonce_bytes = [0u8; STATE_TOKEN_NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(token_key));
-    let ciphertext = cipher
-        .encrypt(
-            XNonce::from_slice(&nonce_bytes),
-            Payload {
-                msg: &plaintext,
-                aad,
-            },
-        )
-        .expect("XChaCha20-Poly1305 encrypt cannot fail for in-memory plaintext");
-
-    let mut wire = Vec::with_capacity(1 + STATE_TOKEN_NONCE_LEN + ciphertext.len());
-    wire.push(STATE_TOKEN_VERSION);
-    wire.extend_from_slice(&nonce_bytes);
-    wire.extend_from_slice(&ciphertext);
-    base64::engine::general_purpose::STANDARD.encode(wire)
+    crate::crypto::seal_base64(&plaintext, token_key, aad, STATE_TOKEN_VERSION)
 }
 
-/// Open and verify a v4 state token. Decryption (which checks the
-/// Poly1305 tag) authenticates the payload; any tampering, wrong key, or
-/// AAD mismatch (e.g. cross-principal replay) surfaces as a uniform
-/// signature-verification error so callers cannot distinguish failure
-/// modes via timing or message content.
+/// Open and verify a v4 state token. [`crypto::open_bytes`] authenticates
+/// the payload; every malformed, wrong-version, tampered, wrong-key, or
+/// AAD-mismatched (e.g. cross-principal replay) token surfaces as the same
+/// uniform signature-verification error so callers cannot distinguish
+/// failure modes via timing or message content. Only a base64 decode
+/// failure — observable before any crypto work — stays a distinct
+/// "Malformed state token".
 pub(crate) fn unpack_state_token(
     token_key: &[u8; 32],
     aad: &[u8],
@@ -534,28 +507,8 @@ pub(crate) fn unpack_state_token(
     let raw = base64::engine::general_purpose::STANDARD
         .decode(token.as_bytes())
         .map_err(|_| RpcError::runtime_error("Malformed state token"))?;
-    if raw.len() < STATE_TOKEN_MIN_LEN {
-        return Err(RpcError::runtime_error("Malformed state token"));
-    }
 
-    let version = raw[0];
-    if version != STATE_TOKEN_VERSION {
-        return Err(RpcError::runtime_error(format!(
-            "Unsupported state token version {version} (expected {STATE_TOKEN_VERSION})"
-        )));
-    }
-
-    let nonce = &raw[1..1 + STATE_TOKEN_NONCE_LEN];
-    let ciphertext = &raw[1 + STATE_TOKEN_NONCE_LEN..];
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(token_key));
-    let plaintext = cipher
-        .decrypt(
-            XNonce::from_slice(nonce),
-            Payload {
-                msg: ciphertext,
-                aad,
-            },
-        )
+    let plaintext = crate::crypto::open_bytes(&raw, token_key, aad, STATE_TOKEN_VERSION)
         .map_err(|_| RpcError::runtime_error("State token signature verification failed"))?;
 
     if plaintext.len() < 8 {
@@ -2118,8 +2071,9 @@ mod tests {
         let mut bytes = base64::engine::general_purpose::STANDARD
             .decode(token.as_bytes())
             .unwrap();
-        // Flip a bit inside the ciphertext (past the version+nonce header).
-        let cipher_idx = 1 + STATE_TOKEN_NONCE_LEN;
+        // Flip a bit inside the ciphertext (past the 1-byte version + 24-byte
+        // nonce header owned by `crypto`).
+        let cipher_idx = 1 + 24;
         bytes[cipher_idx] ^= 0x01;
         let tampered = base64::engine::general_purpose::STANDARD.encode(bytes);
         assert!(s.unpack_state_token(&auth, &tampered).is_err());
@@ -2150,7 +2104,9 @@ mod tests {
         bytes[0] = 0x99;
         let tampered = base64::engine::general_purpose::STANDARD.encode(bytes);
         let err = s.unpack_state_token(&auth, &tampered).unwrap_err();
-        assert!(err.message.contains("Unsupported state token version"));
+        // Wrong-version tokens map to the same uniform error as every other
+        // bad-token mode — callers cannot distinguish failure modes.
+        assert!(err.message.contains("signature verification failed"));
     }
 
     #[tokio::test]

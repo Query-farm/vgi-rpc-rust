@@ -7,6 +7,8 @@
 pub mod access_log;
 pub mod arrow_type;
 pub mod auth;
+#[cfg(feature = "http")]
+pub mod crypto;
 pub mod errors;
 pub mod retry;
 

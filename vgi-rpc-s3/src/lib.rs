@@ -36,11 +36,26 @@ use vgi_rpc::{Result, RpcError};
 
 /// Build a `reqwest::blocking::Client` with the default 30 s timeout used
 /// by both the S3 / GCS storage backends and the shared `HttpFetcher`.
+///
+/// Redirects are **disabled**: a presigned PUT or a fetch of an
+/// already-validated `https://` URL has no legitimate reason to be
+/// redirected, and following one would let an allowlisted host bounce
+/// the request to an internal address (SSRF). A redirect is surfaced as
+/// a non-success status instead.
 pub fn default_blocking_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("reqwest client")
+}
+
+/// Strip the query string (and fragment) from a URL before it goes into
+/// a client-facing error. Presigned URLs carry their credentials in the
+/// query string — those must never be echoed back to a caller.
+fn redact_url(url: &str) -> &str {
+    let cut = url.find(['?', '#']).unwrap_or(url.len());
+    &url[..cut]
 }
 
 /// User-supplied factory: given `(bucket, key)`, return a short-lived
@@ -106,8 +121,9 @@ impl ExternalStorage for PresignedPutStorage {
             .map_err(|e| RpcError::runtime_error(format!("{label} PUT failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(RpcError::runtime_error(format!(
-                "{label} PUT returned {} for {url}",
-                resp.status()
+                "{label} PUT returned {} for {}",
+                resp.status(),
+                redact_url(&url)
             )));
         }
         // sha256 is computed by ExternalLocationConfig's caller; return an
@@ -172,21 +188,48 @@ impl Default for HttpFetcher {
 }
 
 impl Fetcher for HttpFetcher {
-    fn fetch(&self, url: &str, _compression: Compression) -> Result<Vec<u8>> {
-        let resp = self
+    fn fetch(&self, url: &str, _compression: Compression, max_bytes: usize) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let mut resp = self
             .client
             .get(url)
             .send()
             .map_err(|e| RpcError::runtime_error(format!("external GET failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(RpcError::runtime_error(format!(
-                "external GET returned {} for {url}",
-                resp.status()
+                "external GET returned {} for {}",
+                resp.status(),
+                redact_url(url)
             )));
         }
-        resp.bytes()
-            .map(|b| b.to_vec())
-            .map_err(|e| RpcError::runtime_error(format!("external GET body: {e}")))
+        // Fast reject on a declared Content-Length over the cap.
+        if let Some(len) = resp.content_length() {
+            if len > max_bytes as u64 {
+                return Err(RpcError::runtime_error(format!(
+                    "external payload Content-Length {len} exceeds max_bytes={max_bytes}"
+                )));
+            }
+        }
+        // Stream the body, aborting once it grows past the cap — a
+        // remote that lies about (or omits) Content-Length must not be
+        // able to OOM the process by dribbling an unbounded response.
+        let mut out = Vec::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = resp
+                .read(&mut buf)
+                .map_err(|e| RpcError::runtime_error(format!("external GET body: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            if out.len() + n > max_bytes {
+                return Err(RpcError::runtime_error(format!(
+                    "external payload exceeds max_bytes={max_bytes}"
+                )));
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        Ok(out)
     }
 }
 

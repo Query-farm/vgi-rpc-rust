@@ -15,7 +15,7 @@ categories = ["network-programming", "web-programming::http-server", "data-struc
 [features]
 default = ["http", "macros"]
 macros = ["dep:vgi-rpc-macros"]
-http = ["dep:axum", "dep:tokio", "dep:hmac", "dep:base64", "dep:rand", "dep:bincode", "dep:zstd", "dep:chacha20poly1305"]
+http = ["dep:axum", "dep:tower-http", "dep:tokio", "dep:hmac", "dep:base64", "dep:rand", "dep:bincode", "dep:zstd", "dep:chacha20poly1305"]
 jwt = []
 jwt-jsonwebtoken = ["jwt", "dep:jsonwebtoken", "dep:reqwest"]
 oauth-pkce = []
@@ -64,8 +64,10 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+url.workspace = true
 
 axum = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }

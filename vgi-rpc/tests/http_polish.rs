@@ -173,3 +173,73 @@ async fn compression_emits_zstd_encoded_response_on_error() {
     let ce = resp.headers().get(header::CONTENT_ENCODING);
     assert_eq!(ce.map(|v| v.to_str().unwrap()), Some("zstd"));
 }
+
+/// Minimal `HttpState` with a one-method server, configured by `f`.
+fn state_configured(
+    f: impl FnOnce(vgi_rpc::http::HttpStateBuilder) -> vgi_rpc::http::HttpStateBuilder,
+) -> Arc<HttpState> {
+    let mut srv = RpcServer::builder().server_id("it").build();
+    srv.register(MethodInfo::unary(
+        "echo_string",
+        arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "value",
+            arrow_schema::DataType::Utf8,
+            false,
+        )])
+        .into(),
+        arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "result",
+            arrow_schema::DataType::Utf8,
+            false,
+        )])
+        .into(),
+        |_req, _| Ok(None),
+    ));
+    f(HttpState::builder().server(Arc::new(srv))).build()
+}
+
+#[tokio::test]
+async fn oversize_request_body_is_rejected_by_body_limit() {
+    // The body-limit layer enforces `max_body_size` on the raw bytes,
+    // independent of `Content-Length` — a 4 KiB body against a 16-byte
+    // limit must be refused before the handler runs.
+    let state = state_configured(|b| b.max_body_size(16));
+    let app = vgi_rpc::http::build_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/echo_string")
+                .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
+                .body(Body::from(vec![0u8; 4096]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn small_response_under_soft_cap_is_not_rejected() {
+    // `max_response_bytes` is a *soft* producer-side cap — a normal
+    // response (here, a small Arrow error stream) that happens to be
+    // larger than the soft cap must NOT be turned into a 500 by the
+    // post-processing middleware. The middleware's hard ceiling is
+    // separate and far higher; see `response_buffer_ceiling`.
+    let state = state_configured(|b| b.max_response_bytes(8));
+    let app = vgi_rpc::http::build_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/echo_string")
+                .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
+                .body(Body::from(vec![]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Empty body → request parse error → 400 (NOT a 500 from the
+    // middleware buffer cap).
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}

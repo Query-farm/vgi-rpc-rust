@@ -52,6 +52,10 @@ pub struct HttpState {
     producer_batch_limit: usize,
     token_ttl: std::time::Duration,
     max_body_size: usize,
+    /// Wall-clock ceiling for a single HTTP request, enforced by a
+    /// `tower_http::timeout::TimeoutLayer`. A stalled handler or a
+    /// slow-loris client cannot pin a runtime worker indefinitely.
+    request_timeout: std::time::Duration,
     authenticate: Option<crate::auth::Authenticate>,
     #[allow(dead_code)]
     oauth_metadata: Option<Arc<crate::auth::oauth::OAuthResourceMetadata>>,
@@ -86,6 +90,7 @@ pub struct HttpStateBuilder {
     producer_batch_limit: Option<usize>,
     token_ttl: Option<std::time::Duration>,
     max_body_size: Option<usize>,
+    request_timeout: Option<std::time::Duration>,
     authenticate: Option<crate::auth::Authenticate>,
     oauth_metadata: Option<Arc<crate::auth::oauth::OAuthResourceMetadata>>,
     cors_origins: Option<String>,
@@ -108,13 +113,20 @@ impl HttpStateBuilder {
         self
     }
 
-    /// AEAD master key used to seal state tokens. Must be ≥16 bytes; when
-    /// the slice is longer, only the first 32 bytes are used. When not
-    /// set, a random 32-byte key is generated at `build()` time.
+    /// AEAD master key used to seal state tokens. **Must be ≥32 bytes**
+    /// — the XChaCha20-Poly1305 key size; the first 32 bytes are used. A
+    /// shorter slice is a configuration error and panics rather than
+    /// being silently zero-padded into a weak key. When not set, a
+    /// random 32-byte key is generated at `build()` time.
     pub fn token_key(mut self, key: &[u8]) -> Self {
+        assert!(
+            key.len() >= 32,
+            "token_key: signing key must be at least 32 bytes (got {}). \
+             Generate one with `openssl rand -hex 32`.",
+            key.len()
+        );
         let mut k = [0u8; 32];
-        let n = key.len().min(32);
-        k[..n].copy_from_slice(&key[..n]);
+        k.copy_from_slice(&key[..32]);
         self.token_key = Some(k);
         self
     }
@@ -167,9 +179,17 @@ impl HttpStateBuilder {
     }
 
     /// Maximum request body size (post-decompression) in bytes. Default
-    /// `64 * 1024 * 1024` (64 MiB).
+    /// `64 * 1024 * 1024` (64 MiB). Enforced as a hard ceiling on the
+    /// raw request body by a `RequestBodyLimitLayer` — independent of the
+    /// `Content-Length` header, so a chunked upload cannot bypass it.
     pub fn max_body_size(mut self, n: usize) -> Self {
         self.max_body_size = Some(n);
+        self
+    }
+
+    /// Wall-clock timeout for a single HTTP request. Default 30 s.
+    pub fn request_timeout(mut self, d: std::time::Duration) -> Self {
+        self.request_timeout = Some(d);
         self
     }
 
@@ -284,6 +304,18 @@ impl HttpStateBuilder {
 
     pub fn build(self) -> Arc<HttpState> {
         let server = self.server.expect("HttpStateBuilder::server is required");
+        // A wildcard CORS origin combined with a credentialed auth
+        // callback is unsafe and a browser would refuse it anyway: an
+        // `Access-Control-Allow-Origin: *` response cannot carry
+        // `Allow-Credentials: true`. Fail fast at config time instead of
+        // shipping a server whose authenticated cross-origin requests
+        // silently break.
+        assert!(
+            !(self.cors_origins.as_deref() == Some("*") && self.authenticate.is_some()),
+            "HttpStateBuilder: cors_origins(\"*\") cannot be combined with an \
+             authenticate callback — browsers reject credentialed requests \
+             against a wildcard origin. Configure a specific origin."
+        );
         let token_key = self.token_key.unwrap_or_else(|| {
             tracing::warn!(
                 target: "vgi_rpc.http",
@@ -307,6 +339,9 @@ impl HttpStateBuilder {
                 .token_ttl
                 .unwrap_or_else(|| std::time::Duration::from_secs(300)),
             max_body_size: self.max_body_size.unwrap_or(64 * 1024 * 1024),
+            request_timeout: self
+                .request_timeout
+                .unwrap_or_else(|| std::time::Duration::from_secs(30)),
             authenticate: self.authenticate,
             oauth_metadata: self.oauth_metadata,
             oauth_metadata_json,
@@ -521,6 +556,16 @@ pub(crate) fn unpack_state_token(
         if now > created_at && now - created_at > ttl.as_secs() {
             return Err(RpcError::runtime_error("State token expired"));
         }
+        // A `created_at` in the future is clock skew between workers (or
+        // a tampered host clock). Without this guard the expiry check
+        // above is simply skipped — a token minted on a fast-clocked
+        // worker would dodge the TTL on every normal-clocked peer.
+        const MAX_CLOCK_SKEW_SECS: u64 = 60;
+        if created_at > now && created_at - now > MAX_CLOCK_SKEW_SECS {
+            return Err(RpcError::runtime_error(
+                "State token timestamp is implausibly in the future",
+            ));
+        }
     }
 
     let mut pos = 8;
@@ -628,11 +673,53 @@ pub async fn serve_with_shutdown(
         .await
 }
 
+/// Absolute ceiling on a buffered HTTP response body in the
+/// post-processing middleware. Mirrors `wire::MAX_IPC_MESSAGE_BYTES` —
+/// large enough for any reasonable Arrow batch, small enough that the
+/// middleware can never be driven to exhaust the heap.
+///
+/// This is **distinct** from the operator's `max_response_bytes`, which
+/// is a *soft* producer-side cap: a producer is allowed to overshoot it
+/// by one batch and then mint a continuation token, so the response
+/// body on the wire can legitimately exceed `max_response_bytes`. The
+/// middleware therefore caps at `max(this, 2 × max_response_bytes)` —
+/// see [`response_buffer_ceiling`].
+const MAX_RESPONSE_BYTES_HARD_CAP: usize = 256 * 1024 * 1024;
+
+/// Hard ceiling the post-processing middleware buffers a response under.
+/// Always at least [`MAX_RESPONSE_BYTES_HARD_CAP`]; when a (soft)
+/// `max_response_bytes` is configured, it leaves headroom for the
+/// one-batch producer overshoot that the continuation-token design
+/// permits.
+fn response_buffer_ceiling(state: &HttpState) -> usize {
+    match state.max_response_bytes {
+        Some(soft) => MAX_RESPONSE_BYTES_HARD_CAP.max(soft.saturating_mul(2)),
+        None => MAX_RESPONSE_BYTES_HARD_CAP,
+    }
+}
+
 pub fn build_router(state: Arc<HttpState>) -> Router {
-    build_router_inner(state.clone()).layer(axum::middleware::from_fn_with_state(
-        state,
-        postprocess_middleware,
-    ))
+    let body_limit = state.max_body_size;
+    let request_timeout = state.request_timeout;
+    build_router_inner(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            postprocess_middleware,
+        ))
+        // Hard ceiling on the raw request body, enforced regardless of
+        // the `Content-Length` header (chunked uploads included).
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(body_limit))
+        // Wall-clock ceiling per request so a stalled handler or a
+        // slow-loris client can't pin a runtime worker forever.
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            request_timeout,
+        ))
+        // Convert a panic in handler code into a 500 instead of a
+        // dropped connection. The `unwrap`s on the HTTP hot path are on
+        // infallible `Vec` writers and server-controlled schemas, but
+        // this is the defence-in-depth net for any that slip through.
+        .layer(tower_http::catch_panic::CatchPanicLayer::new())
 }
 
 async fn postprocess_middleware(
@@ -689,7 +776,27 @@ async fn postprocess_middleware(
 
     let resp = next.run(req).await;
     let (mut parts, body) = resp.into_parts();
-    let bytes = to_bytes(body, usize::MAX).await.unwrap_or_default();
+    // Buffer the response under a hard ceiling. `usize::MAX` here let a
+    // large handler response exhaust the heap; on overflow fail loud
+    // with a 500 rather than `unwrap_or_default()` silently shipping an
+    // empty 200. The ceiling is *not* `max_response_bytes` (a soft
+    // producer-side cap the wire may legitimately overshoot) — see
+    // `response_buffer_ceiling`. Externalised payloads leave only tiny
+    // pointer batches on the wire, so they never approach this bound.
+    let response_limit = response_buffer_ceiling(&state);
+    let bytes = match to_bytes(body, response_limit).await {
+        Ok(b) => b,
+        Err(_) => {
+            let mut h = HeaderMap::new();
+            attach_cors_headers(&state, &mut h, &req_headers, false);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                h,
+                "response body exceeded the configured size limit",
+            )
+                .into_response();
+        }
+    };
     let is_arrow = parts
         .headers
         .get(header::CONTENT_TYPE)
@@ -946,6 +1053,18 @@ fn attach_cors_headers(
     if let Ok(v) = HeaderValue::from_str(origins) {
         out.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
     }
+    // When an authenticate callback is configured, requests carry
+    // credentials (cookie / bearer). A browser only honours those
+    // cross-origin when `Allow-Credentials: true` is present *and* the
+    // origin is specific — `HttpStateBuilder::build` rejects the
+    // `"*"` + auth combination, so the configured origin here is
+    // always concrete.
+    if state.authenticate.is_some() {
+        out.insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+    }
     out.insert(
         header::ACCESS_CONTROL_ALLOW_METHODS,
         HeaderValue::from_static("POST, GET, OPTIONS"),
@@ -986,14 +1105,20 @@ async fn handle_oauth_metadata(State(state): State<Arc<HttpState>>) -> Response 
     }
 }
 
-/// Parse a `Cookie:` header into a name→value map.
+/// Parse a `Cookie:` header into a name→value map. Surrounding
+/// double-quotes on a value (RFC 6265 quoted form) are stripped.
 fn parse_cookies(raw: Option<&str>) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
     let Some(raw) = raw else { return out };
     for part in raw.split(';') {
         let part = part.trim();
         if let Some((k, v)) = part.split_once('=') {
-            out.insert(k.trim().to_string(), v.trim().to_string());
+            let v = v.trim();
+            let v = v
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(v);
+            out.insert(k.trim().to_string(), v.to_string());
         }
     }
     out
@@ -1035,14 +1160,33 @@ fn authenticate_request(
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             let mut h = HeaderMap::new();
-            if status == StatusCode::UNAUTHORIZED {
+            // The response body must not echo internal detail. A 401 is
+            // part of the auth contract, but the verifier's message can
+            // carry an attacker-supplied `kid` or a raw library error —
+            // keep that in the logs, return a generic body. A 500 from
+            // the auth callback (e.g. a JWKS fetch failure) is purely
+            // internal and gets the same treatment.
+            let body = if status == StatusCode::UNAUTHORIZED {
                 if let Some(wa) = state.www_authenticate.as_deref() {
                     if let Ok(hv) = HeaderValue::from_str(wa) {
                         h.insert(header::WWW_AUTHENTICATE, hv);
                     }
                 }
-            }
-            Err((status, h, err.message.clone()).into_response())
+                tracing::info!(
+                    target: "vgi_rpc.http",
+                    error = %err.message,
+                    "request authentication rejected"
+                );
+                "authentication failed"
+            } else {
+                tracing::error!(
+                    target: "vgi_rpc.http",
+                    error = %err.message,
+                    "authentication callback errored"
+                );
+                "internal error during authentication"
+            };
+            Err((status, h, body).into_response())
         }
     }
 }
@@ -2266,5 +2410,33 @@ mod tests {
         let auth = crate::auth::AuthContext::anonymous();
         let tok = a.pack_state_token(&auth, b"s", b"o", b"i", "sid");
         assert_eq!(b.unpack_state_token(&auth, &tok).unwrap().stream_id, "sid");
+    }
+
+    #[test]
+    fn response_buffer_ceiling_never_below_hard_cap() {
+        use crate::server::RpcServer;
+        let mk = |soft: Option<usize>| {
+            let server = Arc::new(RpcServer::builder().server_id("t").build());
+            let mut b = HttpState::builder().server(server).token_key(&[9u8; 32]);
+            if let Some(n) = soft {
+                b = b.max_response_bytes(n);
+            }
+            b.build()
+        };
+        // No soft cap → exactly the hard cap.
+        assert_eq!(
+            response_buffer_ceiling(&mk(None)),
+            MAX_RESPONSE_BYTES_HARD_CAP
+        );
+        // A small soft cap must NOT shrink the middleware ceiling — the
+        // soft cap is a producer knob the wire may legitimately
+        // overshoot.
+        assert_eq!(
+            response_buffer_ceiling(&mk(Some(8))),
+            MAX_RESPONSE_BYTES_HARD_CAP
+        );
+        // A soft cap larger than the hard cap leaves overshoot headroom.
+        let big = MAX_RESPONSE_BYTES_HARD_CAP;
+        assert_eq!(response_buffer_ceiling(&mk(Some(big))), big * 2);
     }
 }

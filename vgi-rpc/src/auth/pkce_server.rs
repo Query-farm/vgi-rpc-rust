@@ -24,6 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -41,6 +42,12 @@ use crate::errors::RpcError;
 /// Cookie carrying the PKCE session (verifier + state nonce + return_to).
 /// Short-lived; cleared on callback.
 pub const PKCE_SESSION_COOKIE: &str = "_vgi_pkce";
+
+/// Lifetime of a PKCE session cookie — the window between `/_oauth/start`
+/// and the IdP redirecting back to `/_oauth/callback`. Bound into the
+/// cookie's signature (`created_at`) and enforced on the callback, so a
+/// captured cookie cannot be replayed past this window.
+const PKCE_STATE_TTL: Duration = Duration::from_secs(600);
 
 /// Cookie carrying the authenticated user's ID token (JWT). Long-lived
 /// up to the token's `exp` claim.
@@ -108,18 +115,21 @@ async fn handle_start(
     // that wants the JWT in a URL fragment, not a cookie).
     let is_external_frontend = is_absolute_url(&return_to);
     let pair = generate_pkce_pair();
-    let cookie_value = new_state_cookie(&cfg.signing_key, &return_to, &pair);
+    let pkce = new_state_cookie(&cfg.signing_key, &return_to, &pair);
 
-    // Build the authorize URL. For external frontends, request a
-    // refresh token (`access_type=offline&prompt=consent`) so the SPA
-    // can rotate without bouncing the user through the IdP again.
+    // Build the authorize URL. The `state` parameter is the opaque
+    // random nonce only — **not** the cookie — so the `code_verifier`
+    // inside the signed cookie never travels to the IdP. For external
+    // frontends, request a refresh token (`access_type=offline&
+    // prompt=consent`) so the SPA can rotate without bouncing the user
+    // through the IdP again.
     let mut qs_pairs: Vec<(&str, &str)> = vec![
         ("response_type", "code"),
         ("client_id", cfg.client_id.as_str()),
         ("redirect_uri", cfg.redirect_uri.as_str()),
         ("code_challenge", pair.challenge.as_str()),
         ("code_challenge_method", "S256"),
-        ("state", &cookie_value), // bind state nonce to cookie HMAC
+        ("state", pkce.state.as_str()),
         ("scope", cfg.scope.as_str()),
     ];
     if is_external_frontend {
@@ -131,8 +141,8 @@ async fn handle_start(
 
     let cookie = build_cookie(
         PKCE_SESSION_COOKIE,
-        &cookie_value,
-        Some(600),
+        &pkce.cookie,
+        Some(PKCE_STATE_TTL.as_secs() as u32),
         &cfg.prefix,
         cfg.secure_cookie,
     );
@@ -167,26 +177,42 @@ async fn handle_callback(
         return error_page("Missing state parameter", "");
     };
 
-    // Verify the session cookie matches the state echoed by the IdP.
+    // Verify the session cookie, then check the state nonce it carries
+    // matches the one the IdP echoed back. The cookie is signed +
+    // freshness-checked; the verifier is read from it (never from the
+    // query string).
     let cookies = parse_cookies(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let Some(cookie_value) = cookies.get(PKCE_SESSION_COOKIE) else {
         return error_page("Missing session cookie", "");
     };
-    if cookie_value != &state_param {
+    let (state_nonce, return_to, verifier) =
+        match verify_state_cookie(&cfg.signing_key, cookie_value, PKCE_STATE_TTL) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(target: "vgi_rpc.oauth", error = %e, "PKCE session cookie rejected");
+                return error_page(
+                    "Invalid session",
+                    "your login session is invalid or has expired",
+                );
+            }
+        };
+    if state_nonce != state_param {
         return error_page(
             "State mismatch",
-            "session cookie does not match returned state",
+            "your login session does not match the returned state",
         );
     }
-    let (_state, return_to, verifier) = match verify_state_cookie(&cfg.signing_key, cookie_value) {
-        Ok(t) => t,
-        Err(e) => return error_page("Invalid session cookie", &e.message),
-    };
 
     // Token-exchange POST to the IdP.
     let tokens = match exchange_code_for_token(&cfg, &code, &verifier).await {
         Ok(t) => t,
-        Err(e) => return error_page("Token exchange failed", &e.message),
+        Err(e) => {
+            tracing::warn!(target: "vgi_rpc.oauth", error = %e, "OAuth token exchange failed");
+            return error_page(
+                "Token exchange failed",
+                "could not complete login with the identity provider",
+            );
+        }
     };
 
     let clear_session = build_clear_cookie(PKCE_SESSION_COOKIE, &cfg.prefix, cfg.secure_cookie);
@@ -398,7 +424,13 @@ async fn handle_refresh(
     };
     let tokens = match exchange_refresh_token(&cfg, &rt).await {
         Ok(t) => t,
-        Err(e) => return error_page("Refresh failed", &e.message),
+        Err(e) => {
+            tracing::warn!(target: "vgi_rpc.oauth", error = %e, "OAuth refresh-token exchange failed");
+            return error_page(
+                "Refresh failed",
+                "could not refresh the session with the identity provider",
+            );
+        }
     };
     let body = RefreshResponse {
         token: tokens.id_or_access,

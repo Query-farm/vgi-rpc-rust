@@ -62,6 +62,24 @@ fn serialize_request_batch(batch: &RecordBatch) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Lock a mutex, recovering the guard even if a previous holder
+/// panicked. Handler code is arbitrary and *will* panic eventually; a
+/// poisoned lock must not turn that into a process abort on the next
+/// `.lock()`. The panic itself is surfaced to the client as an
+/// `RpcError` by the `catch_unwind` wrappers in the dispatch path.
+fn lock_ok<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Invoke a handler closure, converting a panic into an `RpcError`
+/// instead of unwinding through the serve loop (which on stdio/pipe
+/// would kill the whole process). The panic message is intentionally
+/// not echoed to the client.
+fn call_guard<T>(f: impl FnOnce() -> T) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .map_err(|_| RpcError::new("RuntimeError", "handler panicked"))
+}
+
 /// Context supplied to each handler invocation.
 #[derive(Clone)]
 pub struct CallContext {
@@ -83,18 +101,15 @@ pub struct CallContext {
 
 impl CallContext {
     pub fn client_log(&self, level: LogLevel, message: impl Into<String>) {
-        self.log_sink
-            .lock()
-            .unwrap()
-            .push(LogMessage::new(level, message));
+        lock_ok(&self.log_sink).push(LogMessage::new(level, message));
     }
 
     pub fn client_log_with(&self, msg: LogMessage) {
-        self.log_sink.lock().unwrap().push(msg);
+        lock_ok(&self.log_sink).push(msg);
     }
 
     pub(crate) fn drain_logs(&self) -> Vec<LogMessage> {
-        std::mem::take(&mut *self.log_sink.lock().unwrap())
+        std::mem::take(&mut *lock_ok(&self.log_sink))
     }
 
     /// Build a call context for `server` serving `req`. Defaults to
@@ -519,20 +534,14 @@ impl RpcServer {
     /// or `None` before the framework has observed a transport. Set by
     /// [`notify_transport`](Self::notify_transport).
     pub fn transport_kind(&self) -> Option<crate::transport::TransportKind> {
-        self.transport_state
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|(k, _)| *k)
+        lock_ok(&self.transport_state).as_ref().map(|(k, _)| *k)
     }
 
     /// Currently-advertised [`TransportCapabilities`](crate::transport::TransportCapabilities).
     /// Empty (all-false) before a transport is bound and for transports
     /// without extra capabilities.
     pub fn transport_capabilities(&self) -> crate::transport::TransportCapabilities {
-        self.transport_state
-            .lock()
-            .unwrap()
+        lock_ok(&self.transport_state)
             .as_ref()
             .map(|(_, c)| *c)
             .unwrap_or_default()
@@ -555,7 +564,7 @@ impl RpcServer {
         caps: crate::transport::TransportCapabilities,
     ) {
         let hook = {
-            let mut guard = self.transport_state.lock().unwrap();
+            let mut guard = lock_ok(&self.transport_state);
             if let Some((cur_kind, cur_caps)) = guard.as_ref() {
                 if *cur_kind == kind && *cur_caps == caps {
                     return;
@@ -629,6 +638,15 @@ impl RpcServer {
     }
 
     /// Run the serve loop over a single reader/writer pair (pipe or socket).
+    ///
+    /// Reads are **blocking with no timeout** — a peer that opens the
+    /// connection and then stalls pins this thread until it sends data,
+    /// EOFs, or resets. stdio/pipe has no timeout API, so that transport
+    /// is trusted-peer-only (see also the SHM module docs). On a socket
+    /// transport, the caller owns the stream and **should** set a read
+    /// timeout (e.g. `UnixStream::set_read_timeout`) before handing it
+    /// here; a `TimedOut`/`WouldBlock` error then cleanly ends the
+    /// connection via the error path below.
     pub fn serve<R: Read, W: Write>(&self, mut r: R, mut w: W) {
         loop {
             match self.serve_one(&mut r, &mut w) {
@@ -637,7 +655,17 @@ impl RpcServer {
                         return;
                     }
                 }
-                Err(_e) => {
+                Err(e) => {
+                    // A frame-level error (malformed request, IO error,
+                    // peer reset) ends the connection. Log it so a
+                    // daemonized listener has diagnostics — silently
+                    // returning made transient and hostile-input
+                    // failures indistinguishable from a clean EOF.
+                    tracing::warn!(
+                        target: "vgi_rpc.server",
+                        error = %e,
+                        "serve loop terminating connection on error"
+                    );
                     return;
                 }
             }
@@ -684,7 +712,7 @@ impl RpcServer {
         let stats = Arc::new(Mutex::new(crate::hooks::CallStatistics::default()));
         // Record the unary request batch as input stats (one row).
         {
-            let mut s = stats.lock().unwrap();
+            let mut s = lock_ok(&stats);
             s.input_batches = 1;
             s.input_rows = req.batch.num_rows() as u64;
         }
@@ -759,7 +787,7 @@ impl RpcServer {
 
         if let Some(hook) = self.dispatch_hook.as_ref() {
             let token = hook_token.unwrap_or(0);
-            let final_stats = stats.lock().unwrap().clone();
+            let final_stats = lock_ok(&stats).clone();
             hook.on_dispatch_end(token, &dispatch_info, app_err.as_ref(), &final_stats);
         }
         Ok(true)
@@ -796,7 +824,10 @@ impl RpcServer {
         app_err: &mut Option<RpcError>,
         #[cfg_attr(not(feature = "shm"), allow(unused_variables))] shm: Option<&ShmSegment>,
     ) -> Result<()> {
-        let result = (info.unary.as_ref().unwrap())(req, ctx);
+        // A panic in handler code is converted to an `RpcError` and
+        // flows into the error-envelope path below, rather than
+        // unwinding through the serve loop.
+        let result = call_guard(|| (info.unary.as_ref().unwrap())(req, ctx)).and_then(|r| r);
         let logs = ctx.drain_logs();
         match result {
             Ok(maybe_batch) => {
@@ -810,7 +841,7 @@ impl RpcServer {
                     None => empty_batch(&info.result_schema)?,
                 };
                 {
-                    let mut s = stats.lock().unwrap();
+                    let mut s = lock_ok(stats);
                     s.output_batches = 1;
                     s.output_rows = out_batch.num_rows() as u64;
                 }
@@ -867,7 +898,7 @@ impl RpcServer {
         app_err: &mut Option<RpcError>,
         #[cfg_attr(not(feature = "shm"), allow(unused_variables))] shm: Option<&ShmSegment>,
     ) -> Result<()> {
-        let init_result = (info.stream.as_ref().unwrap())(req, ctx);
+        let init_result = call_guard(|| (info.stream.as_ref().unwrap())(req, ctx)).and_then(|r| r);
         let init_logs = ctx.drain_logs();
         let stream = match init_result {
             Ok(s) => s,
@@ -955,7 +986,7 @@ impl RpcServer {
             };
 
             {
-                let mut s = stats.lock().unwrap();
+                let mut s = lock_ok(stats);
                 s.input_batches += 1;
                 s.input_rows += input_batch.num_rows() as u64;
             }
@@ -987,10 +1018,11 @@ impl RpcServer {
 
             let mut out = OutputCollector::new(output_schema.clone(), input_schema.is_none());
 
-            let iter_result = match &mut state {
+            let iter_result = call_guard(|| match &mut state {
                 StreamStateKind::Producer(p) => p.produce(&mut out, ctx),
                 StreamStateKind::Exchange(e) => e.exchange(&casted, &mut out, ctx),
-            };
+            })
+            .and_then(|r| r);
 
             // Flush any iteration-level logs first (logs appended during produce/exchange).
             let iter_logs = ctx.drain_logs();
@@ -1017,7 +1049,7 @@ impl RpcServer {
                     }
                     Emitted::Batch { batch, metadata } => {
                         {
-                            let mut s = stats.lock().unwrap();
+                            let mut s = lock_ok(stats);
                             s.output_batches += 1;
                             s.output_rows += batch.num_rows() as u64;
                         }
@@ -1160,4 +1192,69 @@ pub(crate) fn write_error_stream<W: Write>(
     sw.write(&empty_batch(schema)?, Some(&md))?;
     sw.finish()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Frame a no-argument request for `method` as a self-contained IPC
+    /// stream the pipe-transport serve loop can read.
+    fn request_bytes(method: &str) -> Vec<u8> {
+        let schema = empty_schema();
+        let batch = empty_batch(&schema).unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut w = StreamWriter::new(&mut buf, &schema).unwrap();
+            let mut md = Metadata::new();
+            md.insert(RPC_METHOD_KEY.into(), method.into());
+            md.insert(REQUEST_VERSION_KEY.into(), REQUEST_VERSION.into());
+            md.insert(REQUEST_ID_KEY.into(), format!("req-{method}"));
+            w.write(&batch, Some(&md)).unwrap();
+            w.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn panicking_handler_yields_error_envelope_and_loop_survives() {
+        let mut server = RpcServer::new("test-srv");
+        server.register(MethodInfo::unary(
+            "boom",
+            empty_schema(),
+            empty_schema(),
+            |_req, _ctx| panic!("handler exploded"),
+        ));
+        let ran_second = Arc::new(AtomicBool::new(false));
+        let flag = ran_second.clone();
+        server.register(MethodInfo::unary(
+            "ok",
+            empty_schema(),
+            empty_schema(),
+            move |_req, _ctx| {
+                flag.store(true, Ordering::SeqCst);
+                Ok(None)
+            },
+        ));
+
+        // Two back-to-back requests: the first handler panics, the
+        // second must still run — the serve loop must not abort.
+        let mut input = request_bytes("boom");
+        input.extend(request_bytes("ok"));
+        let mut output: Vec<u8> = Vec::new();
+        server.serve(Cursor::new(input), &mut output);
+
+        assert!(
+            ran_second.load(Ordering::SeqCst),
+            "serve loop aborted after a handler panic"
+        );
+
+        // The panic was surfaced to the client as an error envelope,
+        // not a silent connection drop.
+        let mut r = StreamReader::new(output.as_slice()).unwrap();
+        let (_b, md) = r.read_next().unwrap().expect("error batch");
+        assert_eq!(md_get(&md, LOG_LEVEL_KEY), Some("EXCEPTION"));
+    }
 }

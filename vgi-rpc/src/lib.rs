@@ -22,7 +22,6 @@ pub mod hooks;
 pub mod introspect;
 pub mod log;
 pub mod metadata;
-pub(crate) mod probe;
 #[cfg(feature = "sentry-sdk")]
 pub mod sentry_sdk;
 #[cfg(feature = "sentry-tracing")]

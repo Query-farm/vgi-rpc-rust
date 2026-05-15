@@ -17,6 +17,7 @@
 //! implementation and a [`Fetcher`] for resolution. The companion
 //! `vgi-rpc-s3` and `vgi-rpc-gcs` crates ship ready-made backends.
 
+use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -82,11 +83,17 @@ pub type UrlValidator = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
 
 /// Pluggable fetcher used to resolve pointer batches back into data.
 ///
-/// Takes a URL (and the declared compression) and returns the decompressed
-/// IPC bytes. `vgi-rpc` ships an HTTPS fetcher; tests plug in an
+/// Takes a URL (and the declared compression) and returns the still-encoded
+/// payload bytes. `vgi-rpc` ships an HTTPS fetcher; tests plug in an
 /// in-memory implementation.
+///
+/// `max_bytes` is a hard ceiling on the number of bytes the fetcher may
+/// read from the remote — implementations **must** abort once it is
+/// exceeded rather than buffering an unbounded response into memory. A
+/// hostile or compromised storage URL would otherwise OOM the process
+/// before decompression's own cap is ever reached.
 pub trait Fetcher: Send + Sync {
-    fn fetch(&self, url: &str, compression: Compression) -> Result<Vec<u8>>;
+    fn fetch(&self, url: &str, compression: Compression, max_bytes: usize) -> Result<Vec<u8>>;
 }
 
 /// Externalization configuration.
@@ -103,9 +110,10 @@ pub struct ExternalLocationConfig {
     /// Resolver used on the read side. Required when resolving inbound
     /// pointer batches.
     pub fetcher: Arc<dyn Fetcher>,
-    /// URL validator; default enforces `https://` unless
-    /// [`https_only`](Self::https_only) is set to `false`. Reject the
-    /// URL by returning `Err`.
+    /// URL validator run on both the upload (post-signing) and fetch
+    /// (pre-download) paths. Defaults to [`safe_https_validator`], which
+    /// rejects non-`https` URLs and internal/non-routable hosts. Reject
+    /// a URL by returning `Err`.
     pub url_validator: UrlValidator,
     /// Hard ceiling on the post-decompression size of a fetched
     /// payload. Zstd frames carry their decompressed size in the
@@ -125,7 +133,13 @@ impl std::fmt::Debug for ExternalLocationConfig {
     }
 }
 
-/// Helper: default HTTPS-only URL validator.
+/// Helper: scheme-only HTTPS validator.
+///
+/// **Insufficient for untrusted input** — it accepts `https://localhost`,
+/// `https://169.254.169.254` (cloud metadata), and any internal-network
+/// host. Use it only when the set of external-location URLs is fully
+/// trusted (e.g. URLs your own backend minted). For anything that can
+/// carry a client-supplied location, use [`safe_https_validator`].
 pub fn https_only_validator() -> UrlValidator {
     Arc::new(|url: &str| {
         if url.starts_with("https://") {
@@ -136,6 +150,103 @@ pub fn https_only_validator() -> UrlValidator {
             )))
         }
     })
+}
+
+/// Helper: default-deny HTTPS validator with SSRF protection.
+///
+/// Requires the `https` scheme, then rejects the URL when its host is —
+/// or resolves to — a loopback, private, link-local, unique-local,
+/// carrier-grade-NAT, broadcast, documentation, or unspecified address.
+/// This is the default for [`ExternalLocationConfig::new`] because the
+/// unary HTTP path resolves a *client-supplied* `vgi_rpc.location`
+/// server-side; without this a client could pivot the server into
+/// fetching `https://169.254.169.254/...` or an internal service.
+///
+/// Note: a hostname is resolved here and again at fetch time, so a
+/// DNS-rebinding attacker could still slip through the gap. Pair this
+/// with a redirect-free, size-capped fetcher (the bundled `HttpFetcher`
+/// is both) and, for high-assurance deployments, an egress firewall.
+pub fn safe_https_validator() -> UrlValidator {
+    Arc::new(|raw: &str| {
+        let url = url::Url::parse(raw)
+            .map_err(|e| RpcError::value_error(format!("invalid external location URL: {e}")))?;
+        if url.scheme() != "https" {
+            return Err(RpcError::value_error(
+                "external location URL must be https://",
+            ));
+        }
+        let host = url
+            .host()
+            .ok_or_else(|| RpcError::value_error("external location URL has no host"))?;
+        match host {
+            url::Host::Ipv4(ip) => reject_unsafe_ip(IpAddr::V4(ip)),
+            url::Host::Ipv6(ip) => reject_unsafe_ip(IpAddr::V6(ip)),
+            url::Host::Domain(name) => {
+                let lname = name.to_ascii_lowercase();
+                if lname == "localhost" || lname.ends_with(".localhost") {
+                    return Err(RpcError::value_error(
+                        "external location host is not publicly routable",
+                    ));
+                }
+                let port = url.port_or_known_default().unwrap_or(443);
+                let addrs = (name, port).to_socket_addrs().map_err(|e| {
+                    RpcError::value_error(format!("external location host does not resolve: {e}"))
+                })?;
+                let mut saw_any = false;
+                for sa in addrs {
+                    saw_any = true;
+                    reject_unsafe_ip(sa.ip())?;
+                }
+                if !saw_any {
+                    return Err(RpcError::value_error(
+                        "external location host does not resolve",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    })
+}
+
+/// Reject an IP address that is not safe for the server to dial: any
+/// loopback / private / link-local / unique-local / CGNAT / broadcast /
+/// documentation / unspecified / multicast address.
+fn reject_unsafe_ip(ip: IpAddr) -> Result<()> {
+    let unsafe_addr = match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                // 100.64.0.0/10 — carrier-grade NAT.
+                || (o[0] == 100 && (o[1] & 0xc0) == 0x40)
+        }
+        IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fc00::/7 — unique local.
+                || (seg0 & 0xfe00) == 0xfc00
+                // fe80::/10 — link local.
+                || (seg0 & 0xffc0) == 0xfe80
+                // IPv4-mapped (::ffff:0:0/96) — classify the embedded v4.
+                || v6
+                    .to_ipv4_mapped()
+                    .map(|m| reject_unsafe_ip(IpAddr::V4(m)).is_err())
+                    .unwrap_or(false)
+        }
+    };
+    if unsafe_addr {
+        return Err(RpcError::value_error(
+            "external location host resolves to a non-routable / internal address",
+        ));
+    }
+    Ok(())
 }
 
 /// Helper: accept any URL (useful for local tests + MinIO).
@@ -150,7 +261,7 @@ impl ExternalLocationConfig {
             compression: Compression::None,
             storage,
             fetcher,
-            url_validator: https_only_validator(),
+            url_validator: safe_https_validator(),
             max_decompressed_bytes: 1024 * 1024 * 1024,
         }
     }
@@ -334,7 +445,13 @@ pub fn resolve_external_location(
     (cfg.url_validator)(url)?;
 
     let start = std::time::Instant::now();
-    let compressed = cfg.fetcher.fetch(url, cfg.compression)?;
+    // Cap the fetched (still-encoded) payload at `max_decompressed_bytes`:
+    // any well-formed compressed body is smaller than its decompressed
+    // form, so this is a safe ceiling that also bounds the uncompressed
+    // case. `decompress` enforces the post-decompression cap on top.
+    let compressed = cfg
+        .fetcher
+        .fetch(url, cfg.compression, cfg.max_decompressed_bytes)?;
     let ipc_bytes = decompress(&compressed, cfg.compression, cfg.max_decompressed_bytes)?;
 
     // Integrity check.
@@ -425,13 +542,21 @@ impl ExternalStorage for InMemoryStorage {
 
 #[cfg(any(test, feature = "test-utils"))]
 impl Fetcher for InMemoryStorage {
-    fn fetch(&self, url: &str, _compression: Compression) -> Result<Vec<u8>> {
-        self.map
+    fn fetch(&self, url: &str, _compression: Compression, max_bytes: usize) -> Result<Vec<u8>> {
+        let bytes = self
+            .map
             .lock()
             .unwrap()
             .get(url)
             .cloned()
-            .ok_or_else(|| RpcError::runtime_error(format!("inmem fetch miss: {url}")))
+            .ok_or_else(|| RpcError::runtime_error(format!("inmem fetch miss: {url}")))?;
+        if bytes.len() > max_bytes {
+            return Err(RpcError::runtime_error(format!(
+                "inmem fetch payload {} bytes exceeds max_bytes={max_bytes}",
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
     }
 }
 
@@ -519,6 +644,25 @@ mod tests {
         bogus_md.insert("vgi_rpc.location".into(), "http://not-secure/x".into());
         let err = resolve_external_location(&batch, &bogus_md, &cfg).unwrap_err();
         assert!(err.message.contains("https://"));
+    }
+
+    #[test]
+    fn safe_https_validator_blocks_ssrf_targets() {
+        let v = safe_https_validator();
+        // Non-https.
+        assert!(v("http://example.com/x").is_err());
+        // IP-literal internal / non-routable targets.
+        assert!(v("https://169.254.169.254/latest/meta-data/").is_err());
+        assert!(v("https://127.0.0.1/").is_err());
+        assert!(v("https://10.0.0.1/").is_err());
+        assert!(v("https://192.168.1.1/").is_err());
+        assert!(v("https://[::1]/").is_err());
+        assert!(v("https://0.0.0.0/").is_err());
+        // Hostname forms of loopback.
+        assert!(v("https://localhost/x").is_err());
+        assert!(v("https://api.localhost/x").is_err());
+        // A public IP literal is allowed.
+        assert!(v("https://1.1.1.1/x").is_ok());
     }
 
     #[test]

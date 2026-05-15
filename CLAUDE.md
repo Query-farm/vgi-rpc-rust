@@ -292,10 +292,16 @@ aligned so cross-referencing is easy. Python module ↔ Rust module:
 
 1. Bump the workspace version in the root `Cargo.toml`.
 2. Update `CHANGELOG.md` with a new `[x.y.z] — YYYY-MM-DD` section.
-3. `cargo publish --dry-run -p vgi-rpc` (repeat for `vgi-rpc-s3`,
+3. **Fuzz gate.** Run the wire-reader fuzz target to a clean stop —
+   this is a release blocker, not optional:
+   `cargo +nightly fuzz run wire_stream_reader -- -runs=1000000`.
+   The wire reader parses hand-crafted flatbuffer frames; the
+   `catch_unwind` + buffer-descriptor checks in `wire.rs` are the
+   safety net, the fuzzer is how we know it holds.
+4. `cargo publish --dry-run -p vgi-rpc` (repeat for `vgi-rpc-s3`,
    `vgi-rpc-gcs`).
-4. Tag `vgi-rpc-vX.Y.Z`, push.
-5. `cargo publish -p vgi-rpc` then `-p vgi-rpc-s3` then `-p vgi-rpc-gcs`
+5. Tag `vgi-rpc-vX.Y.Z`, push.
+6. `cargo publish -p vgi-rpc` then `-p vgi-rpc-s3` then `-p vgi-rpc-gcs`
    (order matters; the backend crates depend on `vgi-rpc`).
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, cargo doc, and
@@ -342,9 +348,29 @@ These weren't gated on conformance and are candidates for a later phase:
   feature).
 - **Rust client crate** — the workspace is server-only today. A
   client crate mirroring the Go port's structure remains a follow-up.
-- **Fuzz coverage on the wire reader.** `wire::StreamReader` parses
-  hand-crafted flatbuffer frames; only happy-path tests today. A
-  `cargo-fuzz` harness is the next robustness step.
+
+## Trust boundaries
+
+Not every transport is safe to expose to untrusted peers:
+
+- **stdio / pipe** — `RpcServer::serve` does blocking reads with **no
+  timeout**; a peer that connects and stalls pins the serve thread.
+  There is no timeout API for stdio. Trusted-peer-only.
+- **SHM** (`shm.rs`) — the client owns the OS segment and supplies its
+  size in request metadata; a lie about the size can make the server
+  `mmap` past the backing object and take a `SIGBUS` that `catch_unwind`
+  cannot catch. Trusted-peer-only. See the `shm` module docs.
+- **unix socket** — safe for untrusted peers *if* the caller sets a
+  read timeout on the stream before handing it to `serve` (a
+  `TimedOut`/`WouldBlock` error then cleanly ends the connection).
+- **HTTP** — the hardened path: body-size + request-timeout layers,
+  AEAD-sealed stateless stream tokens, SSRF-filtered external fetches.
+
+The wire reader (`wire.rs`) validates flatbuffer buffer descriptors and
+wraps arrow-ipc decode in `catch_unwind`; handler panics are isolated by
+`catch_unwind` in `server.rs` and surface as error envelopes. The
+`cargo-fuzz` harness (`fuzz/wire_stream_reader`) is a release gate — see
+the release process.
 
 ## Common pitfalls
 

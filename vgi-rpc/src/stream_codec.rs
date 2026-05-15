@@ -34,10 +34,26 @@ pub fn bincode_encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     bincode::serialize(value).map_err(|e| RpcError::runtime_error(format!("bincode encode: {e}")))
 }
 
+/// Hard ceiling on the number of bytes `bincode_decode` will allocate
+/// from a length-prefixed field. Streaming-state values are small
+/// (counters, cursors, small buffers); 16 MiB is generous headroom.
+/// The HTTP transport already seals these bytes in an AEAD token, so
+/// they are integrity-protected — this is defence-in-depth against a
+/// crafted length prefix should the codec ever be fed untrusted bytes.
+const MAX_STATE_DECODE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Decode bytes produced by [`bincode_encode`].
 ///
 /// **Internal:** used by `#[derive(StreamState)]` expansion.
 #[doc(hidden)]
 pub fn bincode_decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    bincode::deserialize(bytes).map_err(|e| RpcError::runtime_error(format!("bincode decode: {e}")))
+    use bincode::Options;
+    // `DefaultOptions` matches the byte layout of `bincode::serialize`
+    // (used by `bincode_encode`); `.with_limit` bounds allocation
+    // without changing the wire format.
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(MAX_STATE_DECODE_BYTES)
+        .deserialize(bytes)
+        .map_err(|e| RpcError::runtime_error(format!("bincode decode: {e}")))
 }

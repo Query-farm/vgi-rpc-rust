@@ -35,6 +35,23 @@
 //!   touching the segment at the same time, so no locking is needed
 //!   inside the allocator.
 //!
+//! # ⚠️ Trust boundary — trusted peers only
+//!
+//! The SHM transport **must not be exposed to untrusted clients.** The
+//! client owns the OS object: it can mutate the header concurrently from
+//! another thread (the lockstep assumption is cooperative, not
+//! enforceable), and it supplies the segment size in request metadata.
+//! A client that lies about the size can make the server `mmap` a region
+//! larger than the backing object — a subsequent read then faults with
+//! `SIGBUS`, which **cannot** be caught by `catch_unwind`. The header
+//! fields (`num_allocs`, allocation offsets/lengths) are likewise read
+//! from client-writable memory; the parser bounds-checks them
+//! defensively, but corruption still yields garbage allocations.
+//!
+//! Use SHM only when the client and server are in the same trust domain
+//! (e.g. a subprocess pool you spawn). For untrusted peers, use the
+//! pipe / unix / HTTP transports.
+//!
 //! [`SHM_SEGMENT_NAME_KEY`]: crate::metadata::SHM_SEGMENT_NAME_KEY
 //! [`SHM_SEGMENT_SIZE_KEY`]: crate::metadata::SHM_SEGMENT_SIZE_KEY
 
@@ -335,7 +352,10 @@ impl ShmAllocator {
 
     fn read_allocs(&self) -> Vec<(u64, u64)> {
         let buf = self.shm.as_slice();
-        let n = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as usize;
+        // `num_allocs` is read from client-writable memory. Clamp it to
+        // `MAX_ALLOCS` so a corrupt/hostile value can't drive the loop's
+        // slice indexing past the fixed-size allocation table.
+        let n = (u32::from_le_bytes(buf[16..20].try_into().unwrap()) as usize).min(MAX_ALLOCS);
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let base = HEADER_FIXED_SIZE + i * ALLOC_ENTRY_SIZE;

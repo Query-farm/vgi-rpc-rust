@@ -353,13 +353,24 @@ impl<R: Read> StreamReader<R> {
                         .header_as_dictionary_batch()
                         .ok_or_else(|| RpcError::new("IPC", "bad dictionary header"))?;
                     let body_buf = ArrowBuffer::from_vec(msg.body);
-                    ipc_reader::read_dictionary(
-                        &body_buf,
-                        dict,
-                        self.schema.as_ref(),
-                        &mut self.dictionaries,
-                        &version,
-                    )
+                    // Reject buffer descriptors that point outside the
+                    // body *before* handing them to arrow-ipc, which
+                    // would otherwise panic on an out-of-bounds slice.
+                    if let Some(data) = dict.data() {
+                        validate_record_batch_buffers(&data, body_buf.len())?;
+                    }
+                    // arrow-ipc's decoder still has internal invariants
+                    // we don't re-check; `catch_unwind` is the backstop
+                    // that turns any residual panic into a clean error.
+                    decode_guard("dictionary batch", || {
+                        ipc_reader::read_dictionary(
+                            &body_buf,
+                            dict,
+                            self.schema.as_ref(),
+                            &mut self.dictionaries,
+                            &version,
+                        )
+                    })?
                     .map_err(RpcError::from)?;
                 }
                 MessageHeader::RecordBatch => {
@@ -367,6 +378,7 @@ impl<R: Read> StreamReader<R> {
                         .header_as_record_batch()
                         .ok_or_else(|| RpcError::new("IPC", "bad record batch header"))?;
                     let body_buf = ArrowBuffer::from_vec(msg.body);
+                    validate_record_batch_buffers(&rb_fb, body_buf.len())?;
                     // When relaxation is in effect, feed the relaxed
                     // schema directly to `read_record_batch` so its
                     // validation accepts the legitimate null buffers
@@ -377,14 +389,16 @@ impl<R: Read> StreamReader<R> {
                         .relaxed_schema
                         .clone()
                         .unwrap_or_else(|| self.schema.clone());
-                    let batch = ipc_reader::read_record_batch(
-                        &body_buf,
-                        rb_fb,
-                        decode_schema,
-                        &self.dictionaries,
-                        None,
-                        &version,
-                    )
+                    let batch = decode_guard("record batch", || {
+                        ipc_reader::read_record_batch(
+                            &body_buf,
+                            rb_fb,
+                            decode_schema,
+                            &self.dictionaries,
+                            None,
+                            &version,
+                        )
+                    })?
                     .map_err(RpcError::from)?;
                     let metadata = parse_custom_metadata(&msg_fb);
                     return Ok(Some((batch, metadata)));
@@ -424,6 +438,44 @@ fn parse_custom_metadata(msg: &arrow_ipc::Message) -> Metadata {
         }
     }
     out
+}
+
+/// Validate that every `(offset, length)` buffer descriptor in an IPC
+/// record-batch header references a region wholly inside the message
+/// body. arrow-ipc's column decoders index into the body using these
+/// descriptors verbatim and will panic (slice out-of-bounds / arithmetic
+/// overflow) on a crafted frame whose descriptors are inconsistent with
+/// the body it shipped. Catching that here turns a hostile frame into a
+/// clean `RpcError` instead of a thread panic.
+fn validate_record_batch_buffers(rb: &arrow_ipc::RecordBatch, body_len: usize) -> Result<()> {
+    if let Some(buffers) = rb.buffers() {
+        for buf in buffers.iter() {
+            let offset = buf.offset();
+            let length = buf.length();
+            if offset < 0 || length < 0 {
+                return Err(RpcError::new("IPC", "negative IPC buffer descriptor"));
+            }
+            let end = (offset as u64)
+                .checked_add(length as u64)
+                .ok_or_else(|| RpcError::new("IPC", "IPC buffer descriptor overflows"))?;
+            if end > body_len as u64 {
+                return Err(RpcError::new(
+                    "IPC",
+                    "IPC buffer descriptor exceeds message body",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run an arrow-ipc decode call, converting any panic into a clean
+/// `RpcError`. The descriptor pre-validation above catches the common
+/// crafted-frame cases; this is the defence-in-depth net for any other
+/// internal arrow-ipc invariant a hostile frame might trip.
+fn decode_guard<T>(what: &str, f: impl FnOnce() -> T) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .map_err(|_| RpcError::new("IPC", format!("panic decoding {what} (malformed frame)")))
 }
 
 struct RawMessage {
@@ -722,6 +774,53 @@ mod tests {
         let err = r.read_next().expect_err("must reject");
         assert!(
             err.message.contains("bodyLength") && err.message.contains("exceeds cap"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_buffer_descriptor_past_body() {
+        // A record-batch message whose body is 8 bytes but whose buffer
+        // descriptor claims offset 0 / length 1000. arrow-ipc would
+        // index out of bounds and panic; the descriptor pre-check must
+        // reject it as a clean `RpcError` first.
+        use arrow_ipc::{Buffer as FbBuffer, FieldNode, MessageBuilder, RecordBatchBuilder};
+        let schema = Schema::new(vec![Field::new("v", DataType::Int64, false)]);
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let w = StreamWriter::new(&mut buf, &schema).unwrap();
+            std::mem::forget(w);
+        }
+        let mut fbb = FlatBufferBuilder::new();
+        let nodes_vec = fbb.create_vector(&[FieldNode::new(1, 0)]);
+        // offset 0, length 1000 — far past the 8-byte body below.
+        let buffers_vec = fbb.create_vector(&[FbBuffer::new(0, 1000)]);
+        let rb_off = {
+            let mut b = RecordBatchBuilder::new(&mut fbb);
+            b.add_length(1);
+            b.add_nodes(nodes_vec);
+            b.add_buffers(buffers_vec);
+            b.finish()
+        };
+        let msg_off = {
+            let mut mb = MessageBuilder::new(&mut fbb);
+            mb.add_version(arrow_ipc::MetadataVersion::V5);
+            mb.add_header_type(MessageHeader::RecordBatch);
+            mb.add_header(rb_off.as_union_value());
+            mb.add_bodyLength(8);
+            mb.finish()
+        };
+        fbb.finish(msg_off, None);
+        let msg_bytes = fbb.finished_data().to_vec();
+        buf.extend_from_slice(&CONTINUATION_MARKER);
+        buf.extend_from_slice(&(msg_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&msg_bytes);
+        buf.extend_from_slice(&[0u8; 8]); // the 8-byte body
+
+        let mut r = StreamReader::new(buf.as_slice()).unwrap();
+        let err = r.read_next().expect_err("must reject");
+        assert!(
+            err.message.contains("buffer descriptor"),
             "unexpected error: {err:?}"
         );
     }

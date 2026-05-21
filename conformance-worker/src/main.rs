@@ -267,15 +267,55 @@ fn run_http(
         if let Some(n) = max_ext {
             builder = builder.max_externalized_response_bytes(n);
         }
+        // Sticky sessions on by default (matches Python's
+        // serve_conformance_http.py) so the canonical TestSticky group
+        // runs. A fixed marker echo header gives
+        // TestSticky::test_echo_header_round_trip a stable contract.
+        builder = builder.enable_sticky(true).sticky_echo_headers([(
+            "x-vgi-conformance-echo".to_string(),
+            "conformance-fixed-marker".to_string(),
+        )]);
         let state = builder.build();
+        let drain = state.sticky_drain_handle();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind tcp");
         let port = listener.local_addr().unwrap().port();
         println!("PORT:{port}");
         io::stdout().flush().ok();
-        vgi_rpc::http::serve_with_shutdown(state, listener)
+        let app = with_test_drain_route(vgi_rpc::http::build_router(state), drain);
+        axum::serve(listener, app)
+            .with_graceful_shutdown(vgi_rpc::http::shutdown_signal())
             .await
             .expect("axum serve");
     });
+}
+
+/// Attach the test-only `POST/DELETE /__test_drain__` admin endpoint that
+/// lets `TestSticky::test_drain_rejects_new_opens` flip the registry's
+/// drain flag over the wire without sending SIGTERM. Only mounted when
+/// sticky is enabled (the conformance test skips on 404 otherwise).
+fn with_test_drain_route(app: axum::Router, drain: Option<vgi_rpc::DrainHandle>) -> axum::Router {
+    let Some(handle) = drain else {
+        return app;
+    };
+    let on = handle.clone();
+    let off = handle.clone();
+    app.route(
+        "/__test_drain__",
+        axum::routing::post(move || {
+            let h = on.clone();
+            async move {
+                h.drain();
+                axum::http::StatusCode::NO_CONTENT
+            }
+        })
+        .delete(move || {
+            let h = off.clone();
+            async move {
+                h.set_draining(false);
+                axum::http::StatusCode::NO_CONTENT
+            }
+        }),
+    )
 }

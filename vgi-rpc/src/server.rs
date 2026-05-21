@@ -97,6 +97,32 @@ pub struct CallContext {
     /// [`RpcServer::notify_transport`] call).
     pub kind: Option<crate::transport::TransportKind>,
     pub(crate) log_sink: Arc<Mutex<Vec<LogMessage>>>,
+    /// Sticky-session bridge, installed by the HTTP transport when the
+    /// server is sticky-enabled. `None` on pipe/unix/subprocess and on
+    /// HTTP servers without sticky support — [`CallContext::open_session`]
+    /// then raises a clear "not available on this transport" error.
+    pub(crate) sticky: Option<Arc<dyn StickySink>>,
+}
+
+/// Bridge between [`CallContext`]'s sticky-session API and the HTTP
+/// transport's per-worker session registry. Implemented by the HTTP layer
+/// (see `crate::sticky`); the trait lives here so [`CallContext`] carries
+/// no compile-time dependency on the `http` feature.
+pub trait StickySink: Send + Sync {
+    /// Whether the client opted in via `VGI-Session-Accept: true`.
+    fn accept_opens(&self) -> bool;
+    /// The live session state bound to this request, if any.
+    fn current_state(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>>;
+    /// The opaque hex session id bound to this request, if any.
+    fn current_session_id(&self) -> Option<String>;
+    /// Register a session holding `state`; mints + stashes the response token.
+    fn open(
+        &self,
+        state: Arc<dyn std::any::Any + Send + Sync>,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<()>;
+    /// Close the session bound to this request. Returns whether one was live.
+    fn close(&self) -> Result<bool>;
 }
 
 impl CallContext {
@@ -126,6 +152,7 @@ impl CallContext {
             cookies: std::collections::BTreeMap::new(),
             kind: server.transport_kind(),
             log_sink: Arc::new(Mutex::new(Vec::new())),
+            sticky: None,
         }
     }
 
@@ -145,7 +172,76 @@ impl CallContext {
             cookies,
             kind: server.transport_kind(),
             log_sink: Arc::new(Mutex::new(Vec::new())),
+            sticky: None,
         }
+    }
+
+    /// Attach a sticky-session sink (HTTP transport only). No-op semantics
+    /// for callers: the session API simply reports "not available" when
+    /// this is never set.
+    pub(crate) fn set_sticky(&mut self, sink: Arc<dyn StickySink>) {
+        self.sticky = Some(sink);
+    }
+
+    // --- Sticky sessions (HTTP-only) -----------------------------------
+
+    /// The live session state object, downcast to `T`, or `None` when no
+    /// session is bound to this request (or it is not a `T`).
+    ///
+    /// Sticky sessions are HTTP-only; on other transports this is always
+    /// `None`. Mirrors Python's `ctx.session`.
+    pub fn session<T: std::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        let state = self.sticky.as_ref()?.current_state()?;
+        state.downcast::<T>().ok()
+    }
+
+    /// The opaque hex session id bound to this request, or `None`.
+    /// Survives [`CallContext::close_session`] within the same request.
+    pub fn session_id(&self) -> Option<String> {
+        self.sticky.as_ref()?.current_session_id()
+    }
+
+    /// Register a sticky session holding `state` for subsequent requests.
+    ///
+    /// The framework mints a signed `VGI-Session` token and attaches it to
+    /// the response; a client inside a `with_session_token()` block echoes
+    /// it on subsequent requests, and the framework restores `state` as
+    /// [`CallContext::session`]. `ttl` overrides the server default.
+    ///
+    /// Mirrors Python's `ctx.open_session`. Errors when sticky is
+    /// unavailable on this transport, the client did not opt in, or a
+    /// session is already bound to this request.
+    pub fn open_session(
+        &self,
+        state: Arc<dyn std::any::Any + Send + Sync>,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<()> {
+        let sink = self.sticky.as_ref().ok_or_else(|| {
+            RpcError::runtime_error("sticky sessions not available on this transport")
+        })?;
+        if !sink.accept_opens() {
+            return Err(RpcError::runtime_error(
+                "client did not opt in to sticky sessions \
+                 (missing VGI-Session-Accept: true header — open the call inside \
+                 an HttpConnection.with_session_token() block)",
+            ));
+        }
+        if sink.current_state().is_some() {
+            return Err(RpcError::runtime_error(
+                "a sticky session is already active for this request",
+            ));
+        }
+        sink.open(state, ttl)
+    }
+
+    /// Invalidate the sticky session bound to this request. Idempotent;
+    /// mirrors Python's `ctx.close_session`.
+    pub fn close_session(&self) -> Result<()> {
+        let sink = self.sticky.as_ref().ok_or_else(|| {
+            RpcError::runtime_error("sticky sessions not available on this transport")
+        })?;
+        sink.close()?;
+        Ok(())
     }
 }
 
@@ -515,6 +611,7 @@ impl RpcServer {
                 &self.protocol_name,
                 &self.methods,
                 &self.server_id,
+                &self.protocol_version,
             ) {
                 Ok((_, md)) => md
                     .get(crate::metadata::PROTOCOL_HASH_KEY)
@@ -723,6 +820,7 @@ impl RpcServer {
                 &self.protocol_name,
                 &self.methods,
                 &self.server_id,
+                &self.protocol_version,
             ) {
                 Ok((batch, md)) => {
                     crate::introspect::write_describe_response(w, &batch, &md)?;

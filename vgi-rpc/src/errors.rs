@@ -53,6 +53,20 @@ impl RpcError {
     pub fn attribute_error(msg: impl Into<String>) -> Self {
         Self::new("AttributeError", msg)
     }
+
+    /// Sticky-session token did not resolve to a live registry entry
+    /// (missing, expired, evicted, wrong worker, or principal mismatch).
+    /// Mirrors Python's `vgi_rpc.rpc.SessionLostError`.
+    pub fn session_lost_error(msg: impl Into<String>) -> Self {
+        Self::new("SessionLostError", msg)
+    }
+
+    /// Server is draining: new `ctx.open_session` calls are rejected while
+    /// existing sessions continue to serve. Mirrors Python's
+    /// `vgi_rpc.rpc.ServerDrainingError`.
+    pub fn server_draining_error(msg: impl Into<String>) -> Self {
+        Self::new("ServerDrainingError", msg)
+    }
 }
 
 impl fmt::Display for RpcError {

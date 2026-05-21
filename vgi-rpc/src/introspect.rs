@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 
 use crate::errors::{Result, RpcError};
 use crate::metadata::{
-    DESCRIBE_VERSION_KEY, PROTOCOL_HASH_KEY, PROTOCOL_NAME_KEY, REQUEST_VERSION,
-    REQUEST_VERSION_KEY, SERVER_ID_KEY,
+    DESCRIBE_VERSION_KEY, PROTOCOL_HASH_KEY, PROTOCOL_NAME_KEY, PROTOCOL_VERSION_KEY,
+    REQUEST_VERSION, REQUEST_VERSION_KEY, SERVER_ID_KEY,
 };
 use crate::server::{MethodInfo, MethodType};
 use crate::wire::{Metadata, StreamWriter};
@@ -46,6 +46,7 @@ pub fn build_describe(
     protocol_name: &str,
     methods: &HashMap<String, MethodInfo>,
     server_id: &str,
+    protocol_version: &str,
 ) -> Result<(RecordBatch, Metadata)> {
     let schema = describe_schema();
 
@@ -136,6 +137,15 @@ pub fn build_describe(
     );
     md.insert(PROTOCOL_HASH_KEY.to_string(), protocol_hash);
     md.insert(SERVER_ID_KEY.to_string(), server_id.to_string());
+    // Surface the operator-declared protocol-contract version when set so
+    // clients can enforce a version boundary. Omitted when empty (matches
+    // Python, which only writes the key when a value is configured).
+    if !protocol_version.is_empty() {
+        md.insert(
+            PROTOCOL_VERSION_KEY.to_string(),
+            protocol_version.to_string(),
+        );
+    }
 
     Ok((batch, md))
 }

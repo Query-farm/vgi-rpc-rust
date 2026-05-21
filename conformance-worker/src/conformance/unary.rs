@@ -411,6 +411,35 @@ impl UnarySvc {
         Ok(value)
     }
 
+    // --- Sticky sessions (HTTP-only) ---
+
+    /// Open a sticky session holding a counter; return its initial value.
+    #[unary]
+    fn open_counter(&self, ctx: &CallContext, initial: i64) -> Result<i64> {
+        ctx.open_session(Arc::new(super::StickyCounter::new(initial)), None)?;
+        Ok(initial)
+    }
+
+    /// Increment the sticky session's counter; return the post-increment value.
+    #[unary]
+    fn increment_counter(&self, ctx: &CallContext, by: i64) -> Result<i64> {
+        let counter = ctx
+            .session::<super::StickyCounter>()
+            .ok_or_else(|| RpcError::runtime_error("no sticky counter bound to this request"))?;
+        Ok(counter.add(by))
+    }
+
+    /// Close the sticky session; return the counter's final value before close.
+    #[unary]
+    fn close_counter(&self, ctx: &CallContext) -> Result<i64> {
+        let counter = ctx
+            .session::<super::StickyCounter>()
+            .ok_or_else(|| RpcError::runtime_error("no sticky counter bound to this request"))?;
+        let final_value = counter.get();
+        ctx.close_session()?;
+        Ok(final_value)
+    }
+
     // --- Cancel probe ---
 
     /// Return ``[produce_calls, exchange_calls, on_cancel_calls]`` observed on the server.

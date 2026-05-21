@@ -37,6 +37,19 @@ use crate::wire::{bytes_to_hex, empty_batch, md_get, Metadata, StreamReader, Str
 
 pub const ARROW_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 
+// Sticky-session header conventions (HTTP-only). Header names are
+// compared case-insensitively by axum's `HeaderMap`, so the lowercase
+// forms here match the canonical `VGI-Session` etc. on the wire.
+const SESSION_HEADER: &str = "vgi-session";
+const SESSION_ACCEPT_HEADER: &str = "vgi-session-accept";
+const SESSION_CLOSE_HEADER: &str = "vgi-session-close";
+const ECHO_HEADER_PREFIX: &str = "vgi-echo-";
+const STICKY_ENABLED_HEADER: &str = "vgi-sticky-enabled";
+const STICKY_DEFAULT_TTL_HEADER: &str = "vgi-sticky-default-ttl";
+const STICKY_ECHO_HEADERS_HEADER: &str = "vgi-sticky-echo-headers";
+/// Framework-managed sticky session teardown endpoint path segment.
+const SESSION_ENDPOINT: &str = "__session__";
+
 /// HTTP server state shared across all handlers.
 ///
 /// Build via [`HttpState::builder`] (preferred) or [`HttpState::new`] for a
@@ -80,6 +93,8 @@ pub struct HttpState {
     /// Always hard — externalised uploads have no escape valve.
     max_externalized_response_bytes: Option<usize>,
     upload_url_provider: Option<Arc<dyn crate::external::UploadUrlProvider>>,
+    /// Sticky-session context, `Some` when the server is sticky-enabled.
+    sticky: Option<Arc<crate::sticky::StickyContext>>,
 }
 
 /// Fluent builder for [`HttpState`].
@@ -105,6 +120,9 @@ pub struct HttpStateBuilder {
     max_response_bytes: Option<usize>,
     max_externalized_response_bytes: Option<usize>,
     upload_url_provider: Option<Arc<dyn crate::external::UploadUrlProvider>>,
+    enable_sticky: Option<bool>,
+    sticky_default_ttl: Option<std::time::Duration>,
+    sticky_echo_headers: Vec<(String, String)>,
 }
 
 impl HttpStateBuilder {
@@ -302,6 +320,35 @@ impl HttpStateBuilder {
         self
     }
 
+    /// Opt in to sticky sessions (HTTP-only). When enabled the server
+    /// advertises `VGI-Sticky-Enabled: true`, honours the `VGI-Session` /
+    /// `VGI-Session-Accept` headers, and exposes `DELETE {prefix}/__session__`.
+    /// Off by default — the non-sticky wire path is unchanged.
+    pub fn enable_sticky(mut self, enabled: bool) -> Self {
+        self.enable_sticky = Some(enabled);
+        self
+    }
+
+    /// Default session TTL when a method calls `ctx.open_session` without
+    /// an explicit TTL. Default 300 s. Advertised via `VGI-Sticky-Default-TTL`.
+    pub fn sticky_default_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.sticky_default_ttl = Some(ttl);
+        self
+    }
+
+    /// Headers the server tells the client to echo back on every
+    /// subsequent request in a session (emitted as `VGI-Echo-<name>` on
+    /// the session-opening response; advertised by name via
+    /// `VGI-Sticky-Echo-Headers`). Used for client-driven routing
+    /// (e.g. `fly-force-instance-id` on Fly.io).
+    pub fn sticky_echo_headers(
+        mut self,
+        headers: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.sticky_echo_headers = headers.into_iter().collect();
+        self
+    }
+
     pub fn build(self) -> Arc<HttpState> {
         let server = self.server.expect("HttpStateBuilder::server is required");
         // A wildcard CORS origin combined with a credentialed auth
@@ -331,6 +378,19 @@ impl HttpStateBuilder {
             .as_ref()
             .map(|m| m.to_json().into_bytes());
         let www_authenticate = self.oauth_metadata.as_ref().map(|m| m.www_authenticate());
+        let sticky = if self.enable_sticky.unwrap_or(false) {
+            let ttl = self
+                .sticky_default_ttl
+                .unwrap_or_else(|| std::time::Duration::from_secs(300));
+            Some(crate::sticky::StickyContext::new(
+                token_key,
+                ttl,
+                self.sticky_echo_headers,
+                server.server_id.clone(),
+            ))
+        } else {
+            None
+        };
         Arc::new(HttpState {
             server,
             token_key,
@@ -358,6 +418,7 @@ impl HttpStateBuilder {
             max_response_bytes: self.max_response_bytes,
             max_externalized_response_bytes: self.max_externalized_response_bytes,
             upload_url_provider: self.upload_url_provider,
+            sticky,
         })
     }
 }
@@ -371,6 +432,12 @@ impl HttpState {
 
     pub fn builder() -> HttpStateBuilder {
         HttpStateBuilder::default()
+    }
+
+    /// Operator handle for graceful sticky-session drain, or `None` when
+    /// the server is not sticky-enabled. Wire it into a SIGTERM handler.
+    pub fn sticky_drain_handle(&self) -> Option<crate::sticky::DrainHandle> {
+        self.sticky.as_ref().map(|c| c.drain_handle())
     }
 
     pub fn token_ttl(&self) -> std::time::Duration {
@@ -874,6 +941,28 @@ fn attach_capability_headers(
             }
         }
     }
+    // Sticky-session capabilities. Always emit the enabled flag (negative
+    // form when off) so capability discovery is unambiguous.
+    if let Some(sticky) = state.sticky.as_ref() {
+        out.insert(STICKY_ENABLED_HEADER, HeaderValue::from_static("true"));
+        any = true;
+        if let Ok(v) = HeaderValue::from_str(&sticky.default_ttl.as_secs().to_string()) {
+            out.insert(STICKY_DEFAULT_TTL_HEADER, v);
+        }
+        if !sticky.echo_headers.is_empty() {
+            let names = sticky
+                .echo_headers
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            if let Ok(v) = HeaderValue::from_str(&names) {
+                out.insert(STICKY_ECHO_HEADERS_HEADER, v);
+            }
+        }
+    } else {
+        out.insert(STICKY_ENABLED_HEADER, HeaderValue::from_static("false"));
+    }
     if any && method == axum::http::Method::OPTIONS {
         out.insert(
             header::CACHE_CONTROL,
@@ -899,6 +988,15 @@ fn build_router_inner(state: Arc<HttpState>) -> Router {
         api.route(
             "/__upload_url__/init",
             post(handle_upload_url).options(handle_preflight),
+        )
+    } else {
+        api
+    };
+
+    let api = if state.sticky.is_some() {
+        api.route(
+            "/__session__",
+            axum::routing::delete(handle_delete_session).options(handle_preflight),
         )
     } else {
         api
@@ -946,6 +1044,31 @@ fn build_router_inner(state: Arc<HttpState>) -> Router {
     }
 
     app.with_state(state)
+}
+
+/// `DELETE {prefix}/__session__` — idempotent best-effort session teardown.
+/// Token absent / stale / forged / wrong-principal ⇒ 200 (no info leak);
+/// a live session ⇒ close it, emit `VGI-Session-Close: true`, 204.
+async fn handle_delete_session(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+) -> Response {
+    let auth = match authenticate_request(&state, SESSION_ENDPOINT, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(ctx) = state.sticky.as_ref() else {
+        return StatusCode::OK.into_response();
+    };
+    let session_header = headers.get(SESSION_HEADER).and_then(|v| v.to_str().ok());
+    match crate::sticky::handle_delete(ctx, &auth, session_header) {
+        crate::sticky::DeleteOutcome::Idempotent => StatusCode::OK.into_response(),
+        crate::sticky::DeleteOutcome::Closed => {
+            let mut h = HeaderMap::new();
+            h.insert(SESSION_CLOSE_HEADER, HeaderValue::from_static("true"));
+            (StatusCode::NO_CONTENT, h).into_response()
+        }
+    }
 }
 
 async fn handle_preflight(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> Response {
@@ -1354,6 +1477,64 @@ fn arrow_error(
     )
 }
 
+/// Resolve sticky headers on an incoming request. `Ok(Some(sink))` to
+/// install on the [`CallContext`]; `Ok(None)` when sticky is disabled;
+/// `Err(resp)` to short-circuit with a `SessionLostError` response when a
+/// presented token failed to resolve.
+fn sticky_for_request(
+    state: &Arc<HttpState>,
+    auth: &crate::auth::AuthContext,
+    headers: &HeaderMap,
+) -> std::result::Result<Option<Arc<crate::sticky::StickySinkImpl>>, Response> {
+    let Some(ctx) = state.sticky.as_ref() else {
+        return Ok(None);
+    };
+    let accept = headers
+        .get(SESSION_ACCEPT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let session_header = headers.get(SESSION_HEADER).and_then(|v| v.to_str().ok());
+    match crate::sticky::resolve(ctx, auth, accept, session_header) {
+        crate::sticky::StickyResolution::Sink(s) => Ok(Some(s)),
+        crate::sticky::StickyResolution::Lost(err) => Err(cap_error_response(
+            &Schema::empty(),
+            &err,
+            &state.server.server_id,
+            "",
+        )),
+    }
+}
+
+/// Stamp `VGI-Session` (+ echo headers) and `VGI-Session-Close` onto a
+/// response according to the per-request sink's mint/close signals.
+fn stamp_session_headers(
+    resp: &mut Response,
+    state: &Arc<HttpState>,
+    sink: &Arc<crate::sticky::StickySinkImpl>,
+) {
+    let headers = resp.headers_mut();
+    if let Some(token) = sink.mint_token() {
+        if let Ok(v) = HeaderValue::from_str(&token) {
+            headers.insert(SESSION_HEADER, v);
+        }
+        if let Some(ctx) = state.sticky.as_ref() {
+            for (name, value) in &ctx.echo_headers {
+                let full = format!("{ECHO_HEADER_PREFIX}{name}");
+                if let (Ok(n), Ok(v)) = (
+                    axum::http::HeaderName::from_bytes(full.as_bytes()),
+                    HeaderValue::from_str(value),
+                ) {
+                    headers.insert(n, v);
+                }
+            }
+        }
+    }
+    if sink.was_closed() {
+        headers.insert(SESSION_CLOSE_HEADER, HeaderValue::from_static("true"));
+    }
+}
+
 fn decode_hex_key(s: &str) -> std::result::Result<Vec<u8>, String> {
     let s = s.trim();
     if s.len() % 2 != 0 {
@@ -1572,6 +1753,12 @@ async fn handle_unary(
             "need arrow content type".into(),
         );
     }
+    // Resolve sticky-session headers before dispatch. A presented token
+    // that fails to resolve short-circuits with a SessionLostError stream.
+    let sticky_sink = match sticky_for_request(&state, &auth, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
     let cookies = parse_cookies(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let server = state.server.clone();
 
@@ -1612,6 +1799,7 @@ async fn handle_unary(
             server.protocol_name(),
             server.methods(),
             &server.server_id,
+            server.protocol_version(),
         ) {
             Ok(x) => x,
             Err(err) => {
@@ -1636,7 +1824,10 @@ async fn handle_unary(
         return arrow_error(&state, StatusCode::NOT_FOUND, &err, &req.request_id);
     };
 
-    let ctx = CallContext::with_auth_cookies(&server, &req, auth.clone(), cookies);
+    let mut ctx = CallContext::with_auth_cookies(&server, &req, auth.clone(), cookies);
+    if let Some(s) = sticky_sink.clone() {
+        ctx.set_sticky(s);
+    }
     let dispatch_info = crate::hooks::DispatchInfo::from_request(&server, &req, "unary", &auth);
     let hook = server.dispatch_hook.clone();
     let hook_token = hook.as_ref().map(|h| h.on_dispatch_start(&dispatch_info));
@@ -1719,15 +1910,23 @@ async fn handle_unary(
                 limit,
                 method
             ));
-            return cap_error_response(
+            let mut resp = cap_error_response(
                 &info.result_schema,
                 &err,
                 &server.server_id,
                 &req.request_id,
             );
+            if let Some(s) = sticky_sink.as_ref() {
+                stamp_session_headers(&mut resp, &state, s);
+            }
+            return resp;
         }
     }
-    arrow_response(StatusCode::OK, buf)
+    let mut resp = arrow_response(StatusCode::OK, buf);
+    if let Some(s) = sticky_sink.as_ref() {
+        stamp_session_headers(&mut resp, &state, s);
+    }
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -1750,6 +1949,10 @@ async fn handle_stream_init(
             "need arrow content type".into(),
         );
     }
+    let sticky_sink = match sticky_for_request(&state, &auth, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
     let auth_for_token = auth.clone();
     let cookies = parse_cookies(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let server = state.server.clone();
@@ -1770,7 +1973,10 @@ async fn handle_stream_init(
         return arrow_error(&state, StatusCode::NOT_FOUND, &err, &req.request_id);
     };
 
-    let ctx = CallContext::with_auth_cookies(&server, &req, auth, cookies);
+    let mut ctx = CallContext::with_auth_cookies(&server, &req, auth, cookies);
+    if let Some(s) = sticky_sink.clone() {
+        ctx.set_sticky(s);
+    }
     let init_result = (info.stream.as_ref().unwrap())(&req, &ctx);
     let init_logs = ctx.drain_logs();
 
@@ -1828,6 +2034,7 @@ async fn handle_stream_init(
                 &server,
                 &req,
                 state.producer_batch_limit,
+                sticky_sink.as_ref(),
             );
         }
         if !finished {
@@ -1857,7 +2064,11 @@ async fn handle_stream_init(
     }
     let _ = init_error; // surfaced via error envelope already
 
-    arrow_response(StatusCode::OK, body_buf)
+    let mut resp = arrow_response(StatusCode::OK, body_buf);
+    if let Some(s) = sticky_sink.as_ref() {
+        stamp_session_headers(&mut resp, &state, s);
+    }
+    resp
 }
 
 /// Encode a `StreamStateKind` into a signed state token. The token is
@@ -1896,9 +2107,13 @@ fn run_producer<W: std::io::Write>(
     server: &Arc<RpcServer>,
     req: &Request,
     limit: usize,
+    sticky: Option<&Arc<crate::sticky::StickySinkImpl>>,
 ) -> bool {
     // Continuation producers run without auth context (session-bound).
-    let ctx = CallContext::for_request(server, req);
+    let mut ctx = CallContext::for_request(server, req);
+    if let Some(s) = sticky {
+        ctx.set_sticky(s.clone());
+    }
     let producer = match ss {
         StreamStateKind::Producer(p) => p,
         StreamStateKind::Exchange(_) => unreachable!(),
@@ -1964,6 +2179,10 @@ async fn handle_stream_exchange(
             "need arrow content type".into(),
         );
     }
+    let sticky_sink = match sticky_for_request(&state, &auth, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
 
     let server = state.server.clone();
     let body = match maybe_decompress(&headers, &body, state.max_body_size) {
@@ -2027,7 +2246,10 @@ async fn handle_stream_exchange(
         batch: empty_batch(&Schema::empty()).unwrap(),
         metadata: metadata.clone(),
     };
-    let ctx = CallContext::for_request(&server, &req);
+    let mut ctx = CallContext::for_request(&server, &req);
+    if let Some(s) = sticky_sink.clone() {
+        ctx.set_sticky(s);
+    }
 
     let mut body_buf = Vec::new();
 
@@ -2040,7 +2262,11 @@ async fn handle_stream_exchange(
             let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
             let _ = sw.finish();
         }
-        return arrow_response(StatusCode::OK, body_buf);
+        let mut resp = arrow_response(StatusCode::OK, body_buf);
+        if let Some(s) = sticky_sink.as_ref() {
+            stamp_session_headers(&mut resp, &state, s);
+        }
+        return resp;
     }
 
     if matches!(ss, StreamStateKind::Producer(_)) {
@@ -2055,6 +2281,7 @@ async fn handle_stream_exchange(
                 &server,
                 &req,
                 state.producer_batch_limit,
+                sticky_sink.as_ref(),
             );
             if !finished {
                 match build_continuation_token(
@@ -2077,7 +2304,11 @@ async fn handle_stream_exchange(
             }
             let _ = sw.finish();
         }
-        return arrow_response(StatusCode::OK, body_buf);
+        let mut resp = arrow_response(StatusCode::OK, body_buf);
+        if let Some(s) = sticky_sink.as_ref() {
+            stamp_session_headers(&mut resp, &state, s);
+        }
+        return resp;
     }
 
     // Exchange continuation.
@@ -2152,14 +2383,18 @@ async fn handle_stream_exchange(
         let _ = sw.finish();
     }
 
-    enforce_response_body_cap(
+    let mut resp = enforce_response_body_cap(
         &state,
         output_schema.as_ref(),
         body_buf,
         &method,
         &server.server_id,
         "",
-    )
+    );
+    if let Some(s) = sticky_sink.as_ref() {
+        stamp_session_headers(&mut resp, &state, s);
+    }
+    resp
 }
 
 fn read_input_batch(body: &[u8]) -> Result<(RecordBatch, Metadata)> {

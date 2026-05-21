@@ -38,6 +38,8 @@ pub mod wire;
 
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "http")]
+pub mod sticky;
 
 pub use access_log::AccessLogHook;
 pub use arrow_type::{
@@ -51,7 +53,11 @@ pub use hooks::{CallStatistics, ChainHook, DispatchHook, DispatchInfo, HookToken
 pub use introspect::{DESCRIBE_METHOD_NAME, DESCRIBE_VERSION};
 pub use log::{LogLevel, LogMessage};
 pub use retry::RetryConfig;
-pub use server::{CallContext, MethodInfo, MethodType, Request, RpcServer, RpcServerBuilder};
+pub use server::{
+    CallContext, MethodInfo, MethodType, Request, RpcServer, RpcServerBuilder, StickySink,
+};
+#[cfg(feature = "http")]
+pub use sticky::{DrainHandle, SessionRegistry};
 pub use stream::{ExchangeState, OutputCollector, ProducerState, StreamResult};
 pub use transport::{ServeStartHook, TransportCapabilities, TransportKind};
 

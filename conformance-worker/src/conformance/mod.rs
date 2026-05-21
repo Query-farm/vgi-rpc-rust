@@ -31,6 +31,7 @@ pub fn build_server_with_external(
     let mut builder = RpcServer::builder()
         .server_id("rust-conf-0001")
         .protocol_name("ConformanceService")
+        .protocol_version("1.0.0")
         .server_version("rust-conformance-0.2.0")
         .enable_describe(true);
 
@@ -60,6 +61,31 @@ pub fn build_server_with_external(
     unary::register(&mut srv);
     streams::register(&mut srv);
     srv
+}
+
+/// Sticky-session state for the conformance counter methods (unary +
+/// streaming). Shared by `unary::open_counter` (which binds it via
+/// `ctx.open_session`) and the `streams` session-counter methods (which
+/// read it back via `ctx.session`). Interior mutability via an atomic so
+/// it mutates through the shared `Arc` the session registry hands out.
+pub(crate) struct StickyCounter {
+    value: std::sync::atomic::AtomicI64,
+}
+
+impl StickyCounter {
+    pub(crate) fn new(initial: i64) -> Self {
+        Self {
+            value: std::sync::atomic::AtomicI64::new(initial),
+        }
+    }
+    pub(crate) fn add(&self, by: i64) -> i64 {
+        self.value
+            .fetch_add(by, std::sync::atomic::Ordering::SeqCst)
+            + by
+    }
+    pub(crate) fn get(&self) -> i64 {
+        self.value.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Shared cancel probe state (counters observed by cancel conformance tests).

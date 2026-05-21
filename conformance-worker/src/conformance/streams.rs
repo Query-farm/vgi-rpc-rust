@@ -446,6 +446,64 @@ impl ExchangeState for ZeroColumn {
     }
 }
 
+/// Producer that emits the sticky-session counter `count` times. Each
+/// `produce` resolves the counter via `ctx.session`, increments it by one,
+/// and emits the new value. `current` rides in the continuation token
+/// across HTTP turns while the session is rebound on every request.
+#[derive(Serialize, Deserialize)]
+struct SessionCounterProducer {
+    count: i64,
+    current: i64,
+}
+impl_bincode_codec!(SessionCounterProducer);
+impl ProducerState for SessionCounterProducer {
+    fn produce(&mut self, out: &mut OutputCollector, ctx: &CallContext) -> Result<()> {
+        if self.current >= self.count {
+            out.finish();
+            return Ok(());
+        }
+        let counter = ctx
+            .session::<super::StickyCounter>()
+            .ok_or_else(|| RpcError::runtime_error("no sticky counter bound to this request"))?;
+        let value = counter.add(1);
+        out.emit(session_value_batch(value)?)?;
+        self.current += 1;
+        Ok(())
+    }
+    fn encode_state(&self) -> Result<Vec<u8>> {
+        StreamStateCodec::encode(self)
+    }
+}
+
+/// Exchange that adds each input batch's `by` column sum to the sticky
+/// session counter and emits the running value. State is empty — the
+/// counter lives in the session, rebound on every (separate) HTTP turn.
+#[derive(Serialize, Deserialize, Default)]
+struct SessionCounterExchange;
+impl_bincode_codec!(SessionCounterExchange);
+impl ExchangeState for SessionCounterExchange {
+    fn exchange(
+        &mut self,
+        input: &RecordBatch,
+        out: &mut OutputCollector,
+        ctx: &CallContext,
+    ) -> Result<()> {
+        let counter = ctx
+            .session::<super::StickyCounter>()
+            .ok_or_else(|| RpcError::runtime_error("no sticky counter bound to this request"))?;
+        let by = input
+            .column_by_name("by")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| RpcError::type_error("exchange input missing int64 'by' column"))?;
+        let sum: i64 = (0..by.len()).map(|i| by.value(i)).sum();
+        let value = counter.add(sum);
+        out.emit(session_value_batch(value)?)
+    }
+    fn encode_state(&self) -> Result<Vec<u8>> {
+        StreamStateCodec::encode(self)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct CancellableExchange;
 impl_bincode_codec!(CancellableExchange);
@@ -523,6 +581,26 @@ fn accum_schema_fn() -> SchemaRef {
 
 fn empty_schema_fn() -> SchemaRef {
     Arc::new(Schema::empty())
+}
+
+fn session_counter_output_schema_fn() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]))
+}
+
+fn session_counter_input_schema_fn() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new("by", DataType::Int64, false)]))
+}
+
+fn session_value_batch(value: i64) -> Result<RecordBatch> {
+    let arrs: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![value]))];
+    Ok(RecordBatch::try_new(
+        session_counter_output_schema_fn(),
+        arrs,
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -812,6 +890,27 @@ impl StreamSvc {
     )]
     fn cancellable_exchange(&self) -> Result<CancellableExchange> {
         Ok(CancellableExchange)
+    }
+
+    // --- Sticky sessions — streaming ---
+
+    /// Emit `count` increments of the sticky session counter via a producer stream.
+    #[producer(
+        state = SessionCounterProducer,
+        output_schema = session_counter_output_schema_fn
+    )]
+    fn stream_session_counter(&self, count: i64) -> Result<SessionCounterProducer> {
+        Ok(SessionCounterProducer { count, current: 0 })
+    }
+
+    /// Add each input `by` column to the session counter and emit the running value.
+    #[exchange(
+        state = SessionCounterExchange,
+        input_schema = session_counter_input_schema_fn,
+        output_schema = session_counter_output_schema_fn
+    )]
+    fn exchange_session_counter(&self) -> Result<SessionCounterExchange> {
+        Ok(SessionCounterExchange)
     }
 }
 

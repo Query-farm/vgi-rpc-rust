@@ -57,6 +57,23 @@ impl OutputCollector {
         Ok(())
     }
 
+    /// Emit a data batch with per-batch custom metadata (e.g. VGI's
+    /// `vgi_batch_index` / `vgi_partition_values#b64` ordering tags).
+    pub fn emit_with_metadata(&mut self, batch: RecordBatch, metadata: Metadata) -> Result<()> {
+        if batch.schema() != self.schema {
+            return Err(RpcError::runtime_error(format!(
+                "emit_with_metadata(): schema mismatch — expected {:?}, got {:?}",
+                self.schema.fields(),
+                batch.schema().fields()
+            )));
+        }
+        self.items.push(Emitted::Batch {
+            batch,
+            metadata: Some(metadata),
+        });
+        Ok(())
+    }
+
     /// Mark the stream as finished (producer only).
     pub fn finish(&mut self) {
         self.finished = true;

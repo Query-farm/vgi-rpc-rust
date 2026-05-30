@@ -804,6 +804,23 @@ impl RpcServer {
             None => return Ok(false),
         };
 
+        // Enforce application protocol-version compatibility: the client sends
+        // its `vgi_rpc.protocol_version`; if its MAJOR differs from the
+        // server's enforced version, reject (mirrors the Python framework).
+        if !self.protocol_version.is_empty() {
+            if let Some(client_v) = md_get(&req.metadata, crate::metadata::PROTOCOL_VERSION_KEY) {
+                let major = |v: &str| v.split('.').next().unwrap_or("").to_string();
+                if major(client_v) != major(&self.protocol_version) {
+                    let err = RpcError::version_error(format!(
+                        "protocol_version mismatch: client {:?} is incompatible with server {:?}",
+                        client_v, self.protocol_version
+                    ));
+                    write_error_stream(w, &empty_schema(), &err, &self.server_id, &req.request_id)?;
+                    return Ok(true);
+                }
+            }
+        }
+
         let ctx = CallContext::for_request(self, &req);
 
         let stats = Arc::new(Mutex::new(crate::hooks::CallStatistics::default()));

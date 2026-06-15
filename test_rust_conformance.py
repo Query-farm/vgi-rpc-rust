@@ -15,7 +15,7 @@ import pytest
 from vgi_rpc.conformance import ConformanceService
 from vgi_rpc.http import http_connect
 from vgi_rpc.log import Message
-from vgi_rpc.rpc import SubprocessTransport, _RpcProxy, unix_connect
+from vgi_rpc.rpc import SubprocessTransport, UnixTransport, _RpcProxy, unix_connect
 
 RUST_WORKER = os.environ.get(
     "RUST_CONFORMANCE_WORKER",
@@ -400,6 +400,42 @@ class TestExchangeStream(TestExchangeStream):  # type: ignore[no-redef]  # noqa:
 from vgi_rpc.conformance import run_describe_conformance  # noqa: E402
 from vgi_rpc.introspect import introspect, DESCRIBE_METHOD_NAME, DESCRIBE_VERSION  # noqa: E402
 from vgi_rpc.http import http_introspect  # noqa: E402
+
+
+@pytest.fixture(params=[t for t in _TRANSPORTS if t in ("pipe", "subprocess", "http", "unix")])
+def conformance_describe(request: pytest.FixtureRequest):  # type: ignore[no-untyped-def]
+    """Return a ``ServiceDescription`` from a real ``__describe__`` call to the
+    Rust worker under test — the fixture the upstream ``TestDescribeConformance``
+    relies on. Parallels ``conformance_conn``'s transport matrix.
+
+    Both ``pipe`` and ``subprocess`` use a stdio subprocess (the Rust worker has
+    no in-process server); a dedicated child is spawned so the shared transport
+    is left undisturbed.
+    """
+    param = request.param
+    if param in ("pipe", "subprocess"):
+        transport = SubprocessTransport([RUST_WORKER])
+        try:
+            return introspect(transport)
+        finally:
+            transport.close()
+    if param == "http":
+        port = request.getfixturevalue("rust_http_port")
+        return http_introspect(f"http://127.0.0.1:{port}")
+    if param == "unix":
+        path = request.getfixturevalue("rust_unix_path")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(path)
+        except BaseException:
+            sock.close()
+            raise
+        transport = UnixTransport(sock)
+        try:
+            return introspect(transport)
+        finally:
+            transport.close()
+    raise AssertionError(f"unknown describe transport: {param!r}")
 
 
 class TestRustDescribeConformance:

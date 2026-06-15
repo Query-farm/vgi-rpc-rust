@@ -106,6 +106,14 @@ pub trait ProducerState: Send {
     /// Optional cancel hook — invoked when the client signals cancellation.
     fn on_cancel(&mut self, _ctx: &CallContext) {}
 
+    /// Per-producer override of the HTTP `producer_batch_limit` (`None` = use
+    /// the server default). `Some(n)` makes the producer yield a continuation
+    /// after `n` emitting `produce()` calls. Only the HTTP transport consults
+    /// this; pipe/unix always drain fully.
+    fn batch_limit(&self) -> Option<usize> {
+        None
+    }
+
     /// Serialize this state for stateless HTTP continuation. The default
     /// returns an error; override via [`crate::stream_codec::StreamStateCodec`]
     /// for any state type that will be served over HTTP. Pipe/unix

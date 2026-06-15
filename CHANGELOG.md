@@ -2,7 +2,40 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
-## [Unreleased] — AEAD-sealed state tokens (token format v4)
+## [0.2.0] — 2026-06-03
+
+First release since the initial `0.1.0` port. Headline: a production-hardening
+pass, AEAD-sealed stateless stream tokens, opt-in sticky sessions, application
+protocol-version enforcement, and the `__transport_options__` capability
+handshake. Byte-for-byte conformant with the Python canonical — 901/901
+conformance tests pass across pipe / subprocess / HTTP / unix.
+
+- **Added** `__transport_options__` framework handshake (parallel to
+  `__describe__`): a pre-dispatch interception in `RpcServer` that reports
+  transport capabilities (currently POSIX shared memory) as
+  `vgi_rpc.transport.*` response metadata. Not a registered method, so it stays
+  out of `methods` / `__describe__` and does not perturb the protocol hash.
+  Mirrors Python `vgi_rpc.transport_options`. New `vgi_rpc::transport_options`
+  module and `metadata::TRANSPORT_SHM_KEY`.
+- **Added** per-tick input-batch metadata surfaced to producer/exchange
+  handlers via `CallContext::tick_metadata` (e.g. dynamic `vgi_pushdown_filters`),
+  plus an optional per-producer `ProducerState::batch_limit` HTTP continuation
+  cap.
+- **Added** launcher worker contract (server side): `vgi_rpc::unix::serve_unix`
+  — an AF_UNIX accept loop with optional idle self-termination
+  (`max(idle_timeout, 60s)` startup grace, cancel-on-connect /
+  re-arm-on-last-disconnect), and a `--idle-timeout SEC` flag on the
+  conformance worker's `--unix` mode. A Rust worker can now be spawned, warm-
+  reused, and reaped by the Python `vgi_rpc.launcher` unchanged. The launcher
+  *tool* itself (client-side orchestration) remains deferred with the Rust
+  client.
+- **Added** application protocol-version major-compatibility enforcement on
+  incoming requests, and `protocol_version` in the `__describe__` response.
+- **Fixed** describe-conformance harness: provide the `conformance_describe`
+  fixture the upstream `TestDescribeConformance` now requires (describe via a
+  real `__describe__` call across the transport matrix).
+
+### AEAD-sealed state tokens (token format v4)
 
 - **Breaking** Stream-state tokens are now sealed with XChaCha20-Poly1305
   (`chacha20poly1305 = "0.10"`) instead of HMAC-SHA256-signed. The
@@ -23,7 +56,7 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 - **Added** new token-format tests: tampered-ciphertext, tampered-nonce,
   unknown-version, malformed-base64.
 
-## [Unreleased] — Phase 4: external-location batches + S3 / GCS backends
+### Phase 4: external-location batches + S3 / GCS backends
 
 - **Added** `vgi_rpc::external` module: `ExternalStorage` + `Fetcher`
   traits, `ExternalLocationConfig` (threshold, compression, URL
@@ -42,7 +75,7 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
   `vgi-rpc-s3` and is re-exported from `vgi-rpc-gcs`.
 - **Added** 5 unit tests + 3 integration tests + 3 backend unit tests.
 
-## [Unreleased] — Phase 3: observability + HTTP polish
+### Phase 3: observability + HTTP polish
 
 - **Added** `otel::OtelHook` (feature `otel`): per-call `tracing` events
   tagged `vgi_rpc.otel` with method, principal, status, durations,
@@ -60,7 +93,7 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 - **Added** 12 new unit tests and a `tests/http_polish.rs` integration
   suite (CORS, prefix, health, describe page, zstd response).
 
-## [Unreleased] — Phase 2: auth surface
+### Phase 2: auth surface
 
 - **Added** core auth framework: `AuthContext`, `AuthRequest`, `Authenticate`
   callback type, `chain_authenticate` / `chain_all`. `AuthContext` is now
@@ -85,7 +118,7 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 - **Added** 4 HTTP integration tests and 11 new unit tests covering auth
   helpers end-to-end.
 
-## [Unreleased] — Phase 1: production hygiene
+### Phase 1: production hygiene
 
 - **Added** `__describe__` introspection behind `RpcServer::builder().enable_describe(true)`.
 - **Added** `MethodInfo` fluent builder with `.doc()`, `.param_type()`,

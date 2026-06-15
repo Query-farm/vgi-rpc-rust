@@ -31,6 +31,12 @@ pub const SHM_SOURCE_KEY: &str = "vgi_rpc.shm_source";
 pub const SHM_SEGMENT_NAME_KEY: &str = "vgi_rpc.shm_segment_name";
 pub const SHM_SEGMENT_SIZE_KEY: &str = "vgi_rpc.shm_segment_size";
 
+/// Transport capability negotiation (`__transport_options__` request/response
+/// metadata, `vgi_rpc.transport.*` namespace). Each capability is one
+/// `vgi_rpc.transport.<name>` key with a string value; unknown keys are
+/// ignored, so the set is open-ended. Mirrors Python `vgi_rpc.metadata`.
+pub const TRANSPORT_SHM_KEY: &str = "vgi_rpc.transport.shm";
+
 pub const TRACEPARENT_KEY: &str = "traceparent";
 pub const TRACESTATE_KEY: &str = "tracestate";
 

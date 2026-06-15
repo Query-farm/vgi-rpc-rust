@@ -2,6 +2,8 @@
 //!
 //! Supports stdin/stdout (default), `--http` (print `PORT:<n>`), and
 //! `--unix <path>` (print `UNIX:<path>`) modes, mirroring the Go worker.
+//! `--unix` honours the launcher worker contract: `--idle-timeout <SEC>`
+//! self-terminates the worker after a quiet period.
 //!
 //! SIGTERM / SIGINT trigger graceful shutdown of HTTP and unix listeners.
 
@@ -69,7 +71,12 @@ fn main() {
             vgi_rpc::TransportKind::Unix,
             vgi_rpc::TransportCapabilities::none(),
         );
-        run_unix(server, &args[2]);
+        // Launcher worker contract: `--idle-timeout SEC` self-terminates the
+        // worker after a quiet period so abandoned warm workers don't leak.
+        let idle_timeout = parse_secs_flag(&args, "--idle-timeout")
+            .filter(|s| *s > 0.0)
+            .map(std::time::Duration::from_secs_f64);
+        run_unix(server, &args[2], idle_timeout);
         return;
     }
 
@@ -119,16 +126,14 @@ fn build_shared_storage(storage_url: &str) -> std::sync::Arc<fake_storage::FakeS
     std::sync::Arc::new(fake_storage::FakeStorage::new(storage_url))
 }
 
-fn run_unix(server: Arc<vgi_rpc::RpcServer>, path: &str) {
-    use std::os::unix::net::UnixListener;
+fn run_unix(
+    server: Arc<vgi_rpc::RpcServer>,
+    path: &str,
+    idle_timeout: Option<std::time::Duration>,
+) {
     use std::sync::atomic::{AtomicBool, Ordering};
-    let _ = std::fs::remove_file(path);
-    let listener = UnixListener::bind(path).expect("bind unix socket");
-    listener.set_nonblocking(true).ok();
-    println!("UNIX:{path}");
-    io::stdout().flush().ok();
 
-    // SIGTERM/SIGINT → flip the flag → main loop breaks.
+    // SIGTERM/SIGINT → flip the flag → the accept loop unwinds.
     let shutdown = Arc::new(AtomicBool::new(false));
     {
         let sd = shutdown.clone();
@@ -137,38 +142,17 @@ fn run_unix(server: Arc<vgi_rpc::RpcServer>, path: &str) {
         });
     }
 
-    let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
-    while !shutdown.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((mut conn, _)) => {
-                conn.set_nonblocking(false).ok();
-                let srv = server.clone();
-                threads.push(std::thread::spawn(move || {
-                    let reader = match conn.try_clone() {
-                        Ok(r) => r,
-                        Err(_) => return,
-                    };
-                    let mut reader = reader;
-                    srv.serve(&mut reader, &mut conn);
-                }));
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(_) => break,
-        }
-    }
-    // Drop listener and clean up the socket path.
-    drop(listener);
-    let _ = std::fs::remove_file(path);
-    // Wait briefly for in-flight connections to wrap up.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    for t in threads {
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let _ = t.join();
+    // The library helper owns bind / accept / per-connection threads / idle
+    // self-termination; we just print the `UNIX:<path>` contract line once it
+    // is listening.
+    let path_owned = path.to_string();
+    let result = vgi_rpc::unix::serve_unix(server, path, idle_timeout, shutdown, move || {
+        println!("UNIX:{path_owned}");
+        io::stdout().flush().ok();
+    });
+    if let Err(e) = result {
+        eprintln!("failed to bind unix socket {path}: {e}");
+        std::process::exit(1);
     }
 }
 
@@ -178,6 +162,13 @@ fn parse_usize_flag(args: &[String], flag: &str) -> Option<usize> {
     let idx = args.iter().position(|a| a == flag)?;
     let raw = args.get(idx + 1)?;
     raw.parse::<usize>().ok()
+}
+
+/// Parse `--flag <SEC>` as fractional seconds (the launcher passes a float).
+fn parse_secs_flag(args: &[String], flag: &str) -> Option<f64> {
+    let idx = args.iter().position(|a| a == flag)?;
+    let raw = args.get(idx + 1)?;
+    raw.parse::<f64>().ok()
 }
 
 fn run_http_with_storage(

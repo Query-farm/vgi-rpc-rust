@@ -33,6 +33,9 @@ pub mod stream;
 #[cfg(feature = "http")]
 pub mod stream_codec;
 pub mod transport;
+pub mod transport_options;
+#[cfg(unix)]
+pub mod unix;
 pub(crate) mod util;
 pub mod wire;
 

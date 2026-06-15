@@ -2118,6 +2118,9 @@ fn run_producer<W: std::io::Write>(
         StreamStateKind::Producer(p) => p,
         StreamStateKind::Exchange(_) => unreachable!(),
     };
+    // A resumable producer may cap its own per-response batch count (so it
+    // yields a continuation instead of draining the whole shared work queue).
+    let limit = producer.batch_limit().unwrap_or(limit);
     let mut batches_written = 0usize;
     while limit == 0 || batches_written < limit {
         let mut out = OutputCollector::new(output_schema.clone(), true);

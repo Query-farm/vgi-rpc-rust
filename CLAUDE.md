@@ -6,14 +6,17 @@ crate without re-deriving design decisions.
 
 ## Project shape
 
-Workspace at `~/Development/vgi-rpc-rust/` with four crates:
+Workspace at `~/Development/vgi-rpc-rust/` with six crates (four published —
+`vgi-rpc`, `vgi-rpc-macros`, `vgi-rpc-s3`, `vgi-rpc-gcs`; two internal workers):
 
-| crate | purpose |
-|-------|---------|
-| `vgi-rpc/` | The library. All wire-protocol, server, HTTP, auth, observability, external-location code. |
-| `conformance-worker/` | Test binary `vgi-rpc-conformance-rust` that registers every Python `ConformanceService` method and serves stdio / `--http` / `--unix`. This is the artifact the Python conformance suite drives. |
-| `vgi-rpc-s3/` | `PresignedS3Storage` + shared `HttpFetcher`. |
-| `vgi-rpc-gcs/` | `SignedGcsStorage`. |
+| crate | published | purpose |
+|-------|:-:|---------|
+| `vgi-rpc/` | ✅ | The library. All wire-protocol, server, HTTP, auth, observability, external-location, and unix/launcher code. |
+| `vgi-rpc-macros/` | ✅ | Proc-macros: `#[service]`, `#[unary]`, `#[producer]`, `#[exchange]`, `#[derive(VgiArrow)]`, `#[derive(StreamState)]`. Re-exported from `vgi-rpc` behind the default `macros` feature. |
+| `vgi-rpc-s3/` | ✅ | `PresignedS3Storage` + shared `HttpFetcher`. |
+| `vgi-rpc-gcs/` | ✅ | `SignedGcsStorage`. |
+| `conformance-worker/` | — | Test binary `vgi-rpc-conformance-rust` that registers every Python `ConformanceService` method and serves stdio / `--http` / `--unix` (with `--idle-timeout`). The artifact the Python conformance suite drives. |
+| `benchmark-worker/` | — | `vgi-rpc-benchmark-rust` — apples-to-apples benchmark target mirroring the Go / Python benchmark workers. |
 
 The Python canonical lives at `~/Development/vgi-rpc/vgi_rpc/`; the Go port
 at `~/Development/vgi-rpc-go/vgirpc/`. Read them alongside the Rust code
@@ -26,7 +29,7 @@ for each feature.
 All via `scripts/conf.py`:
 
 ```bash
-# Build worker + run full 452-test conformance suite across transports.
+# Build worker + run full 901-test conformance suite across transports.
 ./scripts/conf.py run --transport all
 
 # Slice: one test class over one transport (fast iteration).
@@ -83,20 +86,52 @@ Key invariant: `empty_batch(&Schema)` constructs a zero-row batch with
 dispatch flow:
 
 1. Read one IPC stream (`read_request`) → `Request { method, request_id, batch, metadata }`.
-2. Handle `__describe__` inline if enabled.
-3. Build `CallContext` (with `auth`, `cookies`, `transport_metadata`).
-4. Fire `on_dispatch_start`.
-5. Call `serve_unary` or `serve_stream`. Both take `&mut Option<RpcError>`
+2. Handle `__transport_options__` inline — a pre-dispatch capability
+   handshake (see `transport_options.rs`), answered before everything
+   below so even a version-mismatched client can negotiate.
+3. Enforce application protocol-version compatibility: if the server has
+   an enforced `protocol_version`, reject a request whose
+   `vgi_rpc.protocol_version` MAJOR differs (mirrors the Python gate).
+4. Handle `__describe__` inline if enabled.
+5. Build `CallContext` (with `auth`, `cookies`, `transport_metadata`).
+6. Fire `on_dispatch_start`.
+7. Call `serve_unary` or `serve_stream`. Both take `&mut Option<RpcError>`
    (`app_err`) so they can record a handler error without killing the
    serve loop.
-6. On unary success, optionally externalize the result batch before
+8. On unary success, optionally externalize the result batch before
    writing it to the IPC writer.
-7. Fire `on_dispatch_end` with the final `CallStatistics`.
+9. Fire `on_dispatch_end` with the final `CallStatistics`.
 
 Stream dispatch writes the output IPC stream's schema **before** opening
 the input reader so the client can decode the schema without first sending
 a tick. Every iteration flushes the output writer; producer ticks would
-deadlock otherwise.
+deadlock otherwise. Each iteration also publishes that tick's input-batch
+metadata onto `CallContext` (read via `CallContext::tick_metadata(key)`),
+so handlers can pick up per-tick signals like dynamic pushdown filters.
+
+### Transport-capability handshake — `vgi-rpc/src/transport_options.rs`
+
+`__transport_options__` is a framework method (parallel to `__describe__`)
+that a client calls once, before `init`, to learn which transport features
+the worker supports. It is **not** a registered method — `server.rs`
+intercepts it pre-dispatch — so it never appears in `methods` /
+`__describe__` and does not perturb the protocol hash. Capabilities ride
+as `vgi_rpc.transport.*` response metadata on an empty batch; today the
+only key is `vgi_rpc.transport.shm` (`metadata::TRANSPORT_SHM_KEY`),
+`"true"` on POSIX builds with the `shm` feature. Mirrors Python
+`vgi_rpc.transport_options` byte-for-byte.
+
+### Unix listener + launcher worker contract — `vgi-rpc/src/unix.rs`
+
+`serve_unix(server, path, idle_timeout, shutdown, on_bound)` (unix-only)
+is the AF_UNIX accept loop: bind, fire `on_bound` (the caller prints the
+`UNIX:<path>` line), then one thread per connection. With `idle_timeout`
+set it self-terminates after a quiet period — `max(idle_timeout, 60s)`
+startup grace, cancel-on-connect / re-arm-on-last-disconnect — so the
+cross-language Python `vgi_rpc.launcher` can spawn, warm-reuse, and reap a
+Rust worker. The conformance worker's `--unix` mode wires `--idle-timeout
+SEC` to it. The launcher *tool* itself (client-side) is deferred; see
+"What's not done".
 
 ### HTTP transport — `vgi-rpc/src/http.rs`
 
@@ -280,6 +315,8 @@ aligned so cross-referencing is easy. Python module ↔ Rust module:
 | `vgi_rpc/rpc/_server.py` + `_wire.py` | `server.rs` + `wire.rs` |
 | `vgi_rpc/metadata.py` | `metadata.rs` |
 | `vgi_rpc/introspect.py` | `introspect.rs` |
+| `vgi_rpc/transport_options.py` | `transport_options.rs` |
+| `vgi_rpc/launcher.py` (worker contract only) | `unix.rs` |
 | `vgi_rpc/log.py` | `log.rs` |
 | `vgi_rpc/http/*.py` | `http.rs` (single file; modular submodules on demand) |
 | `vgi_rpc/http/_bearer.py` / `_mtls.py` / `_oauth*.py` | `auth/bearer.rs` / `mtls.rs` / `oauth.rs` / `jwt.rs` / `pkce.rs` |
@@ -290,22 +327,42 @@ aligned so cross-referencing is easy. Python module ↔ Rust module:
 
 ## Release process
 
-1. Bump the workspace version in the root `Cargo.toml`.
+All four published crates share one workspace version. The current line
+is **0.2.0** (0.1.0 was the initial port; both are live on crates.io,
+owned by `rustyconover`). A re-release **must** bump the version — you
+cannot overwrite an existing one.
+
+1. Bump the workspace version in the root `Cargo.toml`, and the internal
+   path-dep `version = "..."` pins (`vgi-rpc-macros` in `vgi-rpc`,
+   `vgi-rpc` in `vgi-rpc-s3`/`vgi-rpc-gcs`, `vgi-rpc-s3` in
+   `vgi-rpc-gcs`). Run `cargo check` to refresh `Cargo.lock`.
 2. Update `CHANGELOG.md` with a new `[x.y.z] — YYYY-MM-DD` section.
 3. **Fuzz gate.** Run the wire-reader fuzz target to a clean stop —
    this is a release blocker, not optional:
    `cargo +nightly fuzz run wire_stream_reader -- -runs=1000000`.
    The wire reader parses hand-crafted flatbuffer frames; the
    `catch_unwind` + buffer-descriptor checks in `wire.rs` are the
-   safety net, the fuzzer is how we know it holds.
-4. `cargo publish --dry-run -p vgi-rpc` (repeat for `vgi-rpc-s3`,
-   `vgi-rpc-gcs`).
-5. Tag `vgi-rpc-vX.Y.Z`, push.
-6. `cargo publish -p vgi-rpc` then `-p vgi-rpc-s3` then `-p vgi-rpc-gcs`
-   (order matters; the backend crates depend on `vgi-rpc`).
+   safety net, the fuzzer is how we know it holds. (`fuzz/` is a
+   standalone workspace that still `[patch]`es arrow to a git fork; the
+   *published* crates use crates.io arrow, so the patch never ships.)
+4. Sanity-check packaging: `cargo publish --dry-run -p vgi-rpc` (repeat
+   for `-p vgi-rpc-macros`, `-p vgi-rpc-s3`, `-p vgi-rpc-gcs`).
+5. **Publish via CI (preferred).** Push a `vX.Y.Z` tag (e.g. `v0.2.0`) —
+   `.github/workflows/release.yml` triggers on that pattern, publishes
+   all four crates **in dependency order** (`vgi-rpc-macros` → `vgi-rpc`
+   → `vgi-rpc-s3` → `vgi-rpc-gcs`) via crates.io Trusted Publishing
+   (OIDC, no long-lived token), and gates on the `crates-io` GitHub
+   Environment's required-reviewer approval. `workflow_dispatch` with
+   `dry_run: true` exercises the whole flow without uploading.
+6. **Manual fallback** (only if CI is unavailable): publish in the same
+   order — `cargo publish -p vgi-rpc-macros`, then `-p vgi-rpc`, then
+   `-p vgi-rpc-s3`, then `-p vgi-rpc-gcs` — sleeping ~30s between each
+   for index propagation. Order matters: every crate depends on one
+   published earlier.
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, cargo doc, and
-the Python-driven conformance job on every push.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, cargo doc, an
+MSRV (1.86) build, and the Python-driven conformance job (full six-
+transport matrix) on every push.
 
 ## Defining a service with the macro
 
@@ -348,6 +405,12 @@ These weren't gated on conformance and are candidates for a later phase:
   feature).
 - **Rust client crate** — the workspace is server-only today. A
   client crate mirroring the Go port's structure remains a follow-up.
+- **Launcher *tool*** — the cross-language launcher *worker contract* is
+  done (`vgi_rpc::unix::serve_unix` honours `--unix` + `--idle-timeout`,
+  prints `UNIX:<path>`, and idle-exits, so the Python `vgi_rpc.launcher`
+  can spawn/reuse/reap a Rust worker). A *Rust* port of the launcher
+  itself (flock coordination, `.meta` discovery, `--status`/`--gc`) is
+  client-side orchestration and stays deferred with the Rust client.
 
 ## Trust boundaries
 
@@ -363,6 +426,10 @@ Not every transport is safe to expose to untrusted peers:
 - **unix socket** — safe for untrusted peers *if* the caller sets a
   read timeout on the stream before handing it to `serve` (a
   `TimedOut`/`WouldBlock` error then cleanly ends the connection).
+  `vgi_rpc::unix::serve_unix` serves each connection on its own thread
+  with **no** per-connection read timeout, so a stalled peer pins one
+  thread (and keeps `conn_count > 0`, suppressing the idle reaper) —
+  trusted-peer / launcher use, not a hardened public listener.
 - **HTTP** — the hardened path: body-size + request-timeout layers,
   AEAD-sealed stateless stream tokens, SSRF-filtered external fetches.
 

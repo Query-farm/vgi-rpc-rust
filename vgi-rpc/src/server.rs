@@ -97,6 +97,9 @@ pub struct CallContext {
     /// [`RpcServer::notify_transport`] call).
     pub kind: Option<crate::transport::TransportKind>,
     pub(crate) log_sink: Arc<Mutex<Vec<LogMessage>>>,
+    /// Per-tick input-batch custom metadata (updated each producer/exchange
+    /// iteration). Carries e.g. `vgi_pushdown_filters` for dynamic filters.
+    pub(crate) tick_metadata: Arc<Mutex<Metadata>>,
     /// Sticky-session bridge, installed by the HTTP transport when the
     /// server is sticky-enabled. `None` on pipe/unix/subprocess and on
     /// HTTP servers without sticky support — [`CallContext::open_session`]
@@ -138,6 +141,12 @@ impl CallContext {
         std::mem::take(&mut *lock_ok(&self.log_sink))
     }
 
+    /// Per-tick input-batch custom metadata value (e.g. `vgi_pushdown_filters`),
+    /// set by the producer/exchange loop for the current iteration.
+    pub fn tick_metadata(&self, key: &str) -> Option<String> {
+        lock_ok(&self.tick_metadata).get(key).cloned()
+    }
+
     /// Build a call context for `server` serving `req`. Defaults to
     /// anonymous auth with no cookies — callers on authenticated
     /// transports (HTTP) override the two after construction or use
@@ -152,6 +161,7 @@ impl CallContext {
             cookies: std::collections::BTreeMap::new(),
             kind: server.transport_kind(),
             log_sink: Arc::new(Mutex::new(Vec::new())),
+            tick_metadata: Arc::new(Mutex::new(Metadata::default())),
             sticky: None,
         }
     }
@@ -172,6 +182,7 @@ impl CallContext {
             cookies,
             kind: server.transport_kind(),
             log_sink: Arc::new(Mutex::new(Vec::new())),
+            tick_metadata: Arc::new(Mutex::new(Metadata::default())),
             sticky: None,
         }
     }
@@ -804,6 +815,24 @@ impl RpcServer {
             None => return Ok(false),
         };
 
+        // __transport_options__ — framework transport-capability handshake,
+        // handled before method dispatch (not a registered method, so it never
+        // appears in `methods` / `__describe__`, and doesn't perturb the
+        // protocol hash). Capabilities ride as response metadata; the response
+        // batch is empty. Always available, including to version-mismatched
+        // clients, since it is the negotiation they perform before `init`.
+        if req.method == crate::transport_options::TRANSPORT_OPTIONS_METHOD_NAME {
+            let mut md = crate::transport_options::worker_transport_metadata();
+            md.insert(REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string());
+            md.insert(SERVER_ID_KEY.to_string(), self.server_id.clone());
+            let schema = empty_schema();
+            let batch = empty_batch(&schema)?;
+            let mut sw = StreamWriter::new(w, &schema)?;
+            sw.write(&batch, Some(&md))?;
+            sw.finish()?;
+            return Ok(true);
+        }
+
         // Enforce application protocol-version compatibility: the client sends
         // its `vgi_rpc.protocol_version`; if its MAJOR differs from the
         // server's enforced version, reject (mirrors the Python framework).
@@ -1106,6 +1135,10 @@ impl RpcServer {
                 s.input_rows += input_batch.num_rows() as u64;
             }
 
+            // Surface this tick's input metadata (e.g. dynamic pushdown
+            // filters) to the producer/exchange handler via the context.
+            *lock_ok(&ctx.tick_metadata) = input_md.clone();
+
             // Cancellation signal.
             if md_get(&input_md, CANCEL_KEY).is_some() {
                 cancelled = true;
@@ -1371,5 +1404,32 @@ mod tests {
         let mut r = StreamReader::new(output.as_slice()).unwrap();
         let (_b, md) = r.read_next().unwrap().expect("error batch");
         assert_eq!(md_get(&md, LOG_LEVEL_KEY), Some("EXCEPTION"));
+    }
+
+    #[test]
+    fn transport_options_reports_shm_capability_unregistered() {
+        use crate::metadata::TRANSPORT_SHM_KEY;
+        use crate::transport_options::{shm_available, TRANSPORT_OPTIONS_METHOD_NAME};
+
+        let mut server = RpcServer::new("test-srv");
+        server.register(MethodInfo::unary(
+            "noop",
+            empty_schema(),
+            empty_schema(),
+            |_req, _ctx| Ok(None),
+        ));
+        // Not a registered method — handled by pre-dispatch interception.
+        assert!(!server.methods.contains_key(TRANSPORT_OPTIONS_METHOD_NAME));
+
+        let input = request_bytes(TRANSPORT_OPTIONS_METHOD_NAME);
+        let mut output: Vec<u8> = Vec::new();
+        server.serve(Cursor::new(input), &mut output);
+
+        let mut r = StreamReader::new(output.as_slice()).unwrap();
+        let (_b, md) = r.read_next().unwrap().expect("transport options batch");
+        let expected = if shm_available() { "true" } else { "false" };
+        assert_eq!(md_get(&md, TRANSPORT_SHM_KEY), Some(expected));
+        assert_eq!(md_get(&md, REQUEST_VERSION_KEY), Some(REQUEST_VERSION));
+        assert_eq!(md_get(&md, SERVER_ID_KEY), Some("test-srv"));
     }
 }

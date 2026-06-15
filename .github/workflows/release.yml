@@ -51,6 +51,8 @@ jobs:
 
       - name: Install Rust toolchain (MSRV 1.86)
         uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 

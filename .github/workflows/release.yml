@@ -1,7 +1,7 @@
 name: Release
 
-# Publish all four workspace crates to crates.io in dependency order
-# when a `v*` tag is pushed.  Uses crates.io Trusted Publishing
+# Publish the workspace's published crates to crates.io in dependency
+# order when a `v*` tag is pushed.  Uses crates.io Trusted Publishing
 # (OIDC) — no long-lived `CARGO_REGISTRY_TOKEN` secret required.
 #
 # Setup checklist (one-time):
@@ -98,6 +98,17 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
+      - name: Publish vgi-rpc-client
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p vgi-rpc-client --locked
+          else
+            cargo publish -p vgi-rpc-client --locked
+            sleep 30
+          fi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
       - name: Publish vgi-rpc-s3
         run: |
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
@@ -126,5 +137,6 @@ jobs:
           echo "Crates released:"
           echo "  - https://crates.io/crates/vgi-rpc-macros"
           echo "  - https://crates.io/crates/vgi-rpc"
+          echo "  - https://crates.io/crates/vgi-rpc-client"
           echo "  - https://crates.io/crates/vgi-rpc-s3"
           echo "  - https://crates.io/crates/vgi-rpc-gcs"

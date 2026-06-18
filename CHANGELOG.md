@@ -2,6 +2,44 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.3.0] — 2026-06-18
+
+Headline: a new **`vgi-rpc-client`** crate — a blocking, dynamic, schema-first
+client for the canonical wire protocol — validated by running the Python
+reference conformance suite against it across pipe / subprocess / unix / HTTP /
+shm, driving the Rust, Python, and Go conformance servers.
+
+- **Added** the `vgi-rpc-client` crate. `RpcClient` (unary / producer /
+  exchange / cancel / `describe` / `transport_options`) over the byte-stream
+  transports (subprocess, AF_UNIX, pipe, shm) plus an `HttpClient`. HTTP
+  production surface: transparent external-location resolution, sticky sessions
+  (with a session stack for nesting), 413 request-externalization via vended
+  upload URLs, 415/zstd request-codec negotiation, a default request timeout,
+  and connection-level retry on idempotent calls (never on `exchange`). The
+  lockstep stream session opens its output reader lazily so it is compatible
+  with both the Rust server (writes the output schema first) and the Python
+  server (reads the input schema first). Native tests cover in-process
+  round-trips and HTTP fault injection (timeout / retry / garbage responses).
+- **Added** a lightweight `external` cargo feature on `vgi-rpc` (zstd only, no
+  axum/tokio server stack) so a client can reuse the external-location module;
+  `http` now implies `external`.
+- **Added** `external::fetch_external_ipc_bytes`, and
+  `resolve_external_location` now merges the *inner* externalized batch's
+  metadata in addition to the outer pointer's — peers differ on where they
+  stamp per-batch keys like the stream-state token (Rust on the outer pointer,
+  Python inside the payload), and the client resolves either layout.
+- **Changed** the HTTP unary and stream-init handlers to run inside
+  `call_guard`, so a panicking handler surfaces as a structured Arrow
+  `EXCEPTION` batch (HTTP 200) matching the stdio/unix loop, rather than a bare
+  500. New `http_panic` integration test.
+- **Internal** the `CallContext::with_auth_cookies` / `set_sticky` helpers are
+  now gated behind the `http` feature (they are http-only; this keeps non-http
+  builds warning-clean). The conformance harness (`scripts/conf.py`,
+  `test_rust_conformance.py`) gained `--role {server,client}` /
+  `--server {rust,python,go}` so the Rust client is conformance-tested against
+  all three servers, and CI runs a `{server,rust}` / `{client,rust}` /
+  `{client,python}` matrix.
+
 ## [0.2.0] — 2026-06-03
 
 First release since the initial `0.1.0` port. Headline: a production-hardening

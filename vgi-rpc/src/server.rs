@@ -75,7 +75,7 @@ fn lock_ok<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// instead of unwinding through the serve loop (which on stdio/pipe
 /// would kill the whole process). The panic message is intentionally
 /// not echoed to the client.
-fn call_guard<T>(f: impl FnOnce() -> T) -> Result<T> {
+pub(crate) fn call_guard<T>(f: impl FnOnce() -> T) -> Result<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
         .map_err(|_| RpcError::new("RuntimeError", "handler panicked"))
 }

@@ -1838,7 +1838,12 @@ async fn handle_unary(
         ..Default::default()
     };
 
-    let result = (info.unary.as_ref().unwrap())(&req, &ctx);
+    // Isolate handler panics: convert them to an `RpcError` that flows into the
+    // structured Arrow error envelope below, matching the stdio/unix serve loop.
+    // Without this a panic would bottom out at the `CatchPanicLayer` as a bare
+    // 500 the DuckDB client can't parse as a VGI error.
+    let result =
+        crate::server::call_guard(|| (info.unary.as_ref().unwrap())(&req, &ctx)).and_then(|r| r);
     let logs = ctx.drain_logs();
     let mut app_err: Option<RpcError> = None;
 
@@ -1977,7 +1982,10 @@ async fn handle_stream_init(
     if let Some(s) = sticky_sink.clone() {
         ctx.set_sticky(s);
     }
-    let init_result = (info.stream.as_ref().unwrap())(&req, &ctx);
+    // Isolate handler panics into the structured stream error envelope below
+    // (see the unary path for rationale).
+    let init_result =
+        crate::server::call_guard(|| (info.stream.as_ref().unwrap())(&req, &ctx)).and_then(|r| r);
     let init_logs = ctx.drain_logs();
 
     let sr = match init_result {

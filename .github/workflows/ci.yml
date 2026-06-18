@@ -47,8 +47,37 @@ jobs:
 
   conformance:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The Python client drives the Rust server — the original
+          # cross-language wire-compat gate.
+          - role: server
+            server: rust
+          # The Rust vgi-rpc-client drives the Rust server (conformance
+          # client-driver + Python shim). Exercises the client across every
+          # transport (incl. the POSIX shm side-channel) and the
+          # external-location / sticky / 413-externalize / 415-codec /
+          # response-cap HTTP feature paths.
+          - role: client
+            server: rust
+          # The Rust client drives the canonical *Python* server — the
+          # cross-language client gate. Uses the Python reference
+          # serve_conformance_*.py scripts from the vgi-rpc-python repo
+          # (storage / sticky / strict / auth), so the client's HTTP features
+          # are validated against the reference implementation.
+          - role: client
+            server: python
     steps:
       - uses: actions/checkout@v5
+
+      - name: Check out vgi-rpc-python (for the python server's serve scripts)
+        if: matrix.server == 'python'
+        uses: actions/checkout@v5
+        with:
+          repository: Query-farm/vgi-rpc-python
+          path: vgi-python
 
       - uses: dtolnay/rust-toolchain@1.86.0
 
@@ -59,35 +88,48 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install vgi-rpc conformance harness
-        # Pinned to the 0.19 line, which carries the slim describe-v4
-        # schema and the `TestDescribeConformance` class that requires
-        # the `conformance_describe` fixture provided by
-        # `test_rust_conformance.py`. Bump the range as the upstream
-        # Python suite evolves so CI stays reproducible.
+      - name: Install conformance harness (PyPI pin for rust server; editable
+          checkout for the python server so package + serve scripts match)
+        # The 0.19 line carries the slim describe-v4 schema and the
+        # `TestDescribeConformance` class that requires the
+        # `conformance_describe` fixture. Bump as the upstream suite evolves.
         run: |
           python -m pip install --upgrade pip
-          # `external` extra pulls in aiohttp, required by the
-          # external_fetch path the upstream test suite exercises.
-          pip install "vgi-rpc[http,cli,external]>=0.19.1,<0.20" pytest pytest-timeout httpx
+          if [ "${{ matrix.server }}" = "python" ]; then
+            pip install -e "./vgi-python[http,cli,external]" pytest pytest-timeout httpx
+          else
+            pip install "vgi-rpc[http,cli,external]>=0.19.1,<0.20" pytest pytest-timeout httpx
+          fi
 
-      - name: Build conformance worker
-        run: cargo build -p vgi-rpc-conformance-rust --locked
-
-      - name: Symlink worker
+      - name: Build conformance worker (+ client-driver for the client role)
         run: |
-          ln -sf target/debug/vgi-rpc-conformance-rust conformance-worker-rust
+          if [ "${{ matrix.server }}" = "rust" ]; then
+            cargo build -p vgi-rpc-conformance-rust --locked
+            ln -sf target/debug/vgi-rpc-conformance-rust conformance-worker-rust
+          fi
+          if [ "${{ matrix.role }}" = "client" ]; then
+            cargo build -p vgi-rpc-conformance-client-driver --locked
+          fi
 
-      - name: Run conformance suite
+      - name: Run conformance suite (role=${{ matrix.role }}, server=${{ matrix.server }})
         # Full transport matrix — matches `scripts/conf.py run --transport all`.
-        # `shm_pipe` exercises the POSIX shared-memory side-channel (the worker
-        # is built with the `shm` feature) and `http_externalize_always` the
-        # external-location upload/fetch path.
+        # `shm_pipe` exercises the POSIX shared-memory side-channel and
+        # `http_externalize_always` the external-location upload/fetch path;
+        # under role=client both flow through the Rust client.
         env:
+          VGI_CONFORMANCE_ROLE: ${{ matrix.role }}
+          VGI_CONFORMANCE_SERVER: ${{ matrix.server }}
           VGI_TRANSPORTS: pipe,subprocess,http,unix,http_externalize_always,shm_pipe
-          RUST_CONFORMANCE_WORKER: ${{ github.workspace }}/conformance-worker-rust
+          VGI_CLIENT_DRIVER: ${{ github.workspace }}/target/debug/vgi-rpc-conformance-client-driver
         run: |
-          python -m pytest test_rust_conformance.py --timeout=10 --timeout-method=signal -v
+          if [ "${{ matrix.server }}" = "python" ]; then
+            export RUST_CONFORMANCE_WORKER="$(command -v vgi-rpc-conformance)"
+            export VGI_PYTHON_BIN="$(command -v python)"
+            export VGI_PY_TESTS_DIR="${{ github.workspace }}/vgi-python/tests"
+          else
+            export RUST_CONFORMANCE_WORKER="${{ github.workspace }}/conformance-worker-rust"
+          fi
+          python -m pytest test_rust_conformance.py --timeout=20 --timeout-method=signal -v
 
   msrv:
     runs-on: ubuntu-latest

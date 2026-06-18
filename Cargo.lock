@@ -2854,6 +2854,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "vgi-rpc-client"
+version = "0.2.0"
+dependencies = [
+ "arrow-array",
+ "arrow-cast",
+ "arrow-ipc",
+ "arrow-schema",
+ "axum",
+ "base64",
+ "bytes",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "vgi-rpc",
+ "zstd",
+]
+
+[[package]]
+name = "vgi-rpc-conformance-client-driver"
+version = "0.2.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "base64",
+ "serde",
+ "serde_json",
+ "vgi-rpc",
+ "vgi-rpc-client",
+]
+
+[[package]]
 name = "vgi-rpc-conformance-rust"
 version = "0.2.0"
 dependencies = [

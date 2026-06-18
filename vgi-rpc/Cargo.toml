@@ -15,7 +15,10 @@ categories = ["network-programming", "web-programming::http-server", "data-struc
 [features]
 default = ["http", "macros"]
 macros = ["dep:vgi-rpc-macros"]
-http = ["dep:axum", "dep:tower-http", "dep:tokio", "dep:hmac", "dep:base64", "dep:rand", "dep:bincode", "dep:zstd", "dep:chacha20poly1305"]
+# External-location batches (upload/resolve). Pulls only zstd — no server
+# (axum/tokio) stack — so a client can reuse `external` without `http`.
+external = ["dep:zstd"]
+http = ["external", "dep:axum", "dep:tower-http", "dep:tokio", "dep:hmac", "dep:base64", "dep:rand", "dep:bincode", "dep:chacha20poly1305"]
 jwt = []
 jwt-jsonwebtoken = ["jwt", "dep:jsonwebtoken", "dep:reqwest"]
 oauth-pkce = []

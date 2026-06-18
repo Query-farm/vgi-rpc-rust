@@ -12,7 +12,7 @@ pub mod crypto;
 pub mod errors;
 pub mod retry;
 
-#[cfg(feature = "http")]
+#[cfg(feature = "external")]
 pub mod external;
 
 #[cfg(feature = "otel")]

@@ -31,49 +31,110 @@ JUNIT = RUN_DIR / "junit.xml"
 LOG = RUN_DIR / "pytest.log"
 ARGS = RUN_DIR / "args.txt"
 VENV_PY = Path("/Users/rusty/Development/vgi-rpc/.venv/bin/python")
+VENV_BIN = VENV_PY.parent
 WORKER = ROOT / "conformance-worker-rust"
+GO_WORKER = Path.home() / "Development" / "vgi-rpc-go" / "vgi-rpc-conformance-go"
 
 
-def _build(release: bool, skip: bool) -> None:
+def _cargo_build(pkg: str, release: bool, build_log: Path) -> None:
+    flags = ["--release"] if release else []
+    with open(build_log, "a") as bl:
+        r = subprocess.run(
+            ["cargo", "build", "-p", pkg, *flags],
+            cwd=ROOT, stdout=bl, stderr=subprocess.STDOUT,
+        )
+    if r.returncode != 0:
+        print(f"[conf] cargo build of {pkg} failed; see {build_log}")
+        raise SystemExit(r.returncode)
+
+
+def _build_rust_worker(release: bool, skip: bool) -> Path:
     profile = "release" if release else "dev"
     target = ROOT / "target" / ("release" if release else "debug") / "vgi-rpc-conformance-rust"
     if not skip:
-        flags = ["--release"] if release else []
-        # cargo build is a no-op when nothing changed, so always invoke it.
-        # Route output to the run log so the terminal stays readable.
         RUN_DIR.mkdir(exist_ok=True)
-        build_log = RUN_DIR / "build.log"
-        with open(build_log, "w") as bl:
-            r = subprocess.run(
-                ["cargo", "build", "-p", "vgi-rpc-conformance-rust", *flags],
-                cwd=ROOT, stdout=bl, stderr=subprocess.STDOUT,
-            )
-        if r.returncode != 0:
-            print(f"[conf] cargo build failed; see {build_log}")
-            raise SystemExit(r.returncode)
+        _cargo_build("vgi-rpc-conformance-rust", release, RUN_DIR / "build.log")
     if not target.exists():
         raise SystemExit(f"[conf] build missing at {target}; use --debug or rebuild")
     WORKER.parent.mkdir(parents=True, exist_ok=True)
     if WORKER.is_symlink() or WORKER.exists():
         WORKER.unlink()
     WORKER.symlink_to(target)
-    print(f"[conf] worker -> {target} (profile={profile})")
+    print(f"[conf] rust worker -> {target} (profile={profile})")
+    return WORKER
+
+
+def _build_client_driver(release: bool, skip: bool) -> Path:
+    target = ROOT / "target" / ("release" if release else "debug") / "vgi-rpc-conformance-client-driver"
+    if not skip:
+        RUN_DIR.mkdir(exist_ok=True)
+        _cargo_build("vgi-rpc-conformance-client-driver", release, RUN_DIR / "build.log")
+    if not target.exists():
+        raise SystemExit(f"[conf] client driver missing at {target}; rebuild")
+    print(f"[conf] client driver -> {target}")
+    return target
+
+
+def _resolve_worker(server: str, release: bool, skip: bool) -> Path:
+    """Resolve the conformance SERVER binary for the requested language."""
+    if server == "rust":
+        return _build_rust_worker(release, skip)
+    if server == "python":
+        cli = VENV_BIN / "vgi-rpc-conformance"
+        if not cli.exists():
+            raise SystemExit(f"[conf] python conformance CLI not found at {cli}")
+        print(f"[conf] python server -> {cli}")
+        return cli
+    if server == "go":
+        if not GO_WORKER.exists():
+            raise SystemExit(
+                f"[conf] go conformance worker not found at {GO_WORKER}; "
+                "build it in ~/Development/vgi-rpc-go first"
+            )
+        print(f"[conf] go server -> {GO_WORKER}")
+        return GO_WORKER
+    raise SystemExit(f"[conf] unknown server {server!r}")
 
 
 def _run(args: argparse.Namespace, extras: list[str]) -> int:
     RUN_DIR.mkdir(exist_ok=True)
-    _build(release=args.release, skip=args.no_build)
+
+    worker = _resolve_worker(args.server, release=args.release, skip=args.no_build)
 
     env = os.environ.copy()
+    env["RUST_CONFORMANCE_WORKER"] = str(worker)
+    env["VGI_CONFORMANCE_ROLE"] = args.role
+    env["VGI_CONFORMANCE_SERVER"] = args.server
+    if args.role == "client":
+        driver = _build_client_driver(release=args.release, skip=args.no_build)
+        env["VGI_CLIENT_DRIVER"] = str(driver)
+
     transports = (
         ["pipe", "subprocess", "http", "unix", "http_externalize_always", "shm_pipe"]
         if args.transport == "all"
         else [args.transport]
     )
+    # shm requires both peers to support the POSIX side-channel. The Rust
+    # client + rust/python servers do; the Go conformance server's shm support
+    # isn't wired here, so drop shm_pipe for go.
+    if args.role == "client" and args.server == "go":
+        transports = [t for t in transports if t != "shm_pipe"]
+    # http_externalize_always needs a storage-capable HTTP server. The rust
+    # worker and the Python serve_conformance_http.py support it; the Go
+    # conformance binary doesn't expose it here.
+    if args.role == "client" and args.server == "go":
+        transports = [t for t in transports if t != "http_externalize_always"]
     env["VGI_TRANSPORTS"] = ",".join(transports)
 
-    # Hard cap to ensure I can always run in the foreground.
-    args.timeout = min(args.timeout, 59)
+    # Wall-clock deadline. The fast rust-only server matrix is capped at 59s
+    # (keeps default foreground runs snappy). The cross-language client matrices
+    # (role=client, server=python/go) spawn a fresh, slower server per
+    # pipe/subprocess test, so they legitimately need more time — give them a
+    # 300s floor and a 600s cap.
+    if args.role == "server" and args.server == "rust":
+        args.timeout = min(args.timeout, 59)
+    else:
+        args.timeout = min(max(args.timeout, 300), 600)
     cmd = [
         str(VENV_PY), "-m", "pytest",
         "test_rust_conformance.py",
@@ -237,6 +298,11 @@ def main() -> int:
     pr = sub.add_parser("run")
     pr.add_argument("--transport", default="pipe",
                     choices=["pipe", "subprocess", "http", "unix", "http_externalize_always", "shm_pipe", "all"])
+    pr.add_argument("--role", default="server", choices=["server", "client"],
+                    help="server: Python client drives the worker (default); "
+                         "client: the Rust vgi-rpc-client drives the server")
+    pr.add_argument("--server", default="rust", choices=["rust", "python", "go"],
+                    help="which conformance SERVER to drive (default rust)")
     pr.add_argument("-k", help="pytest -k filter")
     pr.add_argument("-x", action="store_true", help="stop at first failure")
     pr.add_argument("--release", action="store_true", default=False,

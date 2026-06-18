@@ -302,12 +302,48 @@ pub fn serialize_batch_to_ipc(batch: &RecordBatch) -> Result<Vec<u8>> {
 }
 
 /// Read back an IPC stream containing a single batch.
+/// Fetch, decompress, and integrity-check an external-location pointer's
+/// payload, returning the raw inner IPC stream bytes. The inner stream may
+/// contain **multiple** batches (e.g. a peer that externalizes a whole
+/// per-iteration output — logs followed by the data batch), so callers that
+/// need log/exception handling should process the returned bytes as a full
+/// response stream rather than assuming a single batch.
+///
+/// Returns `Ok(None)` when `metadata` carries no `vgi_rpc.location` pointer.
+pub fn fetch_external_ipc_bytes(
+    metadata: &Metadata,
+    cfg: &ExternalLocationConfig,
+) -> Result<Option<Vec<u8>>> {
+    let Some(url) = md_get(metadata, LOCATION_KEY) else {
+        return Ok(None);
+    };
+    (cfg.url_validator)(url)?;
+    let compressed = cfg
+        .fetcher
+        .fetch(url, cfg.compression, cfg.max_decompressed_bytes)?;
+    let ipc_bytes = decompress(&compressed, cfg.compression, cfg.max_decompressed_bytes)?;
+    if let Some(expected) = md_get(metadata, LOCATION_SHA256_KEY) {
+        let actual = sha256_hex(&ipc_bytes);
+        if expected != actual.as_str() {
+            return Err(RpcError::runtime_error(format!(
+                "external location SHA-256 mismatch (expected {expected}, got {actual})"
+            )));
+        }
+    }
+    Ok(Some(ipc_bytes))
+}
+
 pub fn deserialize_single_batch(ipc_bytes: &[u8]) -> Result<RecordBatch> {
+    Ok(deserialize_single_batch_with_metadata(ipc_bytes)?.0)
+}
+
+/// Like [`deserialize_single_batch`] but also returns the batch's per-message
+/// custom metadata — some peers carry keys (e.g. the stream-state token) on the
+/// externalized inner batch rather than the outer pointer.
+pub fn deserialize_single_batch_with_metadata(ipc_bytes: &[u8]) -> Result<(RecordBatch, Metadata)> {
     let mut r = StreamReader::new(ipc_bytes)?;
-    let (batch, _md) = r
-        .read_next()?
-        .ok_or_else(|| RpcError::runtime_error("external batch stream is empty"))?;
-    Ok(batch)
+    r.read_next()?
+        .ok_or_else(|| RpcError::runtime_error("external batch stream is empty"))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -463,9 +499,15 @@ pub fn resolve_external_location(
             )));
         }
     }
-    let resolved = deserialize_single_batch(&ipc_bytes)?;
+    let (resolved, inner_md) = deserialize_single_batch_with_metadata(&ipc_bytes)?;
     let fetch_ms = start.elapsed().as_secs_f64() * 1000.0;
 
+    // Start from the outer pointer's non-location keys, then overlay the inner
+    // (externalized) batch's metadata. Implementations differ on where they
+    // carry per-batch keys like `vgi_rpc.stream_state#b64`: the Rust server
+    // stamps them on the outer pointer, the Python server on the inner payload
+    // batch. Merging both (inner wins) recovers the token either way and
+    // matches Python's resolver, which uses the inner batch's metadata.
     let mut user_md: Metadata = metadata
         .iter()
         .filter(|(k, _)| {
@@ -473,6 +515,11 @@ pub fn resolve_external_location(
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    for (k, v) in inner_md {
+        if k != LOCATION_KEY && k != LOCATION_SHA256_KEY && k != LOCATION_FETCH_MS_KEY {
+            user_md.insert(k, v);
+        }
+    }
     user_md.insert(
         LOCATION_FETCH_MS_KEY.to_string(),
         format!("{:.2}", fetch_ms),

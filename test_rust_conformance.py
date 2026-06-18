@@ -22,6 +22,152 @@ RUST_WORKER = os.environ.get(
     str(Path(__file__).parent / "conformance-worker-rust"),
 )
 
+# "server" (default): Python client drives the Rust server (legacy behavior).
+# "client": the Rust vgi-rpc-client drives the server, via a Python shim that
+# forwards to the Rust conformance client-driver subprocess.
+ROLE = os.environ.get("VGI_CONFORMANCE_ROLE", "server")
+
+# Which conformance SERVER the worker binary speaks. The binary path is
+# RUST_CONFORMANCE_WORKER regardless (conf.py points it at the python CLI / go
+# binary for cross-language runs); only the CLI flags differ per language.
+SERVER = os.environ.get("VGI_CONFORMANCE_SERVER", "rust")
+
+
+def _worker_cmd(mode: str, path: str | None = None) -> list[str]:
+    """Build the argv to spawn the conformance server in `mode`.
+
+    mode ∈ {"stdio", "http", "unix"}. The Rust and Go workers default
+    describe-on; the Python CLI needs an explicit ``--describe`` and an
+    explicit ``--pipe`` for stdio.
+    """
+    base = [RUST_WORKER]
+    if SERVER == "python":
+        extra = ["--describe"]
+        if mode == "stdio":
+            return base + ["--pipe", *extra]
+        if mode == "http":
+            return base + ["--http", *extra]
+        if mode == "unix":
+            return base + ["--unix", path, *extra]
+    else:  # rust / go share the same flag surface
+        if mode == "stdio":
+            return base
+        if mode == "http":
+            return base + ["--http"]
+        if mode == "unix":
+            return base + ["--unix", path]
+    raise AssertionError(f"unknown worker mode {mode!r}")
+
+
+# --- Python reference HTTP servers (full-featured: sticky, storage, strict,
+# auth) used when SERVER=python so the Rust client's external/sticky/413/strict
+# paths validate against the canonical Python implementation. -----------------
+_VENV_PY = os.environ.get("VGI_PYTHON_BIN", "/Users/rusty/Development/vgi-rpc/.venv/bin/python")
+# Directory holding the Python reference serve_conformance_*.py scripts. These
+# live in the vgi-rpc *repo* (not the PyPI wheel), so cross-language client runs
+# against the Python server set VGI_PY_TESTS_DIR to a checkout of that repo.
+_PY_TESTS = Path(
+    os.environ.get("VGI_PY_TESTS_DIR", str(Path.home() / "Development" / "vgi-rpc" / "tests"))
+)
+_PY_SERVE_HTTP = str(_PY_TESTS / "serve_conformance_http.py")
+_PY_SERVE_STRICT = str(_PY_TESTS / "serve_conformance_http_strict.py")
+_PY_SERVE_AUTH = str(_PY_TESTS / "serve_conformance_http_auth.py")
+
+
+def _free_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _spawn_read_port(args: list[str], *, expect_port: int | None = None) -> tuple[subprocess.Popen, int]:
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdout is not None
+    line = proc.stdout.readline().decode().strip()
+    assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r} (args={args})"
+    port = int(line.split(":", 1)[1])
+    if expect_port is not None:
+        assert port == expect_port, f"expected PORT:{expect_port}, got {port}"
+    _wait_for_http(port)
+    return proc, port
+
+
+def _start_rust_http_with_storage(
+    storage_url: str | None,
+    zstd: bool,
+    *,
+    externalize_threshold: int | None = None,
+    max_request_bytes: int | None = None,
+) -> tuple[subprocess.Popen, int]:
+    args = [RUST_WORKER, "--http-with-storage", storage_url or ""]
+    if zstd:
+        args.append("--zstd")
+    if externalize_threshold is not None:
+        args += ["--externalize-threshold", str(externalize_threshold)]
+    if max_request_bytes is not None:
+        args += ["--max-request-bytes", str(max_request_bytes)]
+    return _spawn_read_port(args)
+
+
+def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[subprocess.Popen, int]:
+    """Spawn an HTTP conformance server of `variant` for the current SERVER.
+
+    variant ∈ {plain, storage, zstd_storage, externalize_always, strict, auth}.
+    Raises ``pytest.skip`` for (server, variant) combinations not wired here
+    (the Go conformance binary doesn't expose the storage/strict/auth modes).
+    """
+    if SERVER == "python":
+        if variant == "plain":
+            return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http"])
+        if variant in ("storage", "zstd_storage", "externalize_always"):
+            port = _free_port()
+            args = [_VENV_PY, _PY_SERVE_HTTP, "--port", str(port), "--fake-storage", storage_url or ""]
+            if variant == "zstd_storage":
+                args += ["--compression", "zstd"]
+            if variant == "externalize_always":
+                args += ["--externalize-threshold", "1", "--max-request-bytes", "1048576"]
+            return _spawn_read_port(args, expect_port=port)
+        if variant == "strict":
+            return _spawn_read_port([_VENV_PY, _PY_SERVE_STRICT])
+        if variant == "auth":
+            port = _free_port()
+            return _spawn_read_port([_VENV_PY, _PY_SERVE_AUTH, "--port", str(port)], expect_port=port)
+    elif SERVER == "rust":
+        if variant == "plain":
+            return _spawn_read_port(_worker_cmd("http"))
+        if variant == "storage":
+            return _start_rust_http_with_storage(storage_url, zstd=False)
+        if variant == "zstd_storage":
+            return _start_rust_http_with_storage(storage_url, zstd=True)
+        if variant == "externalize_always":
+            return _start_rust_http_with_storage(
+                storage_url, zstd=False, externalize_threshold=1, max_request_bytes=1024 * 1024
+            )
+        if variant == "strict":
+            return _spawn_read_port([RUST_WORKER, "--http", "--strict"])
+        if variant == "auth":
+            return _spawn_read_port([RUST_WORKER, "--http-auth"])
+    else:  # go
+        if variant == "plain":
+            return _spawn_read_port(_worker_cmd("http"))
+        pytest.skip(f"go conformance server doesn't expose HTTP variant {variant!r}")
+    raise AssertionError(f"unknown http variant {variant!r} for server {SERVER!r}")
+
+
+# Under client role, route the HTTP-feature tests (external-location, sticky,
+# response-caps) — which import http_connect / http_capabilities /
+# request_upload_urls in-body — through the Rust client so they actually
+# validate it (instead of silently using the Python http client).
+if ROLE == "client":
+    import vgi_rpc.http as _vgi_http
+    import rust_client_proxy as _shim
+
+    _vgi_http.http_connect = _shim.rust_http_connect  # type: ignore[assignment]
+    _vgi_http.http_capabilities = _shim.rust_http_capabilities  # type: ignore[assignment]
+    _vgi_http.request_upload_urls = _shim.rust_request_upload_urls  # type: ignore[assignment]
+
 
 @pytest.fixture(scope="session")
 def rust_transport() -> Iterator[SubprocessTransport]:
@@ -42,22 +188,9 @@ def _wait_for_http(port: int, timeout: float = 5.0) -> None:
     raise TimeoutError(f"HTTP server on port {port} did not start within {timeout}s")
 
 
-@pytest.fixture(scope="session")
-def rust_http_port() -> Iterator[int]:
-    """Start Rust conformance HTTP server."""
-    proc = subprocess.Popen(
-        [RUST_WORKER, "--http"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+def _http_variant_fixture(variant: str, storage_url: str | None = None) -> Iterator[int]:
+    proc, port = _spawn_http_variant(variant, storage_url)
     try:
-        assert proc.stdout is not None
-        line = proc.stdout.readline().decode().strip()
-        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
-        port = int(line.split(":", 1)[1])
-
-        _wait_for_http(port)
-
         yield port
     finally:
         proc.terminate()
@@ -65,8 +198,14 @@ def rust_http_port() -> Iterator[int]:
 
 
 @pytest.fixture(scope="session")
+def rust_http_port() -> Iterator[int]:
+    """Plain HTTP conformance server for the current SERVER (rust/python/go)."""
+    yield from _http_variant_fixture("plain")
+
+
+@pytest.fixture(scope="session")
 def conformance_http_port(rust_http_port: int) -> int:
-    """Alias of `rust_http_port` for the upstream `TestHealth` fixture."""
+    """Alias of `rust_http_port` for the upstream `TestHealth`/`TestSticky`."""
     return rust_http_port
 
 
@@ -82,115 +221,35 @@ def conformance_fake_storage() -> Iterator[str]:
         shutdown()
 
 
-def _start_rust_http_with_storage(
-    storage_url: str,
-    zstd: bool,
-    *,
-    externalize_threshold: int | None = None,
-    max_request_bytes: int | None = None,
-) -> tuple[subprocess.Popen, int]:
-    args = [RUST_WORKER, "--http-with-storage", storage_url]
-    if zstd:
-        args.append("--zstd")
-    if externalize_threshold is not None:
-        args += ["--externalize-threshold", str(externalize_threshold)]
-    if max_request_bytes is not None:
-        args += ["--max-request-bytes", str(max_request_bytes)]
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert proc.stdout is not None
-    line = proc.stdout.readline().decode().strip()
-    assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
-    port = int(line.split(":", 1)[1])
-    _wait_for_http(port)
-    return proc, port
-
-
 @pytest.fixture(scope="session")
 def conformance_http_with_storage_port(conformance_fake_storage: str) -> Iterator[int]:
-    """Run the Rust worker wired to fake storage (no compression)."""
-    proc, port = _start_rust_http_with_storage(conformance_fake_storage, zstd=False)
-    try:
-        yield port
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
+    """HTTP server wired to fake storage (no compression)."""
+    yield from _http_variant_fixture("storage", conformance_fake_storage)
 
 
 @pytest.fixture(scope="session")
 def conformance_http_with_zstd_storage_port(conformance_fake_storage: str) -> Iterator[int]:
-    """Run the Rust worker wired to fake storage with zstd compression."""
-    proc, port = _start_rust_http_with_storage(conformance_fake_storage, zstd=True)
-    try:
-        yield port
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
+    """HTTP server wired to fake storage with zstd compression."""
+    yield from _http_variant_fixture("zstd_storage", conformance_fake_storage)
 
 
 @pytest.fixture(scope="session")
 def conformance_http_externalize_always_port(conformance_fake_storage: str) -> Iterator[int]:
-    """Run the Rust worker forcing externalization of EVERY non-empty response batch.
-
-    Threshold=1 byte makes every data-bearing batch externalize via the
-    upload-URL pointer flow; the inline-request cap stays at 1 MiB so
-    normal-sized client requests still flow inline. Used as a transport
-    variant in ``conformance_conn`` to double-check that externalization
-    is observationally indistinguishable from inline transmission across
-    the entire conformance method matrix.
-    """
-    proc, port = _start_rust_http_with_storage(
-        conformance_fake_storage,
-        zstd=False,
-        externalize_threshold=1,
-        max_request_bytes=1024 * 1024,
-    )
-    try:
-        yield port
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
+    """HTTP server forcing externalization of EVERY non-empty response batch."""
+    yield from _http_variant_fixture("externalize_always", conformance_fake_storage)
 
 
 @pytest.fixture(scope="session")
 def conformance_http_strict_cap_port() -> Iterator[int]:
-    """Run the Rust worker with strict body + externalised response caps.
-
-    Used by `TestHttpResponseCap` / `TestHttpResponseCapSoftWire` to
-    deliberately overshoot the cap on unary / exchange / producer paths.
-    Defaults mirror the Python `serve_conformance_http_strict.py`
-    fixture: 1 MiB inline + 1 MiB externalised.
-    """
-    proc = subprocess.Popen(
-        [RUST_WORKER, "--http", "--strict"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    try:
-        assert proc.stdout is not None
-        line = proc.stdout.readline().decode().strip()
-        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
-        port = int(line.split(":", 1)[1])
-        _wait_for_http(port)
-        yield port
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
+    """HTTP server with strict body + externalised response caps."""
+    yield from _http_variant_fixture("strict")
 
 
 @pytest.fixture(scope="session")
 def conformance_http_auth_port() -> Iterator[int]:
-    """Run the Rust worker with a reject-all auth callback under `/vgi/`."""
-    proc = subprocess.Popen(
-        [RUST_WORKER, "--http-auth"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    """HTTP server with a reject-all auth callback."""
+    proc, port = _spawn_http_variant("auth")
     try:
-        assert proc.stdout is not None
-        line = proc.stdout.readline().decode().strip()
-        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
-        port = int(line.split(":", 1)[1])
-        _wait_for_http(port)
         yield port
     finally:
         proc.terminate()
@@ -226,7 +285,7 @@ def rust_unix_path() -> Iterator[str]:
     """Start Rust conformance Unix socket server."""
     path = _short_unix_path("conf")
     proc = subprocess.Popen(
-        [RUST_WORKER, "--unix", path],
+        _worker_cmd("unix", path),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -281,6 +340,46 @@ class _ShmSubprocessTransport:
         self._inner.close()
 
 
+def _client_factory(
+    param: str,
+    on_log: Callable[[Message], None] | None,
+    http_port: int | None,
+    unix_path: str | None,
+    ext_port: int | None,
+) -> contextlib.AbstractContextManager[Any]:
+    """Yield a Rust-client-backed proxy (VGI_CONFORMANCE_ROLE=client)."""
+    from rust_client_proxy import RustClientProxy
+
+    external_config = None
+    if param == "shm_pipe":
+        transport: str = "shm"
+        target: Any = _worker_cmd("stdio")
+    elif param in ("pipe", "subprocess"):
+        transport = "stdio"
+        target = _worker_cmd("stdio")
+    elif param == "http":
+        transport, target = "http", f"http://127.0.0.1:{http_port}"
+    elif param == "http_externalize_always":
+        from vgi_rpc.external import ExternalLocationConfig
+
+        transport, target = "http", f"http://127.0.0.1:{ext_port}"
+        external_config = ExternalLocationConfig(url_validator=None)
+    elif param == "unix":
+        transport, target = "unix", unix_path
+    else:
+        raise AssertionError(f"unknown transport {param!r}")
+
+    @contextlib.contextmanager
+    def _conn() -> Iterator[Any]:
+        proxy = RustClientProxy(transport, target, on_log, external_config=external_config)
+        try:
+            yield proxy
+        finally:
+            proxy.close()
+
+    return _conn()
+
+
 @pytest.fixture(params=_TRANSPORTS)
 def conformance_conn(
     request: pytest.FixtureRequest,
@@ -296,6 +395,8 @@ def conformance_conn(
     def factory(
         on_log: Callable[[Message], None] | None = None,
     ) -> contextlib.AbstractContextManager[Any]:
+        if ROLE == "client":
+            return _client_factory(request.param, on_log, rust_http_port, rust_unix_path, ext_always_port)
         if request.param == "pipe":
 
             @contextlib.contextmanager
@@ -366,6 +467,18 @@ from vgi_rpc.conformance._pytest_suite import *  # noqa: F401,F403,E402
 from vgi_rpc.rpc import AnnotatedBatch, RpcError  # noqa: E402
 
 
+# The Go conformance server's __describe__ advertises 76 methods (its port
+# implements a subset / names some differently), not the canonical 81 — a
+# Go-*server* describe discrepancy that the Rust client relays faithfully (all
+# method calls still round-trip). Skip the describe-metadata conformance checks
+# for the Go server; they're validated against the rust + python servers.
+class TestDescribeConformance(TestDescribeConformance):  # type: ignore[no-redef]  # noqa: F811
+    pytestmark = pytest.mark.skipif(
+        SERVER == "go",
+        reason="Go server __describe__ reports 76 methods, not the canonical 81",
+    )
+
+
 # Override: allow TestLargeData on all transports (the upstream suite skips
 # non-pipe transports, but the Rust worker handles them fine).
 class TestLargeData(TestLargeData):  # type: ignore[no-redef]  # noqa: F811
@@ -413,6 +526,22 @@ def conformance_describe(request: pytest.FixtureRequest):  # type: ignore[no-unt
     is left undisturbed.
     """
     param = request.param
+    if ROLE == "client":
+        from rust_client_proxy import RustClientProxy
+
+        if param in ("pipe", "subprocess"):
+            tr, tgt = "stdio", _worker_cmd("stdio")
+        elif param == "http":
+            tr, tgt = "http", f"http://127.0.0.1:{request.getfixturevalue('rust_http_port')}"
+        elif param == "unix":
+            tr, tgt = "unix", request.getfixturevalue("rust_unix_path")
+        else:
+            raise AssertionError(f"unknown describe transport: {param!r}")
+        proxy = RustClientProxy(tr, tgt)
+        try:
+            return proxy.describe()
+        finally:
+            proxy.close()
     if param in ("pipe", "subprocess"):
         transport = SubprocessTransport([RUST_WORKER])
         try:
@@ -438,6 +567,10 @@ def conformance_describe(request: pytest.FixtureRequest):  # type: ignore[no-unt
     raise AssertionError(f"unknown describe transport: {param!r}")
 
 
+@pytest.mark.skipif(
+    SERVER != "rust",
+    reason="Rust-worker describe smoke test (uses the Python introspect client directly)",
+)
 class TestRustDescribeConformance:
     """Run the describe conformance suite against the real Rust worker."""
 

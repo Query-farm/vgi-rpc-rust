@@ -1,0 +1,44 @@
+[package]
+name = "vgi-rpc-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Blocking client for the vgi-rpc Arrow-IPC RPC framework"
+readme = "README.md"
+keywords = ["rpc", "arrow", "ipc", "streaming", "client"]
+categories = ["network-programming", "web-programming::http-client", "data-structures"]
+
+[features]
+default = ["http"]
+# HTTP transport (reqwest blocking + zstd codec negotiation + external-location
+# resolve/upload via vgi-rpc's external module).
+http = ["dep:reqwest", "dep:zstd", "dep:base64", "dep:sha2", "vgi-rpc/external"]
+# AF_UNIX socket transport. Compiles to a no-op on non-unix targets.
+unix = []
+# POSIX shared-memory side-channel. Reuses vgi-rpc's shm module.
+shm = ["vgi-rpc/shm"]
+
+[dependencies]
+vgi-rpc = { path = "../vgi-rpc", version = "0.2.0", default-features = false }
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-ipc.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
+zstd = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+arrow-cast.workspace = true
+# Spin up a real axum HTTP server in-process for round-trip tests.
+vgi-rpc = { path = "../vgi-rpc", features = ["http"] }
+tokio = { workspace = true }
+axum = { workspace = true }

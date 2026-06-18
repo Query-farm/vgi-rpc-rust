@@ -1,0 +1,21 @@
+[package]
+name = "vgi-rpc-conformance-client-driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "vgi-rpc-conformance-client-driver"
+path = "src/main.rs"
+
+[dependencies]
+vgi-rpc-client = { path = "../vgi-rpc-client", features = ["shm"] }
+vgi-rpc = { path = "../vgi-rpc", default-features = false }
+arrow-array.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+base64.workspace = true

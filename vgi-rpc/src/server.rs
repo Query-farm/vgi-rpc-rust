@@ -167,6 +167,10 @@ impl CallContext {
     }
 
     /// Build a call context with an explicit auth context + cookie map.
+    /// Only the HTTP transport constructs contexts this way; gated so the
+    /// method isn't dead code (a `-D warnings` build failure) when `vgi-rpc`
+    /// is compiled without the `http` feature (e.g. from `vgi-rpc-client`).
+    #[cfg(feature = "http")]
     pub(crate) fn with_auth_cookies(
         server: &RpcServer,
         req: &Request,
@@ -189,7 +193,9 @@ impl CallContext {
 
     /// Attach a sticky-session sink (HTTP transport only). No-op semantics
     /// for callers: the session API simply reports "not available" when
-    /// this is never set.
+    /// this is never set. HTTP-only, so gated to avoid a dead-code
+    /// `-D warnings` failure in non-`http` builds.
+    #[cfg(feature = "http")]
     pub(crate) fn set_sticky(&mut self, sink: Arc<dyn StickySink>) {
         self.sticky = Some(sink);
     }

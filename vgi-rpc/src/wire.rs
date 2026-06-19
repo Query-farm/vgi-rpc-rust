@@ -300,7 +300,20 @@ impl<R: Read> StreamReader<R> {
         let ipc_schema = msg_fb
             .header_as_schema()
             .ok_or_else(|| RpcError::new("IPC", "bad schema header"))?;
-        let schema = ipc_convert::fb_to_schema(ipc_schema);
+        // A legitimate Arrow Schema message always carries a `fields` vector
+        // (possibly empty). When it's absent, `fb_to_schema` does
+        // `fb.fields().unwrap()` and panics — under cargo-fuzz's `panic=abort`
+        // that aborts the process before any `catch_unwind` can intercept.
+        // Reject the malformed frame explicitly here. (crates.io arrow tolerates
+        // this; the pinned arrow-rs fork the fuzz harness uses does not.)
+        if ipc_schema.fields().is_none() {
+            return Err(RpcError::new("IPC", "schema message has no fields vector"));
+        }
+        // `fb_to_schema` still `unwrap()`s other optional members while walking
+        // field types; keep the `catch_unwind` net (matching record-batch
+        // decode) so any residual panic becomes a clean `RpcError` in normal
+        // (panic=unwind) builds rather than escaping the reader.
+        let schema = decode_guard("schema message", || ipc_convert::fb_to_schema(ipc_schema))?;
         Ok(Self {
             reader,
             schema: Arc::new(schema),
@@ -776,6 +789,24 @@ mod tests {
             err.message.contains("bodyLength") && err.message.contains("exceeds cap"),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn malformed_schema_message_is_error_not_panic() {
+        // Regression for a fuzz-found crash: a structurally-parseable but
+        // malformed Schema message made arrow-ipc's `fb_to_schema` panic
+        // (`Option::unwrap()` on `None` in convert.rs) out of `StreamReader::new`
+        // — aborting the process instead of returning a clean error. The
+        // schema parse must now be caught like the per-batch decode.
+        // `crash-cea0477693563377f77c693ca8d3df51ee421811` from
+        // `fuzz/wire_stream_reader`.
+        let crash: &[u8] = &[
+            22, 0, 0, 0, 12, 0, 0, 0, 0, 0, 8, 0, 4, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0,
+            134,
+        ];
+        // Must not panic; either an Err here or a clean reader is acceptable —
+        // the contract is "no unwind escapes".
+        let _ = StreamReader::new(crash);
     }
 
     #[test]

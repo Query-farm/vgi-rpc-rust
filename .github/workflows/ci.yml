@@ -16,8 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust toolchain (MSRV 1.86)
-        uses: dtolnay/rust-toolchain@1.86.0
+      - name: Install Rust toolchain (MSRV 1.90)
+        uses: dtolnay/rust-toolchain@1.90.0
         with:
           components: rustfmt, clippy
 
@@ -79,7 +79,7 @@ jobs:
           repository: Query-farm/vgi-rpc-python
           path: vgi-python
 
-      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: dtolnay/rust-toolchain@1.90.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -136,8 +136,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install MSRV toolchain (1.86)
-        uses: dtolnay/rust-toolchain@1.86.0
+      - name: Install MSRV toolchain (1.90)
+        uses: dtolnay/rust-toolchain@1.90.0
 
       - uses: Swatinem/rust-cache@v2
 

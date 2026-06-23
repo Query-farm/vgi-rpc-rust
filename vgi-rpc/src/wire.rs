@@ -801,8 +801,7 @@ mod tests {
         // `crash-cea0477693563377f77c693ca8d3df51ee421811` from
         // `fuzz/wire_stream_reader`.
         let crash: &[u8] = &[
-            22, 0, 0, 0, 12, 0, 0, 0, 0, 0, 8, 0, 4, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0,
-            134,
+            22, 0, 0, 0, 12, 0, 0, 0, 0, 0, 8, 0, 4, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 134,
         ];
         // Must not panic; either an Err here or a clean reader is acceptable —
         // the contract is "no unwind escapes".

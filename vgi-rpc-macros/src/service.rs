@@ -532,6 +532,10 @@ fn build_unary(
     Ok((helper_fns, registration))
 }
 
+// `Value` wraps a (large) `syn::Type` next to the unit `Void`; this is a
+// compile-time AST tag built once per method, so the size delta the
+// `large_enum_variant` lint flags is irrelevant here.
+#[allow(clippy::large_enum_variant)]
 enum ReturnSpec {
     Value(Type),
     Void,

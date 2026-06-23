@@ -89,9 +89,7 @@ libc = { version = "0.2", optional = true }
 # features pull in tokio/reqwest transports; we strip them and let
 # operators bring their own runtime. `backtrace` + `contexts` are the
 # minimum surface needed for useful error events.
-# sentry pinned to 0.46 here. 0.47+ require rustc 1.88, which the 1.90
-# workspace MSRV now satisfies — this pin can be lifted when convenient
-# (deferred from the MSRV bump to keep the dependency upgrade separate).
-sentry = { version = "0.46", default-features = false, features = ["backtrace", "contexts"], optional = true }
+# sentry 0.47+ requires rustc 1.88, satisfied by the 1.90 workspace MSRV.
+sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts"], optional = true }
 chrono.workspace = true
 rust_decimal.workspace = true

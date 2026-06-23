@@ -1261,6 +1261,9 @@ fn headers_to_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
 
 /// Run the authenticate callback (if any); on error, build a 401 response
 /// with WWW-Authenticate attached.
+// Err is an axum `Response` (large), shared throughout the HTTP layer; boxing
+// it would churn every call site for no real benefit.
+#[allow(clippy::result_large_err)]
 fn authenticate_request(
     state: &Arc<HttpState>,
     method: &str,
@@ -1481,6 +1484,7 @@ fn arrow_error(
 /// install on the [`CallContext`]; `Ok(None)` when sticky is disabled;
 /// `Err(resp)` to short-circuit with a `SessionLostError` response when a
 /// presented token failed to resolve.
+#[allow(clippy::result_large_err)]
 fn sticky_for_request(
     state: &Arc<HttpState>,
     auth: &crate::auth::AuthContext,
@@ -1537,7 +1541,7 @@ fn stamp_session_headers(
 
 fn decode_hex_key(s: &str) -> std::result::Result<Vec<u8>, String> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("hex length must be even".into());
     }
     let mut out = Vec::with_capacity(s.len() / 2);
@@ -1569,7 +1573,7 @@ fn decode_base64_key(s: &str) -> std::result::Result<Vec<u8>, String> {
     // Accept both padded and unpadded standard base64.
     let s = s.trim().trim_end_matches('=');
     let mut padded = s.to_string();
-    while padded.len() % 4 != 0 {
+    while !padded.len().is_multiple_of(4) {
         padded.push('=');
     }
     let bytes = base64::engine::general_purpose::STANDARD

@@ -31,6 +31,9 @@ use vgi_rpc_client::{HttpClient, RpcClient};
 
 type LogBuf = Arc<Mutex<Vec<LogMessage>>>;
 
+// Holds exactly one client for the driver's lifetime; the size delta between
+// the byte-stream and HTTP variants doesn't matter here.
+#[allow(clippy::large_enum_variant)]
 enum Conn {
     ByteStream(RpcClient),
     Http(HttpClient),

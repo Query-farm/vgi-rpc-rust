@@ -157,7 +157,7 @@ pub fn is_allowed_return_origin(return_to: &str, allow: &[&str]) -> bool {
     let after_scheme = &return_to[scheme_end + 3..];
     let host = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
     let origin = &return_to[..scheme_end + 3 + host.len()];
-    allow.iter().any(|a| *a == origin)
+    allow.contains(&origin)
 }
 
 fn random_state() -> String {

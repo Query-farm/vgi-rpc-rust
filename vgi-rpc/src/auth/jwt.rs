@@ -219,7 +219,7 @@ fn decode_unverified_kid(token: &str) -> Option<String> {
 fn base64url_decode(s: &str) -> Option<Vec<u8>> {
     // Convert URL-safe, unpadded base64 to standard and decode.
     let mut padded = s.replace('-', "+").replace('_', "/");
-    while padded.len() % 4 != 0 {
+    while !padded.len().is_multiple_of(4) {
         padded.push('=');
     }
     #[cfg(feature = "http")]

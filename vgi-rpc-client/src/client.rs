@@ -129,6 +129,28 @@ impl RpcClient {
         Ok(Self::from_transport(Box::new(t)))
     }
 
+    /// Connect to a worker listening on a TCP socket at `host:port`.
+    ///
+    /// Raw TCP carries no authentication or encryption; connect only to
+    /// workers on a trusted network. Use the HTTP transport for untrusted
+    /// peers.
+    pub fn tcp_connect(host: &str, port: u16) -> Result<Self> {
+        let t = crate::transport::TcpTransport::connect(host, port)?;
+        Ok(Self::from_transport(Box::new(t)))
+    }
+
+    /// Connect to a TCP socket with a per-read timeout (recommended for
+    /// untrusted peers — a stalled peer then ends the call with a
+    /// `TransportError` instead of hanging the thread).
+    pub fn tcp_connect_with_timeout(
+        host: &str,
+        port: u16,
+        read_timeout: Option<std::time::Duration>,
+    ) -> Result<Self> {
+        let t = crate::transport::TcpTransport::connect_with_timeout(host, port, read_timeout)?;
+        Ok(Self::from_transport(Box::new(t)))
+    }
+
     /// Connect to a unix socket with a per-read timeout (recommended for
     /// untrusted peers — a stalled peer then ends the call with a
     /// `TransportError` instead of hanging the thread).

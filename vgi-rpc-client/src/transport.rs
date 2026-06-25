@@ -141,6 +141,67 @@ impl Transport for PipeTransport {
     }
 }
 
+/// A transport over a connected AF_INET (TCP) socket — the network analog of
+/// [`UnixTransport`].
+///
+/// Speaks the same raw Arrow-IPC framing protocol over a bare TCP socket.
+/// Nagle's algorithm is disabled (`TCP_NODELAY`) so the lockstep
+/// request/response framing is not delayed waiting to coalesce writes.
+///
+/// Raw TCP carries **no authentication and no TLS** — connect only to workers
+/// on a trusted network. Use the HTTP transport for untrusted peers.
+pub struct TcpTransport {
+    reader: BufReader<std::net::TcpStream>,
+    writer: std::net::TcpStream,
+}
+
+impl TcpTransport {
+    /// Connect to a worker listening on a TCP socket at `host:port`.
+    pub fn connect(host: &str, port: u16) -> Result<Self> {
+        Self::connect_with_timeout(host, port, None)
+    }
+
+    /// Connect with an optional per-read timeout. A read that exceeds the
+    /// timeout surfaces as a `TransportError` (`WouldBlock`/`TimedOut`),
+    /// cleanly ending the call rather than hanging the thread on a stalled
+    /// peer. Recommended for untrusted TCP peers.
+    pub fn connect_with_timeout(
+        host: &str,
+        port: u16,
+        read_timeout: Option<std::time::Duration>,
+    ) -> Result<Self> {
+        let stream = std::net::TcpStream::connect((host, port))
+            .map_err(|e| RpcError::new("TransportError", format!("connect tcp socket: {e}")))?;
+        // Disable Nagle so lockstep framing isn't delayed.
+        stream.set_nodelay(true).ok();
+        if let Some(t) = read_timeout {
+            stream.set_read_timeout(Some(t)).map_err(|e| {
+                RpcError::new("TransportError", format!("set tcp read timeout: {e}"))
+            })?;
+        }
+        let writer = stream
+            .try_clone()
+            .map_err(|e| RpcError::new("TransportError", format!("clone tcp socket: {e}")))?;
+        Ok(Self {
+            reader: BufReader::new(stream),
+            writer,
+        })
+    }
+}
+
+impl Transport for TcpTransport {
+    fn split(&mut self) -> (&mut dyn Read, &mut dyn Write) {
+        (&mut self.reader, &mut self.writer)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        use std::net::Shutdown;
+        self.writer.flush()?;
+        let _ = self.writer.shutdown(Shutdown::Write);
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 pub use unix_impl::UnixTransport;
 

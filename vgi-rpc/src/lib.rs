@@ -32,6 +32,7 @@ pub mod shm;
 pub mod stream;
 #[cfg(feature = "http")]
 pub mod stream_codec;
+pub mod tcp;
 pub mod transport;
 pub mod transport_options;
 #[cfg(unix)]

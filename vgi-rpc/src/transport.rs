@@ -22,6 +22,9 @@ pub enum TransportKind {
     Http,
     /// AF_UNIX socket.
     Unix,
+    /// AF_INET (TCP) socket. Raw Arrow-IPC framing over a bare TCP socket —
+    /// no auth/TLS; use `Http` for untrusted networks.
+    Tcp,
 }
 
 impl TransportKind {
@@ -31,6 +34,7 @@ impl TransportKind {
             TransportKind::Pipe => "pipe",
             TransportKind::Http => "http",
             TransportKind::Unix => "unix",
+            TransportKind::Tcp => "tcp",
         }
     }
 }
@@ -171,5 +175,6 @@ mod tests {
         assert_eq!(TransportKind::Pipe.as_str(), "pipe");
         assert_eq!(TransportKind::Http.as_str(), "http");
         assert_eq!(TransportKind::Unix.as_str(), "unix");
+        assert_eq!(TransportKind::Tcp.as_str(), "tcp");
     }
 }

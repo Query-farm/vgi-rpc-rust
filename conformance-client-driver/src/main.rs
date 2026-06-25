@@ -9,7 +9,7 @@
 //! envelope parsing; the driver just relays.
 //!
 //! Protocol (one JSON object per line, request then response):
-//!   {"op":"connect","transport":"stdio|unix|http","target":<argv|path|url>}
+//!   {"op":"connect","transport":"stdio|unix|tcp|http","target":<argv|path|host:port|url>}
 //!   {"op":"unary","request_b64":...}            -> {ok,result_b64,logs,error}
 //!   {"op":"describe"}                            -> {ok,result_b64}
 //!   {"op":"stream_open","request_b64":...,"is_exchange":bool,"has_header":bool}
@@ -287,6 +287,31 @@ fn do_connect(req: &Value, log_buf: &LogBuf) -> Result<Conn, String> {
                 let _ = path;
                 Err("unix transport not available on this platform".into())
             }
+        }
+        "tcp" => {
+            // Raw TCP, network analog of unix: `[HOST:]PORT` (host defaults to
+            // loopback). No auth/TLS — trusted networks only.
+            let address = target
+                .as_str()
+                .ok_or("tcp target must be a host:port string")?;
+            let (host, port) = match address.rsplit_once(':') {
+                Some((h, p)) => {
+                    let host = if h.is_empty() { "127.0.0.1" } else { h };
+                    (
+                        host.to_string(),
+                        p.parse::<u16>().map_err(|e| e.to_string())?,
+                    )
+                }
+                None => (
+                    "127.0.0.1".to_string(),
+                    address.parse::<u16>().map_err(|e| e.to_string())?,
+                ),
+            };
+            let client = RpcClient::tcp_connect(&host, port)
+                .map_err(|e| e.to_string())?
+                .relax_nullability(relax)
+                .on_log(make_log_sink(log_buf));
+            Ok(Conn::ByteStream(client))
         }
         "http" => {
             let url = target.as_str().ok_or("http target must be a url string")?;

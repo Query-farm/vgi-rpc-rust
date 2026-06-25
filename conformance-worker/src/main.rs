@@ -1,11 +1,13 @@
 //! vgi-rpc Rust conformance worker.
 //!
-//! Supports stdin/stdout (default), `--http` (print `PORT:<n>`), and
-//! `--unix <path>` (print `UNIX:<path>`) modes, mirroring the Go worker.
-//! `--unix` honours the launcher worker contract: `--idle-timeout <SEC>`
-//! self-terminates the worker after a quiet period.
+//! Supports stdin/stdout (default), `--http` (print `PORT:<n>`),
+//! `--unix <path>` (print `UNIX:<path>`), and `--tcp [HOST:]PORT` (print
+//! `TCP:<host>:<port>`) modes, mirroring the Go worker. `--unix`/`--tcp` honour
+//! the launcher worker contract: `--idle-timeout <SEC>` self-terminates the
+//! worker after a quiet period. The `--tcp` host defaults to loopback
+//! (`127.0.0.1`) and carries no auth/TLS — trusted networks only.
 //!
-//! SIGTERM / SIGINT trigger graceful shutdown of HTTP and unix listeners.
+//! SIGTERM / SIGINT trigger graceful shutdown of HTTP, unix, and tcp listeners.
 
 mod conformance;
 mod fake_storage;
@@ -77,6 +79,23 @@ fn main() {
             .filter(|s| *s > 0.0)
             .map(std::time::Duration::from_secs_f64);
         run_unix(server, &args[2], idle_timeout);
+        return;
+    }
+
+    if args.len() > 2 && args[1] == "--tcp" {
+        // Raw TCP transport: same Arrow-IPC framing as `--unix`, only the
+        // listening socket differs. No auth/TLS — trusted networks only; the
+        // host defaults to loopback (127.0.0.1).
+        let server = Arc::new(conformance::build_server());
+        server.notify_transport(
+            vgi_rpc::TransportKind::Tcp,
+            vgi_rpc::TransportCapabilities::none(),
+        );
+        let (host, port) = parse_tcp_address(&args[2]);
+        let idle_timeout = parse_secs_flag(&args, "--idle-timeout")
+            .filter(|s| *s > 0.0)
+            .map(std::time::Duration::from_secs_f64);
+        run_tcp(server, &host, port, idle_timeout);
         return;
     }
 
@@ -152,6 +171,60 @@ fn run_unix(
     });
     if let Err(e) = result {
         eprintln!("failed to bind unix socket {path}: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Parse a `[HOST:]PORT` argument into `(host, port)`, defaulting the host to
+/// loopback (`127.0.0.1`). `rpartition(':')` lets bare `PORT` work and tolerates
+/// host portions that themselves contain colons (e.g. IPv6 literals).
+fn parse_tcp_address(address: &str) -> (String, u16) {
+    let (host, port_part) = match address.rsplit_once(':') {
+        Some((h, p)) => {
+            let host = if h.is_empty() { "127.0.0.1" } else { h };
+            (host.to_string(), p)
+        }
+        None => ("127.0.0.1".to_string(), address),
+    };
+    let port = port_part
+        .parse::<u16>()
+        .unwrap_or_else(|_| panic!("invalid TCP port in --tcp argument: {address:?}"));
+    (host, port)
+}
+
+fn run_tcp(
+    server: Arc<vgi_rpc::RpcServer>,
+    host: &str,
+    port: u16,
+    idle_timeout: Option<std::time::Duration>,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // SIGTERM/SIGINT → flip the flag → the accept loop unwinds.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let sd = shutdown.clone();
+        let _ = ctrlc::try_set_handler(move || {
+            sd.store(true, Ordering::Relaxed);
+        });
+    }
+
+    // The library helper owns bind / accept / per-connection threads / idle
+    // self-termination; we just print the `TCP:<host>:<port>` contract line once
+    // it is listening (the bound port is resolved when `port = 0`).
+    let result = vgi_rpc::tcp::serve_tcp(
+        server,
+        host,
+        port,
+        idle_timeout,
+        shutdown,
+        move |bound_host, bound_port| {
+            println!("TCP:{bound_host}:{bound_port}");
+            io::stdout().flush().ok();
+        },
+    );
+    if let Err(e) = result {
+        eprintln!("failed to bind tcp socket {host}:{port}: {e}");
         std::process::exit(1);
     }
 }

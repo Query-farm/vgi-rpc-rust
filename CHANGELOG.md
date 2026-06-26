@@ -2,6 +2,21 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.6.0] — 2026-06-26
+
+Headline: a **raw-TCP socket transport** — the network analog of the existing
+Unix-socket transport, speaking the same raw Arrow-IPC framing without the HTTP
+envelope.
+
+- **Added** `serve_tcp` (server) and `TcpTransport` + `RpcClient::tcp_connect`
+  (client), plus `TransportKind::Tcp`. Binds loopback (`127.0.0.1`) by default;
+  `port 0` auto-selects. `TCP_NODELAY` enabled; optional idle self-termination
+  mirroring the Unix serve loop. **No auth/TLS** — trusted networks only; use
+  HTTP otherwise.
+- The conformance worker gains `--tcp [HOST:]PORT`, emitting a
+  `TCP:<host>:<port>` discovery line. Verified at full conformance parity with
+  the `--unix` baseline via the Python `vgi-rpc-test --tcp` harness.
+
 ## [0.3.0] — 2026-06-18
 
 Headline: a new **`vgi-rpc-client`** crate — a blocking, dynamic, schema-first

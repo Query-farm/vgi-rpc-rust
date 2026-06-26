@@ -21,7 +21,12 @@ pub fn short_random_id() -> String {
     }
     #[cfg(not(feature = "http"))]
     {
+        // wasm32-wasi has no process ids (`std::process::id()` aborts); nanos
+        // disambiguate within the single wasm process.
+        #[cfg(not(target_arch = "wasm32"))]
         let pid = std::process::id() as u64;
+        #[cfg(target_arch = "wasm32")]
+        let pid: u64 = 0;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)

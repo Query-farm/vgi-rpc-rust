@@ -360,7 +360,12 @@ pub(crate) fn random_stream_id() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
+    // wasm32-wasi has no process ids (`std::process::id()` aborts); the
+    // time+counter mix already disambiguates within the single wasm process.
+    #[cfg(not(target_arch = "wasm32"))]
     let pid = std::process::id() as u64;
+    #[cfg(target_arch = "wasm32")]
+    let pid: u64 = 0;
     format!("{:016x}{:016x}", hi ^ pid, lo)
 }
 

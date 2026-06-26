@@ -600,6 +600,9 @@ pub fn write_one_batch(batch: &RecordBatch, metadata: Option<&Metadata>) -> Resu
 
 /// Lowercase hex encoding of a byte slice. Internal helper — use the
 /// `hex` crate from your application code.
+// Only the http/external/mtls modules call this; unused in a minimal
+// (macros-only) wasm build, so suppress the conditional dead-code warning.
+#[allow(dead_code)]
 pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);

@@ -18,7 +18,11 @@ macros = ["dep:vgi-rpc-macros"]
 # External-location batches (upload/resolve). Pulls only zstd — no server
 # (axum/tokio) stack — so a client can reuse `external` without `http`.
 external = ["dep:zstd"]
-http = ["external", "dep:axum", "dep:tower-http", "dep:tokio", "dep:hmac", "dep:base64", "dep:rand", "dep:bincode", "dep:chacha20poly1305"]
+# Streaming-state bincode codec (serde + bincode only — no server stack). Used by
+# the core dispatch path, so it must be enableable without `http` (keeps the crate
+# wasm-buildable). `http` re-includes it.
+stream-codec = ["dep:bincode"]
+http = ["external", "stream-codec", "dep:axum", "dep:tower-http", "dep:tokio", "dep:hmac", "dep:base64", "dep:rand", "dep:bincode", "dep:chacha20poly1305"]
 jwt = []
 jwt-jsonwebtoken = ["jwt", "dep:jsonwebtoken", "dep:reqwest"]
 oauth-pkce = []

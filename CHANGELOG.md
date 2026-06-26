@@ -2,6 +2,21 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.7.0] — 2026-06-26
+
+Headline: the crate now **builds for `wasm32-wasi`** (a VGI worker can be
+compiled to WebAssembly and served over stdio/TCP under a WASI runtime), with
+no change to native builds.
+
+- **Added** a lightweight `stream-codec` feature (serde + bincode only, no
+  server stack) and moved `stream_codec` behind it instead of `http`. The core
+  dispatch path uses `stream_codec`, so it must be available without the
+  axum/tokio HTTP stack (which does not compile to wasm). `http` re-includes it.
+- **Fixed** `std::process::id()` aborting on `wasm32-wasi` ("no pids on this
+  platform"): `access_log::random_stream_id` and the unary id helper fall back
+  to `0` under `cfg(wasm32)` — time + counter already disambiguate within the
+  single wasm process.
+
 ## [0.6.0] — 2026-06-26
 
 Headline: a **raw-TCP socket transport** — the network analog of the existing

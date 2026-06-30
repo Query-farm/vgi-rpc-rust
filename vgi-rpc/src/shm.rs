@@ -1022,15 +1022,55 @@ pub fn resolve_shm_batch(
 /// keys). On failure (no segment, zero rows, doesn't fit) return `batch`
 /// unchanged. Returns `(batch, metadata)` — metadata carries the SHM
 /// pointer keys when written, or `batch_md` unchanged otherwise.
+/// Smallest batch (bytes) worth shipping through shm; below this the pipe wins,
+/// because shm's fixed per-batch cost (slot allocation + pointer round trip +
+/// the peer's resolve/free) outweighs the copy it saves. The crossover is
+/// platform-specific: POSIX `shm_open`/`mmap` is cheap (~64KB) while Windows'
+/// page-file mapping plus the fast overlapped-pipe read push it to ~1.5MB.
+/// Overridable with `VGI_RPC_SHM_MIN_BATCH_BYTES`. Mirrors the same gate in the
+/// C++ engine and the Python/Go/Java SDK output paths.
+fn shm_min_batch_bytes() -> usize {
+    // Unit tests exercise the shm write/resolve mechanics with tiny batches; the
+    // size gate's real behavior is covered by the end-to-end crossover benchmark,
+    // so neutralize it in test builds.
+    if cfg!(test) {
+        return 0;
+    }
+    use std::sync::OnceLock;
+    static THRESHOLD: OnceLock<usize> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        if let Ok(s) = std::env::var("VGI_RPC_SHM_MIN_BATCH_BYTES") {
+            if let Ok(v) = s.parse::<usize>() {
+                return v;
+            }
+        }
+        if cfg!(windows) {
+            1024 * 1024 // 1 MiB
+        } else {
+            64 * 1024 // 64 KiB
+        }
+    })
+}
+
 pub fn maybe_write_to_shm(
     batch: RecordBatch,
     batch_md: Metadata,
     shm: Option<&ShmSegment>,
 ) -> Result<(RecordBatch, Metadata)> {
+    use arrow_array::Array;
     let Some(shm) = shm else {
         return Ok((batch, batch_md));
     };
     if batch.num_rows() == 0 {
+        return Ok((batch, batch_md));
+    }
+    // Small batches are cheaper over the pipe than through shm.
+    let batch_bytes: usize = batch
+        .columns()
+        .iter()
+        .map(|c| c.get_array_memory_size())
+        .sum();
+    if batch_bytes < shm_min_batch_bytes() {
         return Ok((batch, batch_md));
     }
     let Some((offset, length)) = shm.allocate_and_write(&batch)? else {

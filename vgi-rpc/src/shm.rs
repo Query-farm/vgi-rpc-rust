@@ -55,9 +55,20 @@
 //! [`SHM_SEGMENT_NAME_KEY`]: crate::metadata::SHM_SEGMENT_NAME_KEY
 //! [`SHM_SEGMENT_SIZE_KEY`]: crate::metadata::SHM_SEGMENT_SIZE_KEY
 
+#[cfg(unix)]
 use std::ffi::CString;
 use std::io::Cursor;
 use std::sync::Arc;
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, INVALID_HANDLE_VALUE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Memory::{
+    CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile,
+    MEMORY_MAPPED_VIEW_ADDRESS, FILE_MAP_READ, FILE_MAP_WRITE, PAGE_READWRITE,
+};
 
 use arrow_array::RecordBatch;
 use arrow_ipc::reader::StreamReader as IpcStreamReader;
@@ -89,47 +100,63 @@ const IPC_EOS: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
 // OS shared-memory primitive (POSIX shm_open + mmap)
 // ---------------------------------------------------------------------------
 
-/// Owned handle to a POSIX shared-memory segment.
+/// Owned handle to a named shared-memory segment.
 ///
-/// On non-POSIX platforms compilation fails; cross-platform support is
-/// deferred (Windows would need named file mappings + a different name
-/// resolution scheme).
-struct PosixShm {
+/// Backed by POSIX `shm_open`/`mmap` on Unix and by a page-file-backed
+/// named `CreateFileMapping`/`MapViewOfFile` section on Windows. The
+/// portable layer above ([`ShmAllocator`], [`ShmSegment`]) only touches
+/// [`as_slice`](OsShm::as_slice)/[`as_mut_slice`](OsShm::as_mut_slice),
+/// so the byte layout stays identical across all peers.
+struct OsShm {
     name: String,
     ptr: *mut u8,
     size: usize,
-    /// True if this handle owns the OS object (created with `create=true`)
-    /// and is responsible for `shm_unlink` on drop. Server-side dynamic
+    /// True if this handle owns the OS object (created with `create=true`).
+    /// On Unix it drives `shm_unlink` on drop; on Windows the mapping object
+    /// is reference-counted by the kernel and released when the last handle
+    /// closes, so this is informational there. Server-side dynamic
     /// attachments set this to `false`.
     track: bool,
+    /// Windows file-mapping object handle, closed on drop. Absent on Unix,
+    /// where the fd is closed immediately after `mmap`.
+    #[cfg(windows)]
+    map_handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
-unsafe impl Send for PosixShm {}
-unsafe impl Sync for PosixShm {}
+unsafe impl Send for OsShm {}
+unsafe impl Sync for OsShm {}
 
-// `PosixShm` carries a raw pointer (the mmap region) but the data it
+// `OsShm` carries a raw pointer (the mapped region) but the data it
 // points at is not invalidated by panics — the OS owns the page table
-// entries until `munmap`, and our drop runs only when no Arc clones
+// entries until unmap, and our drop runs only when no Arc clones
 // remain.
-impl std::panic::RefUnwindSafe for PosixShm {}
+impl std::panic::RefUnwindSafe for OsShm {}
 
-#[cfg(unix)]
 fn make_shm_name() -> String {
     // Python's `multiprocessing.shared_memory` uses `psm_<8 hex>_<8 hex>`
-    // on macOS and `/<rand>` on Linux. Either works as long as the
-    // server is given the literal string; we match Python's leading-slash
-    // convention.
+    // on macOS and `/<rand>` on Linux; we match its leading-slash POSIX
+    // convention. Windows `CreateFileMapping` object names must NOT contain
+    // a slash (a leading `\` selects a different namespace), so the name is
+    // emitted slash-free there. Either form works as long as the peer is
+    // handed the literal string via metadata.
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let pid = unsafe { libc::getpid() };
-    format!("/vgi_rpc_{:x}_{:x}", pid, nanos as u64)
+    let pid = std::process::id();
+    #[cfg(windows)]
+    {
+        format!("vgi_rpc_{:x}_{:x}", pid, nanos as u64)
+    }
+    #[cfg(not(windows))]
+    {
+        format!("/vgi_rpc_{:x}_{:x}", pid, nanos as u64)
+    }
 }
 
 #[cfg(unix)]
-impl PosixShm {
+impl OsShm {
     fn create(size: usize) -> Result<Self> {
         for _ in 0..16 {
             let name = make_shm_name();
@@ -261,7 +288,7 @@ impl PosixShm {
 }
 
 #[cfg(unix)]
-impl Drop for PosixShm {
+impl Drop for OsShm {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.size) };
@@ -275,19 +302,139 @@ impl Drop for PosixShm {
 }
 
 // ---------------------------------------------------------------------------
+// Windows backend: page-file-backed named CreateFileMapping + MapViewOfFile.
+//
+// Interoperates with the C++/Go/Python peers, which create the same
+// page-file-backed section under the slash-free advertised name. The mapping
+// object is reference-counted by the kernel, so closing the worker's handle
+// does not destroy the section while the owner (the engine) still holds one —
+// there is no `unlink` step, unlike POSIX `shm_unlink`.
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+fn to_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+impl OsShm {
+    fn create(size: usize) -> Result<Self> {
+        for _ in 0..16 {
+            let name = make_shm_name();
+            match Self::try_create(&name, size) {
+                Ok(h) => return Ok(h),
+                Err(e) if e.error_type == "AlreadyExists" => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(RpcError::new(
+            "IOError",
+            "CreateFileMapping exhausted name retries",
+        ))
+    }
+
+    fn try_create(name: &str, size: usize) -> Result<Self> {
+        let wname = to_wide(name);
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                (size >> 32) as u32,
+                (size & 0xffff_ffff) as u32,
+                wname.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            let err = unsafe { GetLastError() };
+            return Err(RpcError::new(
+                "IOError",
+                format!("CreateFileMapping(create) {name:?}: error {err}"),
+            ));
+        }
+        // Exclusive-create semantics (mirrors POSIX O_CREAT|O_EXCL): a valid
+        // handle plus ERROR_ALREADY_EXISTS means the named object pre-existed.
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe { CloseHandle(handle) };
+            return Err(RpcError::new("AlreadyExists", format!("shm name {name:?} exists")));
+        }
+        Self::map(handle, name, size, true)
+    }
+
+    fn attach(name: &str, size: usize, track: bool) -> Result<Self> {
+        let wname = to_wide(name);
+        let handle =
+            unsafe { OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, 0, wname.as_ptr()) };
+        if handle.is_null() {
+            let err = unsafe { GetLastError() };
+            return Err(RpcError::new(
+                "IOError",
+                format!("OpenFileMapping(attach) {name:?}: error {err}"),
+            ));
+        }
+        Self::map(handle, name, size, track)
+    }
+
+    fn map(handle: HANDLE, name: &str, size: usize, track: bool) -> Result<Self> {
+        let view =
+            unsafe { MapViewOfFile(handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size) };
+        if view.Value.is_null() {
+            let err = unsafe { GetLastError() };
+            unsafe { CloseHandle(handle) };
+            return Err(RpcError::new("IOError", format!("MapViewOfFile: error {err}")));
+        }
+        Ok(Self {
+            name: name.to_string(),
+            ptr: view.Value as *mut u8,
+            size,
+            track,
+            map_handle: handle,
+        })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    fn as_mut_slice(&self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OsShm {
+    fn drop(&mut self) {
+        // `track` is informational on Windows — the kernel reference-counts
+        // the section and frees it when the last handle closes.
+        let _ = self.track;
+        if !self.ptr.is_null() {
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.ptr as *mut core::ffi::c_void,
+                });
+            }
+        }
+        if !self.map_handle.is_null() {
+            unsafe { CloseHandle(self.map_handle) };
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ShmAllocator — first-fit allocator stored in segment header
 // ---------------------------------------------------------------------------
 
 /// First-fit allocator over the segment's data region. State lives in
 /// the segment header; adjacent free regions coalesce implicitly.
 pub struct ShmAllocator {
-    shm: Arc<PosixShm>,
+    shm: Arc<OsShm>,
     total_size: usize,
 }
 
 impl ShmAllocator {
     /// Initialize the header at the start of `shm` with zero allocations.
-    fn initialize(shm: &PosixShm) -> Result<()> {
+    fn initialize(shm: &OsShm) -> Result<()> {
         if shm.size <= HEADER_SIZE {
             return Err(RpcError::new(
                 "ValueError",
@@ -304,7 +451,7 @@ impl ShmAllocator {
         Ok(())
     }
 
-    fn attach(shm: Arc<PosixShm>) -> Result<Self> {
+    fn attach(shm: Arc<OsShm>) -> Result<Self> {
         let buf = shm.as_slice();
         if &buf[0..4] != MAGIC {
             return Err(RpcError::new(
@@ -477,7 +624,7 @@ impl ShmAllocator {
 
 /// Shared-memory segment for zero-copy Arrow IPC batch transfer.
 pub struct ShmSegment {
-    shm: Arc<PosixShm>,
+    shm: Arc<OsShm>,
     allocator: ShmAllocator,
 }
 
@@ -485,7 +632,7 @@ impl ShmSegment {
     /// Create a new segment of `size` bytes. The handle owns the OS
     /// object; dropping `ShmSegment` calls `shm_unlink`.
     pub fn create(size: usize) -> Result<Self> {
-        let shm = Arc::new(PosixShm::create(size)?);
+        let shm = Arc::new(OsShm::create(size)?);
         ShmAllocator::initialize(&shm)?;
         let allocator = ShmAllocator::attach(shm.clone())?;
         Ok(Self { shm, allocator })
@@ -495,7 +642,7 @@ impl ShmSegment {
     /// caller is *not* the owner — the OS object will not be unlinked
     /// on drop. Servers handling a client-advertised segment use this.
     pub fn attach(name: &str, size: usize, track: bool) -> Result<Self> {
-        let shm = Arc::new(PosixShm::attach(name, size, track)?);
+        let shm = Arc::new(OsShm::attach(name, size, track)?);
         let allocator = ShmAllocator::attach(shm.clone())?;
         Ok(Self { shm, allocator })
     }
@@ -641,7 +788,7 @@ impl ShmSegment {
     /// For non-dictionary schemas this is **fully zero-copy**: the
     /// returned [`RecordBatch`]'s column buffers alias the SHM mapping
     /// directly via [`Buffer::from_custom_allocation`], with an
-    /// [`Arc`] of the underlying [`PosixShm`] keeping the mmap alive
+    /// [`Arc`] of the underlying [`OsShm`] keeping the mmap alive
     /// as long as any column buffer references it.
     ///
     /// For dictionary-encoded schemas the SHM region holds only the

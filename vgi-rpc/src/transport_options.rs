@@ -22,13 +22,12 @@ pub const TRANSPORT_OPTIONS_METHOD_NAME: &str = "__transport_options__";
 
 /// Whether this worker can use the POSIX shared-memory side-channel.
 ///
-/// The VGI shm channel is POSIX named shared memory (`shm_open`/`mmap`), which
-/// interoperates across the C++/Java/Go/Python peers on Linux and macOS. It is
-/// only compiled in under the `shm` feature, and Windows' shared-memory backing
-/// is non-interoperable, so shm is offered only on POSIX builds with the
-/// feature enabled.
+/// The VGI shm channel is named shared memory — POSIX `shm_open`/`mmap` on
+/// Unix and a page-file-backed named `CreateFileMapping`/`MapViewOfFile`
+/// section on Windows — interoperating across the C++/Go/Java/Python peers on
+/// all three platforms. It is compiled in only under the `shm` feature.
 pub fn shm_available() -> bool {
-    cfg!(feature = "shm") && !cfg!(windows)
+    cfg!(feature = "shm")
 }
 
 /// This worker's transport capabilities, as `__transport_options__` response

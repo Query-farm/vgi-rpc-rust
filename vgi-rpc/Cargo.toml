@@ -38,7 +38,7 @@ sentry-tracing = []
 # `sentry` crate. Coexists with `sentry-tracing` — different modules,
 # different hooks; pick one (or both) for your deployment.
 sentry-sdk = ["dep:sentry"]
-shm = ["dep:libc"]
+shm = ["dep:libc", "dep:windows-sys"]
 # Test fixtures (e.g. `external::InMemoryStorage`) exposed for
 # downstream integration tests. Not for production use.
 test-utils = []
@@ -89,6 +89,9 @@ vgi-rpc-macros = { path = "../vgi-rpc-macros", version = "0.7.0", optional = tru
 x509-parser = { version = "0.16", optional = true }
 percent-encoding = { version = "2", optional = true }
 libc = { version = "0.2", optional = true }
+# Windows shared-memory backend (page-file-backed named CreateFileMapping).
+# Only used on Windows under the `shm` feature; compiles to ~nothing elsewhere.
+windows-sys = { version = "0.59", optional = true, features = ["Win32_Foundation", "Win32_System_Memory", "Win32_Security"] }
 # Real Sentry SDK — gated by the `sentry-sdk` feature. Default
 # features pull in tokio/reqwest transports; we strip them and let
 # operators bring their own runtime. `backtrace` + `contexts` are the

@@ -66,8 +66,8 @@ use windows_sys::Win32::Foundation::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile,
-    MEMORY_MAPPED_VIEW_ADDRESS, FILE_MAP_READ, FILE_MAP_WRITE, PAGE_READWRITE,
+    CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ,
+    FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 
 use arrow_array::RecordBatch;
@@ -356,15 +356,17 @@ impl OsShm {
         // handle plus ERROR_ALREADY_EXISTS means the named object pre-existed.
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
             unsafe { CloseHandle(handle) };
-            return Err(RpcError::new("AlreadyExists", format!("shm name {name:?} exists")));
+            return Err(RpcError::new(
+                "AlreadyExists",
+                format!("shm name {name:?} exists"),
+            ));
         }
         Self::map(handle, name, size, true)
     }
 
     fn attach(name: &str, size: usize, track: bool) -> Result<Self> {
         let wname = to_wide(name);
-        let handle =
-            unsafe { OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, 0, wname.as_ptr()) };
+        let handle = unsafe { OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, 0, wname.as_ptr()) };
         if handle.is_null() {
             let err = unsafe { GetLastError() };
             return Err(RpcError::new(
@@ -376,12 +378,14 @@ impl OsShm {
     }
 
     fn map(handle: HANDLE, name: &str, size: usize, track: bool) -> Result<Self> {
-        let view =
-            unsafe { MapViewOfFile(handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size) };
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size) };
         if view.Value.is_null() {
             let err = unsafe { GetLastError() };
             unsafe { CloseHandle(handle) };
-            return Err(RpcError::new("IOError", format!("MapViewOfFile: error {err}")));
+            return Err(RpcError::new(
+                "IOError",
+                format!("MapViewOfFile: error {err}"),
+            ));
         }
         Ok(Self {
             name: name.to_string(),

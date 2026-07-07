@@ -53,6 +53,51 @@ const PKCE_STATE_TTL: Duration = Duration::from_secs(600);
 /// up to the token's `exp` claim.
 pub const AUTH_COOKIE_NAME: &str = "_vgi_auth";
 
+/// JS-readable display-identity cookie for the shared VGI landing page.
+/// Derived from the OIDC id_token at the callback (display-only; the
+/// validated bearer in `_vgi_auth` remains the security boundary) so the
+/// page shows the signed-in email/name regardless of whether the bearer is
+/// an access or id token. Value is `base64url(JSON)` of the claims below.
+/// Mirrors `_IDENTITY_COOKIE_NAME` in the Python `_oauth_pkce.py`.
+pub const IDENTITY_COOKIE_NAME: &str = "_vgi_identity";
+
+/// Display-identity claims surfaced in the `_vgi_identity` cookie.
+const IDENTITY_CLAIMS: &[&str] = &["sub", "email", "preferred_username", "name", "picture"];
+
+/// Best-effort decode of a JWT payload (no signature verification). Used only
+/// to derive the display-identity cookie; the token itself was already
+/// validated by the IdP token exchange.
+fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
+    use base64::Engine;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// `base64url(JSON)` of the display-identity claims from an id_token, or
+/// `None` when the token carries none. Mirrors `_identity_cookie_value` in
+/// the Python reference.
+fn identity_cookie_value(id_token: &str) -> Option<String> {
+    use base64::Engine;
+    let claims = decode_jwt_payload(id_token)?;
+    let obj = claims.as_object()?;
+    let mut ident = serde_json::Map::new();
+    for key in IDENTITY_CLAIMS {
+        if let Some(v) = obj.get(*key) {
+            if !v.is_null() {
+                ident.insert((*key).to_string(), v.clone());
+            }
+        }
+    }
+    if ident.is_empty() {
+        return None;
+    }
+    let raw = serde_json::to_vec(&serde_json::Value::Object(ident)).ok()?;
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw))
+}
+
 /// Config for the OAuth/PKCE browser flow.
 ///
 /// Field meanings mirror the OAuth 2.0 + OIDC RFC names. `signing_key`
@@ -258,6 +303,16 @@ async fn handle_callback(
         header::SET_COOKIE,
         HeaderValue::from_str(&auth_cookie).unwrap(),
     );
+    // Display-identity cookie for the shared landing page (JS-readable). Set
+    // from the id_token so the page shows email/name even when the bearer is
+    // an access token that carries no profile claims.
+    if let Some(identity) = identity_cookie_value(&tokens.id_or_access) {
+        let identity_cookie =
+            build_js_cookie(IDENTITY_COOKIE_NAME, &identity, None, "", cfg.secure_cookie);
+        if let Ok(hv) = HeaderValue::from_str(&identity_cookie) {
+            response_headers.append(header::SET_COOKIE, hv);
+        }
+    }
     let location = if return_to.is_empty() {
         "/".to_string()
     } else {
@@ -273,6 +328,12 @@ async fn handle_logout(State(cfg): State<Arc<OAuthPkceConfig>>) -> Response {
     headers.append(
         header::SET_COOKIE,
         HeaderValue::from_str(&clear_auth).unwrap(),
+    );
+    // Clear the JS-readable display-identity cookie too.
+    let clear_identity = build_clear_cookie(IDENTITY_COOKIE_NAME, "", cfg.secure_cookie);
+    headers.append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear_identity).unwrap(),
     );
     headers.insert(header::LOCATION, HeaderValue::from_static("/"));
     (StatusCode::FOUND, headers).into_response()
@@ -500,6 +561,26 @@ fn build_cookie(name: &str, value: &str, max_age: Option<u32>, path: &str, secur
     s
 }
 
+/// Like [`build_cookie`] but JS-readable (no `HttpOnly`) — for the display
+/// identity cookie the shared landing page reads via `document.cookie`.
+fn build_js_cookie(
+    name: &str,
+    value: &str,
+    max_age: Option<u32>,
+    path: &str,
+    secure: bool,
+) -> String {
+    let path = if path.is_empty() { "/" } else { path };
+    let mut s = format!("{name}={value}; Path={path}; SameSite=Lax");
+    if secure {
+        s.push_str("; Secure");
+    }
+    if let Some(age) = max_age {
+        s.push_str(&format!("; Max-Age={age}"));
+    }
+    s
+}
+
 fn build_clear_cookie(name: &str, path: &str, secure: bool) -> String {
     let path = if path.is_empty() { "/" } else { path };
     let mut s = format!(
@@ -614,6 +695,53 @@ mod tests {
             sanitize_return_to(Some("https://evil.example/x"), &allow),
             ""
         );
+    }
+
+    #[test]
+    fn identity_cookie_encodes_display_claims_from_jwt() {
+        use base64::Engine;
+        // A JWT payload carrying display claims plus an ignored one (`exp`).
+        let payload = serde_json::json!({
+            "sub": "user-123",
+            "email": "alice@example.com",
+            "name": "Alice",
+            "exp": 9999999999u64,
+        });
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        let token = format!("header.{b64}.sig");
+
+        let cookie = identity_cookie_value(&token).expect("identity cookie");
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&cookie)
+            .expect("base64url");
+        let claims: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(claims["sub"], "user-123");
+        assert_eq!(claims["email"], "alice@example.com");
+        assert_eq!(claims["name"], "Alice");
+        // Non-display claims are not surfaced.
+        assert!(claims.get("exp").is_none());
+    }
+
+    #[test]
+    fn identity_cookie_none_when_no_display_claims() {
+        use base64::Engine;
+        let payload = serde_json::json!({ "exp": 123, "aud": "x" });
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        assert!(identity_cookie_value(&format!("h.{b64}.s")).is_none());
+        // A non-JWT string yields nothing rather than panicking.
+        assert!(identity_cookie_value("not-a-jwt").is_none());
+    }
+
+    #[test]
+    fn js_cookie_is_not_http_only() {
+        let s = build_js_cookie(IDENTITY_COOKIE_NAME, "v", None, "", false);
+        assert!(
+            !s.contains("HttpOnly"),
+            "identity cookie must be JS-readable"
+        );
+        assert!(s.contains("_vgi_identity=v"));
     }
 
     #[test]

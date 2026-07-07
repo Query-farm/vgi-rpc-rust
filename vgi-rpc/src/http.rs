@@ -37,6 +37,32 @@ use crate::wire::{bytes_to_hex, empty_batch, md_get, Metadata, StreamReader, Str
 
 pub const ARROW_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 
+/// The shared, self-contained VGI landing page, vendored byte-identically
+/// from `vgi-web-frontend/public/landing.html`. Served at `GET {prefix}/`
+/// for browsers; it fetches `{prefix}/describe.json` same-origin and renders
+/// the worker's catalogs. Carries the `vgi-landing-asset` marker the
+/// cross-language conformance harness asserts on.
+const LANDING_HTML: &str = include_str!("landing.html");
+
+/// Producer for the standardized VGI landing contract (see
+/// `~/Development/vgi/docs/http-landing-contract.md`). The HTTP transport
+/// owns the routes, the shared `landing.html`, and the runtime-derived
+/// `oauth` / `server_id`; the application (the VGI worker) supplies the
+/// catalog-introspection JSON via this trait. Mirrors the split in the
+/// Python reference (`vgi/http/describe_json.py` produces the document; the
+/// transport serves it).
+pub trait DescribeProvider: Send + Sync {
+    /// Build the full `describe.json` document. `oauth` and `server_id` are
+    /// supplied by the transport (they depend on runtime config, not the
+    /// worker). Returns a serialized JSON string.
+    fn describe_json(&self, oauth: bool, server_id: &str) -> String;
+
+    /// Build the lazy per-object column payload for
+    /// `GET {prefix}/describe/{catalog}/{schema}/{table}.json`. Returns the
+    /// serialized JSON string, or `None` when the object is unknown (→ 404).
+    fn columns_json(&self, catalog: &str, schema: &str, table: &str) -> Option<String>;
+}
+
 // Sticky-session header conventions (HTTP-only). Header names are
 // compared case-insensitively by axum's `HeaderMap`, so the lowercase
 // forms here match the canonical `VGI-Session` etc. on the wire.
@@ -95,6 +121,10 @@ pub struct HttpState {
     upload_url_provider: Option<Arc<dyn crate::external::UploadUrlProvider>>,
     /// Sticky-session context, `Some` when the server is sticky-enabled.
     sticky: Option<Arc<crate::sticky::StickyContext>>,
+    /// Producer for the standardized landing contract (`describe.json` +
+    /// lazy columns). `Some` mounts the describe routes; `None` leaves the
+    /// server serving only the shared `landing.html` at `GET {prefix}/`.
+    describe_provider: Option<Arc<dyn DescribeProvider>>,
 }
 
 /// Fluent builder for [`HttpState`].
@@ -123,6 +153,7 @@ pub struct HttpStateBuilder {
     enable_sticky: Option<bool>,
     sticky_default_ttl: Option<std::time::Duration>,
     sticky_echo_headers: Vec<(String, String)>,
+    describe_provider: Option<Arc<dyn DescribeProvider>>,
 }
 
 impl HttpStateBuilder {
@@ -349,6 +380,16 @@ impl HttpStateBuilder {
         self
     }
 
+    /// Install a [`DescribeProvider`]. When set, the server mounts
+    /// `GET {prefix}/describe.json` and
+    /// `GET {prefix}/describe/{catalog}/{schema}/{table}.json`, backed by the
+    /// worker's catalog introspection. Without it, only the shared
+    /// `landing.html` is served at `GET {prefix}/`.
+    pub fn describe_provider(mut self, provider: Arc<dyn DescribeProvider>) -> Self {
+        self.describe_provider = Some(provider);
+        self
+    }
+
     pub fn build(self) -> Arc<HttpState> {
         let server = self.server.expect("HttpStateBuilder::server is required");
         // A wildcard CORS origin combined with a credentialed auth
@@ -419,6 +460,7 @@ impl HttpStateBuilder {
             max_externalized_response_bytes: self.max_externalized_response_bytes,
             upload_url_provider: self.upload_url_provider,
             sticky,
+            describe_provider: self.describe_provider,
         })
     }
 }
@@ -1042,6 +1084,20 @@ fn build_router_inner(state: Arc<HttpState>) -> Router {
             axum::routing::get(handle_describe_page),
         );
     }
+    // Standardized landing contract: the versioned `describe.json` document
+    // plus lazy per-object columns. Mounted only when the application wired a
+    // `DescribeProvider` (the shared `landing.html` fetches these).
+    if state.describe_provider.is_some() {
+        app = app
+            .route(
+                &format!("{prefix}/describe.json"),
+                axum::routing::get(handle_describe_json),
+            )
+            .route(
+                &format!("{prefix}/describe/:catalog/:schema/:table"),
+                axum::routing::get(handle_describe_columns),
+            );
+    }
 
     app.with_state(state)
 }
@@ -1092,14 +1148,89 @@ async fn handle_health(State(state): State<Arc<HttpState>>) -> Response {
     (StatusCode::OK, h, body).into_response()
 }
 
-async fn handle_landing(State(state): State<Arc<HttpState>>) -> Response {
-    let body = render_landing(&state);
+/// `GET {prefix}/` — the shared, self-contained `landing.html` for browsers
+/// (Accept: text/html); a small JSON status for health checks / `?format=json`
+/// / `Accept: application/json`. Mirrors the Python `LandingPageResource`.
+async fn handle_landing(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let format_json = query.as_deref().map(query_has_format_json).unwrap_or(false);
+    let want_json =
+        format_json || (accept.contains("application/json") && !accept.contains("text/html"));
+
     let mut h = HeaderMap::new();
+    if want_json {
+        h.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let body = serde_json::json!({
+            "status": "ok",
+            "server_id": state.server.server_id,
+            "protocol": state.server.protocol_name(),
+        })
+        .to_string();
+        return (StatusCode::OK, h, body).into_response();
+    }
     h.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
+    (StatusCode::OK, h, LANDING_HTML).into_response()
+}
+
+/// Whether a raw query string carries `format=json`.
+fn query_has_format_json(raw: &str) -> bool {
+    raw.split('&')
+        .any(|pair| pair == "format=json" || pair.strip_prefix("format=") == Some("json"))
+}
+
+/// `GET {prefix}/describe.json` — the versioned landing contract.
+async fn handle_describe_json(State(state): State<Arc<HttpState>>) -> Response {
+    let Some(provider) = state.describe_provider.as_ref() else {
+        return (StatusCode::NOT_FOUND, "").into_response();
+    };
+    let oauth = state.oauth_metadata.is_some();
+    let body = provider.describe_json(oauth, &state.server.server_id);
+    let mut h = HeaderMap::new();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
     (StatusCode::OK, h, body).into_response()
+}
+
+/// `GET {prefix}/describe/{catalog}/{schema}/{table}.json` — lazy per-object
+/// columns (404 when the object is unknown). The `.json` suffix is stripped
+/// from the final path segment.
+async fn handle_describe_columns(
+    State(state): State<Arc<HttpState>>,
+    Path((catalog, schema, table)): Path<(String, String, String)>,
+) -> Response {
+    let Some(provider) = state.describe_provider.as_ref() else {
+        return (StatusCode::NOT_FOUND, "").into_response();
+    };
+    let table = table.strip_suffix(".json").unwrap_or(&table);
+    let mut h = HeaderMap::new();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    match provider.columns_json(&catalog, &schema, table) {
+        Some(body) => (StatusCode::OK, h, body).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            h,
+            r#"{"error":"object not found"}"#.to_string(),
+        )
+            .into_response(),
+    }
 }
 
 async fn handle_describe_page(State(state): State<Arc<HttpState>>) -> Response {
@@ -1110,28 +1241,6 @@ async fn handle_describe_page(State(state): State<Arc<HttpState>>) -> Response {
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
     (StatusCode::OK, h, body).into_response()
-}
-
-fn render_landing(state: &Arc<HttpState>) -> String {
-    let name = if state.server.protocol_name().is_empty() {
-        "vgi-rpc service"
-    } else {
-        state.server.protocol_name()
-    };
-    let server_id = &state.server.server_id;
-    let describe_link = if state.describe_page_enabled {
-        format!(
-            r#"<p><a href="{0}/describe">API reference</a></p>"#,
-            state.prefix
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{name}</title></head><body>\
-         <h1>{name}</h1><p>server_id: <code>{server_id}</code></p>{describe_link}\
-         </body></html>"
-    )
 }
 
 fn render_describe_page(state: &Arc<HttpState>) -> String {

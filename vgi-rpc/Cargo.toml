@@ -85,7 +85,7 @@ chacha20poly1305 = { workspace = true, optional = true }
 jsonwebtoken = { version = "9.3", optional = true, default-features = false, features = ["use_pem"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }
 urlencoding = { version = "2", optional = true }
-vgi-rpc-macros = { path = "../vgi-rpc-macros", version = "0.10.0", optional = true }
+vgi-rpc-macros = { path = "../vgi-rpc-macros", version = "0.11.0", optional = true }
 x509-parser = { version = "0.16", optional = true }
 percent-encoding = { version = "2", optional = true }
 libc = { version = "0.2", optional = true }

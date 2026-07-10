@@ -22,7 +22,7 @@ external = ["dep:zstd"]
 # the core dispatch path, so it must be enableable without `http` (keeps the crate
 # wasm-buildable). `http` re-includes it.
 stream-codec = ["dep:bincode"]
-http = ["external", "stream-codec", "dep:axum", "dep:tower-http", "dep:tokio", "dep:hmac", "dep:base64", "dep:rand", "dep:bincode", "dep:chacha20poly1305"]
+http = ["external", "stream-codec", "dep:axum", "dep:tower-http", "dep:tokio", "dep:hmac", "dep:base64", "dep:rand", "dep:bincode", "dep:chacha20poly1305", "dep:flate2"]
 jwt = []
 jwt-jsonwebtoken = ["jwt", "dep:jsonwebtoken", "dep:reqwest"]
 oauth-pkce = []
@@ -81,6 +81,7 @@ base64 = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 bincode = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
 jsonwebtoken = { version = "9.3", optional = true, default-features = false, features = ["use_pem"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }

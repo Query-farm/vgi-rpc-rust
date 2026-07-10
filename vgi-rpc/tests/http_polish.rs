@@ -69,6 +69,96 @@ async fn health_endpoint_returns_ok() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// `/health` is the mandatory capability-discovery endpoint, and the C++ client
+/// probes it with `HEAD`. It must not 405 (which carries no Content-Length and
+/// would silently degrade discovery to defaults), and must expose the same
+/// capability headers as GET so discovery is verb-independent.
+#[tokio::test]
+async fn health_head_returns_200_with_capabilities() {
+    let caps = |resp: &axum::response::Response| -> Vec<(String, String)> {
+        let mut v: Vec<_> = resp
+            .headers()
+            .iter()
+            .filter(|(k, _)| k.as_str().starts_with("vgi-"))
+            .map(|(k, val)| (k.as_str().to_string(), val.to_str().unwrap().to_string()))
+            .collect();
+        v.sort();
+        v
+    };
+    let request = |method: &str| {
+        Request::builder()
+            .method(method)
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let get_resp = vgi_rpc::http::build_router(state_with(None, None, None))
+        .oneshot(request("GET"))
+        .await
+        .unwrap();
+    let head_resp = vgi_rpc::http::build_router(state_with(None, None, None))
+        .oneshot(request("HEAD"))
+        .await
+        .unwrap();
+
+    assert_eq!(head_resp.status(), StatusCode::OK);
+    assert!(head_resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("application/json"));
+    assert_eq!(caps(&head_resp), caps(&get_resp));
+    assert!(
+        !caps(&get_resp).is_empty(),
+        "GET should expose capabilities"
+    );
+
+    let get_body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let head_len = head_resp
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .map(|v| v.to_str().unwrap().to_string());
+    let head_body = axum::body::to_bytes(head_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(head_body.is_empty(), "HEAD carries no body");
+    assert_eq!(
+        head_len.as_deref(),
+        Some(get_body.len().to_string().as_str())
+    );
+}
+
+/// The `__upload_url__` wire contract is public, so an intermediary that
+/// terminates or serves the flow needn't copy the method name or schemas.
+#[test]
+fn upload_url_contract_is_exported() {
+    assert_eq!(vgi_rpc::UPLOAD_URL_METHOD, "__upload_url__");
+    assert_eq!(vgi_rpc::MAX_UPLOAD_URL_COUNT, 100);
+    let params = vgi_rpc::upload_url_params_schema();
+    assert_eq!(
+        params
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>(),
+        ["count"]
+    );
+    let response = vgi_rpc::upload_url_response_schema();
+    assert_eq!(
+        response
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>(),
+        ["upload_url", "download_url", "expires_at"]
+    );
+}
+
 #[tokio::test]
 async fn preflight_includes_cors_headers() {
     let state = state_with(Some("https://app.example.com"), None, None);

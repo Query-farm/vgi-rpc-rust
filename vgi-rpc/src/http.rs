@@ -1506,8 +1506,7 @@ fn has_arrow_ct(headers: &HeaderMap) -> bool {
 fn maybe_decompress(headers: &HeaderMap, body: &Bytes, max_size: usize) -> Result<Vec<u8>> {
     let enc = headers
         .get(header::CONTENT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .and_then(|v| v.to_str().ok());
     if body.len() > max_size {
         return Err(RpcError::runtime_error(format!(
             "Request body exceeds max size ({} bytes > {})",
@@ -1515,26 +1514,89 @@ fn maybe_decompress(headers: &HeaderMap, body: &Bytes, max_size: usize) -> Resul
             max_size
         )));
     }
-    if enc.eq_ignore_ascii_case("zstd") {
-        decode_zstd_bounded(body.as_ref(), max_size)
-    } else {
-        Ok(body.to_vec())
-    }
+    decode_content_encoding(body.as_ref(), enc, Some(max_size))
 }
 
-/// Stream-decode a zstd payload, aborting once the decompressed length
-/// exceeds `max_size`. Defends against zip-bomb-style oversized payloads
-/// without first allocating the full decompressed result.
-fn decode_zstd_bounded(input: &[u8], max_size: usize) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let mut decoder = zstd::Decoder::new(input)
-        .map_err(|e| RpcError::runtime_error(format!("zstd decode: {e}")))?;
-    let mut out = Vec::with_capacity(input.len().min(max_size).min(64 * 1024));
+/// Most codings [`decode_content_encoding`] will apply from one
+/// `Content-Encoding` header. Real bodies carry one; the cap bounds the decode
+/// work an attacker can buy with a single bounded request body.
+pub const MAX_CONTENT_CODINGS: usize = 4;
+
+/// Decode an HTTP body per its `Content-Encoding`, or return it unchanged.
+///
+/// Handles the codings vgi-rpc speaks (`zstd`, `gzip`); the header may list
+/// several applied in order, which are decoded in reverse. `identity` and
+/// unknown codings are left as-is. Intended for an intermediary (proxy/gateway)
+/// that must read a compressed request/response body to inspect or rewrite it —
+/// see [`crate::intermediary`] for the framing helpers that go with it.
+///
+/// `max_output_size` caps the decompressed length of **each** coding, defending
+/// against zip-bomb-style payloads without first allocating the full result.
+/// At most [`MAX_CONTENT_CODINGS`] codings are applied, so total decode work
+/// stays bounded by that multiple of the cap rather than by attacker-chosen
+/// header length.
+///
+/// # Errors
+///
+/// Fails on a corrupt payload, a coding that decodes past `max_output_size`, or
+/// a header listing more than [`MAX_CONTENT_CODINGS`] codings.
+pub fn decode_content_encoding(
+    data: &[u8],
+    content_encoding: Option<&str>,
+    max_output_size: Option<usize>,
+) -> Result<Vec<u8>> {
+    let Some(header) = content_encoding.filter(|h| !h.trim().is_empty()) else {
+        return Ok(data.to_vec());
+    };
+    let max_size = max_output_size.unwrap_or(usize::MAX);
+    let codings = header
+        .split(',')
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty());
+    // Each coding gets the full `max_size` budget, so an unbounded list would let
+    // one bounded request body cost K x max_size of decode work and peak memory.
+    // Real bodies carry one coding; refuse an absurd chain rather than serve it.
+    if codings.clone().count() > MAX_CONTENT_CODINGS {
+        return Err(RpcError::runtime_error(format!(
+            "Content-Encoding lists more than {MAX_CONTENT_CODINGS} codings"
+        )));
+    }
+    let mut result = data.to_vec();
+    for name in codings.rev() {
+        result = match name.as_str() {
+            "zstd" => decode_bounded(
+                zstd::Decoder::new(result.as_slice())
+                    .map_err(|e| RpcError::runtime_error(format!("zstd decode: {e}")))?,
+                result.len(),
+                max_size,
+                "zstd",
+            )?,
+            "gzip" => decode_bounded(
+                flate2::read::GzDecoder::new(result.as_slice()),
+                result.len(),
+                max_size,
+                "gzip",
+            )?,
+            _ => result, // identity / unknown coding — leave as-is
+        };
+    }
+    Ok(result)
+}
+
+/// Stream a decoder to completion, aborting once the decoded length exceeds
+/// `max_size` rather than allocating the full result first.
+fn decode_bounded(
+    mut decoder: impl std::io::Read,
+    input_len: usize,
+    max_size: usize,
+    coding: &str,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(input_len.min(max_size).min(64 * 1024));
     let mut buf = [0u8; 16 * 1024];
     loop {
         let n = decoder
             .read(&mut buf)
-            .map_err(|e| RpcError::runtime_error(format!("zstd decode: {e}")))?;
+            .map_err(|e| RpcError::runtime_error(format!("{coding} decode: {e}")))?;
         if n == 0 {
             break;
         }
@@ -1707,21 +1769,9 @@ fn new_session_id() -> String {
 // Upload-URL endpoint
 // ---------------------------------------------------------------------------
 
-const UPLOAD_URL_METHOD: &str = "__upload_url__";
-const MAX_UPLOAD_URL_COUNT: i64 = 100;
-
-fn upload_url_response_schema() -> Schema {
-    use arrow_schema::{DataType, Field, TimeUnit};
-    Schema::new(vec![
-        Field::new("upload_url", DataType::Utf8, false),
-        Field::new("download_url", DataType::Utf8, false),
-        Field::new(
-            "expires_at",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ),
-    ])
-}
+// The method name, count cap, and response schema are the public wire contract;
+// they live in `crate::external` so intermediaries share one definition.
+use crate::external::{upload_url_response_schema, MAX_UPLOAD_URL_COUNT, UPLOAD_URL_METHOD};
 
 async fn handle_upload_url(
     State(state): State<Arc<HttpState>>,
@@ -1782,9 +1832,10 @@ async fn handle_upload_url(
     });
 
     let schema = upload_url_response_schema();
+    let schema_ref = schema.as_ref();
     let mut body_buf = Vec::new();
     {
-        let mut sw = match StreamWriter::new(&mut body_buf, &schema) {
+        let mut sw = match StreamWriter::new(&mut body_buf, schema_ref) {
             Ok(w) => w,
             Err(e) => {
                 return arrow_error(
@@ -1813,7 +1864,7 @@ async fn handle_upload_url(
                 )
                 .with_timezone("UTC");
                 let batch = match RecordBatch::try_new(
-                    Arc::new(schema.clone()),
+                    schema.clone(),
                     vec![
                         Arc::new(upload_arr),
                         Arc::new(download_arr),
@@ -1825,7 +1876,7 @@ async fn handle_upload_url(
                         let err = RpcError::runtime_error(format!("upload-url batch: {e}"));
                         let md =
                             build_error_metadata(&err, &state.server.server_id, &req.request_id);
-                        let _ = sw.write(&empty_batch(&schema).unwrap(), Some(&md));
+                        let _ = sw.write(&empty_batch(schema_ref).unwrap(), Some(&md));
                         let _ = sw.finish();
                         drop(sw);
                         return arrow_response(StatusCode::OK, body_buf);
@@ -1835,7 +1886,7 @@ async fn handle_upload_url(
             }
             Err(err) => {
                 let md = build_error_metadata(&err, &state.server.server_id, &req.request_id);
-                let _ = sw.write(&empty_batch(&schema).unwrap(), Some(&md));
+                let _ = sw.write(&empty_batch(schema_ref).unwrap(), Some(&md));
             }
         }
         let _ = sw.finish();
@@ -2695,7 +2746,8 @@ mod tests {
         let huge = vec![0u8; 8 * 1024 * 1024];
         let compressed = zstd::encode_all(huge.as_slice(), 1).unwrap();
         assert!(compressed.len() < 100_000, "compressed should be tiny");
-        let err = super::decode_zstd_bounded(&compressed, 64 * 1024).unwrap_err();
+        let err =
+            super::decode_content_encoding(&compressed, Some("zstd"), Some(64 * 1024)).unwrap_err();
         assert!(
             err.message.contains("exceeds max size"),
             "expected oversize error, got: {}",
@@ -2707,8 +2759,69 @@ mod tests {
     fn zstd_bounded_passes_small_payload() {
         let small = b"hello-world".repeat(10);
         let compressed = zstd::encode_all(small.as_slice(), 1).unwrap();
-        let out = super::decode_zstd_bounded(&compressed, 1024).unwrap();
+        let out = super::decode_content_encoding(&compressed, Some("zstd"), Some(1024)).unwrap();
         assert_eq!(out, small);
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn decode_content_encoding_handles_gzip() {
+        let payload = b"hello-gzip".repeat(10);
+        let out = super::decode_content_encoding(&gzip(&payload), Some("gzip"), None).unwrap();
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn decode_content_encoding_bounds_gzip_zip_bombs() {
+        let huge = vec![0u8; 8 * 1024 * 1024];
+        let compressed = gzip(&huge);
+        assert!(compressed.len() < 100_000, "compressed should be tiny");
+        let err =
+            super::decode_content_encoding(&compressed, Some("gzip"), Some(64 * 1024)).unwrap_err();
+        assert!(err.message.contains("exceeds max size"));
+    }
+
+    #[test]
+    fn decode_content_encoding_applies_a_coding_list_in_reverse() {
+        // `Content-Encoding: gzip, zstd` means gzip was applied first, then zstd.
+        let payload = b"layered".repeat(20);
+        let body = zstd::encode_all(gzip(&payload).as_slice(), 1).unwrap();
+        let out = super::decode_content_encoding(&body, Some("gzip, zstd"), None).unwrap();
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn decode_content_encoding_refuses_an_absurd_coding_chain() {
+        let chain = std::iter::repeat_n("zstd", super::MAX_CONTENT_CODINGS + 1)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let err = super::decode_content_encoding(b"x", Some(&chain), Some(1024)).unwrap_err();
+        assert!(err.message.contains("more than"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn decode_content_encoding_allows_a_chain_up_to_the_cap() {
+        // gzip applied twice, then zstd: 3 codings, under the cap.
+        let payload = b"bounded".repeat(8);
+        let body = zstd::encode_all(gzip(&gzip(&payload)).as_slice(), 1).unwrap();
+        let out = super::decode_content_encoding(&body, Some("gzip, gzip, zstd"), Some(64 * 1024))
+            .unwrap();
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn decode_content_encoding_passes_through_identity_and_unknown() {
+        let raw = b"plain bytes";
+        for header in [None, Some(""), Some("identity"), Some("br")] {
+            let out = super::decode_content_encoding(raw, header, None).unwrap();
+            assert_eq!(out, raw, "header {header:?} should pass through");
+        }
     }
 
     #[test]

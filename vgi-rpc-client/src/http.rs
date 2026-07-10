@@ -63,7 +63,9 @@ const EXTERNALIZATION_ENABLED_HEADER: &str = "VGI-Externalization-Enabled";
 const MAX_UPLOAD_BYTES_HEADER: &str = "VGI-Max-Upload-Bytes";
 const UPLOAD_URL_HEADER: &str = "VGI-Upload-URL-Support";
 const SESSION_ENDPOINT: &str = "__session__";
-const UPLOAD_URL_METHOD: &str = "__upload_url__";
+// The upload-URL method name is a shared public wire contract, not a
+// client-local literal.
+use vgi_rpc::external::UPLOAD_URL_METHOD;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_COMPRESSION_LEVEL: i32 = 3;

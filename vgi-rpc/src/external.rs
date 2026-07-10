@@ -55,6 +55,46 @@ pub trait ExternalStorage: Send + Sync {
     fn upload(&self, ipc_bytes: &[u8], compression: Compression) -> Result<UploadResult>;
 }
 
+// ---------------------------------------------------------------------------
+// Public `__upload_url__` wire contract
+// ---------------------------------------------------------------------------
+//
+// An intermediary (proxy, gateway) that terminates or serves the upload-URL
+// flow needs the method name and both schemas. They are published here — rather
+// than duplicated as private literals in the server and client — so the contract
+// has exactly one definition. Mirrors Python's `vgi_rpc.http` re-exports.
+
+/// The RPC method name of the upload-URL flow (`POST /__upload_url__/init`).
+pub const UPLOAD_URL_METHOD: &str = "__upload_url__";
+
+/// Upper bound on the `count` an `__upload_url__` request may ask for. The
+/// server clamps to `[1, MAX_UPLOAD_URL_COUNT]`.
+pub const MAX_UPLOAD_URL_COUNT: i64 = 100;
+
+/// Parameter schema of an `__upload_url__` request: a single `count` int64.
+pub fn upload_url_params_schema() -> SchemaRef {
+    use arrow_schema::{DataType, Field};
+    Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::Int64,
+        true,
+    )]))
+}
+
+/// Response schema of an `__upload_url__` reply: one row per generated URL pair.
+pub fn upload_url_response_schema() -> SchemaRef {
+    use arrow_schema::{DataType, Field, TimeUnit};
+    Arc::new(Schema::new(vec![
+        Field::new("upload_url", DataType::Utf8, false),
+        Field::new("download_url", DataType::Utf8, false),
+        Field::new(
+            "expires_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ]))
+}
+
 /// Pre-signed URL pair for client-side data upload.
 ///
 /// `expires_at` is a Unix-epoch microseconds timestamp (UTC). Mirrors

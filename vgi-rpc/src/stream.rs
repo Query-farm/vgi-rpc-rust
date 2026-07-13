@@ -201,7 +201,9 @@ impl StreamResult {
 ///
 /// **Internal:** invoked by the `#[producer]` macro expansion; user
 /// code should not call this directly.
-#[cfg(feature = "http")]
+// Only needs `StreamStateCodec` (the `stream-codec` feature), not the http stack.
+// Gating on `stream-codec` lets producer/exchange workers build for wasm (no tokio).
+#[cfg(feature = "stream-codec")]
 #[doc(hidden)]
 pub fn producer_decoder<S>() -> crate::server::StateDecoder
 where
@@ -214,7 +216,7 @@ where
 /// [`producer_decoder`].
 ///
 /// **Internal:** invoked by the `#[exchange]` macro expansion.
-#[cfg(feature = "http")]
+#[cfg(feature = "stream-codec")]
 #[doc(hidden)]
 pub fn exchange_decoder<S>() -> crate::server::StateDecoder
 where

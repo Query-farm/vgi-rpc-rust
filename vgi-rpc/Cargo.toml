@@ -90,9 +90,11 @@ vgi-rpc-macros = { path = "../vgi-rpc-macros", version = "0.12.0", optional = tr
 x509-parser = { version = "0.16", optional = true }
 percent-encoding = { version = "2", optional = true }
 libc = { version = "0.2", optional = true }
-# Windows shared-memory backend (page-file-backed named CreateFileMapping).
-# Only used on Windows under the `shm` feature; compiles to ~nothing elsewhere.
-windows-sys = { version = "0.59", optional = true, features = ["Win32_Foundation", "Win32_System_Memory", "Win32_Security"] }
+# Windows shared-memory backend (page-file-backed named CreateFileMapping) is
+# declared target-gated below (Windows only). Keeping it out of the cross-platform
+# [dependencies] means the `shm` feature no longer drags windows-sys onto wasm32
+# targets (wasm32-unknown-emscripten / wasip1 / wasip2), where windows-sys 0.59
+# mis-compiles (MEMORY_BASIC_INFORMATION on 32-bit non-Windows).
 # Real Sentry SDK — gated by the `sentry-sdk` feature. Default
 # features pull in tokio/reqwest transports; we strip them and let
 # operators bring their own runtime. `backtrace` + `contexts` are the
@@ -101,3 +103,9 @@ windows-sys = { version = "0.59", optional = true, features = ["Win32_Foundation
 sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts"], optional = true }
 chrono.workspace = true
 rust_decimal.workspace = true
+
+# Windows-only shared-memory backend for the `shm` feature. Target-gated so
+# `shm = ["dep:libc", "dep:windows-sys"]` pulls windows-sys only on Windows;
+# on unix/wasm the shm code uses the `#[cfg(unix)]` libc path instead.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", optional = true, features = ["Win32_Foundation", "Win32_System_Memory", "Win32_Security"] }

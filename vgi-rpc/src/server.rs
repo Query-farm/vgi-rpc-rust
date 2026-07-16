@@ -202,6 +202,15 @@ impl CallContext {
         lock_ok(&self.tick_metadata).get(key).cloned()
     }
 
+    /// Replace the per-tick input-batch metadata for the current iteration.
+    /// Used by the HTTP transport, where a producer's first turn folds into
+    /// the `/init` request (see `run_producer`). HTTP-only, so gated to
+    /// avoid a dead-code `-D warnings` failure in non-`http` builds.
+    #[cfg(feature = "http")]
+    pub(crate) fn set_tick_metadata(&self, md: Metadata) {
+        *lock_ok(&self.tick_metadata) = md;
+    }
+
     /// Build a call context for `server` serving `req`. Defaults to
     /// anonymous auth with no cookies — callers on authenticated
     /// transports (HTTP) override the two after construction or use

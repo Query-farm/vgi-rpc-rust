@@ -2199,6 +2199,9 @@ async fn handle_stream_init(
         }
         let _ = header_metadata;
         if is_producer {
+            // The producer's first turn folds into this /init request, so the
+            // init request's custom metadata is what the pipe transports
+            // would have delivered on the first tick batch.
             finished = run_producer(
                 &mut sw,
                 &mut ss,
@@ -2207,6 +2210,7 @@ async fn handle_stream_init(
                 &req,
                 state.producer_batch_limit,
                 sticky_sink.as_ref(),
+                Some(&req.metadata),
             );
         }
         if !finished {
@@ -2272,6 +2276,14 @@ fn build_continuation_token(
     ))
 }
 
+/// `first_tick_md` is surfaced as [`CallContext::tick_metadata`] on the FIRST
+/// `produce` call only. On the pipe transports a producer's first turn is a
+/// distinct tick batch whose custom metadata reaches the worker; over HTTP
+/// that turn folds into the /init request, so without this the metadata a
+/// client attached to /init (e.g. the VGI result cache's
+/// `vgi.cache.if_none_match` revalidators) would never be seen. Pass `None`
+/// on continuation turns — they are not the producer's first tick.
+#[allow(clippy::too_many_arguments)]
 fn run_producer<W: std::io::Write>(
     sw: &mut StreamWriter<W>,
     ss: &mut StreamStateKind,
@@ -2280,12 +2292,17 @@ fn run_producer<W: std::io::Write>(
     req: &Request,
     limit: usize,
     sticky: Option<&Arc<crate::sticky::StickySinkImpl>>,
+    first_tick_md: Option<&Metadata>,
 ) -> bool {
     // Continuation producers run without auth context (session-bound).
     let mut ctx = CallContext::for_request(server, req);
     if let Some(s) = sticky {
         ctx.set_sticky(s.clone());
     }
+    if let Some(md) = first_tick_md {
+        ctx.set_tick_metadata(md.clone());
+    }
+    let mut first_tick = true;
     let producer = match ss {
         StreamStateKind::Producer(p) => p,
         StreamStateKind::Exchange(_) => unreachable!(),
@@ -2297,6 +2314,12 @@ fn run_producer<W: std::io::Write>(
     while limit == 0 || batches_written < limit {
         let mut out = OutputCollector::new(output_schema.clone(), true);
         let result = producer.produce(&mut out, &ctx);
+        // First-tick metadata is delivered to the first produce call only —
+        // later turns within this response are not the producer's first tick.
+        if first_tick {
+            ctx.set_tick_metadata(Metadata::default());
+            first_tick = false;
+        }
         for log in ctx.drain_logs() {
             let md = build_log_metadata(&log, &server.server_id, &req.request_id);
             let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
@@ -2449,6 +2472,8 @@ async fn handle_stream_exchange(
         let finished;
         {
             let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
+            // A continuation turn is not the producer's first tick, so it
+            // carries no first-tick metadata.
             finished = run_producer(
                 &mut sw,
                 &mut ss,
@@ -2457,6 +2482,7 @@ async fn handle_stream_exchange(
                 &req,
                 state.producer_batch_limit,
                 sticky_sink.as_ref(),
+                None,
             );
             if !finished {
                 match build_continuation_token(

@@ -621,6 +621,38 @@ impl HttpClient {
         })
     }
 
+    /// Resume a producer stream from a continuation `token` without re-binding.
+    ///
+    /// A continuation request (`POST {prefix}/{method}/exchange` carrying only
+    /// the state token) is fully self-describing: the server recovers the
+    /// producer state, schemas, and function identity from the signed token
+    /// alone, so no bind/`init` round-trip is needed. This is the cheap path
+    /// for a stateless relay that holds a per-batch token (see
+    /// [`HttpStreamSession::next_with_token`]) and resumes on any
+    /// connection/node — unlike `open_producer`, which would produce and
+    /// discard a fresh first turn before seeking.
+    ///
+    /// The returned session is positioned at `token`; the first
+    /// [`next_with_token`](HttpStreamSession::next_with_token) (or
+    /// [`tick`](HttpStreamSession::tick)) issues the continuation.
+    ///
+    /// Mirrors Python `_HttpProxy.resume_stream`.
+    pub fn resume_stream(
+        &mut self,
+        method: &str,
+        token: impl Into<String>,
+    ) -> HttpStreamSession<'_> {
+        HttpStreamSession {
+            client: self,
+            method: method.to_string(),
+            header: None,
+            pending: VecDeque::new(),
+            token: Some(token.into()),
+            finished: false,
+            cancelled: false,
+        }
+    }
+
     /// Query server capabilities via `OPTIONS {prefix}/health` (cached).
     pub fn capabilities(&self) -> Result<HttpServerCapabilities> {
         if let Some(c) = self.caps.borrow().as_ref() {
@@ -845,6 +877,89 @@ impl HttpStreamSession<'_> {
             self.token = parsed.token;
             self.finished = parsed.finished;
         }
+    }
+
+    /// Read one producer batch and surface the worker's continuation token.
+    ///
+    /// Reads exactly one data batch and returns it paired with the resume
+    /// token that continues the stream AFTER that batch — the worker's own
+    /// serialized producer state. A fresh session positioned at that token
+    /// (see [`seek_to_token`](Self::seek_to_token) or
+    /// [`HttpClient::resume_stream`]) resumes on any node, which is the
+    /// basis for stateless, load-balanced relays that must not pin a scan
+    /// to one process.
+    ///
+    /// Returns `None` at end-of-stream. Requires per-batch continuation
+    /// tokens (the default server behaviour); errors if a single response
+    /// carries more than one data batch (coarser-than-batch resume is not
+    /// representable here).
+    ///
+    /// Drives the same wire protocol as [`tick`](Self::tick) but yields one
+    /// `(batch, token)` per call instead of auto-following the token. Do not
+    /// interleave with `tick`/`exchange` on the same session.
+    #[allow(clippy::type_complexity)]
+    pub fn next_with_token(&mut self) -> Result<Option<((RecordBatch, Metadata), Option<String>)>> {
+        const MULTI: &str = "next_with_token requires one data batch per response; the upstream \
+                             worker buffered multiple (configured max_response_bytes?)";
+        if self.cancelled {
+            return Err(RpcError::protocol_error("next_with_token after cancel"));
+        }
+        // Init may have preloaded one data batch; its resume point is the
+        // token already held by the session.
+        if !self.pending.is_empty() {
+            if self.pending.len() > 1 {
+                return Err(RpcError::runtime_error(MULTI));
+            }
+            let item = self.pending.pop_front().unwrap();
+            return Ok(Some((item, self.token.clone())));
+        }
+
+        if self.finished || self.token.is_none() {
+            self.finished = true;
+            return Ok(None);
+        }
+
+        let token = self.token.clone().unwrap();
+        let body = self.continuation_body(&token, false)?;
+        // Producer continuation is idempotent (token-addressed) → retryable.
+        let resp = self
+            .client
+            .post(&format!("{}/exchange", self.method), body, true)?;
+        let relax = self.client.relax_nullability;
+        let external = self.client.external.clone();
+        let mut cursor = Cursor::new(resp);
+        let parsed = parse_response(
+            &mut cursor,
+            &mut self.client.on_log,
+            relax,
+            false,
+            external.as_ref(),
+        )?;
+        if parsed.batches.len() > 1 {
+            return Err(RpcError::runtime_error(MULTI));
+        }
+        self.token = parsed.token;
+        match parsed.batches.into_iter().next() {
+            Some(item) => Ok(Some((item, self.token.clone()))),
+            None => {
+                // No data this turn → the producer finished (no token).
+                self.finished = true;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Reposition a freshly-initialised session to resume from `token`.
+    ///
+    /// Discards any init-preloaded batches and points the session at the
+    /// given continuation token (as returned by
+    /// [`next_with_token`](Self::next_with_token)), so the next call
+    /// continues from exactly there. Used to resume a scan on a new
+    /// process/node.
+    pub fn seek_to_token(&mut self, token: impl Into<String>) {
+        self.pending.clear();
+        self.token = Some(token.into());
+        self.finished = false;
     }
 
     /// Exchange step: send `input`, return the server's response batch.

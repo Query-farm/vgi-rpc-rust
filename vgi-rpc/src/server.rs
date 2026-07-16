@@ -10,14 +10,14 @@ use arrow_schema::{Schema, SchemaRef};
 
 use crate::errors::{Result, RpcError};
 use crate::log::{LogLevel, LogMessage};
+#[cfg(feature = "shm")]
+use crate::metadata::SHM_SEGMENT_SIZE_KEY;
 use crate::metadata::{
     CANCEL_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY, REQUEST_ID_KEY, REQUEST_VERSION,
-    REQUEST_VERSION_KEY, RPC_METHOD_KEY, SERVER_ID_KEY,
+    REQUEST_VERSION_KEY, RPC_METHOD_KEY, SERVER_ID_KEY, SHM_OFFSET_KEY, SHM_SEGMENT_NAME_KEY,
 };
 #[cfg(feature = "shm")]
-use crate::metadata::{SHM_SEGMENT_NAME_KEY, SHM_SEGMENT_SIZE_KEY};
-#[cfg(feature = "shm")]
-use crate::shm::{maybe_write_to_shm, resolve_shm_batch, ShmSegment};
+use crate::shm::{is_shm_pointer_batch, maybe_write_to_shm, resolve_shm_batch, ShmSegment};
 
 /// Feature-off stand-in so dispatch signatures stay uniform.
 #[cfg(not(feature = "shm"))]
@@ -42,6 +42,61 @@ fn maybe_attach_shm(req_md: &Metadata) -> Option<ShmSegment> {
 #[inline]
 fn maybe_attach_shm(_req_md: &Metadata) -> Option<ShmSegment> {
     None
+}
+
+/// Per-connection cache of a client-advertised SHM segment.
+///
+/// A client names its segment once — in an early request's metadata — then
+/// routes later batches (request *and* data) through it carrying only an
+/// offset/length, no name (the C++ extension does this; the Python client
+/// happens to re-advertise the name on every request, so it never needed
+/// the cache). The worker attaches on first sight and reuses the
+/// attachment for the connection's lifetime; [`RpcServer::serve`] owns the
+/// cache, and dropping it detaches without unlinking (the client owns the
+/// OS object). Without this, a later offset-only pointer request can't be
+/// resolved and trips the "Expected 1 row in request batch" guard.
+///
+/// Mirrors Python `vgi_rpc.rpc._server._ConnectionShm`.
+#[derive(Default)]
+pub(crate) struct ConnectionShm {
+    #[cfg(feature = "shm")]
+    name: Option<String>,
+    #[cfg(feature = "shm")]
+    segment: Option<ShmSegment>,
+}
+
+#[cfg(feature = "shm")]
+impl ConnectionShm {
+    /// Attach and cache the segment named in `req_md` when it first
+    /// appears or changes.
+    fn refresh(&mut self, req_md: &Metadata) {
+        let Some(name) = req_md.get(SHM_SEGMENT_NAME_KEY) else {
+            return;
+        };
+        if self.name.as_deref() == Some(name.as_str()) {
+            return;
+        }
+        let Some(new) = maybe_attach_shm(req_md) else {
+            return;
+        };
+        self.segment = Some(new);
+        self.name = Some(name.clone());
+    }
+
+    fn segment(&self) -> Option<&ShmSegment> {
+        self.segment.as_ref()
+    }
+}
+
+#[cfg(not(feature = "shm"))]
+impl ConnectionShm {
+    #[inline]
+    fn refresh(&mut self, _req_md: &Metadata) {}
+
+    #[inline]
+    fn segment(&self) -> Option<&ShmSegment> {
+        None
+    }
 }
 use crate::stream::{empty_schema, Emitted, OutputCollector, StreamResult, StreamStateKind};
 use crate::wire::{empty_batch, md_get, Metadata, StreamReader, StreamWriter};
@@ -762,8 +817,12 @@ impl RpcServer {
     /// here; a `TimedOut`/`WouldBlock` error then cleanly ends the
     /// connection via the error path below.
     pub fn serve<R: Read, W: Write>(&self, mut r: R, mut w: W) {
+        // Cache the client's dynamically-advertised SHM segment for the
+        // life of the connection so later offset-only request/data batches
+        // resolve against it (see [`ConnectionShm`]).
+        let mut conn_shm = ConnectionShm::default();
         loop {
-            match self.serve_one(&mut r, &mut w) {
+            match self.serve_one_conn(&mut r, &mut w, Some(&mut conn_shm)) {
                 Ok(keep_going) => {
                     if !keep_going {
                         return;
@@ -797,11 +856,12 @@ impl RpcServer {
         W: Write,
         F: Fn() -> bool,
     {
+        let mut conn_shm = ConnectionShm::default();
         loop {
             if shutdown() {
                 return;
             }
-            match self.serve_one(&mut r, &mut w) {
+            match self.serve_one_conn(&mut r, &mut w, Some(&mut conn_shm)) {
                 Ok(true) => {}
                 _ => return,
             }
@@ -809,14 +869,33 @@ impl RpcServer {
     }
 
     /// Handle one request. Returns `Ok(true)` to continue, `Ok(false)` on EOS/EOF.
+    ///
+    /// With no per-connection SHM cache wired (direct `serve_one` calls), a
+    /// client-advertised segment is attached and detached per call instead
+    /// of being cached across requests (the [`serve`](Self::serve) loop
+    /// supplies the cache).
     pub fn serve_one<R: Read, W: Write>(&self, r: &mut R, w: &mut W) -> Result<bool> {
-        let result = self._serve_one(r, w);
+        self.serve_one_conn(r, w, None)
+    }
+
+    fn serve_one_conn<R: Read, W: Write>(
+        &self,
+        r: &mut R,
+        w: &mut W,
+        shm_cache: Option<&mut ConnectionShm>,
+    ) -> Result<bool> {
+        let result = self._serve_one(r, w, shm_cache);
         let _ = w.flush();
         result
     }
 
-    fn _serve_one<R: Read, W: Write>(&self, r: &mut R, w: &mut W) -> Result<bool> {
-        let req = match self.read_request(r)? {
+    fn _serve_one<R: Read, W: Write>(
+        &self,
+        r: &mut R,
+        w: &mut W,
+        mut shm_cache: Option<&mut ConnectionShm>,
+    ) -> Result<bool> {
+        let (req, request_used_shm) = match self.read_request(r, shm_cache.as_deref_mut())? {
             Some(rq) => rq,
             None => return Ok(false),
         };
@@ -921,8 +1000,31 @@ impl RpcServer {
             .map(|h| h.on_dispatch_start(&dispatch_info));
 
         let mut app_err: Option<RpcError> = None;
-        let shm = maybe_attach_shm(&req.metadata);
-        let shm_ref = shm.as_ref();
+        // Determine the SHM segment for this call's data plane (resolving
+        // input batches, routing output/response batches). Crucially, only
+        // route the *response* through shm when the client signalled shm for
+        // THIS exchange — it sent the request via a shm pointer
+        // (SHM_OFFSET_KEY) or advertised the segment (SHM_SEGMENT_NAME_KEY).
+        // The C++ client resolves shm responses only for those methods; for
+        // plain inline requests (bind, catalog_*, transaction_*) it expects
+        // an inline response and reports a shm-routed one as empty. With no
+        // cache wired (a direct `serve_one` call) fall back to the original
+        // per-call attach, which only succeeds when this request names the
+        // segment.
+        let dynamic_shm: Option<ShmSegment>;
+        let shm_ref: Option<&ShmSegment> = match shm_cache {
+            Some(cache) => {
+                if request_used_shm {
+                    cache.segment()
+                } else {
+                    None
+                }
+            }
+            None => {
+                dynamic_shm = maybe_attach_shm(&req.metadata);
+                dynamic_shm.as_ref()
+            }
+        };
         match info.method_type {
             MethodType::Unary => {
                 self.serve_unary(w, &req, info, &ctx, &stats, &mut app_err, shm_ref)?
@@ -931,9 +1033,9 @@ impl RpcServer {
                 self.serve_stream(r, w, &req, info, &ctx, &stats, &mut app_err, shm_ref)?
             }
         }
-        // `shm` (if any) is dropped here, releasing our mmap of the
-        // client-owned segment without unlinking it.
-        let _ = shm;
+        // A per-call `dynamic_shm` (if any) is dropped here, releasing our
+        // mmap of the client-owned segment without unlinking it; a cached
+        // segment lives until the connection ends.
 
         if let Some(hook) = self.dispatch_hook.as_ref() {
             let token = hook_token.unwrap_or(0);
@@ -943,7 +1045,15 @@ impl RpcServer {
         Ok(true)
     }
 
-    fn read_request<R: Read>(&self, r: &mut R) -> Result<Option<Request>> {
+    /// Read one request off the wire. Returns the parsed request plus
+    /// whether the client signalled SHM for this exchange (the request was
+    /// a shm pointer, or advertised a segment) — which gates whether the
+    /// response/data plane may route through shm.
+    fn read_request<R: Read>(
+        &self,
+        r: &mut R,
+        shm_cache: Option<&mut ConnectionShm>,
+    ) -> Result<Option<(Request, bool)>> {
         let mut reader = match StreamReader::new(r) {
             Ok(r) => r,
             Err(e) => {
@@ -960,7 +1070,49 @@ impl RpcServer {
             None => return Ok(None),
         };
         reader.drain()?;
-        Ok(Some(Request::from_read_batch(batch, metadata, true)?))
+        // Computed on the wire metadata, before pointer resolution strips
+        // the offset key.
+        let request_used_shm =
+            metadata.contains_key(SHM_OFFSET_KEY) || metadata.contains_key(SHM_SEGMENT_NAME_KEY);
+        // A client (e.g. the C++ extension) may route the single-row request
+        // batch through the shm side channel above a size threshold, so the
+        // inline batch arrives as a 0-row pointer; resolve it back to its
+        // real columns before the single-row guard in `from_read_batch`.
+        // The segment comes from the connection cache — refreshed from any
+        // name this request's own metadata advertises — or, with no cache
+        // wired, a one-shot attach released before returning.
+        #[cfg(feature = "shm")]
+        let (batch, metadata) = if is_shm_pointer_batch(&batch, &metadata) {
+            let one_shot: Option<ShmSegment>;
+            let seg: Option<&ShmSegment> = match shm_cache {
+                Some(cache) => {
+                    cache.refresh(&metadata);
+                    cache.segment()
+                }
+                None => {
+                    one_shot = maybe_attach_shm(&metadata);
+                    one_shot.as_ref()
+                }
+            };
+            let resolved = resolve_shm_batch(batch, metadata, seg)?;
+            // The resolved batch copies the region bytes out, so the slot
+            // is dead once materialized — free it for the client.
+            if let (Some(off), Some(seg)) = (resolved.release_offset, seg) {
+                let _ = seg.free(off);
+            }
+            (resolved.batch, resolved.metadata)
+        } else {
+            if let Some(cache) = shm_cache {
+                cache.refresh(&metadata);
+            }
+            (batch, metadata)
+        };
+        #[cfg(not(feature = "shm"))]
+        let _ = shm_cache;
+        Ok(Some((
+            Request::from_read_batch(batch, metadata, true)?,
+            request_used_shm,
+        )))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1437,5 +1589,239 @@ mod tests {
         assert_eq!(md_get(&md, TRANSPORT_SHM_KEY), Some(expected));
         assert_eq!(md_get(&md, REQUEST_VERSION_KEY), Some(REQUEST_VERSION));
         assert_eq!(md_get(&md, SERVER_ID_KEY), Some("test-srv"));
+    }
+
+    /// SHM-routed *request* batches (vgi-rpc Python 42701df).
+    ///
+    /// Cross-language regression: the C++ client routes a large single-row
+    /// request batch through the shm side channel (sending a 0-row pointer
+    /// inline), whereas the Python and Rust clients keep requests inline —
+    /// so no end-to-end conformance lane exercised this path. Before the
+    /// fix, a shm-routed request tripped the ``Expected 1 row in request
+    /// batch`` guard (seen on accumulate / table_buffering over the shm
+    /// transport).
+    #[cfg(feature = "shm")]
+    mod shm_requests {
+        use super::*;
+        use crate::metadata::{SHM_OFFSET_KEY, SHM_SEGMENT_NAME_KEY, SHM_SEGMENT_SIZE_KEY};
+        use crate::shm::{
+            is_shm_pointer_batch, make_shm_pointer_batch, maybe_write_to_shm, ShmSegment,
+        };
+        use arrow_array::{BinaryArray, Int64Array};
+        use arrow_schema::{DataType, Field};
+
+        fn params_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![Field::new(
+                "request",
+                DataType::Binary,
+                false,
+            )]))
+        }
+
+        fn result_schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]))
+        }
+
+        fn request_batch(payload: &[u8]) -> RecordBatch {
+            RecordBatch::try_new(
+                params_schema(),
+                vec![Arc::new(BinaryArray::from(vec![Some(payload)]))],
+            )
+            .unwrap()
+        }
+
+        /// Dispatch metadata the way the C++ client stamps it: method +
+        /// version, plus (optionally) the client-owned segment's name/size.
+        fn dispatch_md(seg: Option<&ShmSegment>) -> Metadata {
+            let mut md = Metadata::new();
+            md.insert(RPC_METHOD_KEY.into(), "do_thing".into());
+            md.insert(REQUEST_VERSION_KEY.into(), REQUEST_VERSION.into());
+            if let Some(seg) = seg {
+                md.insert(SHM_SEGMENT_NAME_KEY.into(), seg.name().to_string());
+                md.insert(SHM_SEGMENT_SIZE_KEY.into(), seg.size().to_string());
+            }
+            md
+        }
+
+        /// Frame one request stream whose parameter batch rides through shm
+        /// (`maybe_write_to_shm`, the way the C++ client builds it). Fresh
+        /// allocation each call: resolving frees the region, so a reused
+        /// pointer would dangle.
+        fn pointer_request(seg: &ShmSegment, payload: &[u8], advertise: bool) -> Vec<u8> {
+            let md = dispatch_md(advertise.then_some(seg));
+            let (ptr, ptr_md) = maybe_write_to_shm(request_batch(payload), md, Some(seg)).unwrap();
+            assert!(
+                is_shm_pointer_batch(&ptr, &ptr_md),
+                "request batch should have routed through shm"
+            );
+            let mut buf = Vec::new();
+            {
+                let mut w = StreamWriter::new(&mut buf, ptr.schema().as_ref()).unwrap();
+                w.write(&ptr, Some(&ptr_md)).unwrap();
+                w.finish().unwrap();
+            }
+            buf
+        }
+
+        /// Frame one inline request stream (optionally advertising the segment).
+        fn inline_request(payload: &[u8], seg: Option<&ShmSegment>) -> Vec<u8> {
+            let batch = request_batch(payload);
+            let md = dispatch_md(seg);
+            let mut buf = Vec::new();
+            {
+                let mut w = StreamWriter::new(&mut buf, batch.schema().as_ref()).unwrap();
+                w.write(&batch, Some(&md)).unwrap();
+                w.finish().unwrap();
+            }
+            buf
+        }
+
+        /// Server whose single unary method records each request payload and
+        /// answers with a 1-row batch (so the response data plane has
+        /// something to route).
+        fn payload_server(seen: Arc<Mutex<Vec<Vec<u8>>>>) -> RpcServer {
+            let mut server = RpcServer::new("shm-srv");
+            let rs = result_schema();
+            server.register(MethodInfo::unary(
+                "do_thing",
+                params_schema(),
+                result_schema(),
+                move |req, _ctx| {
+                    let col = req
+                        .column("request")
+                        .expect("request column")
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .unwrap();
+                    lock_ok(&seen).push(col.value(0).to_vec());
+                    Ok(Some(RecordBatch::try_new(
+                        rs.clone(),
+                        vec![Arc::new(Int64Array::from(vec![1i64]))],
+                    )?))
+                },
+            ));
+            server
+        }
+
+        /// Collect every response batch's metadata across the concatenated
+        /// response streams in `output`.
+        fn response_metadata(output: &[u8]) -> Vec<Metadata> {
+            let mut out = Vec::new();
+            let mut cursor = Cursor::new(output);
+            while (cursor.position() as usize) < output.len() {
+                let mut reader = StreamReader::new(&mut cursor).unwrap();
+                while let Some((_b, md)) = reader.read_next().unwrap() {
+                    out.push(md);
+                }
+            }
+            out
+        }
+
+        /// A shm-pointer request that names its segment resolves before the
+        /// single-row guard — both on the cached `serve` path and on the
+        /// per-call `serve_one` path.
+        #[test]
+        fn pointer_request_batch_resolves_via_segment_named_in_metadata() {
+            let seg = ShmSegment::create(1024 * 1024).unwrap();
+            let payload = b"serialized-request-blob";
+
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let server = payload_server(seen.clone());
+            let mut output: Vec<u8> = Vec::new();
+            server.serve(
+                Cursor::new(pointer_request(&seg, payload, true)),
+                &mut output,
+            );
+            assert_eq!(lock_ok(&seen).as_slice(), &[payload.to_vec()]);
+
+            // Direct serve_one (no connection cache): one-shot attach.
+            let seen2 = Arc::new(Mutex::new(Vec::new()));
+            let server2 = payload_server(seen2.clone());
+            let mut input = Cursor::new(pointer_request(&seg, payload, true));
+            let mut output2: Vec<u8> = Vec::new();
+            assert!(server2.serve_one(&mut input, &mut output2).unwrap());
+            assert_eq!(lock_ok(&seen2).as_slice(), &[payload.to_vec()]);
+        }
+
+        /// The client names its segment once; a later offset-only pointer
+        /// request resolves against the connection-cached attachment.
+        #[test]
+        fn serve_caches_client_segment_for_offset_only_requests() {
+            let seg = ShmSegment::create(1024 * 1024).unwrap();
+
+            // Request A: inline, advertising the segment (first sight).
+            let mut input = inline_request(b"first", Some(&seg));
+
+            // Request B: offset-only pointer — no segment name in sight.
+            let (off, len) = seg
+                .allocate_and_write(&request_batch(b"second"))
+                .unwrap()
+                .expect("payload fits");
+            let (ptr, mut ptr_md) =
+                make_shm_pointer_batch(params_schema().as_ref(), off, len).unwrap();
+            ptr_md.insert(RPC_METHOD_KEY.into(), "do_thing".into());
+            ptr_md.insert(REQUEST_VERSION_KEY.into(), REQUEST_VERSION.into());
+            {
+                let mut w = StreamWriter::new(&mut input, ptr.schema().as_ref()).unwrap();
+                w.write(&ptr, Some(&ptr_md)).unwrap();
+                w.finish().unwrap();
+            }
+
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let server = payload_server(seen.clone());
+            let mut output: Vec<u8> = Vec::new();
+            server.serve(Cursor::new(input), &mut output);
+            assert_eq!(
+                lock_ok(&seen).as_slice(),
+                &[b"first".to_vec(), b"second".to_vec()]
+            );
+        }
+
+        /// With neither a named segment nor a cached one, the 0-row pointer
+        /// trips the single-row guard and the request fails.
+        #[test]
+        fn pointer_request_without_segment_trips_single_row_guard() {
+            let seg = ShmSegment::create(1024 * 1024).unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let server = payload_server(seen.clone());
+            let mut output: Vec<u8> = Vec::new();
+            server.serve(
+                Cursor::new(pointer_request(&seg, b"orphan", false)),
+                &mut output,
+            );
+            assert!(lock_ok(&seen).is_empty(), "guard should reject dispatch");
+        }
+
+        /// The response routes through shm only when the client signalled
+        /// shm for THIS exchange. The C++ client resolves shm responses only
+        /// for the methods it shm-routed; an inline control request (bind,
+        /// catalog_*) expects an inline response, and a shm-routed one is
+        /// reported as empty.
+        #[test]
+        fn response_routed_through_shm_only_when_request_signalled_shm() {
+            let seg = ShmSegment::create(1024 * 1024).unwrap();
+
+            // Request A advertises the segment; request B is plain inline
+            // on the same connection (cache now holds the segment).
+            let mut input = inline_request(b"a", Some(&seg));
+            input.extend(inline_request(b"b", None));
+
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let server = payload_server(seen.clone());
+            let mut output: Vec<u8> = Vec::new();
+            server.serve(Cursor::new(input), &mut output);
+            assert_eq!(lock_ok(&seen).len(), 2);
+
+            let mds = response_metadata(&output);
+            assert_eq!(mds.len(), 2, "one data batch per response");
+            assert!(
+                mds[0].contains_key(SHM_OFFSET_KEY),
+                "response A (segment advertised) should route through shm"
+            );
+            assert!(
+                !mds[1].contains_key(SHM_OFFSET_KEY),
+                "response B (no shm signal) must stay inline despite the cached segment"
+            );
+        }
     }
 }

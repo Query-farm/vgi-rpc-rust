@@ -109,6 +109,9 @@ const IPC_EOS: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
 /// so the byte layout stays identical across all peers.
 struct OsShm {
     name: String,
+    // `ptr`/`track` are only read by the unix/windows backends; the fallback
+    // backend can never construct a value.
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
     ptr: *mut u8,
     size: usize,
     /// True if this handle owns the OS object (created with `create=true`).
@@ -116,6 +119,7 @@ struct OsShm {
     /// is reference-counted by the kernel and released when the last handle
     /// closes, so this is informational there. Server-side dynamic
     /// attachments set this to `false`.
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
     track: bool,
     /// Windows file-mapping object handle, closed on drop. Absent on Unix,
     /// where the fd is closed immediately after `mmap`.
@@ -132,6 +136,7 @@ unsafe impl Sync for OsShm {}
 // remain.
 impl std::panic::RefUnwindSafe for OsShm {}
 
+#[cfg(any(unix, windows))]
 fn make_shm_name() -> String {
     // Python's `multiprocessing.shared_memory` uses `psm_<8 hex>_<8 hex>`
     // on macOS and `/<rand>` on Linux; we match its leading-slash POSIX
@@ -422,6 +427,39 @@ impl Drop for OsShm {
         if !self.map_handle.is_null() {
             unsafe { CloseHandle(self.map_handle) };
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fallback backend: platforms with neither POSIX shm nor Win32 sections
+// (e.g. wasm32-wasip2 — wasm32-unknown-emscripten counts as `unix`). The
+// module stays compilable with the `shm` feature enabled; segments simply
+// cannot be created or attached, so the slice accessors are unreachable.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(any(unix, windows)))]
+impl OsShm {
+    fn create(_size: usize) -> Result<Self> {
+        Err(RpcError::new(
+            "NotImplementedError",
+            "shared memory is not supported on this platform",
+        ))
+    }
+
+    fn attach(_name: &str, _size: usize, _track: bool) -> Result<Self> {
+        Err(RpcError::new(
+            "NotImplementedError",
+            "shared memory is not supported on this platform",
+        ))
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unreachable!("OsShm cannot be constructed on this platform")
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    fn as_mut_slice(&self) -> &mut [u8] {
+        unreachable!("OsShm cannot be constructed on this platform")
     }
 }
 

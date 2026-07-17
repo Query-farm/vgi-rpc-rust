@@ -2,6 +2,30 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.13.0] — 2026-07-16
+
+Headline: **shm request-batch resolution**, **HTTP exchange metadata parity
+with the Python reference**, and **continuation-only stream resume** on the
+client.
+
+- **Fixed (shm)** shm-routed *request* batches now resolve against a
+  per-connection segment cache (attach-from-request-metadata when the cache is
+  empty); responses route through shm only when the request signalled shm this
+  exchange. Mirrors vgi-rpc-python 42701df.
+- **Fixed (http)** the init request's custom metadata now reaches a producer's
+  first tick (`CallContext::tick_metadata`), so result-cache conditional
+  revalidation (`vgi.cache.if_none_match` / `if_modified_since`) fires over
+  HTTP. Parity with the Go/Java/TS ports.
+- **Added (client)** continuation-only stream resume:
+  `HttpClient::resume_stream`, `HttpStreamSession::next_with_token` /
+  `seek_to_token` — resume a producer stream from a relayed token without a
+  bind/init round-trip.
+- **Fixed (wasm)** the crate builds on `wasm32-wasip2` again with `shm`
+  enabled: `windows-sys` is target-gated to Windows, the proc-macro decoders
+  are gated on `stream-codec` (not `http`), and the shm module gained a
+  fallback backend (create/attach return `NotImplementedError`) for platforms
+  with neither POSIX shm nor Win32 sections.
+
 ## [0.7.0] — 2026-06-26
 
 Headline: the crate now **builds for `wasm32-wasi`** (a VGI worker can be

@@ -109,6 +109,19 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
+      - name: Prune transient test build artifacts before cache save
+        # The sanity gate's `cargo test` runs the trybuild compile-fail
+        # cases, which leave scratch build dirs under `target/tests` — on
+        # Linux runners with a dangling `target/tests/target` symlink. The
+        # `Swatinem/rust-cache` post-step walks `target/` to save the cache
+        # and aborts on that broken symlink with `ENOENT: opendir`. Remove
+        # the scratch (and any other broken symlinks) so the save completes
+        # cleanly. Runs regardless of publish outcome.
+        if: always()
+        run: |
+          rm -rf target/tests
+          find target -xtype l -delete 2>/dev/null || true
+
       - name: Summarise
         if: success()
         run: |

@@ -6,16 +6,19 @@ crate without re-deriving design decisions.
 
 ## Project shape
 
-Workspace at `~/Development/vgi-rpc-rust/` with six crates (four published —
-`vgi-rpc`, `vgi-rpc-macros`, `vgi-rpc-s3`, `vgi-rpc-gcs`; two internal workers):
+Workspace at `~/Development/vgi-rpc-rust/` with eight crates (five published —
+`vgi-rpc`, `vgi-rpc-macros`, `vgi-rpc-client`, `vgi-rpc-s3`, `vgi-rpc-gcs`;
+three internal test/benchmark crates):
 
 | crate | published | purpose |
 |-------|:-:|---------|
 | `vgi-rpc/` | ✅ | The library. All wire-protocol, server, HTTP, auth, observability, external-location, and unix/launcher code. |
 | `vgi-rpc-macros/` | ✅ | Proc-macros: `#[service]`, `#[unary]`, `#[producer]`, `#[exchange]`, `#[derive(VgiArrow)]`, `#[derive(StreamState)]`. Re-exported from `vgi-rpc` behind the default `macros` feature. |
+| `vgi-rpc-client/` | ✅ | The Rust client library — drives a vgi-rpc server over pipe / unix / http (and shm), mirroring the Go/Python client patterns. Cross-language conformance green. |
 | `vgi-rpc-s3/` | ✅ | `PresignedS3Storage` + shared `HttpFetcher`. |
 | `vgi-rpc-gcs/` | ✅ | `SignedGcsStorage`. |
 | `conformance-worker/` | — | Test binary `vgi-rpc-conformance-rust` that registers every Python `ConformanceService` method and serves stdio / `--http` / `--unix` (with `--idle-timeout`). The artifact the Python conformance suite drives. |
+| `conformance-client-driver/` | — | Binary `vgi-rpc-conformance-client-driver` exercising the `vgi-rpc-client` role against a Python/Rust server in the cross-language conformance matrix. |
 | `benchmark-worker/` | — | `vgi-rpc-benchmark-rust` — apples-to-apples benchmark target mirroring the Go / Python benchmark workers. |
 
 The Python canonical lives at `~/Development/vgi-rpc/vgi_rpc/`; the Go port
@@ -327,15 +330,15 @@ aligned so cross-referencing is easy. Python module ↔ Rust module:
 
 ## Release process
 
-All four published crates share one workspace version. The current line
-is **0.2.0** (0.1.0 was the initial port; both are live on crates.io,
-owned by `rustyconover`). A re-release **must** bump the version — you
-cannot overwrite an existing one.
+All five published crates share one workspace version. The current line
+is **0.14.x** (the port started at 0.1.0; every release is live on
+crates.io, owned by `rustyconover`). A re-release **must** bump the
+version — you cannot overwrite an existing one.
 
 1. Bump the workspace version in the root `Cargo.toml`, and the internal
-   path-dep `version = "..."` pins (`vgi-rpc-macros` in `vgi-rpc`,
-   `vgi-rpc` in `vgi-rpc-s3`/`vgi-rpc-gcs`, `vgi-rpc-s3` in
-   `vgi-rpc-gcs`). Run `cargo check` to refresh `Cargo.lock`.
+   path-dep `version = "..."` pins (`vgi-rpc-macros` in `vgi-rpc`;
+   `vgi-rpc` in `vgi-rpc-client`/`vgi-rpc-s3`/`vgi-rpc-gcs`; `vgi-rpc-s3`
+   in `vgi-rpc-gcs`). Run `cargo check` to refresh `Cargo.lock`.
 2. Update `CHANGELOG.md` with a new `[x.y.z] — YYYY-MM-DD` section.
 3. **Fuzz gate.** Run the wire-reader fuzz target to a clean stop —
    this is a release blocker, not optional:
@@ -345,20 +348,27 @@ cannot overwrite an existing one.
    safety net, the fuzzer is how we know it holds. (`fuzz/` is a
    standalone workspace that still `[patch]`es arrow to a git fork; the
    *published* crates use crates.io arrow, so the patch never ships.)
-4. Sanity-check packaging: `cargo publish --dry-run -p vgi-rpc` (repeat
-   for `-p vgi-rpc-macros`, `-p vgi-rpc-s3`, `-p vgi-rpc-gcs`).
-5. **Publish via CI (preferred).** Push a `vX.Y.Z` tag (e.g. `v0.2.0`) —
+4. Sanity-check packaging: `cargo publish --dry-run -p vgi-rpc-macros`.
+   (Dry-running the downstream crates — `vgi-rpc`, `vgi-rpc-client`,
+   `-s3`, `-gcs` — fails locally on a fresh version bump because their
+   `version = "x.y.z"` pin can't resolve against crates.io until the
+   upstream crate is actually published; the CI workflow handles this by
+   publishing in dependency order. So only the leaf `vgi-rpc-macros`
+   dry-run is meaningful before the first publish.)
+5. **Publish via CI (preferred).** Push a `vX.Y.Z` tag (e.g. `v0.14.1`) —
    `.github/workflows/release.yml` triggers on that pattern, publishes
-   all four crates **in dependency order** (`vgi-rpc-macros` → `vgi-rpc`
-   → `vgi-rpc-s3` → `vgi-rpc-gcs`) via crates.io Trusted Publishing
-   (OIDC, no long-lived token), and gates on the `crates-io` GitHub
-   Environment's required-reviewer approval. `workflow_dispatch` with
-   `dry_run: true` exercises the whole flow without uploading.
+   all five crates **in dependency order** (`vgi-rpc-macros` → `vgi-rpc`
+   → `vgi-rpc-client` → `vgi-rpc-s3` → `vgi-rpc-gcs`) via crates.io
+   Trusted Publishing (OIDC, no long-lived token). It is idempotent (a
+   version already on crates.io is skipped) and, when the `crates-io`
+   GitHub Environment has required reviewers configured, gates on a human
+   approval. `workflow_dispatch` with `dry_run: true` exercises the whole
+   flow without uploading.
 6. **Manual fallback** (only if CI is unavailable): publish in the same
    order — `cargo publish -p vgi-rpc-macros`, then `-p vgi-rpc`, then
-   `-p vgi-rpc-s3`, then `-p vgi-rpc-gcs` — sleeping ~30s between each
-   for index propagation. Order matters: every crate depends on one
-   published earlier.
+   `-p vgi-rpc-client`, then `-p vgi-rpc-s3`, then `-p vgi-rpc-gcs` —
+   sleeping ~30s between each for index propagation. Order matters: every
+   crate depends on one published earlier.
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, cargo doc, an
 MSRV (1.90) build, and the Python-driven conformance job (full six-
@@ -396,21 +406,20 @@ Compile-fail UI tests live in `vgi-rpc/tests/macro_compile_fail/`.
 
 ## What's **not** done (deferred)
 
-These weren't gated on conformance and are candidates for a later phase:
+Most of the original follow-ups have since shipped: the **Rust client**
+(`vgi-rpc-client`, published, cross-language conformance green) and the
+**shared-memory transport** (`shm` feature + `shm.rs` + the
+`__transport_options__` capability handshake). What remains deferred and
+is a candidate for a later phase:
 
-- **Rust client library** — today the crate is server-only. The Python /
-  Go / Rust clients drive the server; a Rust client would be a separate
-  crate or module and mirror the Go port's patterns.
-- **Shared-memory transport** + subprocess pool (optional Python / Go
-  feature).
-- **Rust client crate** — the workspace is server-only today. A
-  client crate mirroring the Go port's structure remains a follow-up.
+- **Subprocess pool** — the optional Python/Go client-side feature that
+  pools warm worker subprocesses is not ported.
 - **Launcher *tool*** — the cross-language launcher *worker contract* is
   done (`vgi_rpc::unix::serve_unix` honours `--unix` + `--idle-timeout`,
   prints `UNIX:<path>`, and idle-exits, so the Python `vgi_rpc.launcher`
   can spawn/reuse/reap a Rust worker). A *Rust* port of the launcher
-  itself (flock coordination, `.meta` discovery, `--status`/`--gc`) is
-  client-side orchestration and stays deferred with the Rust client.
+  itself (flock coordination, `.meta` discovery, `--status`/`--gc`)
+  remains a follow-up.
 
 ## Trust boundaries
 

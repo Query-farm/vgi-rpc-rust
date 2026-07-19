@@ -16,11 +16,10 @@ the wire, so Python / Go / Rust clients and servers all interoperate.
 └────────────────────────┘                                      └────────────────────────┘
 ```
 
-**Status.** 452 / 452 Python conformance tests pass across pipe,
-subprocess, http, and unix transports (the 450 canonical cases plus 2
-live-`__describe__` tests). 58 Rust-native unit + integration tests
-pass with all features enabled. Workspace-wide `cargo clippy
---all-features -- -D warnings` is clean.
+**Status.** 901 / 901 Python conformance tests pass across pipe,
+subprocess, http, and unix transports. 250 Rust-native unit +
+integration tests pass with all features enabled. Workspace-wide
+`cargo clippy --all-features -- -D warnings` is clean.
 
 ---
 

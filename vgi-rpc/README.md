@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="https://raw.githubusercontent.com/Query-farm/vgi-rpc-rust/main/assets/vgi-logo.png" alt="Vector Gateway Interface" width="320">
+</div>
+
 # vgi-rpc
 
 [![crates.io](https://img.shields.io/crates/v/vgi-rpc.svg)](https://crates.io/crates/vgi-rpc)

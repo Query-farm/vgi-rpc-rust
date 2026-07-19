@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="https://raw.githubusercontent.com/Query-farm/vgi-rpc-rust/main/assets/vgi-logo.png" alt="Vector Gateway Interface" width="320">
+</div>
+
 # vgi-rpc (Rust)
 
 Transport-agnostic RPC framework built on Apache Arrow IPC. The Rust

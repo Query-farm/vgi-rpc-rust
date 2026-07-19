@@ -2,6 +2,12 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.14.1] — 2026-07-19
+
+- **Docs** added the Vector Gateway Interface logo to the repository and
+  crate READMEs (referenced by absolute URL so it renders on both GitHub
+  and crates.io). No code changes.
+
 ## [0.14.0] — 2026-07-19
 
 Headline: **hot-path allocation reductions** across server dispatch, the

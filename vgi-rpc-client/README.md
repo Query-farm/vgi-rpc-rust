@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="https://raw.githubusercontent.com/Query-farm/vgi-rpc-rust/main/assets/vgi-logo.png" alt="Vector Gateway Interface" width="320">
+</div>
+
 # vgi-rpc-client
 
 A blocking, synchronous client for the [`vgi-rpc`](https://crates.io/crates/vgi-rpc)

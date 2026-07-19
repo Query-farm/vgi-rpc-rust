@@ -1568,6 +1568,10 @@ impl<'a> EnvelopeMeta<'a> {
     }
 }
 
+// Only the HTTP transport still calls the standalone builder — the pipe/unix
+// serve loops use a reused `EnvelopeMeta` directly. Gate it so a no-`http`
+// build (e.g. the conformance client-driver) doesn't flag it as dead code.
+#[cfg(feature = "http")]
 pub(crate) fn build_log_metadata(msg: &LogMessage, server_id: &str, request_id: &str) -> Metadata {
     let mut e = EnvelopeMeta::new(server_id, request_id);
     e.log(msg);

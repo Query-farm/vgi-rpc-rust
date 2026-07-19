@@ -1,8 +1,10 @@
-//! Transport identity advertised by a bound [`RpcServer`].
+//! Transport identity advertised by a bound [`RpcServer`](crate::RpcServer).
 //!
-//! Workers (RPC implementations) read [`RpcServer::transport_kind`] —
+//! Workers (RPC implementations) read
+//! [`RpcServer::transport_kind`](crate::RpcServer::transport_kind) —
 //! or register a [`ServeStartHook`] via
-//! [`RpcServerBuilder::on_serve_start`] — to tailor startup behaviour
+//! [`RpcServerBuilder::on_serve_start`](crate::RpcServerBuilder::on_serve_start)
+//! — to tailor startup behaviour
 //! to the transport they were bound to. Mirrors the Python
 //! `TransportKind` / `on_serve_start` API.
 

@@ -238,7 +238,8 @@ impl HttpClientBuilder {
 
     /// Enable transparent external-location response resolution, validating
     /// fetched URLs with `validator` (use [`any_url_validator`] for trusted /
-    /// test storage, [`safe_https_validator`] for production).
+    /// test storage, [`safe_https_validator`](vgi_rpc::external::safe_https_validator)
+    /// for production).
     pub fn external_resolution(mut self, validator: UrlValidator) -> Self {
         self.external_validator = Some(validator);
         self

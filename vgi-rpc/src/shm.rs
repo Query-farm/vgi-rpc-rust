@@ -829,8 +829,8 @@ impl ShmSegment {
     ///
     /// For non-dictionary schemas this is **fully zero-copy**: the
     /// returned [`RecordBatch`]'s column buffers alias the SHM mapping
-    /// directly via [`Buffer::from_custom_allocation`], with an
-    /// [`Arc`] of the underlying [`OsShm`] keeping the mmap alive
+    /// directly via `Buffer::from_custom_allocation`, with an
+    /// [`Arc`] of the underlying `OsShm` keeping the mmap alive
     /// as long as any column buffer references it.
     ///
     /// For dictionary-encoded schemas the SHM region holds only the

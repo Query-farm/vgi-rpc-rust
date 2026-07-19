@@ -31,7 +31,7 @@ enum Sink {
 /// Python validator's filter (`.logger == "vgi_rpc.access"`) matches.
 ///
 /// Two modes:
-/// - [`AccessLogHook::new`] / [`to_stderr`] write synchronously on the
+/// - [`AccessLogHook::new`] / [`AccessLogHook::to_stderr`] write synchronously on the
 ///   dispatch thread (acceptable for stderr or in-memory test sinks).
 /// - [`AccessLogHook::buffered`] queues into a bounded mpsc channel and
 ///   drains on a background thread; on overflow it drops the entry and

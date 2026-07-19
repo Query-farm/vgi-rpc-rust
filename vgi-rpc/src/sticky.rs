@@ -275,7 +275,7 @@ impl SessionRegistry {
 
 /// Operator-facing handle for graceful drain of a sticky-enabled server.
 ///
-/// Returned by [`crate::http::HttpStateBuilder::sticky_drain_handle`].
+/// Returned by [`crate::http::HttpState::sticky_drain_handle`].
 /// Wire it into a SIGTERM handler or a worker-exit hook:
 ///
 /// * [`DrainHandle::drain`] flips the registry's drain flag so subsequent

@@ -176,7 +176,7 @@ pub fn jwt_authenticate_with(
 /// Given the [`JwtConfig`], the matched `JwksKey`, and the raw token,
 /// returns the decoded claims map on success or an error to reject the
 /// token. The verifier is responsible for signature + `exp`/`nbf`
-/// verification; [`validate_token`] additionally enforces `exp`, `iss`,
+/// verification; `validate_token` additionally enforces `exp`, `iss`,
 /// and `aud` from the returned claims, so a verifier that skips those is
 /// still backstopped.
 ///
@@ -435,7 +435,7 @@ pub fn reqwest_jwks_fetcher(url: &str) -> std::result::Result<Jwks, RpcError> {
 /// the attacker-controlled JWT header — which blocks algorithm-confusion
 /// attacks. When the JWKS key also declares an `alg`, the token must
 /// match it exactly. `exp`/`nbf` are enforced (with the configured
-/// leeway); `iss`/`aud` are enforced by [`validate_token`] against the
+/// leeway); `iss`/`aud` are enforced by `validate_token` against the
 /// returned claims.
 #[cfg(feature = "jwt-jsonwebtoken")]
 pub fn jsonwebtoken_verifier() -> Arc<Verifier> {

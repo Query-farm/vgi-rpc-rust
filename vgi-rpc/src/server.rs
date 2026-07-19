@@ -570,9 +570,11 @@ impl MethodInfo {
     ///
     /// **Note:** this form registers the method without a state decoder,
     /// so it will work for pipe/unix transports but HTTP continuation
-    /// requests will fail. Use
-    /// [`MethodInfo::producer_with_codec`] /
-    /// [`MethodInfo::exchange_with_codec`] when HTTP is enabled.
+    /// requests will fail. Attach a decoder via
+    /// [`MethodInfo::with_state_decoder`] with
+    /// [`producer_decoder`](crate::stream::producer_decoder) /
+    /// [`exchange_decoder`](crate::stream::exchange_decoder) when HTTP is
+    /// enabled.
     pub fn stream(
         name: impl Into<String>,
         method_type: MethodType,
@@ -857,7 +859,7 @@ impl RpcServer {
         }
     }
 
-    /// Like [`serve`], but checks `shutdown` between requests and exits
+    /// Like [`Self::serve`], but checks `shutdown` between requests and exits
     /// cleanly when it returns `true`. Useful for daemonized pipe/unix
     /// listeners that want to drain the in-flight request before exiting
     /// on SIGTERM. Blocking reads still must terminate via EOF/peer-close

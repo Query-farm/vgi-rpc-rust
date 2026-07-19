@@ -825,7 +825,7 @@ fn read_schema_bytes(bytes: &[u8]) -> Result<SchemaRef> {
 }
 
 /// A future that resolves when the process receives SIGTERM or SIGINT
-/// (or a Ctrl-C event on non-Unix). Pass to [`axum::serve`]'s
+/// (or a Ctrl-C event on non-Unix). Pass to [`axum::serve`](fn@axum::serve)'s
 /// `with_graceful_shutdown` to stop accepting new connections, drain
 /// in-flight requests, and exit cleanly.
 ///
@@ -870,7 +870,7 @@ pub async fn shutdown_signal() {
 
 /// Serve `state` on `listener`, terminating cleanly on SIGTERM/SIGINT.
 /// Convenience wrapper around [`build_router`] +
-/// [`axum::serve`] + [`shutdown_signal`].
+/// [`axum::serve`](fn@axum::serve) + [`shutdown_signal`].
 pub async fn serve_with_shutdown(
     state: Arc<HttpState>,
     listener: tokio::net::TcpListener,

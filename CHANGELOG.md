@@ -2,6 +2,45 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.14.0] — 2026-07-19
+
+Headline: **hot-path allocation reductions** across server dispatch, the
+Arrow-IPC wire writer, and the HTTP transport. No cross-language wire
+change — the full 901-test conformance suite stays green on every
+transport.
+
+- **Changed (API)** `Request.metadata` is now `Arc<Metadata>` (was
+  `Metadata`). Reads via deref (`req.metadata.get(...)`, `&req.metadata`)
+  are unaffected; the field is now shared with `CallContext` /
+  `DispatchInfo` by `Arc` bump instead of two deep hashmap clones per
+  request.
+- **Performance (dispatch)** the `DispatchInfo` build and the request
+  batch re-serialization now run only when a dispatch hook is registered,
+  so the hookless path skips a full Arrow re-encode and a large
+  owned-clone struct per request. Roughly halves unary-noop allocations.
+- **Performance (streams)** per-tick input metadata is moved into the
+  context instead of deep-cloned; `cast_batch` reuses the caller's
+  `SchemaRef` instead of deep-cloning the `Schema`; the zero-row envelope
+  batch is built once per stream; and a reusable, lazily-allocated
+  `EnvelopeMeta` builds log/error envelope metadata without rebuilding
+  the map (or re-stringifying the ids) per line — and allocates nothing
+  on calls that never log.
+- **Performance (wire)** `StreamWriter` reuses one `FlatBufferBuilder`
+  for the per-batch metadata repack and drops the two throwaway
+  descriptor `Vec`s (`create_vector_from_iter`); `parse_custom_metadata`
+  pre-sizes its map.
+- **Performance (http)** stream continuations reuse the schema bytes
+  already carried in the token instead of a decode→re-encode of both
+  schemas every turn; the post-processing middleware extracts only the
+  header values it needs instead of cloning the whole request
+  `HeaderMap`; capability + CORS response headers are precomputed once at
+  build time.
+- **Changed (http)** zstd response compression now skips bodies below a
+  1 KiB threshold and keeps the compressed form only when it is actually
+  smaller, so tiny error / continuation-token responses ship
+  uncompressed. (`Accept-Encoding` is a client capability, not a demand,
+  so this is transparent to conformant clients.)
+
 ## [0.13.0] — 2026-07-16
 
 Headline: **shm request-batch resolution**, **HTTP exchange metadata parity

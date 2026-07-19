@@ -220,7 +220,7 @@ impl CallContext {
             server_id: server.server_id.clone(),
             method: req.method.clone(),
             request_id: req.request_id.clone(),
-            transport_metadata: Arc::new(req.metadata.clone()),
+            transport_metadata: req.metadata.clone(),
             auth: crate::auth::AuthContext::anonymous(),
             cookies: std::collections::BTreeMap::new(),
             kind: server.transport_kind(),
@@ -245,7 +245,7 @@ impl CallContext {
             server_id: server.server_id.clone(),
             method: req.method.clone(),
             request_id: req.request_id.clone(),
-            transport_metadata: Arc::new(req.metadata.clone()),
+            transport_metadata: req.metadata.clone(),
             auth,
             cookies,
             kind: server.transport_kind(),
@@ -331,7 +331,10 @@ pub struct Request {
     pub method: String,
     pub request_id: String,
     pub batch: RecordBatch,
-    pub metadata: Metadata,
+    /// Request-level custom metadata. Held behind an `Arc` so the dispatch
+    /// path can hand a shared, cheap-to-clone reference to the `CallContext`
+    /// and (when enabled) the `DispatchInfo` without deep-copying the map.
+    pub metadata: Arc<Metadata>,
 }
 
 impl Request {
@@ -386,7 +389,7 @@ impl Request {
             method,
             request_id,
             batch,
-            metadata,
+            metadata: Arc::new(metadata),
         })
     }
 }
@@ -992,21 +995,27 @@ impl RpcServer {
             MethodType::Unary => "unary",
             _ => "stream",
         };
-        let mut dispatch_info =
-            crate::hooks::DispatchInfo::from_request(self, &req, method_type, &ctx.auth);
-        // Best-effort capture of self-contained Arrow IPC bytes of the
-        // request batch for access-log `request_data`. Failures here must
-        // not abort dispatch — observability is non-essential.
-        if let Ok(bytes) = serialize_request_batch(&req.batch) {
-            dispatch_info.request_data = bytes;
-        }
-        if method_type == "stream" {
-            dispatch_info.stream_id = crate::access_log::random_stream_id();
-        }
-        let hook_token = self
-            .dispatch_hook
-            .as_ref()
-            .map(|h| h.on_dispatch_start(&dispatch_info));
+        // The `DispatchInfo` — a large struct with many owned clones — plus
+        // the request re-serialization below are needed *only* when a
+        // dispatch hook is registered. Build nothing on the hookless path.
+        let dispatch_info = self.dispatch_hook.as_ref().map(|_| {
+            let mut di =
+                crate::hooks::DispatchInfo::from_request(self, &req, method_type, &ctx.auth);
+            // Best-effort capture of self-contained Arrow IPC bytes of the
+            // request batch for access-log `request_data`. Failures here must
+            // not abort dispatch — observability is non-essential.
+            if let Ok(bytes) = serialize_request_batch(&req.batch) {
+                di.request_data = bytes;
+            }
+            if method_type == "stream" {
+                di.stream_id = crate::access_log::random_stream_id();
+            }
+            di
+        });
+        let hook_token = match (self.dispatch_hook.as_ref(), dispatch_info.as_ref()) {
+            (Some(h), Some(di)) => Some(h.on_dispatch_start(di)),
+            _ => None,
+        };
 
         let mut app_err: Option<RpcError> = None;
         // Determine the SHM segment for this call's data plane (resolving
@@ -1046,10 +1055,10 @@ impl RpcServer {
         // mmap of the client-owned segment without unlinking it; a cached
         // segment lives until the connection ends.
 
-        if let Some(hook) = self.dispatch_hook.as_ref() {
+        if let (Some(hook), Some(di)) = (self.dispatch_hook.as_ref(), dispatch_info.as_ref()) {
             let token = hook_token.unwrap_or(0);
             let final_stats = lock_ok(&stats).clone();
-            hook.on_dispatch_end(token, &dispatch_info, app_err.as_ref(), &final_stats);
+            hook.on_dispatch_end(token, di, app_err.as_ref(), &final_stats);
         }
         Ok(true)
     }
@@ -1140,12 +1149,13 @@ impl RpcServer {
         // unwinding through the serve loop.
         let result = call_guard(|| (info.unary.as_ref().unwrap())(req, ctx)).and_then(|r| r);
         let logs = ctx.drain_logs();
+        let mut envelope = EnvelopeMeta::new(&self.server_id, &req.request_id);
         match result {
             Ok(maybe_batch) => {
                 let mut sw = StreamWriter::new(w, &info.result_schema)?;
                 for log in logs {
-                    let md = build_log_metadata(&log, &self.server_id, &req.request_id);
-                    sw.write(&empty_batch(&info.result_schema)?, Some(&md))?;
+                    let md = envelope.log(&log);
+                    sw.write(&empty_batch(&info.result_schema)?, Some(md))?;
                 }
                 let out_batch = match maybe_batch {
                     Some(b) => b,
@@ -1184,11 +1194,11 @@ impl RpcServer {
             Err(err) => {
                 let mut sw = StreamWriter::new(w, &info.result_schema)?;
                 for log in logs {
-                    let md = build_log_metadata(&log, &self.server_id, &req.request_id);
-                    sw.write(&empty_batch(&info.result_schema)?, Some(&md))?;
+                    let md = envelope.log(&log);
+                    sw.write(&empty_batch(&info.result_schema)?, Some(md))?;
                 }
-                let md = build_error_metadata(&err, &self.server_id, &req.request_id);
-                sw.write(&empty_batch(&info.result_schema)?, Some(&md))?;
+                let md = envelope.error(&err);
+                sw.write(&empty_batch(&info.result_schema)?, Some(md))?;
                 sw.finish()?;
                 *app_err = Some(err);
             }
@@ -1217,12 +1227,13 @@ impl RpcServer {
                 // Init error: write as unary-style error stream.
                 let output_schema = info.result_schema.clone();
                 let mut sw = StreamWriter::new(w, &output_schema)?;
+                let mut envelope = EnvelopeMeta::new(&self.server_id, &req.request_id);
                 for log in init_logs {
-                    let md = build_log_metadata(&log, &self.server_id, &req.request_id);
-                    sw.write(&empty_batch(&output_schema)?, Some(&md))?;
+                    let md = envelope.log(&log);
+                    sw.write(&empty_batch(&output_schema)?, Some(md))?;
                 }
-                let md = build_error_metadata(&err, &self.server_id, &req.request_id);
-                sw.write(&empty_batch(&output_schema)?, Some(&md))?;
+                let md = envelope.error(&err);
+                sw.write(&empty_batch(&output_schema)?, Some(md))?;
                 sw.finish()?;
                 // Drain any client input (ticks / exchange batches) so the transport
                 // is clean for the next request.
@@ -1240,13 +1251,18 @@ impl RpcServer {
             header_metadata,
         } = stream;
 
+        // Reused across every log/error envelope in this stream: the stable
+        // server_id/request_id entries are allocated once and each envelope
+        // only overwrites the transient level/message/extra values.
+        let mut envelope = EnvelopeMeta::new(&self.server_id, &req.request_id);
+
         // Write header as its own IPC stream if present.
         let wrote_header = header.is_some();
         if let Some(header_batch) = header {
             let mut hw = StreamWriter::new(&mut *w, header_batch.schema().as_ref())?;
             for log in &init_logs {
-                let md = build_log_metadata(log, &self.server_id, &req.request_id);
-                hw.write(&empty_batch(header_batch.schema().as_ref())?, Some(&md))?;
+                let md = envelope.log(log);
+                hw.write(&empty_batch(header_batch.schema().as_ref())?, Some(md))?;
             }
             hw.write(&header_batch, header_metadata.as_ref())?;
             hw.finish()?;
@@ -1262,11 +1278,16 @@ impl RpcServer {
         // Open the input stream (ticks for producer, real batches for exchange).
         let mut input_reader = StreamReader::new(&mut *r)?;
 
+        // A zero-row batch on the output schema, reused for every log/error
+        // envelope in this stream (it's immutable and identical each time)
+        // instead of rebuilding it per log line / per tick.
+        let empty_out = empty_batch(output_schema.as_ref())?;
+
         // If we didn't already write init logs into a header stream, write them now.
         if !wrote_header {
             for log in &init_logs {
-                let md = build_log_metadata(log, &self.server_id, &req.request_id);
-                out_writer.write(&empty_batch(output_schema.as_ref())?, Some(&md))?;
+                let md = envelope.log(log);
+                out_writer.write(&empty_out, Some(md))?;
             }
         }
         let _ = header_metadata;
@@ -1302,12 +1323,17 @@ impl RpcServer {
                 s.input_rows += input_batch.num_rows() as u64;
             }
 
+            // Read the cancel flag before moving `input_md` into the context.
+            let is_cancel = md_get(&input_md, CANCEL_KEY).is_some();
+
             // Surface this tick's input metadata (e.g. dynamic pushdown
             // filters) to the producer/exchange handler via the context.
-            *lock_ok(&ctx.tick_metadata) = input_md.clone();
+            // `input_md` is not used past this point, so move it in rather
+            // than deep-clone the map every tick.
+            *lock_ok(&ctx.tick_metadata) = input_md;
 
             // Cancellation signal.
-            if md_get(&input_md, CANCEL_KEY).is_some() {
+            if is_cancel {
                 cancelled = true;
                 match &mut state {
                     StreamStateKind::Producer(p) => p.on_cancel(ctx),
@@ -1322,8 +1348,8 @@ impl RpcServer {
                     match cast_batch(&input_batch, expected) {
                         Ok(b) => b,
                         Err(e) => {
-                            let md = build_error_metadata(&e, &self.server_id, &req.request_id);
-                            out_writer.write(&empty_batch(output_schema.as_ref())?, Some(&md))?;
+                            let md = envelope.error(&e);
+                            out_writer.write(&empty_out, Some(md))?;
                             break 'lockstep;
                         }
                     }
@@ -1342,13 +1368,13 @@ impl RpcServer {
             // Flush any iteration-level logs first (logs appended during produce/exchange).
             let iter_logs = ctx.drain_logs();
             for log in iter_logs {
-                let md = build_log_metadata(&log, &self.server_id, &req.request_id);
-                out_writer.write(&empty_batch(output_schema.as_ref())?, Some(&md))?;
+                let md = envelope.log(&log);
+                out_writer.write(&empty_out, Some(md))?;
             }
 
             if let Err(err) = iter_result {
-                let md = build_error_metadata(&err, &self.server_id, &req.request_id);
-                out_writer.write(&empty_batch(output_schema.as_ref())?, Some(&md))?;
+                let md = envelope.error(&err);
+                out_writer.write(&empty_out, Some(md))?;
                 *app_err = Some(err);
                 break;
             }
@@ -1359,8 +1385,8 @@ impl RpcServer {
             for item in out.items.drain(..) {
                 match item {
                     Emitted::Log(log) => {
-                        let md = build_log_metadata(&log, &self.server_id, &req.request_id);
-                        out_writer.write(&empty_batch(output_schema.as_ref())?, Some(&md))?;
+                        let md = envelope.log(&log);
+                        out_writer.write(&empty_out, Some(md))?;
                     }
                     Emitted::Batch { batch, metadata } => {
                         {
@@ -1424,7 +1450,7 @@ fn drain_input<R: Read>(r: &mut R) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cast_batch(batch: &RecordBatch, target: &Schema) -> Result<RecordBatch> {
+pub(crate) fn cast_batch(batch: &RecordBatch, target: &SchemaRef) -> Result<RecordBatch> {
     if batch.num_columns() != target.fields().len() {
         return Err(RpcError::type_error(format!(
             "Input schema mismatch: expected {} fields, got {}",
@@ -1455,43 +1481,103 @@ pub(crate) fn cast_batch(batch: &RecordBatch, target: &Schema) -> Result<RecordB
             .map_err(|e| RpcError::type_error(format!("cast field {}: {}", field.name(), e)))?;
         cols.push(c);
     }
-    RecordBatch::try_new(Arc::new(target.clone()), cols).map_err(RpcError::from)
+    // Reuse the caller's `SchemaRef` (Arc bump) instead of deep-cloning the
+    // Schema on every casting tick.
+    RecordBatch::try_new(target.clone(), cols).map_err(RpcError::from)
+}
+
+/// Reusable builder for per-message log / error envelope metadata.
+///
+/// The `server_id` / `request_id` entries are stable for the lifetime of a
+/// call, so they are allocated once at construction and kept in the map.
+/// Each subsequent envelope only overwrites the transient
+/// level/message/extra values in place (`get_mut`, reusing the existing key
+/// and slot allocations) instead of building a fresh `HashMap` and
+/// re-stringifying the ids on every log line — the per-tick allocation cost
+/// under streaming logging. The on-wire bytes are unchanged (metadata key
+/// order is already unspecified).
+pub(crate) struct EnvelopeMeta<'a> {
+    server_id: &'a str,
+    request_id: &'a str,
+    /// Allocated lazily on the first log/error so a call that never logs
+    /// (the common case) pays nothing.
+    md: Option<Metadata>,
+}
+
+impl<'a> EnvelopeMeta<'a> {
+    pub(crate) fn new(server_id: &'a str, request_id: &'a str) -> Self {
+        Self {
+            server_id,
+            request_id,
+            md: None,
+        }
+    }
+
+    /// The metadata map, allocating it (with the stable id entries) on first
+    /// use.
+    fn map(&mut self) -> &mut Metadata {
+        if self.md.is_none() {
+            let mut md = Metadata::with_capacity(5);
+            if !self.server_id.is_empty() {
+                md.insert(SERVER_ID_KEY.to_string(), self.server_id.to_string());
+            }
+            if !self.request_id.is_empty() {
+                md.insert(REQUEST_ID_KEY.to_string(), self.request_id.to_string());
+            }
+            self.md = Some(md);
+        }
+        self.md.as_mut().unwrap()
+    }
+
+    /// Overwrite `key`'s value in place when present (reusing the key + slot
+    /// allocation), else insert it.
+    fn set(&mut self, key: &'static str, val: String) {
+        let md = self.map();
+        if let Some(slot) = md.get_mut(key) {
+            *slot = val;
+        } else {
+            md.insert(key.to_string(), val);
+        }
+    }
+
+    /// Populate for a log message and return the reused metadata map.
+    pub(crate) fn log(&mut self, msg: &LogMessage) -> &Metadata {
+        self.set(LOG_LEVEL_KEY, msg.level.as_str().to_string());
+        self.set(LOG_MESSAGE_KEY, msg.message.clone());
+        if !msg.extras.is_empty() {
+            self.set(LOG_EXTRA_KEY, msg.extras_json());
+        } else {
+            // Clear any extra left by a previous error/log envelope.
+            self.map().remove(LOG_EXTRA_KEY);
+        }
+        self.md.as_ref().unwrap()
+    }
+
+    /// Populate for an error (EXCEPTION level) and return the reused map.
+    pub(crate) fn error(&mut self, err: &RpcError) -> &Metadata {
+        let extra = serde_json::json!({
+            "exception_type": err.error_type,
+            "exception_message": err.message,
+            "traceback": err.traceback,
+        })
+        .to_string();
+        self.set(LOG_LEVEL_KEY, "EXCEPTION".to_string());
+        self.set(LOG_MESSAGE_KEY, err.message.clone());
+        self.set(LOG_EXTRA_KEY, extra);
+        self.md.as_ref().unwrap()
+    }
 }
 
 pub(crate) fn build_log_metadata(msg: &LogMessage, server_id: &str, request_id: &str) -> Metadata {
-    let mut md = Metadata::new();
-    md.insert(LOG_LEVEL_KEY.to_string(), msg.level.as_str().to_string());
-    md.insert(LOG_MESSAGE_KEY.to_string(), msg.message.clone());
-    if !msg.extras.is_empty() {
-        md.insert(LOG_EXTRA_KEY.to_string(), msg.extras_json());
-    }
-    if !server_id.is_empty() {
-        md.insert(SERVER_ID_KEY.to_string(), server_id.to_string());
-    }
-    if !request_id.is_empty() {
-        md.insert(REQUEST_ID_KEY.to_string(), request_id.to_string());
-    }
-    md
+    let mut e = EnvelopeMeta::new(server_id, request_id);
+    e.log(msg);
+    e.md.unwrap()
 }
 
 pub(crate) fn build_error_metadata(err: &RpcError, server_id: &str, request_id: &str) -> Metadata {
-    let extra = serde_json::json!({
-        "exception_type": err.error_type,
-        "exception_message": err.message,
-        "traceback": err.traceback,
-    })
-    .to_string();
-    let mut md = Metadata::new();
-    md.insert(LOG_LEVEL_KEY.to_string(), "EXCEPTION".to_string());
-    md.insert(LOG_MESSAGE_KEY.to_string(), err.message.clone());
-    md.insert(LOG_EXTRA_KEY.to_string(), extra);
-    if !server_id.is_empty() {
-        md.insert(SERVER_ID_KEY.to_string(), server_id.to_string());
-    }
-    if !request_id.is_empty() {
-        md.insert(REQUEST_ID_KEY.to_string(), request_id.to_string());
-    }
-    md
+    let mut e = EnvelopeMeta::new(server_id, request_id);
+    e.error(err);
+    e.md.unwrap()
 }
 
 /// Write an error as a complete single-batch IPC stream.

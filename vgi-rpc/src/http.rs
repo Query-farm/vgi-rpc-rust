@@ -76,6 +76,11 @@ const STICKY_ECHO_HEADERS_HEADER: &str = "vgi-sticky-echo-headers";
 /// Framework-managed sticky session teardown endpoint path segment.
 const SESSION_ENDPOINT: &str = "__session__";
 
+/// Response bodies smaller than this are never zstd-compressed: below it the
+/// frame overhead dominates and often enlarges the payload, so the CPU and
+/// allocation cost of compressing isn't repaid.
+const MIN_ZSTD_COMPRESS_BYTES: usize = 1024;
+
 /// HTTP server state shared across all handlers.
 ///
 /// Build via [`HttpState::builder`] (preferred) or [`HttpState::new`] for a
@@ -100,7 +105,6 @@ pub struct HttpState {
     oauth_metadata: Option<Arc<crate::auth::oauth::OAuthResourceMetadata>>,
     oauth_metadata_json: Option<Vec<u8>>,
     www_authenticate: Option<String>,
-    cors_origins: Option<String>,
     cors_max_age: u32,
     prefix: String,
     response_compression_level: Option<i32>,
@@ -108,16 +112,11 @@ pub struct HttpState {
     describe_page_enabled: bool,
     health_enabled: bool,
     max_request_bytes: Option<usize>,
-    max_upload_bytes: Option<usize>,
     /// Hard cap on the HTTP body size for unary and stream-exchange
     /// responses (advertised via `VGI-Max-Response-Bytes`).  `None` =
     /// unbounded.  Externalised payloads do not count toward this — they
     /// leave only tiny pointer batches on the wire.
     max_response_bytes: Option<usize>,
-    /// Hard cap on bytes uploaded to external storage during one HTTP
-    /// response (advertised via `VGI-Max-Externalized-Response-Bytes`).
-    /// Always hard — externalised uploads have no escape valve.
-    max_externalized_response_bytes: Option<usize>,
     upload_url_provider: Option<Arc<dyn crate::external::UploadUrlProvider>>,
     /// Sticky-session context, `Some` when the server is sticky-enabled.
     sticky: Option<Arc<crate::sticky::StickyContext>>,
@@ -125,6 +124,16 @@ pub struct HttpState {
     /// lazy columns). `Some` mounts the describe routes; `None` leaves the
     /// server serving only the shared `landing.html` at `GET {prefix}/`.
     describe_provider: Option<Arc<dyn DescribeProvider>>,
+    /// Capability response headers precomputed from immutable config at
+    /// build time, cloned into each response instead of re-formatting the
+    /// numeric caps (`n.to_string()` + `HeaderValue::from_str`) per request.
+    capability_headers: HeaderMap,
+    /// Whether any capability header beyond the always-present flags is
+    /// set — gates the preflight `Cache-Control` header.
+    capability_has_any: bool,
+    /// `Access-Control-Allow-Origin` value precomputed from `cors_origins`
+    /// so the per-response CORS path doesn't re-parse the origin string.
+    cors_allow_origin: Option<HeaderValue>,
 }
 
 /// Fluent builder for [`HttpState`].
@@ -432,6 +441,19 @@ impl HttpStateBuilder {
         } else {
             None
         };
+        let cors_allow_origin = self
+            .cors_origins
+            .as_deref()
+            .and_then(|o| HeaderValue::from_str(o).ok());
+        let (capability_headers, capability_has_any) = build_capability_headers(
+            self.max_request_bytes,
+            self.max_response_bytes,
+            self.max_externalized_response_bytes,
+            server.external_config().is_some(),
+            self.upload_url_provider.is_some(),
+            self.max_upload_bytes,
+            sticky.as_deref(),
+        );
         Arc::new(HttpState {
             server,
             token_key,
@@ -447,7 +469,6 @@ impl HttpStateBuilder {
             oauth_metadata: self.oauth_metadata,
             oauth_metadata_json,
             www_authenticate,
-            cors_origins: self.cors_origins,
             cors_max_age: self.cors_max_age.unwrap_or(7200),
             prefix: self.prefix.unwrap_or_default(),
             response_compression_level: self.response_compression_level,
@@ -455,14 +476,92 @@ impl HttpStateBuilder {
             describe_page_enabled: self.describe_page_enabled.unwrap_or(true),
             health_enabled: self.health_enabled.unwrap_or(true),
             max_request_bytes: self.max_request_bytes,
-            max_upload_bytes: self.max_upload_bytes,
             max_response_bytes: self.max_response_bytes,
-            max_externalized_response_bytes: self.max_externalized_response_bytes,
             upload_url_provider: self.upload_url_provider,
             sticky,
             describe_provider: self.describe_provider,
+            capability_headers,
+            capability_has_any,
+            cors_allow_origin,
         })
     }
+}
+
+/// Precompute the immutable capability response headers once, mirroring the
+/// per-response logic that `attach_capability_headers` used to run. Returns
+/// the header set plus whether any "beyond the always-present flags" header
+/// is present (which gates the preflight `Cache-Control`).
+fn build_capability_headers(
+    max_request_bytes: Option<usize>,
+    max_response_bytes: Option<usize>,
+    max_externalized_response_bytes: Option<usize>,
+    externalization_enabled: bool,
+    upload_url_support: bool,
+    max_upload_bytes: Option<usize>,
+    sticky: Option<&crate::sticky::StickyContext>,
+) -> (HeaderMap, bool) {
+    let mut out = HeaderMap::new();
+    let mut any = false;
+    if let Some(n) = max_request_bytes {
+        if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
+            out.insert("vgi-max-request-bytes", v);
+            any = true;
+        }
+    }
+    if let Some(n) = max_response_bytes {
+        if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
+            out.insert("vgi-max-response-bytes", v);
+            any = true;
+        }
+    }
+    if let Some(n) = max_externalized_response_bytes {
+        if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
+            out.insert("vgi-max-externalized-response-bytes", v);
+            any = true;
+        }
+    }
+    // Always present so capability-aware clients can decide whether to
+    // expect externalised payloads.
+    out.insert(
+        "vgi-externalization-enabled",
+        HeaderValue::from_static(if externalization_enabled {
+            "true"
+        } else {
+            "false"
+        }),
+    );
+    if upload_url_support {
+        out.insert("vgi-upload-url-support", HeaderValue::from_static("true"));
+        any = true;
+        if let Some(n) = max_upload_bytes {
+            if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
+                out.insert("vgi-max-upload-bytes", v);
+            }
+        }
+    }
+    // Sticky-session capabilities. Always emit the enabled flag (negative
+    // form when off) so capability discovery is unambiguous.
+    if let Some(sticky) = sticky {
+        out.insert(STICKY_ENABLED_HEADER, HeaderValue::from_static("true"));
+        any = true;
+        if let Ok(v) = HeaderValue::from_str(&sticky.default_ttl.as_secs().to_string()) {
+            out.insert(STICKY_DEFAULT_TTL_HEADER, v);
+        }
+        if !sticky.echo_headers.is_empty() {
+            let names = sticky
+                .echo_headers
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            if let Ok(v) = HeaderValue::from_str(&names) {
+                out.insert(STICKY_ECHO_HEADERS_HEADER, v);
+            }
+        }
+    } else {
+        out.insert(STICKY_ENABLED_HEADER, HeaderValue::from_static("false"));
+    }
+    (out, any)
 }
 
 impl HttpState {
@@ -844,9 +943,22 @@ async fn postprocess_middleware(
         crate::transport::TransportKind::Http,
         crate::transport::TransportCapabilities::none(),
     );
-    let req_headers = req.headers().clone();
+    // Extract only the header values the post-processing needs, rather than
+    // deep-cloning the entire request `HeaderMap` on every request. The
+    // request is consumed by `next.run(req)` below, so these must be taken
+    // first. CORS echoes the client's `Access-Control-Request-Headers`;
+    // compression consults `Accept-Encoding`.
+    let req_acrh = req
+        .headers()
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+        .cloned();
+    let req_accepts_zstd = req
+        .headers()
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.contains("zstd"));
     let req_method = req.method().clone();
-    let req_path = req.uri().path().to_string();
+    let req_path = req.uri().path();
 
     // Enforce server-advertised max_request_bytes before invoking the
     // handler. Exempt the upload-URL flow itself and `/health` so
@@ -867,7 +979,7 @@ async fn postprocess_middleware(
                 if cl > limit {
                     let mut h = HeaderMap::new();
                     attach_capability_headers(&state, &mut h, &req_method);
-                    attach_cors_headers(&state, &mut h, &req_headers, false);
+                    attach_cors_headers(&state, &mut h, req_acrh.as_ref(), false);
                     return (
                         StatusCode::PAYLOAD_TOO_LARGE,
                         h,
@@ -897,7 +1009,7 @@ async fn postprocess_middleware(
         Ok(b) => b,
         Err(_) => {
             let mut h = HeaderMap::new();
-            attach_cors_headers(&state, &mut h, &req_headers, false);
+            attach_cors_headers(&state, &mut h, req_acrh.as_ref(), false);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 h,
@@ -914,23 +1026,30 @@ async fn postprocess_middleware(
 
     if is_arrow {
         if let Some(level) = state.response_compression_level {
-            let accepts = req_headers
-                .get(header::ACCEPT_ENCODING)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            if accepts.contains("zstd") {
+            // Only compress when the client accepts zstd AND the body is large
+            // enough to benefit. Below the threshold, zstd frame overhead
+            // dominates and can enlarge the payload — tiny bodies (empty-schema
+            // error / continuation-token responses, small scalar unary results)
+            // waste CPU and allocation for no gain. `Accept-Encoding` is a
+            // client capability, not a demand, so an uncompressed reply is
+            // always valid.
+            if req_accepts_zstd && bytes.len() >= MIN_ZSTD_COMPRESS_BYTES {
                 if let Ok(compressed) = zstd::encode_all(std::io::Cursor::new(&bytes), level) {
-                    parts
-                        .headers
-                        .insert(header::CONTENT_ENCODING, HeaderValue::from_static("zstd"));
-                    attach_cors_headers(&state, &mut parts.headers, &req_headers, false);
-                    let body_new = axum::body::Body::from(compressed);
-                    return Response::from_parts(parts, body_new);
+                    // Ship the compressed form only if it actually shrank the
+                    // body; otherwise fall through and send it uncompressed.
+                    if compressed.len() < bytes.len() {
+                        parts
+                            .headers
+                            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+                        attach_cors_headers(&state, &mut parts.headers, req_acrh.as_ref(), false);
+                        let body_new = axum::body::Body::from(compressed);
+                        return Response::from_parts(parts, body_new);
+                    }
                 }
             }
         }
     }
-    attach_cors_headers(&state, &mut parts.headers, &req_headers, false);
+    attach_cors_headers(&state, &mut parts.headers, req_acrh.as_ref(), false);
     attach_capability_headers(&state, &mut parts.headers, &req_method);
     Response::from_parts(parts, axum::body::Body::from(bytes))
 }
@@ -945,67 +1064,11 @@ fn attach_capability_headers(
     out: &mut HeaderMap,
     method: &axum::http::Method,
 ) {
-    let mut any = false;
-    if let Some(n) = state.max_request_bytes {
-        if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
-            out.insert("vgi-max-request-bytes", v);
-            any = true;
-        }
+    // The capability set is immutable config, precomputed once in `build()`.
+    for (k, v) in state.capability_headers.iter() {
+        out.insert(k.clone(), v.clone());
     }
-    if let Some(n) = state.max_response_bytes {
-        if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
-            out.insert("vgi-max-response-bytes", v);
-            any = true;
-        }
-    }
-    if let Some(n) = state.max_externalized_response_bytes {
-        if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
-            out.insert("vgi-max-externalized-response-bytes", v);
-            any = true;
-        }
-    }
-    // Always present so capability-aware clients can decide whether to
-    // expect externalised payloads.
-    out.insert(
-        "vgi-externalization-enabled",
-        HeaderValue::from_static(if state.server.external_config().is_some() {
-            "true"
-        } else {
-            "false"
-        }),
-    );
-    if state.upload_url_provider.is_some() {
-        out.insert("vgi-upload-url-support", HeaderValue::from_static("true"));
-        any = true;
-        if let Some(n) = state.max_upload_bytes {
-            if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
-                out.insert("vgi-max-upload-bytes", v);
-            }
-        }
-    }
-    // Sticky-session capabilities. Always emit the enabled flag (negative
-    // form when off) so capability discovery is unambiguous.
-    if let Some(sticky) = state.sticky.as_ref() {
-        out.insert(STICKY_ENABLED_HEADER, HeaderValue::from_static("true"));
-        any = true;
-        if let Ok(v) = HeaderValue::from_str(&sticky.default_ttl.as_secs().to_string()) {
-            out.insert(STICKY_DEFAULT_TTL_HEADER, v);
-        }
-        if !sticky.echo_headers.is_empty() {
-            let names = sticky
-                .echo_headers
-                .iter()
-                .map(|(n, _)| n.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
-            if let Ok(v) = HeaderValue::from_str(&names) {
-                out.insert(STICKY_ECHO_HEADERS_HEADER, v);
-            }
-        }
-    } else {
-        out.insert(STICKY_ENABLED_HEADER, HeaderValue::from_static("false"));
-    }
-    if any && method == axum::http::Method::OPTIONS {
+    if state.capability_has_any && method == axum::http::Method::OPTIONS {
         out.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=300"),
@@ -1129,7 +1192,12 @@ async fn handle_delete_session(
 
 async fn handle_preflight(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> Response {
     let mut h = HeaderMap::new();
-    attach_cors_headers(&state, &mut h, &headers, true);
+    attach_cors_headers(
+        &state,
+        &mut h,
+        headers.get(header::ACCESS_CONTROL_REQUEST_HEADERS),
+        true,
+    );
     (StatusCode::NO_CONTENT, h).into_response()
 }
 
@@ -1276,15 +1344,13 @@ fn html_escape(s: &str) -> String {
 fn attach_cors_headers(
     state: &Arc<HttpState>,
     out: &mut HeaderMap,
-    req_headers: &HeaderMap,
+    requested_headers: Option<&HeaderValue>,
     is_preflight: bool,
 ) {
-    let Some(origins) = state.cors_origins.as_deref() else {
+    let Some(origin) = state.cors_allow_origin.as_ref() else {
         return;
     };
-    if let Ok(v) = HeaderValue::from_str(origins) {
-        out.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
-    }
+    out.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
     // When an authenticate callback is configured, requests carry
     // credentials (cookie / bearer). A browser only honours those
     // cross-origin when `Allow-Credentials: true` is present *and* the
@@ -1301,12 +1367,19 @@ fn attach_cors_headers(
         header::ACCESS_CONTROL_ALLOW_METHODS,
         HeaderValue::from_static("POST, GET, OPTIONS"),
     );
-    let requested = req_headers
-        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("Content-Type, Authorization, Cookie, Accept-Encoding");
-    if let Ok(v) = HeaderValue::from_str(requested) {
-        out.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, v);
+    // Echo the client's requested headers when present, else a sensible
+    // default. When the client already sent a valid `HeaderValue` we reuse
+    // it directly rather than round-tripping through `&str`.
+    match requested_headers {
+        Some(v) => {
+            out.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, v.clone());
+        }
+        None => {
+            out.insert(
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                HeaderValue::from_static("Content-Type, Authorization, Cookie, Accept-Encoding"),
+            );
+        }
     }
     out.insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
@@ -2210,7 +2283,7 @@ async fn handle_stream_init(
                 &req,
                 state.producer_batch_limit,
                 sticky_sink.as_ref(),
-                Some(&req.metadata),
+                Some(req.metadata.as_ref()),
             );
         }
         if !finished {
@@ -2258,20 +2331,43 @@ fn build_continuation_token(
     input_schema: Option<&SchemaRef>,
     stream_id: &str,
 ) -> Result<String> {
-    let state_bytes = match ss {
-        StreamStateKind::Producer(p) => p.encode_state()?,
-        StreamStateKind::Exchange(e) => e.encode_state()?,
-    };
     let out_schema_bytes = write_schema_bytes(output_schema.as_ref())?;
     let in_schema_bytes = match input_schema {
         Some(s) => write_schema_bytes(s.as_ref())?,
         None => Vec::new(),
     };
+    build_continuation_token_from_bytes(
+        state,
+        auth,
+        ss,
+        &out_schema_bytes,
+        &in_schema_bytes,
+        stream_id,
+    )
+}
+
+/// Like [`build_continuation_token`] but takes the already-serialized schema
+/// IPC bytes. Continuation requests carry these verbatim in the incoming
+/// token, so re-serializing the `SchemaRef`s (a decode→re-encode round trip,
+/// plus two `empty_batch` builds) on every turn is pure waste — thread the
+/// bytes straight through instead.
+fn build_continuation_token_from_bytes(
+    state: &Arc<HttpState>,
+    auth: &crate::auth::AuthContext,
+    ss: &StreamStateKind,
+    out_schema_bytes: &[u8],
+    in_schema_bytes: &[u8],
+    stream_id: &str,
+) -> Result<String> {
+    let state_bytes = match ss {
+        StreamStateKind::Producer(p) => p.encode_state()?,
+        StreamStateKind::Exchange(e) => e.encode_state()?,
+    };
     Ok(state.pack_state_token(
         auth,
         &state_bytes,
-        &out_schema_bytes,
-        &in_schema_bytes,
+        out_schema_bytes,
+        in_schema_bytes,
         stream_id,
     ))
 }
@@ -2442,7 +2538,7 @@ async fn handle_stream_exchange(
         method: method.clone(),
         request_id: md_get(&metadata, REQUEST_ID_KEY).unwrap_or("").to_string(),
         batch: empty_batch(&Schema::empty()).unwrap(),
-        metadata: metadata.clone(),
+        metadata: Arc::new(metadata.clone()),
     };
     let mut ctx = CallContext::for_request(&server, &req);
     if let Some(s) = sticky_sink.clone() {
@@ -2485,12 +2581,12 @@ async fn handle_stream_exchange(
                 None,
             );
             if !finished {
-                match build_continuation_token(
+                match build_continuation_token_from_bytes(
                     &state,
                     &auth,
                     &ss,
-                    &output_schema,
-                    input_schema.as_ref(),
+                    &unpacked.output_schema_bytes,
+                    &unpacked.input_schema_bytes,
                     &unpacked.stream_id,
                 ) {
                     Ok(new_token) => {
@@ -2544,12 +2640,12 @@ async fn handle_stream_exchange(
             let md = build_error_metadata(&err, &server.server_id, &req.request_id);
             let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
         } else {
-            let new_token = match build_continuation_token(
+            let new_token = match build_continuation_token_from_bytes(
                 &state,
                 &auth,
                 &ss,
-                &output_schema,
-                input_schema.as_ref(),
+                &unpacked.output_schema_bytes,
+                &unpacked.input_schema_bytes,
                 &unpacked.stream_id,
             ) {
                 Ok(t) => t,

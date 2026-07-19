@@ -88,6 +88,10 @@ pub struct StreamWriter<W: Write> {
     data_gen: IpcDataGenerator,
     dict_tracker: DictionaryTracker,
     finished: bool,
+    /// Reused across `write` calls so the per-batch metadata repack doesn't
+    /// allocate a fresh flatbuffer builder (and its internal vectors) each
+    /// time. `reset()` before each use; the buffer's capacity is retained.
+    fbb: FlatBufferBuilder<'static>,
 }
 
 impl<W: Write> StreamWriter<W> {
@@ -106,6 +110,7 @@ impl<W: Write> StreamWriter<W> {
             data_gen,
             dict_tracker,
             finished: false,
+            fbb: FlatBufferBuilder::new(),
         })
     }
 
@@ -125,9 +130,10 @@ impl<W: Write> StreamWriter<W> {
             write_message(&mut self.writer, d, &self.opts).map_err(RpcError::from)?;
         }
         if let Some(md) = metadata.filter(|m| !m.is_empty()) {
-            let new_msg = repack_record_batch_message_with_metadata(&data.ipc_message, md)?;
+            self.fbb.reset();
+            repack_record_batch_message_with_metadata(&mut self.fbb, &data.ipc_message, md)?;
             let encoded = arrow_ipc::writer::EncodedData {
-                ipc_message: new_msg,
+                ipc_message: self.fbb.finished_data().to_vec(),
                 arrow_data: data.arrow_data,
             };
             write_message(&mut self.writer, encoded, &self.opts).map_err(RpcError::from)?;
@@ -174,12 +180,11 @@ impl<W: Write> Drop for StreamWriter<W> {
 /// Rebuild a Message flatbuffer with `custom_metadata` added,
 /// preserving the embedded RecordBatch header unchanged.
 fn repack_record_batch_message_with_metadata(
+    fbb: &mut FlatBufferBuilder<'static>,
     msg_bytes: &[u8],
     metadata: &Metadata,
-) -> Result<Vec<u8>> {
-    use arrow_ipc::{
-        Buffer as FbBuffer, FieldNode, KeyValue, KeyValueArgs, MessageBuilder, RecordBatchBuilder,
-    };
+) -> Result<()> {
+    use arrow_ipc::{KeyValue, KeyValueArgs, MessageBuilder, RecordBatchBuilder};
 
     let msg = root_as_message(msg_bytes)
         .map_err(|e| RpcError::new("IPC", format!("parsing message: {e}")))?;
@@ -196,27 +201,25 @@ fn repack_record_batch_message_with_metadata(
         .header_as_record_batch()
         .ok_or_else(|| RpcError::new("IPC", "missing RecordBatch header"))?;
 
-    let mut fbb = FlatBufferBuilder::new();
-
+    // The caller has already `reset()` the builder. Feed the field-node and
+    // buffer descriptors straight from the source flatbuffer vectors via
+    // `create_vector_from_iter` — no throwaway `Vec` per batch.
     let src_nodes = rb
         .nodes()
         .ok_or_else(|| RpcError::new("IPC", "RecordBatch missing nodes"))?;
-    let nodes: Vec<FieldNode> = src_nodes.iter().copied().collect();
-    let nodes_vec = fbb.create_vector(&nodes);
+    let nodes_vec = fbb.create_vector_from_iter(src_nodes.iter());
 
     let src_buffers = rb
         .buffers()
         .ok_or_else(|| RpcError::new("IPC", "RecordBatch missing buffers"))?;
-    let buffers: Vec<FbBuffer> = src_buffers.iter().copied().collect();
-    let buffers_vec = fbb.create_vector(&buffers);
+    let buffers_vec = fbb.create_vector_from_iter(src_buffers.iter());
 
-    let variadic_vec = rb.variadicBufferCounts().map(|v| {
-        let counts: Vec<i64> = v.iter().collect();
-        fbb.create_vector(&counts)
-    });
+    let variadic_vec = rb
+        .variadicBufferCounts()
+        .map(|v| fbb.create_vector_from_iter(v.iter()));
 
     let new_rb = {
-        let mut b = RecordBatchBuilder::new(&mut fbb);
+        let mut b = RecordBatchBuilder::new(fbb);
         b.add_length(rb.length());
         b.add_nodes(nodes_vec);
         b.add_buffers(buffers_vec);
@@ -237,7 +240,7 @@ fn repack_record_batch_message_with_metadata(
             let k_off = fbb.create_string(k);
             let v_off = fbb.create_string(v);
             KeyValue::create(
-                &mut fbb,
+                fbb,
                 &KeyValueArgs {
                     key: Some(k_off),
                     value: Some(v_off),
@@ -247,7 +250,7 @@ fn repack_record_batch_message_with_metadata(
         .collect();
     let md_vec = fbb.create_vector(&kvs);
 
-    let mut mb = MessageBuilder::new(&mut fbb);
+    let mut mb = MessageBuilder::new(fbb);
     mb.add_version(version);
     mb.add_header_type(header_type);
     mb.add_header(new_rb.as_union_value());
@@ -255,7 +258,7 @@ fn repack_record_batch_message_with_metadata(
     mb.add_custom_metadata(md_vec);
     let m = mb.finish();
     fbb.finish(m, None);
-    Ok(fbb.finished_data().to_vec())
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -442,13 +445,15 @@ impl<R: Read> StreamReader<R> {
 }
 
 fn parse_custom_metadata(msg: &arrow_ipc::Message) -> Metadata {
-    let mut out = Metadata::new();
-    if let Some(md) = msg.custom_metadata() {
-        for kv in md.iter() {
-            let k = kv.key().unwrap_or("").to_string();
-            let v = kv.value().unwrap_or("").to_string();
-            out.insert(k, v);
-        }
+    let Some(md) = msg.custom_metadata() else {
+        return Metadata::new();
+    };
+    // Size the map to the known key count so it doesn't rehash while filling.
+    let mut out = Metadata::with_capacity(md.len());
+    for kv in md.iter() {
+        let k = kv.key().unwrap_or("").to_string();
+        let v = kv.value().unwrap_or("").to_string();
+        out.insert(k, v);
     }
     out
 }

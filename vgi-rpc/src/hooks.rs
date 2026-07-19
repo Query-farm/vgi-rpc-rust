@@ -81,7 +81,7 @@ impl DispatchInfo {
             protocol_hash: server.protocol_hash().to_string(),
             protocol_version: server.protocol_version().to_string(),
             request_id: req.request_id.clone(),
-            transport_metadata: Arc::new(req.metadata.clone()),
+            transport_metadata: req.metadata.clone(),
             principal: auth.principal.clone(),
             auth_domain: auth.domain.clone(),
             authenticated: auth.authenticated,

@@ -3,12 +3,30 @@
 
 use std::sync::Arc;
 
+use arrow_array::{RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema};
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use tower::ServiceExt;
 
 use vgi_rpc::http::{HttpState, ARROW_CONTENT_TYPE};
+use vgi_rpc::metadata::{REQUEST_VERSION, REQUEST_VERSION_KEY};
+use vgi_rpc::wire::{Metadata, StreamWriter};
 use vgi_rpc::{MethodInfo, RpcServer};
+
+/// Encode a valid unary HTTP request body: one IPC stream carrying `batch`
+/// with the request-version metadata (the method is derived from the URL).
+fn encode_unary_body(schema: &Schema, batch: &RecordBatch) -> Vec<u8> {
+    let mut md = Metadata::new();
+    md.insert(REQUEST_VERSION_KEY.into(), REQUEST_VERSION.into());
+    let mut buf = Vec::new();
+    {
+        let mut w = StreamWriter::new(&mut buf, schema).unwrap();
+        w.write(batch, Some(&md)).unwrap();
+        w.finish().unwrap();
+    }
+    buf
+}
 
 fn state_with(
     cors: Option<&str>,
@@ -40,6 +58,25 @@ fn state_with(
         .doc("stub echo")
         .param_type("value", "str"),
     );
+    // A method that returns a large, highly compressible body — used to
+    // exercise the response-compression path above the size threshold.
+    srv.register(MethodInfo::unary(
+        "big",
+        Schema::new(vec![Field::new("value", DataType::Utf8, false)]).into(),
+        Schema::new(vec![Field::new("result", DataType::Utf8, false)]).into(),
+        |_req, _| {
+            let big = "abcdefgh".repeat(2048); // 16 KiB, compresses well
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "result",
+                DataType::Utf8,
+                false,
+            )]));
+            let arr = StringArray::from(vec![big]);
+            Ok(Some(
+                RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap(),
+            ))
+        },
+    ));
     let mut b = HttpState::builder().server(Arc::new(srv));
     if let Some(o) = cors {
         b = b.cors_origins(o);
@@ -241,11 +278,13 @@ async fn describe_html_page_served() {
 }
 
 #[tokio::test]
-async fn compression_emits_zstd_encoded_response_on_error() {
+async fn small_response_below_threshold_is_not_compressed() {
     let state = state_with(None, None, Some(3));
     let app = vgi_rpc::http::build_router(state);
-    // Send a request missing Content-Type to force an error body; the
-    // response is an Arrow error stream which exercises the compression path.
+    // Send a request missing a body to force a small Arrow error stream. It is
+    // well under the 1 KiB compression threshold, so even though the client
+    // offered `Accept-Encoding: zstd` the reply is shipped uncompressed —
+    // `Accept-Encoding` is a client capability, not a demand.
     let resp = app
         .oneshot(
             Request::builder()
@@ -258,10 +297,53 @@ async fn compression_emits_zstd_encoded_response_on_error() {
         )
         .await
         .unwrap();
-    // Empty body parses as an error — we expect a 400 with arrow content.
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let ce = resp.headers().get(header::CONTENT_ENCODING).cloned();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    // Verify the premise (small body) and the behaviour (no compression).
+    assert!(
+        body.len() < 1024,
+        "error body unexpectedly large ({} bytes)",
+        body.len()
+    );
+    assert!(
+        ce.is_none(),
+        "sub-threshold bodies must not be zstd-compressed, got {ce:?}"
+    );
+}
+
+#[tokio::test]
+async fn large_response_above_threshold_is_zstd_compressed() {
+    let state = state_with(None, None, Some(3));
+    let app = vgi_rpc::http::build_router(state);
+    let params_schema = Schema::new(vec![Field::new("value", DataType::Utf8, false)]);
+    let batch = RecordBatch::try_new(
+        Arc::new(params_schema.clone()),
+        vec![Arc::new(StringArray::from(vec!["x"]))],
+    )
+    .unwrap();
+    let body = encode_unary_body(&params_schema, &batch);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/big")
+                .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
+                .header(header::ACCEPT_ENCODING, "zstd")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
     let ce = resp.headers().get(header::CONTENT_ENCODING);
-    assert_eq!(ce.map(|v| v.to_str().unwrap()), Some("zstd"));
+    assert_eq!(
+        ce.and_then(|v| v.to_str().ok()),
+        Some("zstd"),
+        "large compressible bodies must be zstd-compressed"
+    );
 }
 
 /// Minimal `HttpState` with a one-method server, configured by `f`.

@@ -2,6 +2,13 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.14.2] — 2026-07-19
+
+- **Docs** fixed all rustdoc intra-doc-link warnings across `vgi-rpc` and
+  `vgi-rpc-client` (broken/renamed/private links and an ambiguous
+  `axum::serve` reference), so `cargo doc --all-features` builds clean and
+  the affected items render as proper links on docs.rs. No code changes.
+
 ## [0.14.1] — 2026-07-19
 
 - **Docs** added the Vector Gateway Interface logo to the repository and

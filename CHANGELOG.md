@@ -2,7 +2,7 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
-## [Unreleased]
+## [0.15.0] — 2026-07-21
 
 - **Changed (http, default)** zstd response compression is now **on by
   default** at level 1 (`DEFAULT_RESPONSE_COMPRESSION_LEVEL`), matching the

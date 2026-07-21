@@ -8,6 +8,14 @@
 //! (`127.0.0.1`) and carries no auth/TLS — trusted networks only.
 //!
 //! SIGTERM / SIGINT trigger graceful shutdown of HTTP, unix, and tcp listeners.
+//!
+//! `--no-compression` may appear anywhere on the command line and disables
+//! response compression on **every** HTTP path, so the server advertises a
+//! present-but-empty `VGI-Supported-Encodings`. It backs the shared
+//! conformance case `test_empty_advertisement_means_never_compressed`: that
+//! state is a *server configuration* ("I can produce no codecs") which no
+//! client request can induce — `identity` is the client-side opt-out and is
+//! covered separately.
 
 mod conformance;
 mod fake_storage;
@@ -28,12 +36,17 @@ fn main() {
         }
     }
 
+    // Positional-flag scan rather than a per-mode flag, so the opt-out reaches
+    // every HTTP state construction below. Wiring only one of them is exactly
+    // the bug the Python worker shipped first (it still advertised zstd).
+    let no_compression = args.iter().any(|a| a == "--no-compression");
+
     if args.len() > 1 && args[1] == "--http" {
         let server = Arc::new(conformance::build_server());
         let strict = args.iter().any(|a| a == "--strict");
         let max_resp = parse_usize_flag(&args, "--max-response-bytes");
         let max_ext = parse_usize_flag(&args, "--max-externalized-response-bytes");
-        run_http(server, false, strict, max_resp, max_ext);
+        run_http(server, false, strict, max_resp, max_ext, no_compression);
         return;
     }
 
@@ -43,7 +56,7 @@ fn main() {
         // assert that `/health` bypasses auth while RPC endpoints
         // return 401.
         let server = Arc::new(conformance::build_server());
-        run_http(server, true, false, None, None);
+        run_http(server, true, false, None, None, no_compression);
         return;
     }
 
@@ -63,7 +76,7 @@ fn main() {
         // normal-sized request bodies flowing inline. Defaults to 4096 to
         // preserve the previous fixed cap for the existing storage tests.
         let max_req = parse_usize_flag(&args, "--max-request-bytes").unwrap_or(4096);
-        run_http_with_storage(&storage_url, zstd, threshold, max_req);
+        run_http_with_storage(&storage_url, zstd, threshold, max_req, no_compression);
         return;
     }
 
@@ -249,6 +262,7 @@ fn run_http_with_storage(
     zstd: bool,
     threshold: usize,
     max_request_bytes: usize,
+    no_compression: bool,
 ) {
     use std::sync::Arc as StdArc;
     use vgi_rpc::external::{Compression, ExternalLocationConfig};
@@ -272,12 +286,15 @@ fn run_http_with_storage(
         .build()
         .expect("tokio runtime");
     rt.block_on(async move {
-        let state = vgi_rpc::http::HttpState::builder()
+        let mut builder = vgi_rpc::http::HttpState::builder()
             .server(server)
             .upload_url_provider(upload_provider)
             .max_request_bytes(max_request_bytes)
-            .max_upload_bytes(64 * 1024 * 1024)
-            .build();
+            .max_upload_bytes(64 * 1024 * 1024);
+        if no_compression {
+            builder = builder.disable_response_compression();
+        }
+        let state = builder.build();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind tcp");
@@ -296,6 +313,7 @@ fn run_http(
     strict: bool,
     max_response_bytes_arg: Option<usize>,
     max_externalized_response_bytes_arg: Option<usize>,
+    no_compression: bool,
 ) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -339,6 +357,9 @@ fn run_http(
             "x-vgi-conformance-echo".to_string(),
             "conformance-fixed-marker".to_string(),
         )]);
+        if no_compression {
+            builder = builder.disable_response_compression();
+        }
         let state = builder.build();
         let drain = state.sticky_drain_handle();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

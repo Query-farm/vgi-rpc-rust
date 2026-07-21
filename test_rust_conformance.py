@@ -114,13 +114,16 @@ def _start_rust_http_with_storage(
 def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[subprocess.Popen, int]:
     """Spawn an HTTP conformance server of `variant` for the current SERVER.
 
-    variant ∈ {plain, storage, zstd_storage, externalize_always, strict, auth}.
+    variant ∈ {plain, no_compression, storage, zstd_storage, externalize_always,
+    strict, auth}.
     Raises ``pytest.skip`` for (server, variant) combinations not wired here
     (the Go conformance binary doesn't expose the storage/strict/auth modes).
     """
     if SERVER == "python":
         if variant == "plain":
             return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http"])
+        if variant == "no_compression":
+            return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--no-compression"])
         if variant in ("storage", "zstd_storage", "externalize_always"):
             port = _free_port()
             args = [_VENV_PY, _PY_SERVE_HTTP, "--port", str(port), "--fake-storage", storage_url or ""]
@@ -137,6 +140,8 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
     elif SERVER == "rust":
         if variant == "plain":
             return _spawn_read_port(_worker_cmd("http"))
+        if variant == "no_compression":
+            return _spawn_read_port([*_worker_cmd("http"), "--no-compression"])
         if variant == "storage":
             return _start_rust_http_with_storage(storage_url, zstd=False)
         if variant == "zstd_storage":
@@ -207,6 +212,24 @@ def rust_http_port() -> Iterator[int]:
 def conformance_http_port(rust_http_port: int) -> int:
     """Alias of `rust_http_port` for the upstream `TestHealth`/`TestSticky`."""
     return rust_http_port
+
+
+@pytest.fixture(scope="session")
+def conformance_http_no_compression_port() -> Iterator[int]:
+    """HTTP conformance server booted with response compression disabled.
+
+    Backs the shared ``test_empty_advertisement_means_never_compressed``
+    case, which needs its own server because the state under test is a
+    *server configuration* -- "I can produce no codecs" -- that no client
+    request can induce. ``identity`` covers a client's ability to demand an
+    uncompressed body; only a server booted this way emits the
+    present-but-empty ``VGI-Supported-Encodings`` that distinguishes
+    "speaks no compression" from the absent header of a legacy server.
+
+    The fixture name is load-bearing: the shared suite looks it up with
+    ``getfixturevalue`` and silently skips if it is missing.
+    """
+    yield from _http_variant_fixture("no_compression")
 
 
 @pytest.fixture(scope="session")

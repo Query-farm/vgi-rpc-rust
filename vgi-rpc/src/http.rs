@@ -1242,6 +1242,15 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
         ))
         // Hard ceiling on the raw request body, enforced regardless of
         // the `Content-Length` header (chunked uploads included).
+        //
+        // `DefaultBodyLimit::disable()` is required for this to mean
+        // anything. axum installs its own 2 MiB `DefaultBodyLimit` on every
+        // route, and it is checked *before* this layer — so without the
+        // disable, `max_body_size` was silently inert above 2 MiB and every
+        // Arrow batch larger than that got a 413, whatever the builder said.
+        // Measured before the fix: 2 MiB accepted, 4 MiB rejected, against a
+        // configured ceiling of 64 MiB.
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(tower_http::limit::RequestBodyLimitLayer::new(body_limit))
         // Wall-clock ceiling per request so a stalled handler or a
         // slow-loris client can't pin a runtime worker forever.

@@ -735,6 +735,58 @@ async fn oversize_request_body_is_rejected_by_body_limit() {
 }
 
 #[tokio::test]
+async fn body_limit_above_axums_default_is_honoured() {
+    // Regression: axum installs its own 2 MiB `DefaultBodyLimit` on every
+    // route and checks it *before* our `RequestBodyLimitLayer`, so without
+    // `DefaultBodyLimit::disable()` the configured `max_body_size` was
+    // silently inert above 2 MiB and every larger Arrow batch got a 413 —
+    // regardless of what the builder was told.
+    //
+    // The sibling test above cannot catch this: it configures a 16-byte
+    // limit, far *below* axum's default, so it asserts only rejection and
+    // passes whether or not the layer is authoritative. The missing
+    // assertion is acceptance of a body between axum's default and ours.
+    const LIMIT: usize = 8 * 1024 * 1024;
+    let state = state_configured(|b| b.max_body_size(LIMIT));
+    let app = vgi_rpc::http::build_router(state);
+
+    // 4 MiB: over axum's 2 MiB default, under our 8 MiB ceiling. Must reach
+    // the handler — it fails as a malformed Arrow stream, which is exactly
+    // the point: anything but 413 proves the body was admitted.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/echo_string")
+                .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
+                .body(Body::from(vec![0u8; 4 * 1024 * 1024]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "4 MiB body must be admitted under an 8 MiB max_body_size"
+    );
+
+    // And the configured ceiling is still enforced above it.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/echo_string")
+                .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
+                .body(Body::from(vec![0u8; LIMIT + 1024]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn small_response_under_soft_cap_is_not_rejected() {
     // `max_response_bytes` is a *soft* producer-side cap — a normal
     // response (here, a small Arrow error stream) that happens to be

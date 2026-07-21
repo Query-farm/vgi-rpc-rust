@@ -15,7 +15,7 @@ passes the **complete 868-test Python conformance suite** across
 pipe, subprocess, HTTP, Unix-socket, externalised-upload, and
 shared-memory pipe transports.
 
-Stock `arrow-rs` 59.x dependency tree, MSRV 1.90, no
+Stock `arrow-rs` 59.x dependency tree, MSRV 1.97, no
 `[patch.crates-io]` required.
 
 ## Highlights

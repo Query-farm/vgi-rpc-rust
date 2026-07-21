@@ -379,7 +379,7 @@ version — you cannot overwrite an existing one.
    crate depends on one published earlier.
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, cargo doc, an
-MSRV (1.90) build, and the Python-driven conformance job (full six-
+MSRV (1.97) build, and the Python-driven conformance job (full six-
 transport matrix) on every push.
 
 ## Defining a service with the macro

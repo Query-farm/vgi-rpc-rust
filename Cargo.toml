@@ -5,7 +5,7 @@ members = ["vgi-rpc", "vgi-rpc-macros", "vgi-rpc-client", "conformance-client-dr
 [workspace.package]
 version = "0.15.0"
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.97"
 license = "Apache-2.0"
 authors = ["Query Farm LLC <hello@query.farm>"]
 homepage = "https://query.farm"

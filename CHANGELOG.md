@@ -2,6 +2,19 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.16.0] — 2026-07-21
+
+- **Fixed (http)** `max_body_size` is now actually enforced. axum installs a
+  2 MiB `DefaultBodyLimit` on every route and checks it *before* our
+  `RequestBodyLimitLayer`, so the configured ceiling — including the
+  documented 64 MiB default — was silently inert above 2 MiB and every larger
+  request body got a 413. Measured against a stock worker: 4 MiB was rejected
+  before, accepted now; 80 MiB is still rejected against the 64 MiB ceiling.
+  Found by a benchmark with realistic (incompressible) Arrow payloads, which
+  produce ~4.4 MiB compressed exchange bodies; the previous benchmark payload
+  compressed ~1242x, so bodies never approached the limit.
+- **Changed (MSRV)** minimum supported Rust version raised 1.90 → 1.97.
+
 ## [0.15.0] — 2026-07-21
 
 - **Changed (http, default)** zstd response compression is now **on by

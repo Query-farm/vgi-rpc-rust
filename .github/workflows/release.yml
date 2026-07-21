@@ -19,6 +19,10 @@ name: Release
 #   2. Update `CHANGELOG.md`.
 #   3. `git tag v0.1.0 && git push origin v0.1.0`.
 #   4. Approve the workflow run in the `crates-io` environment.
+# The GitHub Release is then cut automatically from the CHANGELOG section
+# for that version — see the final step.  Unlike the sibling SDK repos,
+# which publish *in response to* a published Release, this repo publishes
+# on tag push, so nothing else would ever create one.
 
 on:
   push:
@@ -37,9 +41,10 @@ on:
 # Trusted publishing exchanges the workflow's OIDC token for a
 # short-lived crates.io API token.  `id-token: write` is required to
 # mint the OIDC token; `contents: read` lets us check out the repo.
+# `contents: write` additionally lets the final step cut the GitHub Release.
 permissions:
   id-token: write
-  contents: read
+  contents: write
 
 jobs:
   publish:
@@ -121,6 +126,38 @@ jobs:
         run: |
           rm -rf target/tests
           find target -xtype l -delete 2>/dev/null || true
+
+      - name: Create GitHub Release
+        # This repo publishes on *tag push*, whereas the sibling SDK repos
+        # publish in response to a *published Release* — so there, a Release
+        # necessarily exists. Here nothing created one, and the repo sat
+        # advertising v0.8.0 as "latest" while crates.io had shipped seven
+        # versions past it, with a maintained CHANGELOG nobody could see.
+        # Idempotent so a re-run after a partial publish doesn't error.
+        if: success() && startsWith(github.ref, 'refs/tags/v') && github.event.inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists — skipping"
+            exit 0
+          fi
+          VER="${GITHUB_REF_NAME#v}"
+          # Extract just this version's section from CHANGELOG.md.
+          awk -v ver="$VER" '
+            index($0, "## [" ver "]") == 1 { inside = 1; next }
+            inside && index($0, "## [") == 1 { exit }
+            inside { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+          if ! grep -q '[^[:space:]]' /tmp/release-notes.md; then
+            echo "No CHANGELOG section for $VER; falling back to a pointer."
+            echo "See CHANGELOG.md for details." > /tmp/release-notes.md
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file /tmp/release-notes.md \
+            --verify-tag
 
       - name: Summarise
         if: success()

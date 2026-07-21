@@ -189,10 +189,18 @@ server logs a `vgi_rpc.http` warn-level line at startup and uses an
 ephemeral per-process key — tokens won't survive a restart or load
 balance across workers, so it's test-only.
 
-Response post-processing (CORS headers + zstd compression) runs as an
-axum `middleware::from_fn_with_state` layer applied at the top of
-`build_router`, so every endpoint — including the HTML pages — gets the
-same treatment.
+Response post-processing (CORS headers + capability headers + zstd
+compression) runs as an axum `middleware::from_fn_with_state` layer applied
+at the top of `build_router`, so every endpoint — including the HTML pages —
+gets the same treatment. CORS and capability headers are attached *before*
+the compression branch so a compressed body cannot return past them.
+
+Response compression is **on by default** at zstd level 1
+(`DEFAULT_RESPONSE_COMPRESSION_LEVEL`, matching Python's
+`compression_level=1`); level 1 measured both faster and smaller than level 3
+on large Arrow bodies. `.response_compression_level(n)` changes the level;
+`.disable_response_compression()` turns it off, which makes the server
+advertise an empty `VGI-Supported-Encodings`.
 
 ### Auth — `vgi-rpc/src/auth/`
 

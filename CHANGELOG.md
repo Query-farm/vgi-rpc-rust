@@ -2,6 +2,31 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased]
+
+- **Changed (http, default)** zstd response compression is now **on by
+  default** at level 1 (`DEFAULT_RESPONSE_COMPRESSION_LEVEL`), matching the
+  Python SDK's `compression_level=1`. Level 1 measured 4.7x faster than
+  level 3 *and* produced a smaller body on an 8.41 MB Arrow payload, so this
+  is not a size/speed trade. A stock server therefore advertises
+  `VGI-Supported-Encodings: zstd` and actually compresses.
+- **Added (http)** `HttpStateBuilder::disable_response_compression()` — the
+  explicit opt-out now that the default is on.
+  `response_compression_level(n)` only changes the level.
+- **Fixed (http)** capability (`VGI-*`) headers are now attached to
+  compressed responses. The compressed early-return path skipped
+  `attach_capability_headers`, so every compressed Arrow body arrived
+  without a single capability header.
+- **Fixed (http, CORS)** `Access-Control-Expose-Headers` now lists every
+  `VGI-*` capability header the server emits (plus `X-VGI-Content-Encoding`,
+  `X-VGI-RPC-Error`, and the sticky-session headers). Previously it named
+  only `Content-Encoding` / `WWW-Authenticate`, so a browser `fetch()`
+  client could not read a single server capability.
+- **Fixed (client)** `VGI-Supported-Encodings` absent and present-but-empty
+  are no longer conflated. Absent means a legacy server (assume `zstd`);
+  present-but-empty means the server speaks no compression, and the client
+  now stops sending compressed request bodies instead of eating a 415.
+
 ## [0.14.2] — 2026-07-19
 
 - **Docs** fixed all rustdoc intra-doc-link warnings across `vgi-rpc` and

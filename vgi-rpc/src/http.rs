@@ -81,6 +81,230 @@ const SESSION_ENDPOINT: &str = "__session__";
 /// allocation cost of compressing isn't repaid.
 const MIN_ZSTD_COMPRESS_BYTES: usize = 1024;
 
+/// zstd level used for response compression when the builder is not told
+/// otherwise. Response compression is **on by default**, matching the Python
+/// SDK's `compression_level=1`.
+///
+/// Level 1 rather than the zstd default of 3 is not a size/speed trade: on an
+/// 8.41 MB Arrow payload level 1 measured 4.7x faster than level 3 *and*
+/// produced the smaller body. Arrow IPC is already dictionary/run-length
+/// friendly, so the extra search effort at higher levels buys nothing here.
+pub const DEFAULT_RESPONSE_COMPRESSION_LEVEL: i32 = 1;
+
+/// VGI's own response-codec preference header. Clients that cannot set the
+/// standard `Accept-Encoding` state their preference here instead — notably
+/// browser `fetch()`, for which `Accept-Encoding` is a forbidden header name.
+/// That is the WASM path, so ignoring this header would mean the browser
+/// always gets identity-encoded responses.
+const VGI_ACCEPT_ENCODING_HEADER: &str = "x-vgi-accept-encoding";
+/// Response counterpart of [`VGI_ACCEPT_ENCODING_HEADER`]. Stamped instead of
+/// the standard `Content-Encoding` when the winning codec was offered *only*
+/// via the custom request header: such a client's fetch/proxy layer would
+/// auto-decode or mangle a standard `Content-Encoding`, so the response must
+/// not claim one.
+const VGI_CONTENT_ENCODING_HEADER: &str = "x-vgi-content-encoding";
+/// Marks a 200 response whose Arrow body carries an RPC error rather than a
+/// result. Browser clients must be able to read it, so it is CORS-exposed.
+const RPC_ERROR_HEADER: &str = "x-vgi-rpc-error";
+
+/// A response content coding vgi-rpc knows how to negotiate.
+///
+/// Knowing a codec is not the same as being able to *produce* it — see
+/// [`ResponseEncoding::producible`]. `gzip` is decode-only on this server
+/// today (requests may arrive gzip-encoded; responses are never gzipped).
+/// `identity` is a first-class token: a client can ask for it explicitly to
+/// switch response compression off for that request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseEncoding {
+    /// No coding at all. Always producible; carries no response header.
+    Identity,
+    Zstd,
+    Gzip,
+}
+
+/// The compressed codings this server advertises, in its own preference
+/// order. Informational only — the *client's* order decides the winner (see
+/// [`pick_response_encoding`]). `identity` is deliberately absent: it is
+/// always available and so carries no information.
+const RESPONSE_ENCODING_PREFERENCE: [ResponseEncoding; 2] =
+    [ResponseEncoding::Zstd, ResponseEncoding::Gzip];
+
+impl ResponseEncoding {
+    /// Wire token, as it appears in `Accept-Encoding` / `Content-Encoding`.
+    fn as_str(self) -> &'static str {
+        match self {
+            ResponseEncoding::Identity => "identity",
+            ResponseEncoding::Zstd => "zstd",
+            ResponseEncoding::Gzip => "gzip",
+        }
+    }
+
+    /// Parse a single already-trimmed, already-lowercased token.
+    fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "identity" => Some(ResponseEncoding::Identity),
+            "zstd" => Some(ResponseEncoding::Zstd),
+            "gzip" => Some(ResponseEncoding::Gzip),
+            _ => None,
+        }
+    }
+
+    /// Can this server actually emit this coding right now? True only when an
+    /// encoder exists in the build *and* configuration enables it.
+    ///
+    /// This is the single source of truth for producibility: both the
+    /// negotiation walk and the `VGI-Supported-Encodings` advertisement read
+    /// it, so the two cannot drift. Registering a new producible codec is one
+    /// arm here plus the matching arm in [`encode_response_body`].
+    fn producible(self, compression_level: Option<i32>) -> bool {
+        match self {
+            // Shipping bytes unchanged needs no encoder and no configuration.
+            ResponseEncoding::Identity => true,
+            // The `zstd` crate is a hard dependency, so the encoder always
+            // exists; `response_compression_level` is the configuration gate,
+            // on by default at [`DEFAULT_RESPONSE_COMPRESSION_LEVEL`] and
+            // cleared by `HttpStateBuilder::disable_response_compression`.
+            ResponseEncoding::Zstd => compression_level.is_some(),
+            // No gzip encoder is registered on the response path, so the
+            // negotiation walk skips gzip and falls through to the next
+            // codec the client offered.
+            ResponseEncoding::Gzip => false,
+        }
+    }
+
+    /// Can this server decompress a *request* body in this coding? See
+    /// [`decode_content_encoding`], which implements the request side.
+    fn decodable(self) -> bool {
+        match self {
+            ResponseEncoding::Identity => true,
+            ResponseEncoding::Zstd | ResponseEncoding::Gzip => true,
+        }
+    }
+}
+
+/// Value for the `VGI-Supported-Encodings` capability header: the codings this
+/// server can handle in **both** directions — decode on requests *and* produce
+/// on responses — in server-preference order, excluding `identity`.
+///
+/// The intersection is deliberate. This server decodes zstd and gzip requests
+/// but only encodes zstd responses, so gzip drops out and the advertised value
+/// is `zstd` (or empty). Losing the "I can still decode gzip requests"
+/// information is accepted; a client that wants a mutually-supported codec
+/// needs the both-directions set, and one header stating it beats two headers
+/// that can disagree.
+///
+/// Empty when the intersection is empty — response compression disabled by
+/// config (the default) or no encoder available. The header is still emitted
+/// in that case: present-but-empty means "I speak no compression", which is a
+/// different statement from an older server that omits the header entirely
+/// (which clients read as "assume zstd").
+///
+/// Derived from [`ResponseEncoding::producible`] / [`ResponseEncoding::decodable`]
+/// so it cannot drift from what the negotiation walk actually does.
+fn supported_encodings_header_value(compression_level: Option<i32>) -> String {
+    RESPONSE_ENCODING_PREFERENCE
+        .iter()
+        .filter(|e| {
+            **e != ResponseEncoding::Identity && e.producible(compression_level) && e.decodable()
+        })
+        .map(|e| e.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Parse a comma-separated `Accept-Encoding`-style header value into an
+/// ordered, de-duplicated list of the codings we know.
+///
+/// Mirrors the canonical Python `parse_encoding_list`: split on `,`, trim,
+/// lowercase, drop everything after `;` (q-values are parsed off and
+/// **ignored**, never honoured), skip unknown tokens, keep the first
+/// occurrence of each codec, and preserve the client's stated order. A
+/// missing or empty header parses to an empty list.
+fn parse_encoding_list(header_value: Option<&str>) -> Vec<ResponseEncoding> {
+    let mut out: Vec<ResponseEncoding> = Vec::new();
+    let Some(value) = header_value else {
+        return out;
+    };
+    for raw in value.split(',') {
+        let token = raw
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(enc) = ResponseEncoding::from_token(&token) {
+            if !out.contains(&enc) {
+                out.push(enc);
+            }
+        }
+    }
+    out
+}
+
+/// Negotiate the response content coding, honouring the **client's** stated
+/// preference order rather than a server-side hardcoded one.
+///
+/// The merged sequence is `custom ++ [e for e in standard if e not in custom]`
+/// where `custom` comes from `X-VGI-Accept-Encoding` and `standard` from
+/// `Accept-Encoding`; the first entry this server can produce wins. VGI's own
+/// preference header takes precedence because generic HTTP clients inject
+/// their own list: the DuckDB engine uses cpp-httplib, which sends
+/// `Accept-Encoding: deflate, gzip, br, zstd` — gzip *before* zstd — while VGI
+/// states `X-VGI-Accept-Encoding: zstd, gzip`. Walking the generic header
+/// first would pick gzip, which dominates large Arrow bodies.
+///
+/// `identity` participates in the walk like any other coding and is always
+/// producible, so a client that lists it ahead of a compressed codec gets an
+/// uncompressed body — an explicit, uniform way to switch compression off per
+/// request. Winning as `identity` stamps no encoding header at all.
+///
+/// Returns `None` when the client offered nothing this server can produce (the
+/// body then ships uncompressed — `Accept-Encoding` is a client capability,
+/// not a demand). Otherwise returns the chosen codec plus `used_custom`: true
+/// when the winner appeared only in the custom header, which selects
+/// [`VGI_CONTENT_ENCODING_HEADER`] over the standard `Content-Encoding`.
+fn pick_response_encoding(
+    headers: &HeaderMap,
+    compression_level: Option<i32>,
+) -> Option<(ResponseEncoding, bool)> {
+    let header_str = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v: &HeaderValue| v.to_str().ok())
+    };
+    let custom = parse_encoding_list(header_str(VGI_ACCEPT_ENCODING_HEADER));
+    let standard = parse_encoding_list(
+        headers
+            .get(header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+    );
+    custom
+        .iter()
+        .copied()
+        .chain(standard.iter().copied().filter(|e| !custom.contains(e)))
+        .find(|enc| enc.producible(compression_level))
+        .map(|enc| {
+            let used_custom = custom.contains(&enc) && !standard.contains(&enc);
+            (enc, used_custom)
+        })
+}
+
+/// Compress `body` with `encoding` at `level`. `None` means "no compressed
+/// form to ship", so the caller sends the body as-is and stamps no encoding
+/// header. That covers three cases: the client explicitly chose `identity`;
+/// no response encoder is registered for the coding (gzip — though
+/// [`ResponseEncoding::producible`] already keeps it out of the negotiation);
+/// or the encoder failed.
+fn encode_response_body(encoding: ResponseEncoding, body: &[u8], level: i32) -> Option<Vec<u8>> {
+    match encoding {
+        ResponseEncoding::Identity | ResponseEncoding::Gzip => None,
+        ResponseEncoding::Zstd => zstd::encode_all(std::io::Cursor::new(body), level).ok(),
+    }
+}
+
 /// HTTP server state shared across all handlers.
 ///
 /// Build via [`HttpState::builder`] (preferred) or [`HttpState::new`] for a
@@ -131,6 +355,11 @@ pub struct HttpState {
     /// Whether any capability header beyond the always-present flags is
     /// set — gates the preflight `Cache-Control` header.
     capability_has_any: bool,
+    /// `Access-Control-Expose-Headers` value, precomputed alongside
+    /// `capability_headers` so it lists exactly the `VGI-*` headers this
+    /// server actually emits. Without it a browser can read none of them:
+    /// `fetch()` hides every non-safelisted response header.
+    cors_expose_headers: HeaderValue,
     /// `Access-Control-Allow-Origin` value precomputed from `cors_origins`
     /// so the per-response CORS path doesn't re-parse the origin string.
     cors_allow_origin: Option<HeaderValue>,
@@ -150,7 +379,11 @@ pub struct HttpStateBuilder {
     cors_origins: Option<String>,
     cors_max_age: Option<u32>,
     prefix: Option<String>,
-    response_compression_level: Option<i32>,
+    /// Two-level option so the builder can tell "never configured" (outer
+    /// `None` — take [`DEFAULT_RESPONSE_COMPRESSION_LEVEL`]) apart from
+    /// "explicitly switched off" (`Some(None)`), which the single-level form
+    /// could not express once the default became on.
+    response_compression_level: Option<Option<i32>>,
     landing_page_enabled: Option<bool>,
     describe_page_enabled: Option<bool>,
     health_enabled: Option<bool>,
@@ -288,10 +521,27 @@ impl HttpStateBuilder {
         self
     }
 
-    /// Enable zstd response compression at the given level (1..=22) when
-    /// the client sends `Accept-Encoding: zstd`. Default off.
+    /// Override the zstd level (1..=22) used for response compression.
+    ///
+    /// Response compression is **on by default** at
+    /// [`DEFAULT_RESPONSE_COMPRESSION_LEVEL`]; this only changes the level.
+    /// It applies when the client offers zstd in `X-VGI-Accept-Encoding` or
+    /// `Accept-Encoding` and the body clears [`MIN_ZSTD_COMPRESS_BYTES`].
+    /// Use [`HttpStateBuilder::disable_response_compression`] to turn it off.
     pub fn response_compression_level(mut self, level: i32) -> Self {
-        self.response_compression_level = Some(level);
+        self.response_compression_level = Some(Some(level));
+        self
+    }
+
+    /// Turn response compression off entirely.
+    ///
+    /// The server then advertises an empty `VGI-Supported-Encodings` — a
+    /// positive statement that it speaks no compression, distinct from a
+    /// legacy server that omits the header — and ships every body
+    /// uncompressed however the client asks. Use this when a proxy or CDN
+    /// already compresses, or when measuring the uncompressed wire.
+    pub fn disable_response_compression(mut self) -> Self {
+        self.response_compression_level = Some(None);
         self
     }
 
@@ -445,15 +695,22 @@ impl HttpStateBuilder {
             .cors_origins
             .as_deref()
             .and_then(|o| HeaderValue::from_str(o).ok());
-        let (capability_headers, capability_has_any) = build_capability_headers(
-            self.max_request_bytes,
-            self.max_response_bytes,
-            self.max_externalized_response_bytes,
-            server.external_config().is_some(),
-            self.upload_url_provider.is_some(),
-            self.max_upload_bytes,
-            sticky.as_deref(),
-        );
+        // Unconfigured ⇒ compression on at the default level. `Some(None)` is
+        // the explicit opt-out from `disable_response_compression`.
+        let response_compression_level = self
+            .response_compression_level
+            .unwrap_or(Some(DEFAULT_RESPONSE_COMPRESSION_LEVEL));
+        let (capability_headers, capability_has_any, cors_expose_headers) =
+            build_capability_headers(CapabilityInputs {
+                max_request_bytes: self.max_request_bytes,
+                max_response_bytes: self.max_response_bytes,
+                max_externalized_response_bytes: self.max_externalized_response_bytes,
+                externalization_enabled: server.external_config().is_some(),
+                upload_url_support: self.upload_url_provider.is_some(),
+                max_upload_bytes: self.max_upload_bytes,
+                sticky: sticky.as_deref(),
+                response_compression_level,
+            });
         Arc::new(HttpState {
             server,
             token_key,
@@ -471,7 +728,7 @@ impl HttpStateBuilder {
             www_authenticate,
             cors_max_age: self.cors_max_age.unwrap_or(7200),
             prefix: self.prefix.unwrap_or_default(),
-            response_compression_level: self.response_compression_level,
+            response_compression_level,
             landing_page_enabled: self.landing_page_enabled.unwrap_or(true),
             describe_page_enabled: self.describe_page_enabled.unwrap_or(true),
             health_enabled: self.health_enabled.unwrap_or(true),
@@ -482,26 +739,67 @@ impl HttpStateBuilder {
             describe_provider: self.describe_provider,
             capability_headers,
             capability_has_any,
+            cors_expose_headers,
             cors_allow_origin,
         })
     }
 }
 
-/// Precompute the immutable capability response headers once, mirroring the
-/// per-response logic that `attach_capability_headers` used to run. Returns
-/// the header set plus whether any "beyond the always-present flags" header
-/// is present (which gates the preflight `Cache-Control`).
-fn build_capability_headers(
+/// Everything `build_capability_headers` advertises, grouped so the signature
+/// stays readable as capabilities accumulate.
+struct CapabilityInputs<'a> {
     max_request_bytes: Option<usize>,
     max_response_bytes: Option<usize>,
     max_externalized_response_bytes: Option<usize>,
     externalization_enabled: bool,
     upload_url_support: bool,
     max_upload_bytes: Option<usize>,
-    sticky: Option<&crate::sticky::StickyContext>,
-) -> (HeaderMap, bool) {
+    sticky: Option<&'a crate::sticky::StickyContext>,
+    response_compression_level: Option<i32>,
+}
+
+/// Response headers a browser client must be able to read that are *not*
+/// capability headers, and so cannot be derived from the capability map:
+/// the two content-coding stampings (`X-VGI-Content-Encoding` is how a
+/// `fetch()` client learns it must decompress the body itself), the RPC
+/// error marker, and the auth challenge. `Content-Encoding` and
+/// `WWW-Authenticate` are technically CORS-safelisted already; listing them
+/// costs nothing and keeps the set explicit.
+const CORS_EXPOSE_FIXED: [&str; 4] = [
+    "Content-Encoding",
+    VGI_CONTENT_ENCODING_HEADER,
+    RPC_ERROR_HEADER,
+    "WWW-Authenticate",
+];
+
+/// Precompute the immutable capability response headers once, mirroring the
+/// per-response logic that `attach_capability_headers` used to run. Returns
+/// the header set, whether any "beyond the always-present flags" header is
+/// present (which gates the preflight `Cache-Control`), and the matching
+/// `Access-Control-Expose-Headers` value.
+fn build_capability_headers(inputs: CapabilityInputs<'_>) -> (HeaderMap, bool, HeaderValue) {
+    let CapabilityInputs {
+        max_request_bytes,
+        max_response_bytes,
+        max_externalized_response_bytes,
+        externalization_enabled,
+        upload_url_support,
+        max_upload_bytes,
+        sticky,
+        response_compression_level,
+    } = inputs;
     let mut out = HeaderMap::new();
     let mut any = false;
+    // Compression codecs usable in both directions. Always emitted, even
+    // empty: present-but-empty says "I speak no compression", while an
+    // absent header means "legacy server, assume zstd". Like
+    // `vgi-externalization-enabled`, an always-present flag does not flip
+    // `any` (which gates the preflight `Cache-Control`).
+    if let Ok(v) = HeaderValue::from_str(&supported_encodings_header_value(
+        response_compression_level,
+    )) {
+        out.insert("vgi-supported-encodings", v);
+    }
     if let Some(n) = max_request_bytes {
         if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
             out.insert("vgi-max-request-bytes", v);
@@ -561,7 +859,35 @@ fn build_capability_headers(
     } else {
         out.insert(STICKY_ENABLED_HEADER, HeaderValue::from_static("false"));
     }
-    (out, any)
+
+    // Expose every capability header we actually emit, derived from `out`
+    // itself so a capability added above is readable from a browser without
+    // a second edit here. Previously nothing `vgi-*` was exposed at all, so
+    // a `fetch()` client could see none of them — including
+    // `VGI-Supported-Encodings`, which is the whole point of the
+    // advertisement. Names are sorted only for a stable header value;
+    // `Access-Control-Expose-Headers` is an unordered, case-insensitive set.
+    let mut expose: Vec<String> = CORS_EXPOSE_FIXED.iter().map(|s| s.to_string()).collect();
+    let mut cap_names: Vec<String> = out.keys().map(|k| k.as_str().to_string()).collect();
+    // Sticky session headers are stamped per-response by
+    // `stamp_session_headers`, not held in the capability map, so they have
+    // to be named explicitly — a browser client cannot resume a session it
+    // is unable to read the token for.
+    if let Some(sticky) = sticky {
+        cap_names.push(SESSION_HEADER.to_string());
+        cap_names.push(SESSION_CLOSE_HEADER.to_string());
+        cap_names.extend(
+            sticky
+                .echo_headers
+                .iter()
+                .map(|(n, _)| format!("{ECHO_HEADER_PREFIX}{n}")),
+        );
+    }
+    cap_names.sort();
+    expose.extend(cap_names);
+    let expose = HeaderValue::from_str(&expose.join(", "))
+        .unwrap_or_else(|_| HeaderValue::from_static("Content-Encoding, WWW-Authenticate"));
+    (out, any, expose)
 }
 
 impl HttpState {
@@ -947,16 +1273,12 @@ async fn postprocess_middleware(
     // deep-cloning the entire request `HeaderMap` on every request. The
     // request is consumed by `next.run(req)` below, so these must be taken
     // first. CORS echoes the client's `Access-Control-Request-Headers`;
-    // compression consults `Accept-Encoding`.
+    // compression negotiates over `X-VGI-Accept-Encoding` + `Accept-Encoding`.
     let req_acrh = req
         .headers()
         .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
         .cloned();
-    let req_accepts_zstd = req
-        .headers()
-        .get(header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s.contains("zstd"));
+    let req_encoding = pick_response_encoding(req.headers(), state.response_compression_level);
     let req_method = req.method().clone();
     let req_path = req.uri().path();
 
@@ -1024,24 +1346,42 @@ async fn postprocess_middleware(
         .and_then(|v| v.to_str().ok())
         == Some(ARROW_CONTENT_TYPE);
 
+    // Attach CORS + capability headers *before* the compression branch, so a
+    // compressed response can no longer return past them. It previously did,
+    // leaving every compressed Arrow body without a single `VGI-*` header —
+    // capability discovery silently degraded to defaults for exactly the
+    // large responses that matter most.
+    attach_cors_headers(&state, &mut parts.headers, req_acrh.as_ref(), false);
+    attach_capability_headers(&state, &mut parts.headers, &req_method);
+
     if is_arrow {
-        if let Some(level) = state.response_compression_level {
-            // Only compress when the client accepts zstd AND the body is large
-            // enough to benefit. Below the threshold, zstd frame overhead
-            // dominates and can enlarge the payload — tiny bodies (empty-schema
-            // error / continuation-token responses, small scalar unary results)
-            // waste CPU and allocation for no gain. `Accept-Encoding` is a
-            // client capability, not a demand, so an uncompressed reply is
-            // always valid.
-            if req_accepts_zstd && bytes.len() >= MIN_ZSTD_COMPRESS_BYTES {
-                if let Ok(compressed) = zstd::encode_all(std::io::Cursor::new(&bytes), level) {
+        if let (Some(level), Some((encoding, used_custom))) =
+            (state.response_compression_level, req_encoding)
+        {
+            // Only compress when the client offered a codec we can produce AND
+            // the body is large enough to benefit. Below the threshold, frame
+            // overhead dominates and can enlarge the payload — tiny bodies
+            // (empty-schema error / continuation-token responses, small scalar
+            // unary results) waste CPU and allocation for no gain.
+            // `Accept-Encoding` is a client capability, not a demand, so an
+            // uncompressed reply is always valid.
+            if bytes.len() >= MIN_ZSTD_COMPRESS_BYTES {
+                if let Some(compressed) = encode_response_body(encoding, &bytes, level) {
                     // Ship the compressed form only if it actually shrank the
                     // body; otherwise fall through and send it uncompressed.
                     if compressed.len() < bytes.len() {
+                        // A client that had to use the custom request header
+                        // is one whose fetch/proxy layer would auto-decode or
+                        // mangle a standard `Content-Encoding`, so answer in
+                        // kind on the custom response header.
+                        let name = if used_custom {
+                            axum::http::HeaderName::from_static(VGI_CONTENT_ENCODING_HEADER)
+                        } else {
+                            header::CONTENT_ENCODING
+                        };
                         parts
                             .headers
-                            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("zstd"));
-                        attach_cors_headers(&state, &mut parts.headers, req_acrh.as_ref(), false);
+                            .insert(name, HeaderValue::from_static(encoding.as_str()));
                         let body_new = axum::body::Body::from(compressed);
                         return Response::from_parts(parts, body_new);
                     }
@@ -1049,8 +1389,6 @@ async fn postprocess_middleware(
             }
         }
     }
-    attach_cors_headers(&state, &mut parts.headers, req_acrh.as_ref(), false);
-    attach_capability_headers(&state, &mut parts.headers, &req_method);
     Response::from_parts(parts, axum::body::Body::from(bytes))
 }
 
@@ -1377,13 +1715,22 @@ fn attach_cors_headers(
         None => {
             out.insert(
                 header::ACCESS_CONTROL_ALLOW_HEADERS,
-                HeaderValue::from_static("Content-Type, Authorization, Cookie, Accept-Encoding"),
+                // `X-VGI-Accept-Encoding` is how a browser states a codec
+                // preference at all: `fetch()` cannot set `Accept-Encoding`
+                // (forbidden header name), so it must be allowed here.
+                HeaderValue::from_static(
+                    "Content-Type, Authorization, Cookie, Accept-Encoding, X-VGI-Accept-Encoding",
+                ),
             );
         }
     }
+    // Precomputed in `build_capability_headers` from the capability headers
+    // this server actually emits, plus `CORS_EXPOSE_FIXED`. Everything
+    // `VGI-*` is listed: a browser sees only safelisted response headers
+    // otherwise, so an unexposed capability header may as well not exist.
     out.insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
-        HeaderValue::from_static("Content-Encoding, WWW-Authenticate"),
+        state.cors_expose_headers.clone(),
     );
     if is_preflight {
         if let Ok(v) = HeaderValue::from_str(&state.cors_max_age.to_string()) {
@@ -1560,7 +1907,7 @@ fn cap_error_response(
         header::CONTENT_TYPE,
         HeaderValue::from_static(ARROW_CONTENT_TYPE),
     );
-    headers.insert("x-vgi-rpc-error", HeaderValue::from_static("true"));
+    headers.insert(RPC_ERROR_HEADER, HeaderValue::from_static("true"));
     (StatusCode::OK, headers, buf).into_response()
 }
 
@@ -2944,6 +3291,199 @@ mod tests {
             let out = super::decode_content_encoding(raw, header, None).unwrap();
             assert_eq!(out, raw, "header {header:?} should pass through");
         }
+    }
+
+    // ---- response-codec negotiation ------------------------------------
+    //
+    // `pick_response_encoding` walks the *client's* stated order over the
+    // merged `X-VGI-Accept-Encoding ++ Accept-Encoding` list. zstd is the
+    // only coding this server can produce, so gzip is never chosen; the
+    // tests below pin the ordering, the parsing, and which response header
+    // carries the answer.
+
+    /// Build a `HeaderMap` from `(name, value)` pairs.
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn parse_encoding_list_is_ordered_deduped_and_ignores_q_values() {
+        use super::ResponseEncoding::*;
+        assert_eq!(super::parse_encoding_list(None), vec![]);
+        assert_eq!(super::parse_encoding_list(Some("")), vec![]);
+        assert_eq!(super::parse_encoding_list(Some("  ,  ,")), vec![]);
+        // Unknown tokens are skipped, known ones keep the client's order.
+        assert_eq!(
+            super::parse_encoding_list(Some("deflate, gzip, br, zstd")),
+            vec![Gzip, Zstd]
+        );
+        // q-values are parsed off and ignored — not honoured as weights.
+        assert_eq!(
+            super::parse_encoding_list(Some("zstd;q=0.5, gzip")),
+            vec![Zstd, Gzip]
+        );
+        // Case-insensitive, whitespace-tolerant, first occurrence wins.
+        assert_eq!(
+            super::parse_encoding_list(Some(" ZSTD , gzip ,zstd")),
+            vec![Zstd, Gzip]
+        );
+        // `identity` is a first-class token, ordered like any other.
+        assert_eq!(
+            super::parse_encoding_list(Some("identity, zstd")),
+            vec![Identity, Zstd]
+        );
+        // `identity;q=0` is not special-cased — q is parsed off and ignored,
+        // so order alone decides and identity still leads.
+        assert_eq!(
+            super::parse_encoding_list(Some("identity;q=0, zstd")),
+            vec![Identity, Zstd]
+        );
+    }
+
+    #[test]
+    fn custom_header_alone_negotiates_and_stamps_the_custom_response_header() {
+        // The browser/WASM case: `fetch()` cannot set `Accept-Encoding`, so
+        // the only preference the server sees is the custom header. Before
+        // this negotiation existed such a client always got identity.
+        let h = headers(&[("x-vgi-accept-encoding", "zstd, gzip")]);
+        let (enc, used_custom) = super::pick_response_encoding(&h, Some(3)).unwrap();
+        assert_eq!(enc, super::ResponseEncoding::Zstd);
+        assert!(
+            used_custom,
+            "zstd came only from the custom header, so the custom response \
+             header must carry it"
+        );
+    }
+
+    #[test]
+    fn custom_header_wins_over_a_gzip_first_standard_header() {
+        // The cpp-httplib regression case: the DuckDB engine's HTTP client
+        // injects `Accept-Encoding: deflate, gzip, br, zstd` (gzip first)
+        // while VGI states zstd first. zstd must win, and because it is in
+        // both lists the answer rides the standard `Content-Encoding`.
+        let h = headers(&[
+            ("accept-encoding", "deflate, gzip, br, zstd"),
+            ("x-vgi-accept-encoding", "zstd, gzip"),
+        ]);
+        let (enc, used_custom) = super::pick_response_encoding(&h, Some(3)).unwrap();
+        assert_eq!(enc, super::ResponseEncoding::Zstd);
+        assert!(
+            !used_custom,
+            "zstd is in the standard header too, so stamp Content-Encoding"
+        );
+    }
+
+    #[test]
+    fn no_encoding_headers_means_uncompressed() {
+        assert!(super::pick_response_encoding(&HeaderMap::new(), Some(3)).is_none());
+    }
+
+    #[test]
+    fn a_codec_we_cannot_produce_means_uncompressed() {
+        // gzip is decode-only on the response path: the walk skips it and,
+        // with nothing else offered, the body ships uncompressed.
+        for pairs in [
+            &[("accept-encoding", "gzip")][..],
+            &[("x-vgi-accept-encoding", "gzip")][..],
+            &[("accept-encoding", "br, deflate")][..],
+        ] {
+            let h = headers(pairs);
+            assert!(
+                super::pick_response_encoding(&h, Some(3)).is_none(),
+                "unexpected codec chosen for {pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compression_disabled_means_uncompressed_whatever_the_client_offers() {
+        // The configuration gate is part of "producible": default-off stays
+        // off no matter how the client asks.
+        let h = headers(&[
+            ("accept-encoding", "zstd"),
+            ("x-vgi-accept-encoding", "zstd"),
+        ]);
+        assert!(!matches!(
+            super::pick_response_encoding(&h, None),
+            Some((super::ResponseEncoding::Zstd, _))
+        ));
+    }
+
+    #[test]
+    fn standard_header_alone_still_negotiates_on_the_standard_response_header() {
+        let h = headers(&[("accept-encoding", "zstd, identity")]);
+        let (enc, used_custom) = super::pick_response_encoding(&h, Some(3)).unwrap();
+        assert_eq!(enc, super::ResponseEncoding::Zstd);
+        assert!(!used_custom);
+    }
+
+    #[test]
+    fn q_values_do_not_reorder_the_walk() {
+        // `zstd;q=0.5, gzip` — a q-value-honouring parser would prefer gzip.
+        // We parse q off and keep the stated order, so zstd stays first.
+        let h = headers(&[("x-vgi-accept-encoding", "zstd;q=0.5, gzip")]);
+        let (enc, _) = super::pick_response_encoding(&h, Some(3)).unwrap();
+        assert_eq!(enc, super::ResponseEncoding::Zstd);
+    }
+
+    #[test]
+    fn identity_first_wins_and_suppresses_compression() {
+        // `identity` is always producible, so reaching it first ends the walk
+        // — an explicit, uniform way for a client to turn compression off for
+        // one request. Encoding it produces no compressed form, so the caller
+        // ships the body as-is and stamps no header.
+        for pairs in [
+            &[("x-vgi-accept-encoding", "identity")][..],
+            &[
+                ("x-vgi-accept-encoding", "identity"),
+                ("accept-encoding", "gzip, zstd"),
+            ][..],
+            &[("x-vgi-accept-encoding", "identity, zstd")][..],
+            &[("accept-encoding", "identity, gzip")][..],
+        ] {
+            let h = headers(pairs);
+            let (enc, _) = super::pick_response_encoding(&h, Some(3)).unwrap();
+            assert_eq!(
+                enc,
+                super::ResponseEncoding::Identity,
+                "identity should win for {pairs:?}"
+            );
+            assert!(
+                super::encode_response_body(enc, &vec![0u8; 4096], 3).is_none(),
+                "identity must never produce a compressed body"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_after_a_producible_codec_does_not_win() {
+        let h = headers(&[("x-vgi-accept-encoding", "zstd, identity")]);
+        let (enc, used_custom) = super::pick_response_encoding(&h, Some(3)).unwrap();
+        assert_eq!(enc, super::ResponseEncoding::Zstd);
+        assert!(used_custom);
+        // But an unproducible codec ahead of identity is skipped, not honoured.
+        let h = headers(&[("x-vgi-accept-encoding", "gzip, identity, zstd")]);
+        let (enc, _) = super::pick_response_encoding(&h, Some(3)).unwrap();
+        assert_eq!(enc, super::ResponseEncoding::Identity);
+    }
+
+    #[test]
+    fn supported_encodings_is_the_both_directions_intersection() {
+        // zstd is decodable and (with a level configured) producible; gzip is
+        // decodable but never producible, so it drops out of the intersection.
+        assert_eq!(super::supported_encodings_header_value(Some(3)), "zstd");
+        // Compression off — the default — advertises an empty list, not an
+        // absent header. Present-but-empty means "I speak no compression".
+        assert_eq!(super::supported_encodings_header_value(None), "");
+        // `identity` is never advertised: always available, no information.
+        assert!(!super::supported_encodings_header_value(Some(3)).contains("identity"));
     }
 
     #[test]

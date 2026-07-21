@@ -28,11 +28,33 @@ fn encode_unary_body(schema: &Schema, batch: &RecordBatch) -> Vec<u8> {
     buf
 }
 
+/// Build a test `HttpState`. `compression: None` means *disabled*, not
+/// "unset" — response compression is on by default now, and these tests
+/// predate that, so `None` keeps its original "no compression" meaning.
+/// See `default_server_compresses_and_advertises_zstd` for the default.
 fn state_with(
     cors: Option<&str>,
     prefix: Option<&str>,
     compression: Option<i32>,
 ) -> Arc<HttpState> {
+    let mut b = stock_builder();
+    if let Some(o) = cors {
+        b = b.cors_origins(o);
+    }
+    if let Some(p) = prefix {
+        b = b.prefix(p);
+    }
+    match compression {
+        Some(l) => b.response_compression_level(l),
+        None => b.disable_response_compression(),
+    }
+    .build()
+}
+
+/// The same two-method test server, wrapped in a builder with **nothing**
+/// configured — so it exercises the shipped defaults, response compression
+/// included.
+fn stock_builder() -> vgi_rpc::http::HttpStateBuilder {
     let mut srv = RpcServer::builder()
         .server_id("it")
         .protocol_name("Test")
@@ -77,17 +99,7 @@ fn state_with(
             ))
         },
     ));
-    let mut b = HttpState::builder().server(Arc::new(srv));
-    if let Some(o) = cors {
-        b = b.cors_origins(o);
-    }
-    if let Some(p) = prefix {
-        b = b.prefix(p);
-    }
-    if let Some(l) = compression {
-        b = b.response_compression_level(l);
-    }
-    b.build()
+    HttpState::builder().server(Arc::new(srv))
 }
 
 #[tokio::test]
@@ -344,6 +356,337 @@ async fn large_response_above_threshold_is_zstd_compressed() {
         Some("zstd"),
         "large compressible bodies must be zstd-compressed"
     );
+}
+
+/// Drive `POST /big` (a 16 KiB compressible Arrow body) with the given
+/// request headers against a zstd-level-3 server, returning the response
+/// headers.
+async fn big_response_headers(headers: &[(&str, &str)]) -> header::HeaderMap {
+    big_response_headers_on(state_with(None, None, Some(3)), headers).await
+}
+
+/// As `big_response_headers`, but against a caller-supplied state.
+async fn big_response_headers_on(
+    state: Arc<HttpState>,
+    headers: &[(&str, &str)],
+) -> header::HeaderMap {
+    let app = vgi_rpc::http::build_router(state);
+    let params_schema = Schema::new(vec![Field::new("value", DataType::Utf8, false)]);
+    let batch = RecordBatch::try_new(
+        Arc::new(params_schema.clone()),
+        vec![Arc::new(StringArray::from(vec!["x"]))],
+    )
+    .unwrap();
+    let body = encode_unary_body(&params_schema, &batch);
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/big")
+        .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE);
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let resp = app
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.headers().clone()
+}
+
+/// The browser/WASM case: `fetch()` cannot set `Accept-Encoding` (forbidden
+/// header name), so the client states its preference only in
+/// `X-VGI-Accept-Encoding`. The server must honour it and answer on the
+/// matching custom response header — a standard `Content-Encoding` would be
+/// auto-decoded or mangled by the very fetch layer that forced the custom
+/// request header.
+#[tokio::test]
+async fn custom_accept_encoding_alone_compresses_and_stamps_custom_header() {
+    let h = big_response_headers(&[("x-vgi-accept-encoding", "zstd, gzip")]).await;
+    assert_eq!(
+        h.get("x-vgi-content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("zstd"),
+        "custom-header-only clients must still get a compressed response"
+    );
+    assert!(
+        h.get(header::CONTENT_ENCODING).is_none(),
+        "must not claim a standard Content-Encoding for a custom-header client"
+    );
+}
+
+/// The cpp-httplib case: the DuckDB engine's HTTP client injects
+/// `Accept-Encoding: deflate, gzip, br, zstd` (gzip before zstd) while VGI
+/// states zstd first in its own header. zstd must win — and because it is
+/// present in both lists, it rides the standard `Content-Encoding`.
+#[tokio::test]
+async fn custom_header_beats_gzip_first_standard_header() {
+    let h = big_response_headers(&[
+        (header::ACCEPT_ENCODING.as_str(), "deflate, gzip, br, zstd"),
+        ("x-vgi-accept-encoding", "zstd, gzip"),
+    ])
+    .await;
+    assert_eq!(
+        h.get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("zstd")
+    );
+    assert!(h.get("x-vgi-content-encoding").is_none());
+}
+
+/// A client offering only codings this server cannot produce (gzip is
+/// decode-only on the response path) gets an uncompressed body — and no
+/// encoding header at all. Same for a client that explicitly asks for
+/// `identity`: an identity body is just a body.
+#[tokio::test]
+async fn unproducible_absent_or_identity_offers_yield_no_encoding_header() {
+    for req_headers in [
+        &[][..],
+        &[("x-vgi-accept-encoding", "gzip")][..],
+        &[(header::ACCEPT_ENCODING.as_str(), "gzip, br, deflate")][..],
+        // Explicit opt-out, even though zstd is offered right behind it.
+        &[("x-vgi-accept-encoding", "identity, zstd")][..],
+        &[(header::ACCEPT_ENCODING.as_str(), "identity, zstd")][..],
+    ] {
+        let h = big_response_headers(req_headers).await;
+        assert!(
+            h.get(header::CONTENT_ENCODING).is_none() && h.get("x-vgi-content-encoding").is_none(),
+            "unexpected encoding header for request headers {req_headers:?}"
+        );
+    }
+}
+
+/// `identity` only wins when the client puts it first — a compressed codec
+/// ahead of it still takes the response.
+#[tokio::test]
+async fn identity_behind_zstd_still_compresses() {
+    let h = big_response_headers(&[("x-vgi-accept-encoding", "zstd, identity")]).await;
+    assert_eq!(
+        h.get("x-vgi-content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("zstd")
+    );
+}
+
+/// `VGI-Supported-Encodings` advertises the codecs usable in both directions
+/// (decode requests *and* encode responses), in server-preference order and
+/// without `identity`. `OPTIONS /health` is the dedicated capability probe.
+#[tokio::test]
+async fn supported_encodings_advertised_on_options_health() {
+    async fn probe(compression: Option<i32>) -> Option<String> {
+        let app = vgi_rpc::http::build_router(state_with(None, None, compression));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.headers()
+            .get("vgi-supported-encodings")
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+    // zstd is decodable and producible; gzip is decode-only, so it is not in
+    // the intersection and is not advertised.
+    assert_eq!(probe(Some(3)).await.as_deref(), Some("zstd"));
+    // Response compression is off by default: the header must still be
+    // present, with an empty value. Absent would mean "legacy server, assume
+    // zstd" — the opposite of the truth.
+    assert_eq!(probe(None).await.as_deref(), Some(""));
+}
+
+/// With compression disabled, a client advertising zstd still gets an
+/// uncompressed body and no encoding header — matching the empty
+/// `VGI-Supported-Encodings` advertisement.
+#[tokio::test]
+async fn compression_disabled_server_advertises_and_behaves_consistently() {
+    let state = state_with(None, None, None);
+    let app = vgi_rpc::http::build_router(state);
+    let params_schema = Schema::new(vec![Field::new("value", DataType::Utf8, false)]);
+    let batch = RecordBatch::try_new(
+        Arc::new(params_schema.clone()),
+        vec![Arc::new(StringArray::from(vec!["x"]))],
+    )
+    .unwrap();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/big")
+                .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
+                .header(header::ACCEPT_ENCODING, "zstd")
+                .header("x-vgi-accept-encoding", "zstd")
+                .body(Body::from(encode_unary_body(&params_schema, &batch)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("vgi-supported-encodings")
+            .map(|v| v.to_str().unwrap()),
+        Some("")
+    );
+    assert!(resp.headers().get(header::CONTENT_ENCODING).is_none());
+    assert!(resp.headers().get("x-vgi-content-encoding").is_none());
+}
+
+/// A server built with **no** compression configuration compresses, and says
+/// so. Response compression used to default to off, which meant a stock Rust
+/// server advertised an empty `VGI-Supported-Encodings` and shipped every
+/// Arrow body raw. It now defaults to zstd at
+/// `DEFAULT_RESPONSE_COMPRESSION_LEVEL`.
+#[tokio::test]
+async fn default_server_compresses_and_advertises_zstd() {
+    let h = big_response_headers_on(stock_builder().build(), &[("accept-encoding", "zstd")]).await;
+    assert_eq!(
+        h.get("vgi-supported-encodings")
+            .and_then(|v| v.to_str().ok()),
+        Some("zstd"),
+        "a stock server must advertise the codec it can produce"
+    );
+    assert_eq!(
+        h.get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("zstd"),
+        "a stock server must actually compress, not just advertise"
+    );
+}
+
+/// Level 1 is the default, and it is the level that is actually applied —
+/// not merely a flag that switches compression on at zstd's own default of 3.
+/// Level 1 was measured 4.7x faster than level 3 *and* smaller on an 8.41 MB
+/// Arrow payload, so the level is the point, not an incidental.
+#[tokio::test]
+async fn default_compression_level_is_one() {
+    let body_len = |state: Arc<HttpState>| async move {
+        let app = vgi_rpc::http::build_router(state);
+        let params_schema = Schema::new(vec![Field::new("value", DataType::Utf8, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(params_schema.clone()),
+            vec![Arc::new(StringArray::from(vec!["x"]))],
+        )
+        .unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/big")
+                    .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
+                    .header(header::ACCEPT_ENCODING, "zstd")
+                    .body(Body::from(encode_unary_body(&params_schema, &batch)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .len()
+    };
+    assert_eq!(
+        body_len(stock_builder().build()).await,
+        body_len(state_with(None, None, Some(1))).await,
+        "the default must be exactly level 1"
+    );
+}
+
+/// Regression: the compressed-response path used to `return` before
+/// `attach_capability_headers` ran, so every compressed Arrow body — i.e.
+/// every large response, the ones a client most needs to size correctly —
+/// arrived with no `VGI-*` headers at all. Capability discovery is stamped on
+/// *every* response in the other SDKs; it must be here too.
+#[tokio::test]
+async fn compressed_response_still_carries_capability_headers() {
+    let state = stock_builder()
+        .max_request_bytes(1024 * 1024)
+        .max_response_bytes(2 * 1024 * 1024)
+        .build();
+    let h = big_response_headers_on(state, &[("accept-encoding", "zstd")]).await;
+    // Premise: this response really was compressed.
+    assert_eq!(
+        h.get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("zstd"),
+        "test is vacuous unless the body was compressed"
+    );
+    for name in [
+        "vgi-supported-encodings",
+        "vgi-max-request-bytes",
+        "vgi-max-response-bytes",
+        "vgi-externalization-enabled",
+        "vgi-sticky-enabled",
+    ] {
+        assert!(
+            h.contains_key(name),
+            "compressed response is missing capability header {name}; got {:?}",
+            h.keys().map(|k| k.as_str()).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A browser can only read a response header that CORS exposes. Rust used to
+/// expose none of the `VGI-*` capability headers, so a `fetch()` client could
+/// not discover a single server capability — including
+/// `VGI-Supported-Encodings`, whose entire purpose is client-side discovery.
+#[tokio::test]
+async fn cors_exposes_every_vgi_capability_header() {
+    let state = stock_builder()
+        .cors_origins("https://app.example.com")
+        .max_request_bytes(1024 * 1024)
+        .max_upload_bytes(4096)
+        .enable_sticky(true)
+        .build();
+    let app = vgi_rpc::http::build_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let headers = resp.headers().clone();
+    let exposed: Vec<String> = headers
+        .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Every capability header actually emitted must be readable.
+    for (name, _) in headers.iter() {
+        if name.as_str().starts_with("vgi-") {
+            assert!(
+                exposed.contains(&name.as_str().to_string()),
+                "capability header {name} is emitted but not CORS-exposed; \
+                 exposed = {exposed:?}"
+            );
+        }
+    }
+    // Plus the non-capability headers a browser client has to read.
+    for name in [
+        "content-encoding",
+        "x-vgi-content-encoding",
+        "x-vgi-rpc-error",
+        "www-authenticate",
+        // Sticky-session headers are stamped per-response, not part of the
+        // capability map, so they are named explicitly by the builder.
+        "vgi-session",
+        "vgi-session-close",
+    ] {
+        assert!(
+            exposed.contains(&name.to_string()),
+            "{name} must be CORS-exposed; exposed = {exposed:?}"
+        );
+    }
 }
 
 /// Minimal `HttpState` with a one-method server, configured by `f`.

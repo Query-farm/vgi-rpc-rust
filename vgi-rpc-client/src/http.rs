@@ -69,9 +69,12 @@ use vgi_rpc::external::UPLOAD_URL_METHOD;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
+/// The only coding this client can produce for request bodies. Also the
+/// assumed server capability when `VGI-Supported-Encodings` is absent.
+const DEFAULT_REQUEST_ENCODING: &str = "zstd";
 
 /// Server capabilities advertised on `OPTIONS {prefix}/health`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HttpServerCapabilities {
     pub sticky_enabled: bool,
     pub sticky_default_ttl: Option<u64>,
@@ -82,7 +85,44 @@ pub struct HttpServerCapabilities {
     pub max_externalized_response_bytes: Option<u64>,
     pub externalization_enabled: bool,
     pub max_upload_bytes: Option<u64>,
+    /// Content codings the server can decompress on request bodies (and
+    /// re-encode on responses), from `VGI-Supported-Encodings`.
+    ///
+    /// Three distinct server answers collapse into this one field, so read
+    /// it as a set, not as "did the header parse":
+    ///
+    /// - header **absent** ⇒ `["zstd"]`. A server predating the
+    ///   advertisement; every such server accepted zstd, so assuming it
+    ///   keeps request compression working against old deployments.
+    /// - header **present but empty** ⇒ `[]`. The server positively states
+    ///   it speaks no compression. Sending it a compressed body would earn
+    ///   a 415, so [`HttpClient`] stops compressing on seeing this.
+    /// - header **present and non-empty** ⇒ the parsed list.
+    ///
+    /// Mirrors Python's `HttpServerCapabilities.supported_encodings`,
+    /// including the `(zstd,)` default — hence the hand-written [`Default`].
     pub supported_encodings: Vec<String>,
+}
+
+impl Default for HttpServerCapabilities {
+    /// All-negative defaults except `supported_encodings`, which defaults to
+    /// the absent-header reading (`zstd`) rather than the empty set — an
+    /// undiscovered server is a legacy server, not one that refuses
+    /// compression.
+    fn default() -> Self {
+        Self {
+            sticky_enabled: false,
+            sticky_default_ttl: None,
+            sticky_echo_headers: Vec::new(),
+            upload_url_support: false,
+            max_request_bytes: None,
+            max_response_bytes: None,
+            max_externalized_response_bytes: None,
+            externalization_enabled: false,
+            max_upload_bytes: None,
+            supported_encodings: vec![DEFAULT_REQUEST_ENCODING.to_string()],
+        }
+    }
 }
 
 /// A pre-signed upload-URL pair returned by `request_upload_urls`.
@@ -427,6 +467,11 @@ impl HttpClient {
         // Proactive externalization when caps are known and the body is large.
         let body = self.maybe_externalize_request(body)?;
         let (mut resp_headers, mut bytes, mut status) = self.send(path, &body, retryable)?;
+        // The server stamps `VGI-Supported-Encodings` on every response, so
+        // the first reply already tells us whether it speaks compression —
+        // no OPTIONS probe, and no wasted 415 round-trip against a server
+        // that advertises none.
+        self.refresh_supported_encodings(&resp_headers);
 
         // 415: server can't decode our request encoding — disable compression
         // and retry once with an identity body.
@@ -660,6 +705,7 @@ impl HttpClient {
             return Ok(c.clone());
         }
         let caps = self.fetch_capabilities()?;
+        self.apply_supported_encodings(&caps.supported_encodings);
         *self.caps.borrow_mut() = Some(caps.clone());
         Ok(caps)
     }
@@ -674,19 +720,42 @@ impl HttpClient {
         Ok(parse_caps(resp.headers()))
     }
 
+    /// Harvest `VGI-Supported-Encodings` from a response and cache it.
+    ///
+    /// An **absent** header is left alone — it says nothing new, and
+    /// overwriting the cache with a guess would lose a real advertisement
+    /// seen earlier. A **present but empty** header is recorded as the empty
+    /// set, which is the whole reason this is not a plain `split()`: it is
+    /// the server saying "no compression", and it must switch request
+    /// compression off rather than read as "nothing to update".
     fn refresh_supported_encodings(&self, headers: &HeaderMap) {
-        if let Some(list) = headers
-            .get(SUPPORTED_ENCODINGS_HEADER)
-            .and_then(|v| v.to_str().ok())
-        {
-            let encs: Vec<String> = list
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let mut c = self.caps.borrow_mut();
-            let caps = c.get_or_insert_with(HttpServerCapabilities::default);
+        let Some(encs) = parse_supported_encodings(headers) else {
+            return;
+        };
+        self.apply_supported_encodings(&encs);
+        // Refine an already-discovered capability set, but never seed one:
+        // a stub holding only this field would be served from cache by
+        // `capabilities()` in place of the real `OPTIONS /health` probe,
+        // silently reporting every other capability as absent.
+        if let Some(caps) = self.caps.borrow_mut().as_mut() {
             caps.supported_encodings = encs;
+        }
+    }
+
+    /// Stop compressing request bodies when the server's advertised set has
+    /// no coding this client can produce — an empty set, or one listing only
+    /// codings we cannot emit (this client produces zstd only).
+    ///
+    /// One-way on purpose: nothing here re-enables compression. The other
+    /// path that clears the flag is the 415 fallback, and a server that has
+    /// already rejected our coding should not be retried with it because a
+    /// later response happened to advertise it.
+    fn apply_supported_encodings(&self, encodings: &[String]) {
+        if !encodings
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(DEFAULT_REQUEST_ENCODING))
+        {
+            *self.send_compressed.borrow_mut() = false;
         }
     }
 
@@ -1222,6 +1291,32 @@ fn parse_upload_urls(bytes: &[u8], on_log: &mut Option<OnLog>) -> Result<Vec<Upl
     Ok(out)
 }
 
+/// Read `VGI-Supported-Encodings`, keeping absent and present-but-empty
+/// apart — a plain `split()` maps both to an empty list, which is wrong for
+/// one of them.
+///
+/// Returns `None` only when the header is absent. Mirrors Python's
+/// `http_capabilities` / `_refresh_supported_encodings_from_response`:
+///
+/// - absent ⇒ `None`; callers substitute `["zstd"]`, the pre-advertisement
+///   server's capability.
+/// - present but empty ⇒ `Some([])`, the server stating it speaks no
+///   compression. Substituting zstd here would send it bodies it cannot
+///   decode.
+/// - present, non-empty ⇒ `Some(list)`, lowercased and trimmed, order
+///   preserved.
+fn parse_supported_encodings(h: &HeaderMap) -> Option<Vec<String>> {
+    let raw = h
+        .get(SUPPORTED_ENCODINGS_HEADER)
+        .and_then(|v| v.to_str().ok())?;
+    Some(
+        raw.split(',')
+            .map(|p| p.trim().to_ascii_lowercase())
+            .filter(|p| !p.is_empty())
+            .collect(),
+    )
+}
+
 fn parse_caps(h: &HeaderMap) -> HttpServerCapabilities {
     let get = |name: &str| {
         h.get(name)
@@ -1249,6 +1344,80 @@ fn parse_caps(h: &HeaderMap) -> HttpServerCapabilities {
         max_externalized_response_bytes: parse_u64(MAX_EXTERNALIZED_RESPONSE_BYTES_HEADER),
         externalization_enabled: get(EXTERNALIZATION_ENABLED_HEADER).as_deref() == Some("true"),
         max_upload_bytes: parse_u64(MAX_UPLOAD_BYTES_HEADER),
-        supported_encodings: split(SUPPORTED_ENCODINGS_HEADER),
+        // Absent ⇒ legacy server ⇒ assume zstd. `split` would have said
+        // "no codecs", which is the present-but-empty answer.
+        supported_encodings: parse_supported_encodings(h)
+            .unwrap_or_else(|| vec![DEFAULT_REQUEST_ENCODING.to_string()]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    /// The three answers `VGI-Supported-Encodings` can give must stay
+    /// distinguishable. A plain `split()` collapses "absent" and "present but
+    /// empty" into the same empty list, and they mean opposite things: the
+    /// first is an old server that certainly accepts zstd, the second is a
+    /// server stating it accepts none.
+    #[test]
+    fn supported_encodings_separates_absent_from_present_but_empty() {
+        assert_eq!(parse_supported_encodings(&HeaderMap::new()), None);
+        assert_eq!(
+            parse_supported_encodings(&headers(&[(SUPPORTED_ENCODINGS_HEADER, "")])),
+            Some(vec![])
+        );
+        // Whitespace-only is still "present but empty" — a server writing
+        // ", ," is saying nothing, not naming a codec.
+        assert_eq!(
+            parse_supported_encodings(&headers(&[(SUPPORTED_ENCODINGS_HEADER, " , ")])),
+            Some(vec![])
+        );
+        assert_eq!(
+            parse_supported_encodings(&headers(&[(SUPPORTED_ENCODINGS_HEADER, "ZSTD, gzip")])),
+            Some(vec!["zstd".to_string(), "gzip".to_string()]),
+            "tokens are lowercased and the server's order is preserved"
+        );
+    }
+
+    #[test]
+    fn caps_assume_zstd_only_when_the_header_is_absent() {
+        // Absent ⇒ a server predating the advertisement. Every such server
+        // decoded zstd, so keep compressing.
+        assert_eq!(
+            parse_caps(&HeaderMap::new()).supported_encodings,
+            vec!["zstd".to_string()]
+        );
+        // Present-but-empty ⇒ the server says it speaks no compression.
+        // Substituting zstd here would send it bodies it rejects with a 415.
+        assert!(parse_caps(&headers(&[(SUPPORTED_ENCODINGS_HEADER, "")]))
+            .supported_encodings
+            .is_empty());
+        assert_eq!(
+            parse_caps(&headers(&[(SUPPORTED_ENCODINGS_HEADER, "zstd")])).supported_encodings,
+            vec!["zstd".to_string()]
+        );
+    }
+
+    /// An undiscovered server is a legacy server, not one refusing
+    /// compression — so the field's default is `zstd`, matching Python's
+    /// `HttpServerCapabilities.supported_encodings = (Encoding.ZSTD,)`.
+    #[test]
+    fn default_caps_assume_zstd() {
+        assert_eq!(
+            HttpServerCapabilities::default().supported_encodings,
+            vec!["zstd".to_string()]
+        );
     }
 }

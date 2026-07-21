@@ -86,10 +86,12 @@ async fn main() {
         .param_type("value", "str"),
     );
 
+    // zstd response compression is on by default (level 1); override with
+    // `.response_compression_level(n)` or turn it off with
+    // `.disable_response_compression()`.
     let state = HttpState::builder()
         .server(Arc::new(srv))
         .cors_origins("*")
-        .response_compression_level(3)
         .build();
     let app = vgi_rpc::http::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await.unwrap();

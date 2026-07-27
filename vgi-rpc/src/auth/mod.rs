@@ -11,12 +11,16 @@
 //!   - [`mtls::mtls_authenticate_fingerprint`] / [`mtls::mtls_authenticate_subject`]
 //!     / [`mtls::mtls_authenticate_xfcc`]
 //!   - [`oauth::OAuthResourceMetadata`] (RFC 9728)
+//!   - [`proof::proof_authenticate`] (feature `http`)
 //!   - [`jwt::jwt_authenticate`] (feature `jwt`)
 //!   - [`pkce`] (feature `oauth-pkce`)
 
 pub mod bearer;
 pub mod mtls;
 pub mod oauth;
+
+#[cfg(feature = "http")]
+pub mod proof;
 
 #[cfg(feature = "jwt")]
 pub mod jwt;

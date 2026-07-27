@@ -63,6 +63,7 @@ Stock `arrow-rs` 59.x dependency tree, MSRV 1.97, no
 | `oauth-pkce` |  | `auth::pkce` cookie + verifier crypto primitives. |
 | `oauth-pkce-server` |  | OAuth 2 PKCE server-side redirect / token-exchange (`reqwest`). |
 | `mtls-pem` |  | PEM-cert parsing helpers (`x509-parser`). XFCC parsing is always on. |
+| — |  | `auth::proof` (proxy proof) ships with `http`; no extra dependency. See `docs/proxy-proof-spec.md` in vgi-rpc. |
 | `otel` |  | `OtelHook` — real `tracing::Span` per RPC for `tracing-opentelemetry`. |
 | `sentry-tracing` |  | `TracingSentryHook` — lightweight, no extra deps. |
 | `sentry-sdk` |  | `SentrySdkHook` — full Sentry SDK integration (`sentry` 0.46). |
@@ -137,6 +138,7 @@ use vgi_rpc::{
 // Feature-gated:
 use vgi_rpc::auth::bearer::bearer_authenticate_static;      // always on
 use vgi_rpc::auth::mtls::mtls_authenticate_fingerprint;     // always on
+use vgi_rpc::auth::proof::proof_authenticate;               // feature `http`
 use vgi_rpc::http::{HttpState, HttpStateBuilder};            // "http"
 use vgi_rpc::external::{ExternalLocationConfig, Compression}; // "http"
 // use vgi_rpc::auth::jwt::jwt_authenticate;                 // "jwt"

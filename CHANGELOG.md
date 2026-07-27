@@ -2,6 +2,34 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.17.0] — 2026-07-27
+
+### Added
+
+- **Proxy proof** (`auth::proof`, feature `http`): a worker can refuse any
+  request that did not arrive through a trusted proxy, by recomputing an
+  HMAC-SHA256 over a timestamp, a nonce and the worker's own identifier
+  against a secret shared only with that proxy. Unlike a forwarded assertion
+  about what happened at a TLS terminator, a proof cannot be produced by
+  someone who merely reaches the worker directly — without the secret there is
+  nothing to replay.
+  - `proof_authenticate(cfg, inner)` composes as an **AND**. It is deliberately
+    not passed to `chain_authenticate`, whose first-non-anonymous-wins
+    semantics would let a later credential bypass it.
+  - `NonceCache` is bounded by capacity as well as TTL: a TTL bounds how long
+    an entry lives, never how many arrive inside the window, so TTL-only would
+    be a remote memory-exhaustion vector.
+  - No new dependency — `hmac` and `sha2` were already in the tree, and
+    `Mac::verify_slice` is constant-time internally.
+  - Verified against golden vectors minted by the Python reference
+    implementation: this port both verifies its tokens and mints byte-identical
+    output, which is the only check that catches a canonical string framed
+    differently from the other languages.
+  - `--http-proof` on the conformance worker; the shared `TestProxyProof` group
+    (22 cases) runs against this port.
+
+  Contract: `docs/proxy-proof-spec.md` in vgi-rpc.
+
 ## [0.16.0] — 2026-07-21
 
 - **Fixed (http)** `max_body_size` is now actually enforced. axum installs a

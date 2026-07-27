@@ -269,6 +269,41 @@ def conformance_http_strict_cap_port() -> Iterator[int]:
 
 
 @pytest.fixture(scope="session")
+def proof_worker_factory() -> Iterator[Callable[..., Any]]:
+    """Spawn Rust workers gated on proxy proof, for the shared TestProxyProof group.
+
+    Only wired for SERVER == "rust"; other servers have their own harness and
+    the shared group skips cleanly when this fixture is absent.
+    """
+    if SERVER != "rust":
+        pytest.skip(f"proof worker not wired for SERVER={SERVER}")
+
+    from vgi_rpc.conformance.proof_harness import ProofWorker, ProofWorkerConfig
+
+    @contextlib.contextmanager
+    def spawn(config: ProofWorkerConfig) -> Iterator[ProofWorker]:
+        args = [
+            RUST_WORKER,
+            "--http-proof",
+            "--proof-mode", config.mode,
+            "--proof-origin-id", config.origin_id,
+            "--proof-secrets", config.secrets,
+            "--proof-skew", str(config.skew_seconds),
+        ]
+        if not config.replay_cache:
+            args.append("--proof-no-replay-cache")
+        proc, port = _spawn_read_port(args)
+        try:
+            # The Rust worker mounts proof mode under /vgi, mirroring auth mode.
+            yield ProofWorker(port=port, prefix="/vgi", config=config)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    yield spawn
+
+
+@pytest.fixture(scope="session")
 def conformance_http_auth_port() -> Iterator[int]:
     """HTTP server with a reject-all auth callback."""
     proc, port = _spawn_http_variant("auth")

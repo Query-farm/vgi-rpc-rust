@@ -50,6 +50,14 @@ fn main() {
         return;
     }
 
+    if args.len() > 1 && args[1] == "--http-proof" {
+        // Run the HTTP transport gated on proxy proof, so the shared
+        // TestProxyProof conformance group can drive this port.
+        let server = Arc::new(conformance::build_server());
+        run_http_proof(server, &args);
+        return;
+    }
+
     if args.len() > 1 && args[1] == "--http-auth" {
         // Run the HTTP transport with a reject-all `authenticate`
         // callback, used by the conformance suite's TestHealth to
@@ -301,6 +309,57 @@ fn run_http_with_storage(
         let port = listener.local_addr().unwrap().port();
         println!("PORT:{port}");
         io::stdout().flush().ok();
+        vgi_rpc::http::serve_with_shutdown(state, listener)
+            .await
+            .expect("axum serve");
+    });
+}
+
+fn parse_str_flag(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+fn run_http_proof(server: Arc<vgi_rpc::RpcServer>, args: &[String]) {
+    use vgi_rpc::auth::proof::{parse_proof_secrets, proof_authenticate, ProofConfig, ProofMode};
+
+    let secrets = parse_proof_secrets(&parse_str_flag(args, "--proof-secrets").unwrap_or_default())
+        .expect("valid --proof-secrets");
+    let origin_id =
+        parse_str_flag(args, "--proof-origin-id").unwrap_or_else(|| "conformance-origin".into());
+    let mode = match parse_str_flag(args, "--proof-mode").as_deref() {
+        Some("allow") => ProofMode::Allow,
+        Some("off") => ProofMode::Off,
+        _ => ProofMode::Require,
+    };
+    let mut cfg = ProofConfig::new(mode, origin_id, secrets);
+    if let Some(skew) = parse_str_flag(args, "--proof-skew").and_then(|s| s.parse().ok()) {
+        cfg = cfg.with_skew_seconds(skew);
+    }
+    if args.iter().any(|a| a == "--proof-no-replay-cache") {
+        cfg = cfg.without_replay_cache();
+    }
+    let gate = proof_authenticate(cfg, None).expect("valid proof config");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async move {
+        let state = vgi_rpc::http::HttpState::builder()
+            .server(server)
+            .authenticate(gate)
+            .prefix("/vgi")
+            .build();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        println!("PORT:{port}");
+        use std::io::Write as _;
+        std::io::stdout().flush().ok();
         vgi_rpc::http::serve_with_shutdown(state, listener)
             .await
             .expect("axum serve");

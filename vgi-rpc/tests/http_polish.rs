@@ -689,6 +689,82 @@ async fn cors_exposes_every_vgi_capability_header() {
     }
 }
 
+/// `VGI-Proxy-Proof-Required` is how a proxy confirms the worker it is
+/// minting proofs for actually checks them — the misconfiguration that turns
+/// the whole feature into a silent no-op. Only `require` may advertise it:
+/// `allow` verifies but never denies, so claiming enforcement there would be
+/// a lie, and `off` installs no gate at all. Mirrors the mode → advertisement
+/// mapping the conformance worker performs.
+#[tokio::test]
+async fn require_mode_advertises_the_proof_capability() {
+    use vgi_rpc::auth::proof::{proof_authenticate, ProofConfig, ProofMode, PROOF_REQUIRED_HEADER};
+
+    async fn advertised(mode: ProofMode) -> Option<String> {
+        let state = state_configured(|b| {
+            // `off` installs no gate at all — `proof_authenticate` refuses
+            // that mode rather than compiling a callback that does nothing.
+            let b = if mode == ProofMode::Off {
+                b
+            } else {
+                let mut secrets = std::collections::HashMap::new();
+                secrets.insert("k1".to_string(), ([7u8; 32], "edge".to_string()));
+                let cfg = ProofConfig::new(mode, "worker-a", secrets);
+                b.authenticate(proof_authenticate(cfg, None).expect("valid proof config"))
+            };
+            b.proxy_proof_required(mode == ProofMode::Require)
+                // A concrete origin so the expose list is emitted at all;
+                // `"*"` plus an authenticate callback is rejected at build.
+                .cors_origins("https://proxy.example.com")
+        });
+        let resp = vgi_rpc::http::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let headers = resp.headers().clone();
+        // Nothing a browser cannot read: an unexposed capability header may
+        // as well not exist for a `fetch()` client.
+        if headers.contains_key(PROOF_REQUIRED_HEADER) {
+            let exposed = headers
+                .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            assert!(
+                exposed.contains(&PROOF_REQUIRED_HEADER.to_ascii_lowercase()),
+                "{PROOF_REQUIRED_HEADER} is emitted but not CORS-exposed; exposed = {exposed:?}"
+            );
+        }
+        headers
+            .get(PROOF_REQUIRED_HEADER)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    assert_eq!(
+        advertised(ProofMode::Require).await.as_deref(),
+        Some("true")
+    );
+    assert_eq!(advertised(ProofMode::Allow).await, None);
+    assert_eq!(advertised(ProofMode::Off).await, None);
+    // The knob is off unless asked for, so a stock server — one that never
+    // heard of the feature — cannot claim a posture it does not hold.
+    let state = state_configured(|b| b);
+    let resp = vgi_rpc::http::build_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!resp.headers().contains_key(PROOF_REQUIRED_HEADER));
+}
+
 /// Minimal `HttpState` with a one-method server, configured by `f`.
 fn state_configured(
     f: impl FnOnce(vgi_rpc::http::HttpStateBuilder) -> vgi_rpc::http::HttpStateBuilder,

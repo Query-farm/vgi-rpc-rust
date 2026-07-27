@@ -25,6 +25,13 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
     implementation: this port both verifies its tokens and mints byte-identical
     output, which is the only check that catches a canonical string framed
     differently from the other languages.
+  - `HttpStateBuilder::proxy_proof_required(true)` advertises the
+    `VGI-Proxy-Proof-Required: true` capability header (and CORS-exposes it) on
+    every response, so a proxy can tell an enforcing worker from one silently
+    ignoring the header — the misconfiguration that makes the feature a no-op.
+    Advertisement only: the gate arrives through `authenticate` as an opaque
+    callback the builder cannot introspect, so the operator states the posture.
+    Emitted only for `require`; `allow` never denies, so it must not claim to.
   - `--http-proof` on the conformance worker; the shared `TestProxyProof` group
     (22 cases) runs against this port.
 

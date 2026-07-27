@@ -396,6 +396,7 @@ pub struct HttpStateBuilder {
     sticky_default_ttl: Option<std::time::Duration>,
     sticky_echo_headers: Vec<(String, String)>,
     describe_provider: Option<Arc<dyn DescribeProvider>>,
+    proxy_proof_required: Option<bool>,
 }
 
 impl HttpStateBuilder {
@@ -488,6 +489,19 @@ impl HttpStateBuilder {
     /// anonymous for all callers (mirrors the Python `make_wsgi_app` default).
     pub fn authenticate(mut self, cb: crate::auth::Authenticate) -> Self {
         self.authenticate = Some(cb);
+        self
+    }
+
+    /// Advertise `VGI-Proxy-Proof-Required: true` so a proxy can tell it is
+    /// minting proofs for a worker that actually checks them. Set it when
+    /// the [`proof gate`](crate::auth::proof::proof_authenticate) is
+    /// installed in [`ProofMode::Require`](crate::auth::proof::ProofMode).
+    ///
+    /// Advertisement only — it enables and enforces nothing. The gate rides
+    /// in through [`Self::authenticate`] as an opaque callback the builder
+    /// cannot introspect, so the operator states the posture here.
+    pub fn proxy_proof_required(mut self, required: bool) -> Self {
+        self.proxy_proof_required = Some(required);
         self
     }
 
@@ -710,6 +724,7 @@ impl HttpStateBuilder {
                 max_upload_bytes: self.max_upload_bytes,
                 sticky: sticky.as_deref(),
                 response_compression_level,
+                proxy_proof_required: self.proxy_proof_required.unwrap_or(false),
             });
         Arc::new(HttpState {
             server,
@@ -756,6 +771,7 @@ struct CapabilityInputs<'a> {
     max_upload_bytes: Option<usize>,
     sticky: Option<&'a crate::sticky::StickyContext>,
     response_compression_level: Option<i32>,
+    proxy_proof_required: bool,
 }
 
 /// Response headers a browser client must be able to read that are *not*
@@ -787,6 +803,7 @@ fn build_capability_headers(inputs: CapabilityInputs<'_>) -> (HeaderMap, bool, H
         max_upload_bytes,
         sticky,
         response_compression_level,
+        proxy_proof_required,
     } = inputs;
     let mut out = HeaderMap::new();
     let mut any = false;
@@ -836,6 +853,17 @@ fn build_capability_headers(inputs: CapabilityInputs<'_>) -> (HeaderMap, bool, H
                 out.insert("vgi-max-upload-bytes", v);
             }
         }
+    }
+    // Proxy-proof posture. Emitted only in `require` mode — `allow` never
+    // denies, so advertising there would tell a proxy the hop is enforced
+    // when it is not. Absence therefore means "not enforcing", which is why
+    // there is no negative form.
+    if proxy_proof_required {
+        out.insert(
+            crate::auth::proof::PROOF_REQUIRED_HEADER,
+            HeaderValue::from_static("true"),
+        );
+        any = true;
     }
     // Sticky-session capabilities. Always emit the enabled flag (negative
     // form when off) so capability discovery is unambiguous.

@@ -342,6 +342,8 @@ fn run_http_proof(server: Arc<vgi_rpc::RpcServer>, args: &[String]) {
         cfg = cfg.without_replay_cache();
     }
     let gate = proof_authenticate(cfg, None).expect("valid proof config");
+    // The gate is opaque to the builder, so state the posture explicitly.
+    let advertise = mode == ProofMode::Require;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -351,6 +353,7 @@ fn run_http_proof(server: Arc<vgi_rpc::RpcServer>, args: &[String]) {
         let state = vgi_rpc::http::HttpState::builder()
             .server(server)
             .authenticate(gate)
+            .proxy_proof_required(advertise)
             .prefix("/vgi")
             .build();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

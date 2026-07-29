@@ -42,11 +42,21 @@ fn main() {
     let no_compression = args.iter().any(|a| a == "--no-compression");
 
     if args.len() > 1 && args[1] == "--http" {
-        let server = Arc::new(conformance::build_server());
+        let server = Arc::new(conformance::build_server_with_id(
+            parse_str_flag(&args, "--server-id").as_deref(),
+        ));
         let strict = args.iter().any(|a| a == "--strict");
         let max_resp = parse_usize_flag(&args, "--max-response-bytes");
         let max_ext = parse_usize_flag(&args, "--max-externalized-response-bytes");
-        run_http(server, false, strict, max_resp, max_ext, no_compression);
+        run_http(
+            server,
+            false,
+            strict,
+            max_resp,
+            max_ext,
+            no_compression,
+            StickyOpts::from_args(&args),
+        );
         return;
     }
 
@@ -64,7 +74,15 @@ fn main() {
         // assert that `/health` bypasses auth while RPC endpoints
         // return 401.
         let server = Arc::new(conformance::build_server());
-        run_http(server, true, false, None, None, no_compression);
+        run_http(
+            server,
+            true,
+            false,
+            None,
+            None,
+            no_compression,
+            StickyOpts::default(),
+        );
         return;
     }
 
@@ -155,7 +173,7 @@ fn build_server_with_storage(storage_url: &str, zstd: bool) -> vgi_rpc::RpcServe
     if zstd {
         cfg = cfg.with_compression(Compression::Zstd(0));
     }
-    conformance::build_server_with_external(Some(cfg))
+    conformance::build_server_with_external(Some(cfg), None)
 }
 
 /// Borrow the shared `FakeStorage` instance, used both as the
@@ -287,7 +305,7 @@ fn run_http_with_storage(
     if zstd {
         cfg = cfg.with_compression(Compression::Zstd(0));
     }
-    let server = Arc::new(conformance::build_server_with_external(Some(cfg)));
+    let server = Arc::new(conformance::build_server_with_external(Some(cfg), None));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -369,6 +387,34 @@ fn run_http_proof(server: Arc<vgi_rpc::RpcServer>, args: &[String]) {
     });
 }
 
+/// Sticky knobs the upstream failure-path fixtures drive.
+///
+/// Each backs one `TestSticky` case that cannot run against the plain worker;
+/// see the reference repo's `docs/sticky-sessions-spec.md` §9.1.
+#[derive(Default)]
+struct StickyOpts {
+    /// `--sticky-ttl <SECONDS>` — short enough that the expiry case can outwait
+    /// it. Whole seconds, matching what `VGI-Sticky-Default-TTL` advertises.
+    ttl_secs: Option<u64>,
+    /// `--token-key <HEX>` — pins the AEAD key so two workers can open each
+    /// other's session tokens, leaving `server_id` as the only thing that can
+    /// reject one.
+    token_key_hex: Option<String>,
+    /// `--sticky-auth` — resolve the principal named in
+    /// `X-Conformance-Principal` so one worker is reachable as two identities.
+    principal_auth: bool,
+}
+
+impl StickyOpts {
+    fn from_args(args: &[String]) -> Self {
+        Self {
+            ttl_secs: parse_str_flag(args, "--sticky-ttl").and_then(|v| v.parse::<u64>().ok()),
+            token_key_hex: parse_str_flag(args, "--token-key"),
+            principal_auth: args.iter().any(|a| a == "--sticky-auth"),
+        }
+    }
+}
+
 fn run_http(
     server: Arc<vgi_rpc::RpcServer>,
     reject_all_auth: bool,
@@ -376,6 +422,7 @@ fn run_http(
     max_response_bytes_arg: Option<usize>,
     max_externalized_response_bytes_arg: Option<usize>,
     no_compression: bool,
+    sticky: StickyOpts,
 ) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -419,6 +466,34 @@ fn run_http(
             "x-vgi-conformance-echo".to_string(),
             "conformance-fixed-marker".to_string(),
         )]);
+        if let Some(secs) = sticky.ttl_secs {
+            builder = builder.sticky_default_ttl(std::time::Duration::from_secs(secs));
+        }
+        if let Some(hex) = sticky.token_key_hex.as_deref() {
+            builder = builder.token_key_hex(hex);
+        }
+        if sticky.principal_auth {
+            // Resolve the principal named in X-Conformance-Principal, or stay
+            // anonymous. Naming yourself in a header is obviously not
+            // authentication — it is the cheapest thing every port can
+            // implement identically, and the cross-principal replay case only
+            // needs the two identities to be distinguishable.
+            //
+            // Requests without the header stay anonymous rather than being
+            // rejected: the suite probes /health and the capability endpoint
+            // before it authenticates anything. And unlike the reject-all mode
+            // above, this deliberately leaves the prefix at the root — the
+            // suite connects to this worker exactly as to the plain one.
+            builder =
+                builder.authenticate(std::sync::Arc::new(|req: &vgi_rpc::auth::AuthRequest| {
+                    Ok(match req.header("x-conformance-principal") {
+                        Some(principal) if !principal.is_empty() => {
+                            vgi_rpc::auth::AuthContext::for_principal("conformance", principal)
+                        }
+                        _ => vgi_rpc::auth::AuthContext::anonymous(),
+                    })
+                }));
+        }
         if no_compression {
             builder = builder.disable_response_compression();
         }

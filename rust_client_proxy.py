@@ -71,6 +71,7 @@ class RustClientProxy:
         *,
         external_config: Any = None,
         compression_level: Any = 3,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self._methods = rpc_methods(ConformanceService)
         self._on_log = on_log
@@ -80,6 +81,7 @@ class RustClientProxy:
         self._external = external_config is not None
         self._compression_level = compression_level
         self._protocol_version = vars(ConformanceService).get("protocol_version")
+        self._headers = headers or {}
         self._proc = subprocess.Popen(
             [_DRIVER],
             stdin=subprocess.PIPE,
@@ -109,6 +111,9 @@ class RustClientProxy:
                 "target": target,
                 "external": self._external,
                 "compression_level": self._compression_level,
+                # Default request headers, e.g. the identity the upstream
+                # sticky cross-principal test pins on its client.
+                "headers": self._headers,
             }
         )
         resp = self._recv()
@@ -405,6 +410,25 @@ class _UploadUrl:
         self.expires_at = d.get("expires_at")
 
 
+def _target_and_headers(base_url: Any, client: Any) -> tuple[Any, dict[str, str]]:
+    """Resolve ``http_connect``'s ``base_url`` / ``client`` pair for the Rust driver.
+
+    ``http_connect`` accepts either a URL or a pre-built ``httpx.Client``; the
+    upstream sticky cross-principal test uses the latter to pin an identity
+    header. The Rust client takes a URL plus default headers, so unwrap the
+    client into that shape. Only headers the caller actually added are
+    forwarded — httpx installs its own defaults (accept, accept-encoding,
+    user-agent, connection) which the Rust client sets for itself.
+    """
+    if client is None:
+        return base_url, {}
+    import httpx
+
+    stock = {k.lower() for k in httpx.Client().headers}
+    headers = {k: v for k, v in client.headers.items() if k.lower() not in stock}
+    return str(client.base_url), headers
+
+
 def rust_http_connect(
     protocol: Any,
     base_url: Any = None,
@@ -420,14 +444,17 @@ def rust_http_connect(
     client (used under VGI_CONFORMANCE_ROLE=client)."""
     import contextlib
 
+    target, headers = _target_and_headers(base_url, client)
+
     @contextlib.contextmanager
     def _cm() -> Any:
         proxy = RustClientProxy(
             "http",
-            base_url,
+            target,
             on_log,
             external_config=external_location,
             compression_level=compression_level,
+            headers=headers,
         )
         try:
             yield proxy
@@ -438,7 +465,8 @@ def rust_http_connect(
 
 
 def rust_http_capabilities(base_url: Any = None, *, prefix: Any = None, client: Any = None, **_kw: Any) -> _Caps:
-    proxy = RustClientProxy("http", base_url)
+    target, headers = _target_and_headers(base_url, client)
+    proxy = RustClientProxy("http", target, headers=headers)
     try:
         return _Caps(proxy._admin("capabilities")["caps"])
     finally:

@@ -10,6 +10,7 @@
 //!
 //! Protocol (one JSON object per line, request then response):
 //!   {"op":"connect","transport":"stdio|unix|tcp|http","target":<argv|path|host:port|url>}
+//!        http may also carry {"headers":{name:value}} — default request headers
 //!   {"op":"unary","request_b64":...}            -> {ok,result_b64,logs,error}
 //!   {"op":"describe"}                            -> {ok,result_b64}
 //!   {"op":"stream_open","request_b64":...,"is_exchange":bool,"has_header":bool}
@@ -324,6 +325,16 @@ fn do_connect(req: &Value, log_buf: &LogBuf) -> Result<Conn, String> {
                 Some(Value::Null) => builder = builder.compression_level(None),
                 Some(v) => {
                     builder = builder.compression_level(v.as_i64().map(|n| n as i32));
+                }
+            }
+            // Optional default headers, sent on every request. The upstream
+            // sticky cross-principal test pins an identity this way, handing
+            // http_connect a pre-built client whose headers we forward here.
+            if let Some(Value::Object(headers)) = req.get("headers") {
+                for (name, value) in headers {
+                    if let Some(v) = value.as_str() {
+                        builder = builder.header(name, v).map_err(|e| e.to_string())?;
+                    }
                 }
             }
             if req

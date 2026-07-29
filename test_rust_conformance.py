@@ -111,19 +111,41 @@ def _start_rust_http_with_storage(
     return _spawn_read_port(args)
 
 
+# Shared AEAD key for the sticky peer pair. Both workers can open each other's
+# session tokens, which is the point: the rejection under test has to come from
+# the server_id comparison, not from a decrypt failure.
+_STICKY_PEER_TOKEN_KEY = "5f" * 32
+
+
 def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[subprocess.Popen, int]:
     """Spawn an HTTP conformance server of `variant` for the current SERVER.
 
     variant ∈ {plain, no_compression, storage, zstd_storage, externalize_always,
-    strict, auth}.
+    strict, auth, sticky_short_ttl, sticky_peer_a, sticky_peer_b, sticky_auth}.
     Raises ``pytest.skip`` for (server, variant) combinations not wired here
     (the Go conformance binary doesn't expose the storage/strict/auth modes).
+
+    The sticky_* variants back the upstream failure-path fixtures; see the
+    reference repo's ``docs/sticky-sessions-spec.md`` §9.1. The two peers share
+    one AEAD key so the wrong-worker rejection provably comes from the
+    ``server_id`` comparison rather than a decrypt failure — which is why they
+    must also report *different* ids.
     """
     if SERVER == "python":
         if variant == "plain":
             return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http"])
         if variant == "no_compression":
             return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--no-compression"])
+        if variant == "sticky_short_ttl":
+            return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--sticky-ttl", "1"])
+        if variant in ("sticky_peer_a", "sticky_peer_b"):
+            # The reference server mints a random server_id per process, so the
+            # two peers differ without an explicit flag.
+            return _spawn_read_port(
+                [_VENV_PY, _PY_SERVE_HTTP, "--http", "--token-key", _STICKY_PEER_TOKEN_KEY]
+            )
+        if variant == "sticky_auth":
+            return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--sticky-auth"])
         if variant in ("storage", "zstd_storage", "externalize_always"):
             port = _free_port()
             args = [_VENV_PY, _PY_SERVE_HTTP, "--port", str(port), "--fake-storage", storage_url or ""]
@@ -154,6 +176,25 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
             return _spawn_read_port([RUST_WORKER, "--http", "--strict"])
         if variant == "auth":
             return _spawn_read_port([RUST_WORKER, "--http-auth"])
+        if variant == "sticky_short_ttl":
+            return _spawn_read_port([RUST_WORKER, "--http", "--sticky-ttl", "1"])
+        if variant in ("sticky_peer_a", "sticky_peer_b"):
+            # The Rust worker otherwise hardcodes "rust-conf-0001", so both
+            # peers would be the same worker without the explicit --server-id.
+            return _spawn_read_port(
+                [
+                    RUST_WORKER,
+                    "--http",
+                    "--token-key",
+                    _STICKY_PEER_TOKEN_KEY,
+                    "--server-id",
+                    f"rust-conf-{variant}",
+                ]
+            )
+        if variant == "sticky_auth":
+            # NOT --http-auth: that one is reject-all and moves the prefix
+            # to /vgi. This is the plain worker plus a principal resolver.
+            return _spawn_read_port([RUST_WORKER, "--http", "--sticky-auth"])
     else:  # go
         if variant == "plain":
             return _spawn_read_port(_worker_cmd("http"))
@@ -312,6 +353,48 @@ def conformance_http_auth_port() -> Iterator[int]:
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Sticky failure-path fixtures (upstream TestSticky; see the reference repo's
+# docs/sticky-sessions-spec.md §9.1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def conformance_http_sticky_short_ttl_port() -> Iterator[int]:
+    """A sticky worker whose default session TTL is short enough to outwait.
+
+    Backs ``TestSticky::test_expired_session_surfaces_session_lost``; the main
+    worker's 300s default is not something a test can sit out.
+    """
+    yield from _http_variant_fixture("sticky_short_ttl")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_sticky_peer_ports() -> Iterator[tuple[int, int]]:
+    """Two sticky workers sharing one AEAD key but reporting distinct server ids.
+
+    Backs ``TestSticky::test_token_from_other_worker_rejected``.
+    """
+    proc_a, port_a = _spawn_http_variant("sticky_peer_a")
+    proc_b, port_b = _spawn_http_variant("sticky_peer_b")
+    try:
+        yield port_a, port_b
+    finally:
+        for proc in (proc_a, proc_b):
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def conformance_http_sticky_auth_port() -> Iterator[int]:
+    """A sticky worker that authenticates the ``X-Conformance-Principal`` header.
+
+    Backs ``TestSticky::test_cross_principal_replay_rejected``, which needs one
+    worker reachable as two identities.
+    """
+    yield from _http_variant_fixture("sticky_auth")
 
 
 def _short_unix_path(name: str) -> str:

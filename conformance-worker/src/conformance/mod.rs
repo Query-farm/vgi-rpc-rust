@@ -20,16 +20,28 @@ use vgi_rpc::RpcServer;
 
 /// Build an `RpcServer` with all conformance methods registered.
 pub fn build_server() -> RpcServer {
-    build_server_with_external(None)
+    build_server_with_external(None, None)
+}
+
+/// Build an `RpcServer` with a caller-chosen `server_id`.
+///
+/// `TestSticky::test_token_from_other_worker_rejected` runs two workers that
+/// share one AEAD key and asserts they report distinct `server_id` before it
+/// asserts anything else — otherwise a token that supposedly "belongs to the
+/// other worker" belongs to this one, and the test proves nothing.
+pub fn build_server_with_id(server_id: Option<&str>) -> RpcServer {
+    build_server_with_external(None, server_id)
 }
 
 /// Build an `RpcServer` with all conformance methods registered, optionally
-/// wired to an external-location config (used by `TestExternalLocation`).
+/// wired to an external-location config (used by `TestExternalLocation`) and
+/// with an optional `server_id` override.
 pub fn build_server_with_external(
     external: Option<vgi_rpc::external::ExternalLocationConfig>,
+    server_id: Option<&str>,
 ) -> RpcServer {
     let mut builder = RpcServer::builder()
-        .server_id("rust-conf-0001")
+        .server_id(server_id.unwrap_or("rust-conf-0001"))
         .protocol_name("ConformanceService")
         .protocol_version("1.0.0")
         .server_version("rust-conformance-0.2.0")

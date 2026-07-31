@@ -106,7 +106,7 @@ jobs:
           if [ "${{ matrix.server }}" = "python" ]; then
             pip install -e "./vgi-python[http,cli,external]" pytest pytest-timeout httpx
           else
-            pip install "vgi-rpc[http,cli,external]>=0.29.0" pytest pytest-timeout httpx
+            pip install "vgi-rpc[http,cli,external]>=0.30.0" pytest pytest-timeout httpx
           fi
 
       - name: Build conformance worker (+ client-driver for the client role)

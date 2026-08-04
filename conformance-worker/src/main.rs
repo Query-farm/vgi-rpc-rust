@@ -23,17 +23,117 @@ mod fake_storage;
 use std::io::{self, Write};
 use std::sync::Arc;
 
+/// Header letting a conformance request name the reason it wants refused
+/// with, so the suite can prove this server *discriminates* between reason
+/// codes rather than stamping one constant on every 401.
+///
+/// A fixture affordance, never a protocol behaviour — nothing outside the
+/// conformance worker reads it.
+const CONFORMANCE_REASON_HEADER: &str = "x-conformance-auth-reason";
+
+/// Reject every request, with the reason the caller named when it named one
+/// the spec allows a request to ask for.
+///
+/// `proxy_required` is deliberately unreachable here: the spec derives it
+/// from server configuration, never from the request, so a worker that let a
+/// caller summon it would model the contract wrong. Anything unrecognised
+/// falls through to the unclassified path.
+fn reject_all(req: &vgi_rpc::auth::AuthRequest) -> vgi_rpc::auth::AuthResult {
+    use vgi_rpc::unauthorized::AuthReason;
+    let requested = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(CONFORMANCE_REASON_HEADER))
+        .map(|(_, v)| v.as_str());
+    let reason = match requested {
+        Some("missing_credential") => Some(AuthReason::MissingCredential),
+        Some("invalid_credential") => Some(AuthReason::InvalidCredential),
+        Some("expired_credential") => Some(AuthReason::ExpiredCredential),
+        Some("insufficient_scope") => Some(AuthReason::InsufficientScope),
+        _ => None,
+    };
+    match reason {
+        // The detail is the reason code itself so the suite can assert the
+        // header and the JSON body agree without pinning prose.
+        Some(r) => Err(vgi_rpc::RpcError::auth_failure(r, r.as_str())),
+        // ValueError, not PermissionError: the latter is a *classified*
+        // rejection meaning "identified but not permitted", so it would land
+        // on insufficient_scope. This branch is the unclassified one and must
+        // reach the `unauthorized` fallback. Mirrors the reference worker.
+        None => Err(vgi_rpc::RpcError::value_error(
+            "auth required (conformance test fixture)",
+        )),
+    }
+}
+
+/// Fixed conformance values for the token-introspection group, mirroring the
+/// module constants in the shared `_pytest_suite.py`. A port supplying
+/// `conformance_http_introspect_port` MUST configure exactly these: the shared
+/// tests post the subject credential and assert the principal, so they are part
+/// of the fixture's contract rather than decoration.
+mod introspect_fixture {
+    pub const INTROSPECTOR: &str = "conformance-introspector";
+    pub const SUBJECT_TOKEN: &str = "conformance-opaque-subject-token";
+    pub const SUBJECT_PRINCIPAL: &str = "subject@conformance.example";
+    pub const SUBJECT_TOKEN_NAME: &str = "conformance-subject";
+    /// A JWS-shaped credential the resolver *would* resolve. Deliberately
+    /// resolvable: against an unknown JWS a port with no shape guard rejects it
+    /// as unknown and passes the test for the wrong reason. Made resolvable,
+    /// the guard is the only thing that can produce a rejection.
+    pub const JWS_TRAP_TOKEN: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl";
+}
+
+/// Resolve the one fixed subject credential the shared tests post.
+fn conformance_resolve_token(
+    token: &str,
+) -> Result<Option<vgi_rpc::auth::introspect::TokenIdentity>, vgi_rpc::RpcError> {
+    use introspect_fixture::*;
+    Ok(
+        (token == SUBJECT_TOKEN || token == JWS_TRAP_TOKEN).then(|| {
+            vgi_rpc::auth::introspect::TokenIdentity::new(SUBJECT_PRINCIPAL)
+                .with_token_name(SUBJECT_TOKEN_NAME)
+        }),
+    )
+}
+
+/// Resolve the principal named in `X-Conformance-Principal`, or stay anonymous.
+///
+/// Naming yourself in a header is obviously not authentication — it is the
+/// cheapest thing every port can implement identically, and the cases that use
+/// it only need two identities to be distinguishable. Requests without the
+/// header stay anonymous rather than being rejected: the suite probes /health
+/// and the capability endpoint before it authenticates anything.
+fn principal_from_header(req: &vgi_rpc::auth::AuthRequest) -> vgi_rpc::auth::AuthResult {
+    Ok(match req.header("x-conformance-principal") {
+        Some(principal) if !principal.is_empty() => {
+            vgi_rpc::auth::AuthContext::for_principal("conformance", principal)
+        }
+        _ => vgi_rpc::auth::AuthContext::anonymous(),
+    })
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // --access-log <path> may appear anywhere on the command line. Forward it
-    // to the existing VGI_ACCESS_LOG plumbing in conformance::build_server.
-    for i in 0..args.len().saturating_sub(1) {
-        if args[i] == "--access-log" {
+    // The access-log flags may appear anywhere on the command line. Forward
+    // them to the VGI_ACCESS_LOG* plumbing in conformance::build_server,
+    // mirroring the Python reference's flag names and env vars.
+    for (flag, var) in [
+        ("--access-log", "VGI_ACCESS_LOG"),
+        ("--access-log-sample", "VGI_ACCESS_LOG_SAMPLE"),
+        ("--access-log-queue-size", "VGI_ACCESS_LOG_QUEUE_SIZE"),
+        (
+            "--access-log-max-record-bytes",
+            "VGI_ACCESS_LOG_MAX_RECORD_BYTES",
+        ),
+    ] {
+        if let Some(value) = parse_str_flag(&args, flag) {
             // SAFETY: set_var is unsafe in newer std but still used; suppress with allow.
-            std::env::set_var("VGI_ACCESS_LOG", &args[i + 1]);
-            break;
+            std::env::set_var(var, value);
         }
+    }
+    if args.iter().any(|a| a == "--access-log-async") {
+        std::env::set_var("VGI_ACCESS_LOG_ASYNC", "1");
     }
 
     // Positional-flag scan rather than a per-mode flag, so the opt-out reaches
@@ -320,6 +420,14 @@ fn run_http_with_storage(
         if no_compression {
             builder = builder.disable_response_compression();
         }
+        // The CORS fixture points here rather than at the plain worker: the
+        // derived exposure check can only catch a missing entry for a header
+        // the worker actually advertises, and the upload/size-cap trio only
+        // exists in storage mode.
+        if let Some(origin) = parse_str_flag(&std::env::args().collect::<Vec<_>>(), "--cors-origin")
+        {
+            builder = builder.cors_origins(origin);
+        }
         let state = builder.build();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -430,15 +538,26 @@ fn run_http(
         .expect("tokio runtime");
     rt.block_on(async move {
         let mut builder = vgi_rpc::http::HttpState::builder().server(server);
+        // Disabling the call-state cache forces every stream continuation
+        // down the cache-miss path, so the client's obligation to echo the
+        // call token is checked deterministically rather than by luck.
+        if std::env::args().any(|a| a == "--no-call-state-cache") {
+            builder = builder.call_state_cache_entries(0);
+        }
+        // `--cors-origin <origin>` backs the shared TestCors group, which
+        // needs a worker that grants exactly one origin. Read from argv here
+        // rather than threaded through this function's parameter list, same
+        // as the cache opt-out above. Absent, the worker stays CORS-off —
+        // TestCorsOffMode asserts precisely that of the plain worker.
+        if let Some(origin) = parse_str_flag(&std::env::args().collect::<Vec<_>>(), "--cors-origin")
+        {
+            builder = builder.cors_origins(origin);
+        }
         if reject_all_auth {
             // Reject every request with PermissionError → mapped to 401.
             // /health bypasses authenticate_request entirely, so it stays 200.
             builder = builder
-                .authenticate(std::sync::Arc::new(|_req| {
-                    Err(vgi_rpc::RpcError::permission_error(
-                        "auth required (conformance test fixture)",
-                    ))
-                }))
+                .authenticate(std::sync::Arc::new(reject_all))
                 .prefix("/vgi");
         }
         // Strict-cap mode: tight body + external caps so the
@@ -472,27 +591,23 @@ fn run_http(
         if let Some(hex) = sticky.token_key_hex.as_deref() {
             builder = builder.token_key_hex(hex);
         }
-        if sticky.principal_auth {
-            // Resolve the principal named in X-Conformance-Principal, or stay
-            // anonymous. Naming yourself in a header is obviously not
-            // authentication — it is the cheapest thing every port can
-            // implement identically, and the cross-principal replay case only
-            // needs the two identities to be distinguishable.
-            //
-            // Requests without the header stay anonymous rather than being
-            // rejected: the suite probes /health and the capability endpoint
-            // before it authenticates anything. And unlike the reject-all mode
-            // above, this deliberately leaves the prefix at the root — the
-            // suite connects to this worker exactly as to the plain one.
-            builder =
-                builder.authenticate(std::sync::Arc::new(|req: &vgi_rpc::auth::AuthRequest| {
-                    Ok(match req.header("x-conformance-principal") {
-                        Some(principal) if !principal.is_empty() => {
-                            vgi_rpc::auth::AuthContext::for_principal("conformance", principal)
-                        }
-                        _ => vgi_rpc::auth::AuthContext::anonymous(),
-                    })
-                }));
+        // `--introspect` backs the shared TestTokenIntrospection group: the
+        // endpoint plus a single-principal allowlist. It implies principal-
+        // header auth so the allowlist has something to check — without an
+        // identity every caller is anonymous and the group could only ever
+        // observe the refusal. Read from argv here rather than threaded through
+        // this function's parameter list, same as the two options above.
+        let introspect = std::env::args().any(|a| a == "--introspect");
+        if sticky.principal_auth || introspect {
+            // Unlike the reject-all mode above, this deliberately leaves the
+            // prefix at the root — the suite connects to this worker exactly as
+            // to the plain one.
+            builder = builder.authenticate(std::sync::Arc::new(principal_from_header));
+        }
+        if introspect {
+            builder = builder
+                .introspect_resolver(std::sync::Arc::new(conformance_resolve_token))
+                .introspect_principals([introspect_fixture::INTROSPECTOR]);
         }
         if no_compression {
             builder = builder.disable_response_compression();

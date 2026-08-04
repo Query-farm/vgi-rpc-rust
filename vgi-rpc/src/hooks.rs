@@ -5,10 +5,90 @@
 //! receives `CallStatistics` tallied by the framework and may record
 //! spans / metrics / sentry events.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::errors::RpcError;
 use crate::wire::Metadata;
+
+/// A record that cannot be written yet because it is still missing a figure
+/// only the transport knows. Called with the final on-wire response size, or
+/// `None` when that size is unknowable (a streamed body with no length).
+pub type DeferredRecord = Box<dyn FnOnce(Option<u64>) + Send>;
+
+/// Holds records back until the response they describe actually exists.
+///
+/// A handler knows what it produced; it does not know what was sent. Response
+/// compression runs after the handler returns, so a record emitted there can
+/// only ever report the uncompressed body — which is the wrong number for
+/// anything that costs money. A transport that can measure the final body
+/// installs a sink here, hooks defer into it, and the transport drains it once
+/// the body is final. A transport that installs no sink gets inline emission,
+/// so the immediate-vs-deferred choice is made in exactly one place.
+#[derive(Clone, Default)]
+pub struct AccessSink {
+    inner: Arc<SinkInner>,
+}
+
+#[derive(Default)]
+struct SinkInner {
+    pending: Mutex<Vec<DeferredRecord>>,
+}
+
+impl SinkInner {
+    fn drain(&self, response_bytes: Option<u64>) {
+        let pending = match self.pending.lock() {
+            Ok(mut p) => std::mem::take(&mut *p),
+            Err(_) => return,
+        };
+        for record in pending {
+            record(response_bytes);
+        }
+    }
+}
+
+impl Drop for SinkInner {
+    /// A sink nobody drained still emits, minus the size it was waiting on.
+    /// Losing a record because a transport forgot to drain would be
+    /// indistinguishable, to a log reader, from a call that never happened.
+    fn drop(&mut self) {
+        self.drain(None);
+    }
+}
+
+impl AccessSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue a record for emission once the response size is known.
+    pub fn defer(&self, record: DeferredRecord) {
+        if let Ok(mut pending) = self.inner.pending.lock() {
+            pending.push(record);
+        }
+    }
+
+    /// Emit every deferred record, stamping `response_bytes` when known.
+    pub fn emit(&self, response_bytes: Option<u64>) {
+        self.inner.drain(response_bytes);
+    }
+
+    /// True when no record is waiting — the transport can skip attaching it.
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .pending
+            .lock()
+            .map(|p| p.is_empty())
+            .unwrap_or(true)
+    }
+}
+
+impl std::fmt::Debug for AccessSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessSink")
+            .field("pending", &!self.is_empty())
+            .finish()
+    }
+}
 
 /// Per-call statistics accumulated during dispatch.
 ///
@@ -26,7 +106,11 @@ pub struct CallStatistics {
 }
 
 /// Information passed to a dispatch hook at start and end of each call.
-#[derive(Clone, Debug)]
+///
+/// `Default` exists so a hook test (or a transport that only fills a few
+/// fields) can use struct-update syntax and not be broken by a field added
+/// later; the defaults are inert, not meaningful.
+#[derive(Clone, Debug, Default)]
 pub struct DispatchInfo {
     pub method: String,
     pub method_type: &'static str,
@@ -62,6 +146,24 @@ pub struct DispatchInfo {
     /// dispatch start. Used by the Sentry hook to enrich user / tag
     /// fields per Python `2d93987`.
     pub claims: std::collections::BTreeMap<String, String>,
+    /// On-wire size of the request body as received, **before**
+    /// decompression — what the peer actually sent. `None` on transports
+    /// with no discrete request body (pipe / unix / tcp), where the framing
+    /// is a continuous IPC stream rather than a message with a length.
+    ///
+    /// Distinct from [`CallStatistics::input_bytes`], which counts logical
+    /// Arrow buffers after decoding and is routinely orders of magnitude
+    /// larger. One figure is what egress is billed on, the other what the
+    /// worker had to process.
+    pub request_bytes: Option<u64>,
+    /// Bytes uploaded to external storage during this call. Externalised
+    /// payloads leave only a pointer batch on the wire, so transport-level
+    /// accounting cannot see them at all — and they are frequently the
+    /// largest of the three byte figures.
+    pub externalized_bytes: u64,
+    /// Where a hook parks a record it cannot finish yet. `None` means emit
+    /// inline. See [`AccessSink`].
+    pub access_sink: Option<AccessSink>,
 }
 
 impl DispatchInfo {
@@ -91,6 +193,9 @@ impl DispatchInfo {
             stream_id: String::new(),
             cancelled: false,
             claims: auth.claims.clone(),
+            request_bytes: None,
+            externalized_bytes: 0,
+            access_sink: None,
         }
     }
 }
@@ -193,20 +298,7 @@ mod tests {
             method: "echo".into(),
             method_type: "unary",
             server_id: "test".into(),
-            protocol: String::new(),
-            protocol_hash: String::new(),
-            protocol_version: String::new(),
-            request_id: String::new(),
-            transport_metadata: Arc::new(Default::default()),
-            principal: String::new(),
-            auth_domain: String::new(),
-            authenticated: false,
-            remote_addr: String::new(),
-            http_status: 0,
-            request_data: Vec::new(),
-            stream_id: String::new(),
-            cancelled: false,
-            claims: std::collections::BTreeMap::new(),
+            ..Default::default()
         };
         let token = chain.on_dispatch_start(&info);
         chain.on_dispatch_end(token, &info, None, &CallStatistics::default());

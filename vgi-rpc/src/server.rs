@@ -104,7 +104,7 @@ use crate::wire::{empty_batch, md_get, Metadata, StreamReader, StreamWriter};
 /// Serialize a parsed request batch back to a self-contained Arrow IPC
 /// stream (one schema message + one record batch + EOS) for inclusion in
 /// access-log `request_data`.
-fn serialize_request_batch(batch: &RecordBatch) -> std::io::Result<Vec<u8>> {
+pub(crate) fn serialize_request_batch(batch: &RecordBatch) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     {
         let mut w = arrow_ipc::writer::StreamWriter::try_new(&mut buf, batch.schema_ref())
@@ -1000,7 +1000,7 @@ impl RpcServer {
         // The `DispatchInfo` — a large struct with many owned clones — plus
         // the request re-serialization below are needed *only* when a
         // dispatch hook is registered. Build nothing on the hookless path.
-        let dispatch_info = self.dispatch_hook.as_ref().map(|_| {
+        let mut dispatch_info = self.dispatch_hook.as_ref().map(|_| {
             let mut di =
                 crate::hooks::DispatchInfo::from_request(self, &req, method_type, &ctx.auth);
             // Best-effort capture of self-contained Arrow IPC bytes of the
@@ -1045,6 +1045,12 @@ impl RpcServer {
                 dynamic_shm.as_ref()
             }
         };
+        // Externalised uploads leave only a pointer batch on the wire, so
+        // they have to be counted where they happen rather than where the
+        // response is framed. Scoped to this dispatch; the serve loop is
+        // synchronous on one thread per connection.
+        #[cfg(feature = "http")]
+        let externalized = crate::external::ExternalizedScope::new();
         match info.method_type {
             MethodType::Unary => {
                 self.serve_unary(w, &req, info, &ctx, &stats, &mut app_err, shm_ref)?
@@ -1052,6 +1058,12 @@ impl RpcServer {
             MethodType::Producer | MethodType::Exchange | MethodType::Dynamic => {
                 self.serve_stream(r, w, &req, info, &ctx, &stats, &mut app_err, shm_ref)?
             }
+        }
+        #[cfg(feature = "http")]
+        let externalized_bytes = externalized.finish();
+        #[cfg(feature = "http")]
+        if let Some(di) = dispatch_info.as_mut() {
+            di.externalized_bytes = externalized_bytes;
         }
         // A per-call `dynamic_shm` (if any) is dropped here, releasing our
         // mmap of the client-owned segment without unlinking it; a cached

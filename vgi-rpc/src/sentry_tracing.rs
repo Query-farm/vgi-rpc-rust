@@ -246,20 +246,9 @@ mod tests {
             method: "raise".into(),
             method_type: "unary",
             server_id: "srv".into(),
-            protocol: String::new(),
-            request_id: String::new(),
             transport_metadata: Arc::new(Default::default()),
-            principal: String::new(),
-            auth_domain: String::new(),
-            authenticated: false,
-            remote_addr: String::new(),
-            http_status: 0,
-            request_data: Vec::new(),
-            stream_id: String::new(),
-            cancelled: false,
             claims,
-            protocol_hash: String::new(),
-            protocol_version: String::new(),
+            ..Default::default()
         }
     }
 

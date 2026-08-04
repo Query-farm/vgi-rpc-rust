@@ -252,6 +252,54 @@ implementations:
 | hook | module | feature | purpose |
 |------|--------|:-:|---------|
 | `AccessLogHook`  | `access_log` | — | JSON-per-call access records (validated by Python's `vgi_rpc.access_log_conformance` and the `vgi_rpc/access_log.schema.json` JSON Schema). Records include `protocol_hash` always and `protocol_version` when set on the server. Configure via `RpcServerBuilder::protocol_version(...)`. |
+
+**Access log options** (`AccessLogHook::with_*`, all applied at startup —
+they rebuild the hook and reset its in-flight call table):
+
+- `with_sample_rate(r)` — keep `r` of the *successful* calls. Errors are never
+  sampled; the decision is keyed on `stream_id` then `request_id` so a stream's
+  continuations share its init's fate; kept records carry `sample_rate`. An
+  out-of-range rate is an `Err` at construction, not a surprise at the first
+  request.
+- `with_claim_redactor(f)` — replace the key-based redaction applied to
+  `claims`. `access_log::no_redaction` opts out. A redactor that panics fails
+  closed (claims dropped, never emitted raw).
+- `with_max_record_bytes(n)` — per-record cap, default 1 MiB. Sheds
+  `request_data`, then `claims`, then all but the required envelope.
+- `with_verbose(true)` — log `request_data` verbatim. Off by default, which is
+  what `truncated: "payload_omitted"` reports; `truncated: true` is reserved
+  for genuine size-driven shedding.
+- `AccessLogHook::buffered(sink, version, capacity)` — async emission. Bounded,
+  never blocks, and a full queue drops; the next record through reports
+  `dropped_records`. Opt-in because it trades durability.
+
+**Trace correlation** is pluggable rather than compiled in: the crate carries
+no OpenTelemetry dependency, so `access_log::set_trace_context_provider` takes
+a closure that reads the *current* span's ids (e.g. via
+`tracing_opentelemetry::OpenTelemetrySpanExt` on `Span::current()`). Ids are
+validated against the schema's hex patterns and emitted both-or-neither.
+
+**Deferred emission.** `response_bytes` is the on-wire size *after*
+compression, which runs in `http.rs`'s post-processing middleware — after the
+handler that would have written the record. So `DispatchInfo::access_sink`
+carries a `hooks::AccessSink`: the hook parks the record there and the
+middleware emits it once the final body exists. Transports that install no
+sink (pipe / unix / tcp) keep logging inline. A crash between handler and
+response loses that request's records; the alternative is a permanently wrong
+number.
+
+**Validating the access log** — there is no cross-language gate for it in CI,
+so run it by hand after touching `access_log.rs`:
+
+```bash
+cargo build --release -p vgi-rpc-conformance-rust
+~/Development/vgi-rpc/.venv/bin/vgi-rpc-test \
+  --cmd "target/release/vgi-rpc-conformance-rust --access-log /tmp/rust-al.jsonl" \
+  --access-log /tmp/rust-al.jsonl
+```
+
+Exit 0 means every conformance test passed **and** every record validated
+against `vgi_rpc/access_log.schema.json`.
 | `OtelHook`       | `otel`       | `otel`   | `tracing::info!(target: "vgi_rpc.otel", ...)` spans + in-memory counters. |
 | `SentryHook`     | `sentry`     | `sentry` | `tracing::error!(target: "vgi_rpc.sentry", ...)` on handler errors. |
 

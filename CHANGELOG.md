@@ -2,6 +2,68 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased]
+
+### Added
+
+- **Access log: trace correlation.** Records carry `trace_id` / `span_id` as
+  W3C hex when a valid span is current. `request_id` only joins records within
+  one service, so without these a log line and the span describing the same
+  call cannot be matched. The ids are read from whatever span is *current*,
+  via a provider installed with `access_log::set_trace_context_provider`, so an
+  application-opened span correlates as readily as a framework-opened one —
+  and so the core keeps no OpenTelemetry dependency (the `otel` feature is
+  tracing-only). Ids that are not 32 / 16 lowercase hex, or are all zeroes, are
+  dropped rather than emitted, and the pair is always emitted together or not
+  at all.
+- **Access log: sampling.** `AccessLogHook::with_sample_rate(rate)`. Errors are
+  never sampled — a rate below 1 exists because successes repeat, which
+  failures do not. The decision is deterministic and keyed on `stream_id`, then
+  `request_id`, so every record of one stream shares its init's fate rather
+  than being shredded into fragments indistinguishable from data loss. Every
+  kept record carries `sample_rate`, because a consumer scaling counts has to
+  divide by it. An out-of-range rate is an error at construction, not at the
+  first request.
+- **Access log: egress accounting.** `request_bytes` (on-wire, before
+  decompression), `response_bytes` (on-wire, after compression) and
+  `externalized_bytes` (uploaded to external storage). Distinct from
+  `input_bytes` / `output_bytes`, which measure logical Arrow buffers and can
+  differ by a factor of a thousand on a compressible body. `response_bytes`
+  cannot be measured where the others are — compression runs after the handler
+  — so emission is deferred through a `hooks::AccessSink` that the HTTP
+  post-processing middleware drains once the final body exists. A transport
+  that installs no sink keeps logging inline.
+- **Access log: claim redaction.** `claims` are now emitted, redacted by key
+  (credentials plus the standard OIDC personal-data claims). Values are
+  replaced rather than dropped, so which claims a credential carried stays
+  answerable. `AccessLogHook::with_claim_redactor` replaces the policy;
+  `access_log::no_redaction` opts out for a service that owns its logs end to
+  end. A redactor that panics fails **closed** — the claims are dropped, never
+  emitted raw.
+- **Access log: `dropped_records`.** The bounded async queue already dropped
+  rather than blocked; the loss is now reported in-band on the next record
+  through, so a consumer can tell a quiet period from a lossy one.
+- **Access log: per-record size cap.** `AccessLogHook::with_max_record_bytes`
+  (default 1 MiB) sheds `request_data`, then `claims`, then everything but the
+  required envelope (`truncated: "record_too_large"`). `error_message` is never
+  truncated.
+- Conformance worker: `--access-log-sample`, `--access-log-async`,
+  `--access-log-queue-size`, `--access-log-max-record-bytes`.
+
+### Changed
+
+- **Access log: `truncated` disambiguated.** A record that omits the request
+  payload because this level does not log payloads now reports
+  `"payload_omitted"`; `true` again means genuine size-driven shedding. The
+  two shared one value, which fired on essentially every record and left a
+  consumer scanning for real data loss with nothing to filter on.
+- HTTP unary records now carry the request payload's size and the omission
+  marker (previously neither, which failed the schema's "unary requires
+  `request_data` unless truncated" rule for every HTTP record).
+- `hooks::DispatchInfo` gains `request_bytes`, `externalized_bytes` and
+  `access_sink`, and now implements `Default` so a later field addition does
+  not break struct literals.
+
 ## [0.17.0] — 2026-07-27
 
 ### Added

@@ -14,6 +14,14 @@ pub const LOG_EXTRA_KEY: &str = "vgi_rpc.log_extra";
 pub const SERVER_ID_KEY: &str = "vgi_rpc.server_id";
 
 pub const STATE_KEY: &str = "vgi_rpc.stream_state#b64";
+/// The stream's *call state* — the half of a stream's state fixed for the
+/// life of the call (the init request, the resolved schemas). A server that
+/// splits its stream state mints this once on `/init` and never re-issues
+/// it; only [`STATE_KEY`], the cursor, comes back per turn. A client must
+/// echo it on every subsequent request: the server may resolve it from a
+/// cache while one is warm, but a continuation landing on a process that
+/// never saw the `/init` has only the client's copy to work from.
+pub const CALL_STATE_KEY: &str = "vgi_rpc.call_state#b64";
 pub const CANCEL_KEY: &str = "vgi_rpc.cancel";
 
 pub const LOCATION_KEY: &str = "vgi_rpc.location";

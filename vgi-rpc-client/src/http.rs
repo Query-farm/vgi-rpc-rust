@@ -35,7 +35,7 @@ use vgi_rpc::external::{
     UrlValidator,
 };
 use vgi_rpc::introspect::DESCRIBE_METHOD_NAME;
-use vgi_rpc::metadata::{CANCEL_KEY, LOCATION_KEY, REQUEST_ID_KEY, STATE_KEY};
+use vgi_rpc::metadata::{CALL_STATE_KEY, CANCEL_KEY, LOCATION_KEY, REQUEST_ID_KEY, STATE_KEY};
 use vgi_rpc::retry::RetryConfig;
 use vgi_rpc::wire::{empty_batch, write_one_batch, Metadata, StreamReader};
 
@@ -663,6 +663,7 @@ impl HttpClient {
             pending: parsed.batches.into(),
             finished: parsed.finished,
             token: parsed.token,
+            call_token: parsed.call_token,
             cancelled: false,
         })
     }
@@ -682,18 +683,25 @@ impl HttpClient {
     /// [`next_with_token`](HttpStreamSession::next_with_token) (or
     /// [`tick`](HttpStreamSession::tick)) issues the continuation.
     ///
+    /// `token` is the opaque blob from
+    /// [`next_with_token`](HttpStreamSession::next_with_token), which packs
+    /// both the cursor and the call token — the resuming node may never have
+    /// seen this stream's `/init`, so it needs both.
+    ///
     /// Mirrors Python `_HttpProxy.resume_stream`.
     pub fn resume_stream(
         &mut self,
         method: &str,
         token: impl Into<String>,
     ) -> HttpStreamSession<'_> {
+        let (cursor, call_token) = unpack_resume_token(&token.into());
         HttpStreamSession {
             client: self,
             method: method.to_string(),
             header: None,
             pending: VecDeque::new(),
-            token: Some(token.into()),
+            token: Some(cursor),
+            call_token,
             finished: false,
             cancelled: false,
         }
@@ -890,6 +898,59 @@ impl HttpClient {
 }
 
 // ---------------------------------------------------------------------------
+// Resume tokens
+// ---------------------------------------------------------------------------
+
+/// Pack a stream's cursor and call tokens into one opaque resume blob.
+///
+/// Callers of [`HttpStreamSession::next_with_token`] treat the result as
+/// unstructured text to hand to
+/// [`seek_to_token`](HttpStreamSession::seek_to_token) or
+/// [`HttpClient::resume_stream`], possibly in another process. Both halves
+/// have to travel: the node that serves the resumed turn may have no cached
+/// knowledge of this stream.
+///
+/// Layout is `<cursor_len>:<cursor><call>`, and a stream with no call token
+/// packs to the bare cursor. Both tokens are base64, whose alphabet contains
+/// no `:`, so a bare cursor can never be mistaken for a packed pair — which
+/// is what keeps tokens minted before the split readable.
+///
+/// This is deliberately *not* Python's binary
+/// `[u32 LE cursor_len][cursor][call]` layout: the blob never crosses the
+/// wire, it is a private encoding between nodes running this client, and
+/// this port's API hands it out as a `String`.
+fn pack_resume_token(cursor: &str, call_token: Option<&str>) -> String {
+    match call_token {
+        Some(call) => format!("{}:{}{}", cursor.len(), cursor, call),
+        None => cursor.to_string(),
+    }
+}
+
+/// Unpack a blob produced by [`pack_resume_token`].
+///
+/// A blob that carries no length prefix is a bare cursor — either minted by
+/// a server that does not split its stream state, or by a client predating
+/// the split.
+fn unpack_resume_token(token: &str) -> (String, Option<String>) {
+    let Some((len_str, rest)) = token.split_once(':') else {
+        return (token.to_string(), None);
+    };
+    let Ok(cursor_len) = len_str.parse::<usize>() else {
+        return (token.to_string(), None);
+    };
+    if cursor_len > rest.len() || !rest.is_char_boundary(cursor_len) {
+        return (token.to_string(), None);
+    }
+    let (cursor, call) = rest.split_at(cursor_len);
+    let call = if call.is_empty() {
+        None
+    } else {
+        Some(call.to_string())
+    };
+    (cursor.to_string(), call)
+}
+
+// ---------------------------------------------------------------------------
 // Stream session
 // ---------------------------------------------------------------------------
 
@@ -900,6 +961,10 @@ pub struct HttpStreamSession<'c> {
     header: Option<(RecordBatch, Metadata)>,
     pending: VecDeque<(RecordBatch, Metadata)>,
     token: Option<String>,
+    /// The stream's call token: handed over once by `/init` and echoed on
+    /// every subsequent request. The server never re-issues it, so this is
+    /// the only copy once the response is parsed.
+    call_token: Option<String>,
     finished: bool,
     cancelled: bool,
 }
@@ -981,7 +1046,7 @@ impl HttpStreamSession<'_> {
                 return Err(RpcError::runtime_error(MULTI));
             }
             let item = self.pending.pop_front().unwrap();
-            return Ok(Some((item, self.token.clone())));
+            return Ok(Some((item, self.resume_token())));
         }
 
         if self.finished || self.token.is_none() {
@@ -1010,7 +1075,7 @@ impl HttpStreamSession<'_> {
         }
         self.token = parsed.token;
         match parsed.batches.into_iter().next() {
-            Some(item) => Ok(Some((item, self.token.clone()))),
+            Some(item) => Ok(Some((item, self.resume_token()))),
             None => {
                 // No data this turn → the producer finished (no token).
                 self.finished = true;
@@ -1022,13 +1087,16 @@ impl HttpStreamSession<'_> {
     /// Reposition a freshly-initialised session to resume from `token`.
     ///
     /// Discards any init-preloaded batches and points the session at the
-    /// given continuation token (as returned by
+    /// given resume token (as returned by
     /// [`next_with_token`](Self::next_with_token)), so the next call
     /// continues from exactly there. Used to resume a scan on a new
-    /// process/node.
+    /// process/node — which is why the call token travels inside the blob
+    /// too: that node may never have seen this stream's `/init`.
     pub fn seek_to_token(&mut self, token: impl Into<String>) {
+        let (cursor, call_token) = unpack_resume_token(&token.into());
         self.pending.clear();
-        self.token = Some(token.into());
+        self.token = Some(cursor);
+        self.call_token = call_token;
         self.finished = false;
     }
 
@@ -1047,6 +1115,9 @@ impl HttpStreamSession<'_> {
             .ok_or_else(|| RpcError::protocol_error("exchange without a stream token"))?;
         let mut md = metadata.cloned().unwrap_or_default();
         md.insert(STATE_KEY.to_string(), token);
+        if let Some(call) = self.call_token.as_ref() {
+            md.insert(CALL_STATE_KEY.to_string(), call.clone());
+        }
         let body = write_one_batch(input, Some(&md))?;
         // Exchange is NEVER retried (process() may have side effects).
         let resp = self
@@ -1088,14 +1159,34 @@ impl HttpStreamSession<'_> {
     }
 
     /// The current continuation token (for stateless relay / resume).
+    ///
+    /// This is the cursor half only. To hand a stream's position to another
+    /// process, use [`next_with_token`](Self::next_with_token), whose blob
+    /// also carries the call token that node will need.
     pub fn current_token(&self) -> Option<&str> {
         self.token.as_deref()
     }
 
+    /// Encode this session's current position as one opaque resume blob.
+    fn resume_token(&self) -> Option<String> {
+        self.token
+            .as_deref()
+            .map(|cursor| pack_resume_token(cursor, self.call_token.as_deref()))
+    }
+
+    /// Build a continuation request body.
+    ///
+    /// The call token is echoed on every request because the server does not
+    /// re-issue it; a request that omitted it would still succeed while the
+    /// server's call-state cache is warm and fail once it is not — exactly
+    /// the kind of load-dependent bug worth designing out.
     fn continuation_body(&self, token: &str, cancel: bool) -> Result<Vec<u8>> {
         let batch = empty_batch(&Schema::empty())?;
         let mut md = Metadata::new();
         md.insert(STATE_KEY.to_string(), token.to_string());
+        if let Some(call) = self.call_token.as_ref() {
+            md.insert(CALL_STATE_KEY.to_string(), call.clone());
+        }
         md.insert(REQUEST_ID_KEY.to_string(), generate_request_id());
         if cancel {
             md.insert(CANCEL_KEY.to_string(), "1".to_string());
@@ -1111,6 +1202,9 @@ impl HttpStreamSession<'_> {
 struct ParsedStream {
     batches: Vec<(RecordBatch, Metadata)>,
     token: Option<String>,
+    /// The call token, when the server split its stream state. Only `/init`
+    /// carries one; continuations never re-issue it.
+    call_token: Option<String>,
     finished: bool,
 }
 
@@ -1145,6 +1239,7 @@ fn parse_response(
     let mut out = ParsedStream {
         batches: Vec::new(),
         token: None,
+        call_token: None,
         finished: true,
     };
     while let Some((batch, md)) = reader.read_next()? {
@@ -1199,6 +1294,9 @@ fn process_frame(
                         if let Some(tok) = md.remove(STATE_KEY) {
                             out.token = Some(tok);
                         }
+                        if let Some(call) = md.remove(CALL_STATE_KEY) {
+                            out.call_token = Some(call);
+                        }
                         if let Some(inner) = vgi_rpc::external::fetch_external_ipc_bytes(&md, cfg)?
                         {
                             let mut ir = StreamReader::new(&inner[..])?;
@@ -1222,6 +1320,12 @@ fn process_frame(
                         return Ok(());
                     }
                 }
+            }
+            // `/init` pairs the call token with the cursor on the same frame;
+            // strip it either way so it never leaks into user metadata.
+            let call = md.remove(CALL_STATE_KEY);
+            if call.is_some() {
+                out.call_token = call;
             }
             if let Some(tok) = md.remove(STATE_KEY) {
                 out.token = Some(tok);

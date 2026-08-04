@@ -14,8 +14,13 @@
 //!   - [`proof::proof_authenticate`] (feature `http`)
 //!   - [`jwt::jwt_authenticate`] (feature `jwt`)
 //!   - [`pkce`] (feature `oauth-pkce`)
+//!
+//! [`introspect`] is the inverse direction: resolving an opaque credential to a
+//! principal *on behalf of a fronting proxy*, which is a distinct capability
+//! from authenticating a request and is off unless explicitly enabled.
 
 pub mod bearer;
+pub mod introspect;
 pub mod mtls;
 pub mod oauth;
 
@@ -133,6 +138,14 @@ pub type Authenticate = Arc<dyn Fn(&AuthRequest<'_>) -> AuthResult + Send + Sync
 ///
 /// Matches the Python `chain_authenticate` semantics: first-non-anonymous
 /// wins, errors short-circuit.
+///
+/// "Not my credential, try the next" is `Ok(anonymous)` here — never an `Err` —
+/// which is what keeps [`RpcError::auth_unavailable`] intact across the chain.
+/// An outage must not be read as a miss and re-emerge as a 401 from the end of
+/// the chain: that turns a sidecar restart into a fleet-wide re-login storm and
+/// invites callers to negative-cache the outage. Every `Err` propagates
+/// unchanged, and the HTTP layer decides between `401` and `503` from the
+/// error's type.
 pub fn chain_authenticate(a: Authenticate, b: Authenticate) -> Authenticate {
     Arc::new(move |req| {
         let first = (a)(req)?;
@@ -188,6 +201,35 @@ mod tests {
         let req = AuthRequest::anonymous_pipe("echo");
         let ctx = chain(&req).unwrap();
         assert_eq!(ctx.principal, "alice");
+    }
+
+    #[test]
+    fn chain_propagates_a_transient_failure_rather_than_advancing() {
+        // The distinction the whole definitive/transient split rests on: an
+        // authority that could not answer must not look like a miss, or the
+        // chain ends in a 401 and every caller re-authenticates against a
+        // service that is merely down.
+        let down: Authenticate = Arc::new(|_| Err(RpcError::auth_unavailable("jwks fetch failed")));
+        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = reached.clone();
+        let next: Authenticate = Arc::new(move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(AuthContext::for_principal("bearer", "alice"))
+        });
+        let req = AuthRequest::anonymous_pipe("echo");
+
+        for chain in [
+            chain_authenticate(down.clone(), next.clone()),
+            chain_all([down.clone(), next.clone()]).expect("non-empty"),
+        ] {
+            let err = chain(&req).expect_err("an outage must not resolve to an identity");
+            assert!(err.is_auth_unavailable(), "reclassified as {err}");
+            assert_eq!(err.retry_after_seconds, Some(5));
+        }
+        assert!(
+            !reached.load(std::sync::atomic::Ordering::SeqCst),
+            "the chain advanced past an outage"
+        );
     }
 
     #[test]

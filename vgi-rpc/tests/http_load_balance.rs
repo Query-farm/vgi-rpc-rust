@@ -17,7 +17,7 @@ use tower::ServiceExt;
 
 use vgi_rpc::http::{HttpState, ARROW_CONTENT_TYPE};
 use vgi_rpc::metadata::{
-    REQUEST_ID_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY, STATE_KEY,
+    CALL_STATE_KEY, REQUEST_ID_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY, STATE_KEY,
 };
 use vgi_rpc::server::{MethodType, StateDecoder};
 use vgi_rpc::stream::{OutputCollector, ProducerState, StreamResult, StreamStateKind};
@@ -131,26 +131,36 @@ fn init_body(total: i64) -> Vec<u8> {
     buf
 }
 
-/// Build a producer-continuation body: empty batch carrying the state token.
-fn exchange_body(token: &str) -> Vec<u8> {
+/// Build a producer-continuation body: empty batch carrying both of the
+/// stream's tokens. A conformant client echoes the call token on every
+/// request, which is precisely what lets a worker that never saw the /init
+/// resume the stream.
+fn exchange_body(token: &str, call_token: &str) -> Vec<u8> {
     let empty = empty_batch(&Schema::empty()).unwrap();
     let md = std::collections::HashMap::<String, String>::from([
         (STATE_KEY.to_string(), token.to_string()),
+        (CALL_STATE_KEY.to_string(), call_token.to_string()),
         (REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string()),
         (REQUEST_ID_KEY.to_string(), "lb-cont".to_string()),
     ]);
     write_one_batch(&empty, Some(&md)).unwrap()
 }
 
-/// Extract (data_values, state_token_or_none) from an arrow response body.
-fn parse_response(body: &[u8]) -> (Vec<i64>, Option<String>) {
+/// Extract (data_values, cursor_token, call_token) from an arrow response
+/// body. Only /init carries a call token; continuations re-mint the cursor
+/// alone.
+fn parse_response(body: &[u8]) -> (Vec<i64>, Option<String>, Option<String>) {
     let mut r = StreamReader::new(body).unwrap();
     let mut values = Vec::new();
     let mut token: Option<String> = None;
+    let mut call_token: Option<String> = None;
     while let Some((rb, md)) = r.read_next().unwrap() {
         if rb.num_rows() == 0 {
             if let Some(t) = md_get(&md, STATE_KEY) {
                 token = Some(t.to_string());
+            }
+            if let Some(t) = md_get(&md, CALL_STATE_KEY) {
+                call_token = Some(t.to_string());
             }
         } else if let Some(col) = rb.column(0).as_any().downcast_ref::<Int64Array>() {
             for i in 0..col.len() {
@@ -158,7 +168,7 @@ fn parse_response(body: &[u8]) -> (Vec<i64>, Option<String>) {
             }
         }
     }
-    (values, token)
+    (values, token, call_token)
 }
 
 async fn post_arrow(app: axum::Router, path: &str, body: Vec<u8>) -> Bytes {
@@ -186,25 +196,40 @@ async fn second_worker_can_resume_stream_from_first() {
     let worker_a = state_with_shared_key(&key, server.clone());
     let app_a = vgi_rpc::http::build_router(worker_a);
     let body_a = post_arrow(app_a, "/counter/init", init_body(3)).await;
-    let (values_a, token_a) = parse_response(&body_a);
+    let (values_a, token_a, call_token) = parse_response(&body_a);
     assert_eq!(values_a, vec![0], "worker A should emit exactly one batch");
     let token_a = token_a.expect("worker A must emit a continuation token");
+    let call_token = call_token.expect("/init must hand over a call token");
 
     // Worker B (independent HttpState, same key, same server) serves the
     // continuation — this is the load-balance-across-workers scenario.
     let worker_b = state_with_shared_key(&key, server.clone());
     let app_b = vgi_rpc::http::build_router(worker_b);
-    let body_b = post_arrow(app_b, "/counter/exchange", exchange_body(&token_a)).await;
-    let (values_b, token_b) = parse_response(&body_b);
+    let body_b = post_arrow(
+        app_b,
+        "/counter/exchange",
+        exchange_body(&token_a, &call_token),
+    )
+    .await;
+    let (values_b, token_b, reissued) = parse_response(&body_b);
     assert_eq!(values_b, vec![1], "worker B should continue at cur=1");
+    assert!(
+        reissued.is_none(),
+        "a continuation must not re-issue the call token"
+    );
     let token_b = token_b.expect("worker B must emit a refreshed token");
 
     // And a third hop back to worker A (proving the token is freshly
     // valid after B's mutation).
     let worker_a2 = state_with_shared_key(&key, server.clone());
     let app_a2 = vgi_rpc::http::build_router(worker_a2);
-    let body_c = post_arrow(app_a2, "/counter/exchange", exchange_body(&token_b)).await;
-    let (values_c, _token_c) = parse_response(&body_c);
+    let body_c = post_arrow(
+        app_a2,
+        "/counter/exchange",
+        exchange_body(&token_b, &call_token),
+    )
+    .await;
+    let (values_c, _token_c, _) = parse_response(&body_c);
     assert_eq!(values_c, vec![2], "round-trip C should see cur=2");
 }
 
@@ -214,8 +239,9 @@ async fn worker_with_different_key_rejects_peer_token() {
     let worker_a = state_with_shared_key(&[1u8; 32], server.clone());
     let app_a = vgi_rpc::http::build_router(worker_a);
     let body_a = post_arrow(app_a, "/counter/init", init_body(3)).await;
-    let (_vals, token_a) = parse_response(&body_a);
+    let (_vals, token_a, call_token) = parse_response(&body_a);
     let token_a = token_a.expect("init token");
+    let call_token = call_token.expect("init call token");
 
     // Worker with a *different* signing key must reject the token.
     let hostile = state_with_shared_key(&[2u8; 32], server);
@@ -226,7 +252,7 @@ async fn worker_with_different_key_rejects_peer_token() {
                 .uri("/counter/exchange")
                 .method("POST")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
-                .body(Body::from(exchange_body(&token_a)))
+                .body(Body::from(exchange_body(&token_a, &call_token)))
                 .unwrap(),
         )
         .await

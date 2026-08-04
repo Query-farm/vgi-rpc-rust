@@ -18,6 +18,20 @@ use std::sync::Arc;
 
 use vgi_rpc::RpcServer;
 
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
+}
+
 /// Build an `RpcServer` with all conformance methods registered.
 pub fn build_server() -> RpcServer {
     build_server_with_external(None, None)
@@ -60,7 +74,40 @@ pub fn build_server_with_external(
             .open(&path)
         {
             Ok(f) => {
-                let hook = vgi_rpc::AccessLogHook::new(f, "rust-conformance-0.2.0");
+                let version = "rust-conformance-0.2.0";
+                let hook = match env_usize("VGI_ACCESS_LOG_QUEUE_SIZE") {
+                    // Async emission is opt-in: it trades the guarantee that
+                    // a record on disk means the call completed.
+                    Some(queue) if env_flag("VGI_ACCESS_LOG_ASYNC") => {
+                        vgi_rpc::AccessLogHook::buffered(f, version, queue)
+                    }
+                    _ if env_flag("VGI_ACCESS_LOG_ASYNC") => {
+                        vgi_rpc::AccessLogHook::buffered(f, version, 10_000)
+                    }
+                    _ => vgi_rpc::AccessLogHook::new(f, version),
+                };
+                let hook = match env_usize("VGI_ACCESS_LOG_MAX_RECORD_BYTES") {
+                    Some(n) => hook.with_max_record_bytes(n),
+                    None => hook,
+                };
+                let hook = match std::env::var("VGI_ACCESS_LOG_SAMPLE") {
+                    Ok(raw) => {
+                        let rate: f64 = raw.parse().unwrap_or_else(|_| {
+                            eprintln!(
+                                "[vgi-rpc] --access-log-sample must be a number, got {raw:?}"
+                            );
+                            std::process::exit(2);
+                        });
+                        // Out of range fails here rather than at the first
+                        // request: 100 meaning "100%" would otherwise
+                        // silently log everything.
+                        hook.with_sample_rate(rate).unwrap_or_else(|e| {
+                            eprintln!("[vgi-rpc] {}", e.message);
+                            std::process::exit(2);
+                        })
+                    }
+                    Err(_) => hook,
+                };
                 builder = builder.with_hook(hook);
             }
             Err(e) => {

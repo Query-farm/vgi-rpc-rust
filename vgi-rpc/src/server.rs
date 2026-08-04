@@ -1000,6 +1000,9 @@ impl RpcServer {
         // The `DispatchInfo` — a large struct with many owned clones — plus
         // the request re-serialization below are needed *only* when a
         // dispatch hook is registered. Build nothing on the hookless path.
+        // `mut` is needed only by the http-gated externalized-bytes stamp
+        // further down; without that feature nothing mutates this.
+        #[cfg_attr(not(feature = "http"), allow(unused_mut))]
         let mut dispatch_info = self.dispatch_hook.as_ref().map(|_| {
             let mut di =
                 crate::hooks::DispatchInfo::from_request(self, &req, method_type, &ctx.auth);

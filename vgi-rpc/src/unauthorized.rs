@@ -67,6 +67,7 @@ impl fmt::Display for AuthReason {
 /// that the service is only reachable through its proxy, which header names
 /// the proxy must set, and that a rejection here is at least as likely to be
 /// a proxy misconfiguration as a bad credential.
+#[cfg(feature = "http")]
 pub(crate) fn proxy_hint(headers: &[String]) -> String {
     format!(
         "This service only accepts requests that arrive through its configured \
@@ -81,6 +82,7 @@ pub(crate) fn proxy_hint(headers: &[String]) -> String {
 ///
 /// `proxy_hint` is absent, not empty, when it does not apply, so its presence
 /// alone is a usable signal.
+#[cfg(feature = "http")]
 pub(crate) fn envelope(reason: AuthReason, detail: &str, hint: Option<&str>) -> String {
     let mut out = String::from("{\"error\":\"unauthorized\",\"reason\":\"");
     out.push_str(reason.as_str());
@@ -96,6 +98,7 @@ pub(crate) fn envelope(reason: AuthReason, detail: &str, hint: Option<&str>) -> 
 
 /// Minimal JSON string escaping — the envelope has no other dynamic shape,
 /// so pulling in a serializer for it would not earn its keep.
+#[cfg(feature = "http")]
 fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -114,7 +117,7 @@ fn json_string(s: &str) -> String {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "http"))]
 mod tests {
     use super::*;
 

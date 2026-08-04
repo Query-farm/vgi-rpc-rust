@@ -135,6 +135,13 @@ fn main() {
     if args.iter().any(|a| a == "--access-log-async") {
         std::env::set_var("VGI_ACCESS_LOG_ASYNC", "1");
     }
+    // `request_data` is the DEBUG-only field, so a log emitted without this
+    // flag never carries it and every rule governing it goes unexercised —
+    // the validator only checks it is well-formed *when present*. Mirrors the
+    // Python worker's `--access-log-debug`, which exists for the same reason.
+    if args.iter().any(|a| a == "--access-log-debug") {
+        std::env::set_var("VGI_ACCESS_LOG_DEBUG", "1");
+    }
 
     // Positional-flag scan rather than a per-mode flag, so the opt-out reaches
     // every HTTP state construction below. Wiring only one of them is exactly

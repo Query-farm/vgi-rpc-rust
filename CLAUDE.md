@@ -288,18 +288,25 @@ sink (pipe / unix / tcp) keep logging inline. A crash between handler and
 response loses that request's records; the alternative is a permanently wrong
 number.
 
-**Validating the access log** — there is no cross-language gate for it in CI,
-so run it by hand after touching `access_log.rs`:
+**Validating the access log** — the `conformance` job runs this on every push
+("Verify access log against the spec"); it used to be a manual check and the
+contract drifted anyway. To reproduce a CI failure locally:
 
 ```bash
 cargo build --release -p vgi-rpc-conformance-rust
 ~/Development/vgi-rpc/.venv/bin/vgi-rpc-test \
-  --cmd "target/release/vgi-rpc-conformance-rust --access-log /tmp/rust-al.jsonl" \
-  --access-log /tmp/rust-al.jsonl
+  --cmd "target/release/vgi-rpc-conformance-rust --access-log /tmp/rust-al.jsonl --access-log-debug" \
+  --access-log /tmp/rust-al.jsonl \
+  --require-request-data
 ```
 
 Exit 0 means every conformance test passed **and** every record validated
-against `vgi_rpc/access_log.schema.json`.
+against `vgi_rpc/access_log.schema.json`. `--access-log-debug` is what puts
+`request_data` on the record (DEBUG-equivalent, `with_verbose`); without it
+every rule governing that field is satisfied vacuously, which is what
+`--require-request-data` turns into a failure. Do not narrow the run with a
+`--filter` that drops the zero-parameter methods (`void*`) — an empty schema
+with no row is the case a row-demanding validator gets wrong.
 | `OtelHook`       | `otel`       | `otel`   | `tracing::info!(target: "vgi_rpc.otel", ...)` spans + in-memory counters. |
 | `SentryHook`     | `sentry`     | `sentry` | `tracing::error!(target: "vgi_rpc.sentry", ...)` on handler errors. |
 

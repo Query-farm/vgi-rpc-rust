@@ -90,6 +90,10 @@ pub fn build_server_with_external(
                     Some(n) => hook.with_max_record_bytes(n),
                     None => hook,
                 };
+                // DEBUG-equivalent: the only setting that puts `request_data`
+                // on the record, so it is what `--require-request-data`
+                // validates against.
+                let hook = hook.with_verbose(env_flag("VGI_ACCESS_LOG_DEBUG"));
                 let hook = match std::env::var("VGI_ACCESS_LOG_SAMPLE") {
                     Ok(raw) => {
                         let rate: f64 = raw.parse().unwrap_or_else(|_| {

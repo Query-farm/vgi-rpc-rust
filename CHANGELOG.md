@@ -49,6 +49,12 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
   truncated.
 - Conformance worker: `--access-log-sample`, `--access-log-async`,
   `--access-log-queue-size`, `--access-log-max-record-bytes`.
+- Conformance worker: `--access-log-debug` (DEBUG-equivalent verbosity, i.e.
+  `AccessLogHook::with_verbose`), and CI now runs `vgi-rpc-test --access-log
+  ... --require-request-data` against it. Validated at INFO the log simply
+  never carries `request_data`, so every rule governing the field was
+  satisfied vacuously — and the check itself was manual, which is how the
+  contract drifted with four people having inspected it.
 
 ### Changed
 

@@ -1221,12 +1221,21 @@ mod tests {
 
     /// A sink whose writes park until the test opens the gate, so the queue
     /// overflows on demand rather than on timing.
+    ///
+    /// `entered` fires the first time the writer thread is *inside* `write`.
+    /// The test waits for it before flooding: until the writer has parked,
+    /// how many records the queue swallows is a scheduling question, and
+    /// "did the queue overflow" is not yet a fact the test can assert.
     struct GatedSink {
         gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        entered: std::sync::mpsc::SyncSender<()>,
         out: Arc<Mutex<Vec<u8>>>,
     }
     impl Write for GatedSink {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            // Non-blocking: only the first send needs to land, and the
+            // receiver may already be gone by a later write.
+            let _ = self.entered.try_send(());
             let (lock, cv) = &*self.gate;
             let mut open = lock.lock().unwrap();
             while !*open {
@@ -1247,16 +1256,26 @@ mod tests {
         // one: a consumer cannot tell a quiet period from a lossy one.
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let hook = AccessLogHook::buffered(
             GatedSink {
                 gate: gate.clone(),
+                entered: entered_tx,
                 out: buf.clone(),
             },
             "v",
             1,
         );
-        // The writer thread parks on the first line, the queue holds one
-        // more, and everything after that is dropped.
+        // Park the writer *before* asserting anything about overflow. This
+        // record is the one it takes off the queue and blocks on; until it
+        // is provably inside `write`, the queue has a consumer and how much
+        // it swallows is up to the scheduler, not the test.
+        run(&hook, &info("park"), None);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("access-log writer thread never reached the sink");
+
+        // Writer parked, queue holds one more, everything after that drops.
         for _ in 0..10 {
             run(&hook, &info("flood"), None);
         }

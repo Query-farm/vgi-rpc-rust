@@ -194,12 +194,19 @@ fn main() {
     }
 
     // `--http-with-storage <base_url> [--zstd] [--externalize-threshold N]
-    //  [--max-request-bytes N]` wires the conformance worker against the
-    // external-location feature for the upstream TestExternalLocation suite,
-    // and (with threshold=1, max-request-bytes=1MiB) the
-    // ``http_externalize_always`` transport variant that re-runs the entire
-    // conformance suite forcing every non-empty response batch to externalize.
+    //  [--max-request-bytes N] [--max-response-bytes N]
+    //  [--max-externalized-response-bytes N]` wires the conformance worker
+    // against the external-location feature for the upstream
+    // TestExternalLocation suite, and (with threshold=1,
+    // max-request-bytes=1MiB) the ``http_externalize_always`` transport
+    // variant that re-runs the entire conformance suite forcing every
+    // non-empty response batch to externalize.
     // `<base_url>` is the `vgi_rpc.conformance.fake_storage` HTTP service.
+    //
+    // The two cap flags exist for `TestExternalizedResponseCap`, which needs
+    // storage wired *and* a tight external cap paired with a deliberately
+    // generous body cap — with both caps tight the body cap fails first and
+    // the group proves nothing about the external channel.
     if args.len() > 2 && args[1] == "--http-with-storage" {
         let storage_url = args[2].clone();
         let zstd = args.iter().any(|a| a == "--zstd");
@@ -209,7 +216,15 @@ fn main() {
         // normal-sized request bodies flowing inline. Defaults to 4096 to
         // preserve the previous fixed cap for the existing storage tests.
         let max_req = parse_usize_flag(&args, "--max-request-bytes").unwrap_or(4096);
-        run_http_with_storage(&storage_url, zstd, threshold, max_req, no_compression);
+        run_http_with_storage(
+            &storage_url,
+            zstd,
+            threshold,
+            max_req,
+            parse_usize_flag(&args, "--max-response-bytes"),
+            parse_usize_flag(&args, "--max-externalized-response-bytes"),
+            no_compression,
+        );
         return;
     }
 
@@ -390,11 +405,14 @@ fn parse_secs_flag(args: &[String], flag: &str) -> Option<f64> {
     raw.parse::<f64>().ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_http_with_storage(
     storage_url: &str,
     zstd: bool,
     threshold: usize,
     max_request_bytes: usize,
+    max_response_bytes: Option<usize>,
+    max_externalized_response_bytes: Option<usize>,
     no_compression: bool,
 ) {
     use std::sync::Arc as StdArc;
@@ -424,6 +442,12 @@ fn run_http_with_storage(
             .upload_url_provider(upload_provider)
             .max_request_bytes(max_request_bytes)
             .max_upload_bytes(64 * 1024 * 1024);
+        if let Some(n) = max_response_bytes {
+            builder = builder.max_response_bytes(n);
+        }
+        if let Some(n) = max_externalized_response_bytes {
+            builder = builder.max_externalized_response_bytes(n);
+        }
         if no_compression {
             builder = builder.disable_response_compression();
         }

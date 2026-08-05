@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 
 use crate::errors::{Result, RpcError};
 use crate::metadata::{LOCATION_FETCH_MS_KEY, LOCATION_KEY, LOCATION_SHA256_KEY};
-use crate::wire::{bytes_to_hex, empty_batch, md_get, write_one_batch, Metadata, StreamReader};
+use crate::wire::{bytes_to_hex, empty_batch, md_get, write_one_batch_as, Metadata, StreamReader};
 
 thread_local! {
     /// Bytes uploaded to external storage during the call in flight.
@@ -381,7 +381,7 @@ pub fn serialize_batch_to_ipc(batch: &RecordBatch) -> Result<Vec<u8>> {
     // External payloads carry the raw data only; the pointer batch on
     // the outside owns the metadata. Pass `None` to omit any
     // `custom_metadata` field on the wire.
-    write_one_batch(batch, None)
+    write_one_batch_as(batch, batch.schema().as_ref(), None)
 }
 
 /// Read back an IPC stream containing a single batch.
@@ -502,47 +502,175 @@ pub fn pointer_schema() -> SchemaRef {
     Arc::new(Schema::empty())
 }
 
+/// A batch that has been serialized (and compressed) for external storage
+/// but **not yet uploaded**.
+///
+/// Splitting the prepare step out of [`maybe_externalize_batch`] is what
+/// makes an operator cap (`max_externalized_response_bytes`) enforceable
+/// *before* the bytes leave the process: the exact payload is already in
+/// hand, so a response that would violate the cap can be refused without
+/// paying for the storage round trip. Nothing observable happens until
+/// [`upload_prepared`] is called, so dropping a `PreparedExternal` is a
+/// clean abort.
+pub struct PreparedExternal {
+    /// Raw (pre-compression) IPC bytes — what the cap is measured in.
+    raw_len: usize,
+    /// The bytes that will actually be uploaded.
+    payload: Vec<u8>,
+    /// SHA-256 of the **raw** IPC bytes.
+    sha: String,
+    /// Zero-row pointer batch matching the source batch's schema.
+    ptr: RecordBatch,
+    /// Caller metadata with any stale location keys already stripped.
+    md: Metadata,
+}
+
+impl PreparedExternal {
+    /// Size of this payload as `max_externalized_response_bytes` measures
+    /// it: the **raw** IPC bytes, captured *before* external compression.
+    ///
+    /// Pre-compression on purpose, and identical whether or not
+    /// [`ExternalLocationConfig::with_compression`] is in effect. Python's
+    /// `maybe_externalize_batch` returns exactly this quantity for cap
+    /// accounting (`raw_size = original_bytes ...`, taken before
+    /// `_codec_compress`), and TypeScript compares an uncompressed batch
+    /// size too. Charging the compressed upload instead would make one
+    /// configuration mean different things on different ports, and would
+    /// silently loosen the cap by the compression ratio — which for the
+    /// repetitive payloads that provoke externalisation is enormous.
+    ///
+    /// The access-log counter (`DispatchInfo::externalized_bytes`) stays on
+    /// the compressed number: that one answers "what left the machine",
+    /// this one answers "what did the operator allow".
+    ///
+    /// One deliberate deviation from the reference: Python's *pre-flight*
+    /// predicts with `batch.get_total_buffer_size()` and then charges the
+    /// raw IPC count, so its two numbers are only approximately equal.
+    /// Rust has already serialized by this point (the threshold gate needs
+    /// the IPC length anyway), so the pre-flight and the charge are the
+    /// same number and cannot disagree. Same units, same
+    /// "uncompressed size of the data" semantics, no estimate error.
+    pub fn cap_bytes(&self) -> usize {
+        self.raw_len
+    }
+}
+
+/// Serialize `batch` for external storage without uploading it.
+///
+/// Returns `None` under exactly the conditions [`maybe_externalize_batch`]
+/// declines to externalize (empty batch, or IPC bytes below the configured
+/// threshold), so a caller that pre-flights with this and then uploads sees
+/// the same decision it would have gotten from the one-shot helper.
+///
+/// `declared_schema` is the schema of the **enclosing** IPC stream — the one
+/// the peer already read and will validate the fetched payload against. It
+/// is not always `batch.schema()`: a worker may emit a batch that differs
+/// from its stream's declared schema in nullability, dictionary encoding or
+/// schema metadata, and inline delivery hides that completely (see
+/// [`crate::wire::write_one_batch_as`]). Declaring the batch's own schema on
+/// the uploaded payload is what turns such a difference into a client-side
+/// `Schema mismatch` the moment externalisation is switched on.
+pub fn prepare_externalize_batch(
+    batch: &RecordBatch,
+    declared_schema: &Schema,
+    inline_metadata: Option<&Metadata>,
+    cfg: &ExternalLocationConfig,
+) -> Result<Option<PreparedExternal>> {
+    if batch.num_rows() == 0 {
+        return Ok(None);
+    }
+    // Build pointer metadata, merging the caller-supplied metadata first.
+    // The location keys are added by `upload_prepared`, which is the only
+    // place that knows the URL.
+    let mut md: Metadata = inline_metadata.cloned().unwrap_or_default();
+    md.remove(LOCATION_KEY);
+    md.remove(LOCATION_SHA256_KEY);
+    md.remove(LOCATION_FETCH_MS_KEY);
+
+    // The caller's metadata is written on BOTH sides of the indirection:
+    // inside the uploaded stream and on the pointer batch. Ports disagree
+    // about which one carries per-batch keys — Python's resolver returns the
+    // *inner* batch's metadata and discards the pointer's, while this crate's
+    // resolver merges both. Writing it twice is what makes a key that must
+    // survive externalisation (the exchange cursor
+    // `vgi_rpc.stream_state#b64`, `vgi_batch_index`, partition values)
+    // survive for either client. The duplicate costs a few bytes and the
+    // values are identical, so a merge in any order agrees.
+    let ipc_bytes = write_one_batch_as(
+        batch,
+        declared_schema,
+        if md.is_empty() { None } else { Some(&md) },
+    )?;
+    if ipc_bytes.len() < cfg.threshold_bytes {
+        return Ok(None);
+    }
+    let raw_len = ipc_bytes.len();
+    let sha = sha256_hex(&ipc_bytes);
+    let payload = compress(&ipc_bytes, cfg.compression)?;
+
+    // Pointer batch: zero-row but matching the enclosing stream's schema,
+    // matching Python's `make_external_location_batch` shape so the
+    // client's IPC reader sees a consistent column count — and so the
+    // schema it validates the fetched payload against is the one the
+    // payload declares.
+    let ptr = empty_batch(declared_schema)?;
+    Ok(Some(PreparedExternal {
+        raw_len,
+        payload,
+        sha,
+        ptr,
+        md,
+    }))
+}
+
+/// Upload a [`PreparedExternal`] and return the pointer batch + metadata.
+///
+/// This is the single upload choke point: the externalised-bytes counter
+/// read by [`ExternalizedScope`] is incremented here, so a new call site
+/// cannot make the total drift from reality.
+pub fn upload_prepared(
+    prepared: PreparedExternal,
+    cfg: &ExternalLocationConfig,
+) -> Result<(RecordBatch, Metadata)> {
+    let PreparedExternal {
+        payload,
+        sha,
+        ptr,
+        mut md,
+        ..
+    } = prepared;
+    EXTERNALIZED_BYTES.with(|c| c.set(c.get() + payload.len() as u64));
+    let upload = cfg.storage.upload(&payload, cfg.compression)?;
+    // Validator runs over the final URL.
+    (cfg.url_validator)(&upload.url)?;
+    md.insert(LOCATION_KEY.to_string(), upload.url);
+    md.insert(LOCATION_SHA256_KEY.to_string(), sha);
+    Ok((ptr, md))
+}
+
 /// Decide whether to externalize `batch`; return the pointer (zero-row)
 /// batch + pointer metadata when yes, else `None`. The original batch is
 /// left untouched so the caller can emit it inline.
 ///
 /// `inline_metadata` — optional custom metadata the caller wants to
 /// attach alongside the location keys (merged; location keys win).
+///
+/// Callers that must enforce a byte cap should use
+/// [`prepare_externalize_batch`] + [`upload_prepared`] instead, which lets
+/// them see the payload size before the upload happens.
+///
+/// `declared_schema` is the enclosing IPC stream's schema; see
+/// [`prepare_externalize_batch`].
 pub fn maybe_externalize_batch(
     batch: &RecordBatch,
+    declared_schema: &Schema,
     inline_metadata: Option<&Metadata>,
     cfg: &ExternalLocationConfig,
 ) -> Result<Option<(RecordBatch, Metadata)>> {
-    if batch.num_rows() == 0 {
-        return Ok(None);
+    match prepare_externalize_batch(batch, declared_schema, inline_metadata, cfg)? {
+        None => Ok(None),
+        Some(prepared) => upload_prepared(prepared, cfg).map(Some),
     }
-    let ipc_bytes = serialize_batch_to_ipc(batch)?;
-    if ipc_bytes.len() < cfg.threshold_bytes {
-        return Ok(None);
-    }
-    let sha = sha256_hex(&ipc_bytes);
-    let payload = compress(&ipc_bytes, cfg.compression)?;
-    // Counted here rather than at the call sites: this is the one function
-    // every externalised payload passes through, so the total cannot drift
-    // from reality because someone added a new upload path.
-    EXTERNALIZED_BYTES.with(|c| c.set(c.get() + payload.len() as u64));
-    let upload = cfg.storage.upload(&payload, cfg.compression)?;
-    // Validator runs over the final URL.
-    (cfg.url_validator)(&upload.url)?;
-
-    // Build pointer metadata, merging the caller-supplied metadata first.
-    let mut md: Metadata = inline_metadata.cloned().unwrap_or_default();
-    md.remove(LOCATION_KEY);
-    md.remove(LOCATION_SHA256_KEY);
-    md.remove(LOCATION_FETCH_MS_KEY);
-    md.insert(LOCATION_KEY.to_string(), upload.url);
-    md.insert(LOCATION_SHA256_KEY.to_string(), sha);
-
-    // Pointer batch: zero-row but matching the input batch's schema,
-    // matching Python's `make_external_location_batch` shape so the
-    // client's IPC reader sees a consistent column count.
-    let ptr = empty_batch(batch.schema().as_ref())?;
-    Ok(Some((ptr, md)))
 }
 
 // ---------------------------------------------------------------------------
@@ -727,7 +855,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let cfg = cfg_with(storage.clone(), 1024 * 1024);
         let batch = big_batch(10);
-        let out = maybe_externalize_batch(&batch, None, &cfg).unwrap();
+        let out = maybe_externalize_batch(&batch, batch.schema().as_ref(), None, &cfg).unwrap();
         assert!(out.is_none());
         assert!(storage.is_empty());
     }
@@ -738,7 +866,7 @@ mod tests {
         let cfg = cfg_with(storage.clone(), 1024);
         let batch = big_batch(50_000);
 
-        let (ptr, md) = maybe_externalize_batch(&batch, None, &cfg)
+        let (ptr, md) = maybe_externalize_batch(&batch, batch.schema().as_ref(), None, &cfg)
             .unwrap()
             .unwrap();
         assert_eq!(ptr.num_rows(), 0);
@@ -759,11 +887,82 @@ mod tests {
         let storage = InMemoryStorage::new();
         let cfg = cfg_with(storage.clone(), 1024).with_compression(Compression::Zstd(3));
         let batch = big_batch(20_000);
-        let (ptr, md) = maybe_externalize_batch(&batch, None, &cfg)
+        let (ptr, md) = maybe_externalize_batch(&batch, batch.schema().as_ref(), None, &cfg)
             .unwrap()
             .unwrap();
         let (resolved, _) = resolve_external_location(&ptr, &md, &cfg).unwrap();
         assert_eq!(resolved.num_rows(), batch.num_rows());
+    }
+
+    // An externalised payload is a standalone IPC stream and declares its own
+    // schema, whereas an inline batch rides a stream whose schema was declared
+    // once, up front. A batch differing from that declared schema only
+    // cosmetically — here, field nullability — is invisible inline (the writer
+    // never reconciles the two) and becomes a hard `Schema mismatch` at a peer
+    // that validates the fetched payload the moment externalisation is turned
+    // on. The declared schema must therefore travel with the payload.
+    #[test]
+    fn externalized_payload_declares_the_enclosing_stream_schema() {
+        let storage = InMemoryStorage::new();
+        let cfg = cfg_with(storage.clone(), 1024);
+        // What the stream promised: `value` is nullable.
+        let declared = Schema::new(vec![Field::new("value", DataType::Int64, true)]);
+        // What the worker emitted: same data, non-nullable field.
+        let batch = big_batch(50_000);
+        assert!(!batch.schema().field(0).is_nullable());
+
+        let (ptr, md) = maybe_externalize_batch(&batch, &declared, None, &cfg)
+            .unwrap()
+            .unwrap();
+        // The pointer the peer decodes carries the declared schema...
+        assert!(ptr.schema().field(0).is_nullable());
+        // ...and so does the payload behind it, so a validating peer sees
+        // the two agree.
+        let raw = cfg
+            .fetcher
+            .fetch(
+                md_get(&md, LOCATION_KEY).unwrap(),
+                cfg.compression,
+                cfg.max_decompressed_bytes,
+            )
+            .unwrap();
+        let mut reader = StreamReader::new(raw.as_slice()).unwrap();
+        let (fetched, _) = reader.read_next().unwrap().unwrap();
+        assert_eq!(fetched.schema().as_ref(), &declared);
+        assert_eq!(fetched.num_rows(), batch.num_rows());
+    }
+
+    // Java's uploader cannot carry dictionaries, so its port has to keep
+    // dictionary-encoded batches inline. Rust's writer emits the dictionary
+    // messages and the reader consumes them transparently, so no such
+    // carve-out is needed here — pinned so a future change to either side
+    // cannot quietly reintroduce the constraint.
+    #[test]
+    fn dictionary_encoded_batch_round_trips_externally() {
+        use arrow_array::types::Int32Type;
+        use arrow_array::{Array, DictionaryArray};
+
+        let storage = InMemoryStorage::new();
+        let cfg = cfg_with(storage.clone(), 1024);
+        let values: Vec<&str> = (0..20_000)
+            .map(|i| ["alpha", "beta", "gamma"][i % 3])
+            .collect();
+        let dict: DictionaryArray<Int32Type> = values.into_iter().collect();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "label",
+            dict.data_type().clone(),
+            false,
+        )]));
+        let col: Ar<dyn arrow_array::Array> = Arc::new(dict);
+        let batch = RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
+
+        let (ptr, md) = maybe_externalize_batch(&batch, schema.as_ref(), None, &cfg)
+            .unwrap()
+            .unwrap();
+        assert_eq!(storage.len(), 1);
+        let (resolved, _) = resolve_external_location(&ptr, &md, &cfg).unwrap();
+        assert_eq!(resolved.num_rows(), batch.num_rows());
+        assert_eq!(resolved.column(0).as_ref(), batch.column(0).as_ref());
     }
 
     #[test]
@@ -804,7 +1003,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let cfg = cfg_with(storage.clone(), 1024);
         let batch = big_batch(10_000);
-        let (ptr, mut md) = maybe_externalize_batch(&batch, None, &cfg)
+        let (ptr, mut md) = maybe_externalize_batch(&batch, batch.schema().as_ref(), None, &cfg)
             .unwrap()
             .unwrap();
         // Corrupt the recorded hash.

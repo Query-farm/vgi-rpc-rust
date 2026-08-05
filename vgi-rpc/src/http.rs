@@ -363,6 +363,18 @@ pub struct HttpState {
     /// unbounded.  Externalised payloads do not count toward this — they
     /// leave only tiny pointer batches on the wire.
     max_response_bytes: Option<usize>,
+    /// Cap on bytes uploaded to external storage while producing one HTTP
+    /// response (advertised via `VGI-Max-Externalized-Response-Bytes`).
+    /// `None` = unbounded.
+    ///
+    /// **Hard on every method type**, unlike `max_response_bytes` which is
+    /// soft for producers: a wire overshoot can be carried to the next turn
+    /// by a continuation token, but bytes already uploaded cannot be
+    /// un-uploaded, so there is nothing for a continuation to rescue.
+    /// Enforced by pre-flighting the payload size before each upload (see
+    /// [`crate::external::prepare_externalize_batch`]) with a post-flush
+    /// backstop on the unary path.
+    max_externalized_response_bytes: Option<usize>,
     upload_url_provider: Option<Arc<dyn crate::external::UploadUrlProvider>>,
     /// Sticky-session context, `Some` when the server is sticky-enabled.
     sticky: Option<Arc<crate::sticky::StickyContext>>,
@@ -886,6 +898,7 @@ impl HttpStateBuilder {
             health_enabled: self.health_enabled.unwrap_or(true),
             max_request_bytes: self.max_request_bytes,
             max_response_bytes: self.max_response_bytes,
+            max_externalized_response_bytes: self.max_externalized_response_bytes,
             upload_url_provider: self.upload_url_provider,
             sticky,
             introspect,
@@ -2650,6 +2663,20 @@ fn enforce_response_body_cap(
     arrow_response(StatusCode::OK, body)
 }
 
+/// The one message shape for a `max_externalized_response_bytes` overshoot.
+///
+/// Every enforcement site funnels through here so the wording cannot drift
+/// between the unary pre-flight, the producer loop, the exchange turn and
+/// the post-flush backstops. The literal `max_externalized_response_bytes`
+/// token is load-bearing: the cross-language conformance suite matches the
+/// client-visible `RpcError` against exactly that string, and the reference
+/// implementations emit the same `(actual > limit) for method ...` shape.
+fn external_cap_error(bytes: usize, limit: usize, method: &str) -> RpcError {
+    RpcError::runtime_error(format!(
+        "Externalised payload exceeds max_externalized_response_bytes ({bytes} > {limit}) for method {method:?}"
+    ))
+}
+
 /// Build a fresh IPC stream containing only an EXCEPTION batch and emit
 /// it as 200 + `X-VGI-RPC-Error: true` so RPC clients see the message
 /// as `RpcError`, not a transport failure. Used by the response-cap
@@ -3246,6 +3273,11 @@ async fn handle_unary(
         crate::server::call_guard(|| (info.unary.as_ref().unwrap())(&req, &ctx)).and_then(|r| r);
     let logs = ctx.drain_logs();
     let mut app_err: Option<RpcError> = None;
+    // Bytes this response pushed to external storage, in the units
+    // `max_externalized_response_bytes` is expressed in (raw, pre-compression
+    // IPC). Kept separate from `dispatch_info.externalized_bytes`, which is
+    // the compressed egress figure the access log wants.
+    let mut external_bytes_written = 0usize;
 
     let mut buf = Vec::new();
     {
@@ -3261,12 +3293,40 @@ async fn handle_unary(
                 stats.output_batches = 1;
                 stats.output_rows = out_batch.num_rows() as u64;
                 if let Some(cfg) = server.external_config().as_ref() {
-                    // `maybe_externalize_batch` may invoke a blocking
-                    // upload (e.g. reqwest::blocking). Allow blocking
-                    // in this async handler so the inner client's
-                    // tokio runtime can drop without panicking.
+                    // Prepare (serialize + compress) but do not upload yet:
+                    // `max_externalized_response_bytes` is pre-flighted below
+                    // so a violating response costs no storage round trip.
+                    // The prepare/upload pair may invoke a blocking client
+                    // (e.g. reqwest::blocking), so both run under
+                    // `block_in_place` — otherwise the inner client's tokio
+                    // runtime panics on drop inside this async handler.
                     let externalized = tokio::task::block_in_place(|| {
-                        crate::external::maybe_externalize_batch(&out_batch, None, cfg)
+                        // The result schema, not `out_batch.schema()`: the
+                        // response stream declares the former, so that is
+                        // what the client will validate the fetched payload
+                        // against.
+                        let prepared = crate::external::prepare_externalize_batch(
+                            &out_batch,
+                            &info.result_schema,
+                            None,
+                            cfg,
+                        )?;
+                        match prepared {
+                            None => Ok(None),
+                            Some(p) => {
+                                if let Some(limit) = state.max_externalized_response_bytes {
+                                    if p.cap_bytes() > limit {
+                                        return Err(external_cap_error(
+                                            p.cap_bytes(),
+                                            limit,
+                                            &method,
+                                        ));
+                                    }
+                                }
+                                external_bytes_written += p.cap_bytes();
+                                crate::external::upload_prepared(p, cfg).map(Some)
+                            }
+                        }
                     });
                     match externalized {
                         Ok(Some((ptr, md))) => {
@@ -3303,31 +3363,45 @@ async fn handle_unary(
             &stats,
         );
     }
-    // Operator-facing wire body cap.  Hard for unary — overshoot
-    // replaces the response with an EXCEPTION-only IPC stream surfaced
-    // via 200 + `X-VGI-RPC-Error: true`.  Mirrors Python's strict-fail
-    // contract; the literal `max_response_bytes` token in the message
-    // is what the cross-language conformance suite asserts on.
-    if let Some(limit) = state.max_response_bytes {
-        if buf.len() > limit {
-            let err = RpcError::runtime_error(format!(
+    // Operator-facing caps.  Both are hard for unary — overshoot replaces
+    // the response with an EXCEPTION-only IPC stream surfaced via 200 +
+    // `X-VGI-RPC-Error: true`.  Mirrors Python's strict-fail contract; the
+    // literal `max_response_bytes` / `max_externalized_response_bytes`
+    // tokens in the messages are what the cross-language conformance suite
+    // asserts on.
+    //
+    // The external cap has already been pre-flighted above, before the
+    // upload; this is the backstop that catches an upload path added later
+    // that forgot to pre-flight.
+    let body_cap_error = state
+        .max_response_bytes
+        .filter(|limit| buf.len() > *limit)
+        .map(|limit| {
+            RpcError::runtime_error(format!(
                 "HTTP body exceeds max_response_bytes ({} > {}) for method {:?}",
                 buf.len(),
                 limit,
                 method
-            ));
-            let mut resp = cap_error_response(
-                &info.result_schema,
-                &err,
-                &server.server_id,
-                &req.request_id,
-            );
-            if let Some(s) = sticky_sink.as_ref() {
-                stamp_session_headers(&mut resp, &state, s);
-            }
-            attach_access_sink(&mut resp, access_sink);
-            return resp;
+            ))
+        })
+        .or_else(|| {
+            state
+                .max_externalized_response_bytes
+                .filter(|limit| external_bytes_written > *limit)
+                .map(|limit| external_cap_error(external_bytes_written, limit, &method))
+        });
+    if let Some(err) = body_cap_error {
+        let mut resp = cap_error_response(
+            &info.result_schema,
+            &err,
+            &server.server_id,
+            &req.request_id,
+        );
+        if let Some(s) = sticky_sink.as_ref() {
+            stamp_session_headers(&mut resp, &state, s);
         }
+        attach_access_sink(&mut resp, access_sink);
+        return resp;
     }
     let mut resp = arrow_response(StatusCode::OK, buf);
     if app_err.is_some() {
@@ -3468,7 +3542,8 @@ async fn handle_stream_init(
                 &mut sw,
                 &mut ss,
                 &output_schema,
-                &server,
+                &state,
+                &method,
                 &req,
                 state.producer_batch_limit,
                 sticky_sink.as_ref(),
@@ -3570,6 +3645,84 @@ fn build_cursor_token(
     Ok(state.pack_cursor_token(auth, &state_bytes, call_id))
 }
 
+/// What the HTTP stream paths should do with one output batch after the
+/// external-location machinery has had a look at it.
+enum StreamEmit {
+    /// Externalised: write this zero-row pointer batch with this metadata.
+    Pointer(RecordBatch, Metadata),
+    /// Not externalised (no storage configured, or below the threshold) —
+    /// write the batch inline exactly as the worker emitted it.
+    Inline,
+    /// Refused or failed. The turn must stop and emit this error envelope.
+    Failed(RpcError),
+}
+
+/// Externalize one stream output batch, enforcing the **hard** external cap.
+///
+/// Both HTTP stream shapes route their emitted batches through here.  Before
+/// this existed the HTTP transport was the only one that never externalised
+/// stream output: `maybe_externalize_batch` was wired into the unary handler
+/// and into the pipe/unix serve loop, but the HTTP producer and exchange
+/// loops wrote every batch inline.  Python (`_flush_collector` under
+/// `_run_http_producer_turn` / `_run_http_exchange_turn`) and TypeScript
+/// (`produceStreamResponse`) both externalise here, so a client talking to a
+/// Rust worker over HTTP got whole batches on the wire where the other ports
+/// handed back a pointer.
+///
+/// `cumulative_external` is the running total for *this HTTP turn*, in the
+/// units the cap is expressed in, and is advanced only when an upload is
+/// actually performed.
+///
+/// The cap is checked **before** the upload and is hard: a producer's *wire*
+/// overshoot (`max_response_bytes`) is absorbed by minting a continuation
+/// token, but there is no equivalent rescue for the external channel —
+/// by the time a continuation could be minted the bytes are already in
+/// object storage. So an overshoot ends the turn with an error instead.
+fn externalize_stream_batch(
+    state: &Arc<HttpState>,
+    batch: &RecordBatch,
+    output_schema: &SchemaRef,
+    metadata: Option<&Metadata>,
+    method: &str,
+    cumulative_external: &mut usize,
+) -> StreamEmit {
+    let Some(cfg) = state.server.external_config() else {
+        return StreamEmit::Inline;
+    };
+    // The upload may drive a blocking client (e.g. reqwest::blocking) whose
+    // inner runtime panics if dropped on an async worker thread; see the
+    // unary path for the same treatment.
+    tokio::task::block_in_place(|| {
+        // `output_schema`, not `batch.schema()` — the response stream was
+        // opened with the former, and a batch that differs from it only
+        // cosmetically must externalise to the same bytes it would have
+        // been delivered as inline.
+        let prepared =
+            match crate::external::prepare_externalize_batch(batch, output_schema, metadata, cfg) {
+                Ok(Some(p)) => p,
+                Ok(None) => return StreamEmit::Inline,
+                Err(err) => return StreamEmit::Failed(err),
+            };
+        let cap_bytes = prepared.cap_bytes();
+        if let Some(limit) = state.max_externalized_response_bytes {
+            let projected = *cumulative_external + cap_bytes;
+            if projected > limit {
+                return StreamEmit::Failed(external_cap_error(projected, limit, method));
+            }
+        }
+        match crate::external::upload_prepared(prepared, cfg) {
+            Ok((ptr, md)) => {
+                // Charged after the upload succeeded — a failed upload put
+                // nothing in storage, so charging it would shrink the budget
+                // for bytes that never left.
+                *cumulative_external += cap_bytes;
+                StreamEmit::Pointer(ptr, md)
+            }
+            Err(err) => StreamEmit::Failed(err),
+        }
+    })
+}
+
 /// Outcome of one HTTP producer turn.
 ///
 /// `errored` is separate from `finished` because a raising `produce` ends the
@@ -3595,12 +3748,14 @@ fn run_producer<W: std::io::Write>(
     sw: &mut StreamWriter<W>,
     ss: &mut StreamStateKind,
     output_schema: &SchemaRef,
-    server: &Arc<RpcServer>,
+    state: &Arc<HttpState>,
+    method: &str,
     req: &Request,
     limit: usize,
     sticky: Option<&Arc<crate::sticky::StickySinkImpl>>,
     first_tick_md: Option<&Metadata>,
 ) -> ProducerTurn {
+    let server = &state.server;
     // Continuation producers run without auth context (session-bound).
     let mut ctx = CallContext::for_request(server, req);
     if let Some(s) = sticky {
@@ -3618,6 +3773,10 @@ fn run_producer<W: std::io::Write>(
     // yields a continuation instead of draining the whole shared work queue).
     let limit = producer.batch_limit().unwrap_or(limit);
     let mut batches_written = 0usize;
+    // Bytes this turn has pushed to external storage. Resets per HTTP turn,
+    // matching the reference: each turn is one response and the cap is a
+    // per-response ceiling.
+    let mut cumulative_external = 0usize;
     while limit == 0 || batches_written < limit {
         let mut out = OutputCollector::new(output_schema.clone(), true);
         let result = producer.produce(&mut out, &ctx);
@@ -3648,7 +3807,34 @@ fn run_producer<W: std::io::Write>(
                     let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                 }
                 Emitted::Batch { batch, metadata } => {
-                    let _ = sw.write(&batch, metadata.as_ref());
+                    match externalize_stream_batch(
+                        state,
+                        &batch,
+                        output_schema,
+                        metadata.as_ref(),
+                        method,
+                        &mut cumulative_external,
+                    ) {
+                        StreamEmit::Pointer(ptr, md) => {
+                            let _ = sw.write(&ptr, Some(&md));
+                        }
+                        StreamEmit::Inline => {
+                            let _ = sw.write(&batch, metadata.as_ref());
+                        }
+                        StreamEmit::Failed(err) => {
+                            // Hard stop: no continuation token is minted, so
+                            // the client sees an `RpcError` on iteration
+                            // rather than a stream that quietly resumes past
+                            // a cap it just blew.
+                            let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+                            let _ =
+                                sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                            return ProducerTurn {
+                                finished: true,
+                                errored: true,
+                            };
+                        }
+                    }
                     emitted_data = true;
                 }
             }
@@ -3806,7 +3992,8 @@ async fn handle_stream_exchange(
                 &mut sw,
                 &mut ss,
                 &output_schema,
-                &server,
+                &state,
+                &method,
                 &req,
                 state.producer_batch_limit,
                 sticky_sink.as_ref(),
@@ -3887,6 +4074,9 @@ async fn handle_stream_exchange(
                 }
             };
             let mut wrote_data = false;
+            // Per-response external budget, same units and same hard
+            // semantics as the producer path.
+            let mut cumulative_external = 0usize;
             for item in out.items.drain(..) {
                 match item {
                     Emitted::Log(log) => {
@@ -3894,14 +4084,45 @@ async fn handle_stream_exchange(
                         let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                     }
                     Emitted::Batch { batch, metadata } => {
+                        // The refreshed cursor rides the data batch's
+                        // metadata, so it has to survive externalisation —
+                        // pass it in as the pointer batch's inline metadata
+                        // rather than stamping the batch we may not write.
                         let mut md = metadata.unwrap_or_default();
                         md.insert(STATE_KEY.to_string(), new_token.clone());
-                        let _ = sw.write(&batch, Some(&md));
+                        match externalize_stream_batch(
+                            &state,
+                            &batch,
+                            &output_schema,
+                            Some(&md),
+                            &method,
+                            &mut cumulative_external,
+                        ) {
+                            StreamEmit::Pointer(ptr, ptr_md) => {
+                                let _ = sw.write(&ptr, Some(&ptr_md));
+                            }
+                            StreamEmit::Inline => {
+                                let _ = sw.write(&batch, Some(&md));
+                            }
+                            StreamEmit::Failed(err) => {
+                                let emd =
+                                    build_error_metadata(&err, &server.server_id, &req.request_id);
+                                let _ = sw.write(
+                                    &empty_batch(output_schema.as_ref()).unwrap(),
+                                    Some(&emd),
+                                );
+                                wrote_error = true;
+                                break;
+                            }
+                        }
                         wrote_data = true;
                     }
                 }
             }
-            if !wrote_data {
+            // A cap overshoot already wrote the EXCEPTION envelope and left
+            // `wrote_data` false; handing back a fresh cursor after it would
+            // invite the client to keep going on a turn that failed.
+            if !wrote_data && !wrote_error {
                 let md = Metadata::from([(STATE_KEY.to_string(), new_token)]);
                 let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
             }

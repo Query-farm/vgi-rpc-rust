@@ -1196,9 +1196,16 @@ impl RpcServer {
                 }
                 #[cfg(feature = "http")]
                 if let Some(cfg) = self.external_config.as_ref() {
-                    if let Ok(Some((ptr, md))) =
-                        crate::external::maybe_externalize_batch(&out_batch, None, cfg)
-                    {
+                    // Declare the response stream's schema on the payload,
+                    // not the batch's: `StreamWriter::write` never reconciles
+                    // the two, so a cosmetic difference is invisible inline and
+                    // a hard client-side mismatch once externalised.
+                    if let Ok(Some((ptr, md))) = crate::external::maybe_externalize_batch(
+                        &out_batch,
+                        &info.result_schema,
+                        None,
+                        cfg,
+                    ) {
                         sw.write(&ptr, Some(&md))?;
                         sw.finish()?;
                         return Ok(());
@@ -1426,6 +1433,7 @@ impl RpcServer {
                         if let Some(cfg) = self.external_config.as_ref() {
                             match crate::external::maybe_externalize_batch(
                                 &batch,
+                                output_schema.as_ref(),
                                 metadata.as_ref(),
                                 cfg,
                             ) {

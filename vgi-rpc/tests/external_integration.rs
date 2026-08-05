@@ -43,7 +43,7 @@ fn round_trip_5mb_uncompressed() {
     let storage = InMemoryStorage::new();
     let cfg = cfg_from(storage.clone(), 64 * 1024, Compression::None);
     let batch = make_batch(1_000_000);
-    let (ptr, md) = maybe_externalize_batch(&batch, None, &cfg)
+    let (ptr, md) = maybe_externalize_batch(&batch, batch.schema().as_ref(), None, &cfg)
         .expect("externalize")
         .expect("threshold exceeded");
     assert_eq!(ptr.num_rows(), 0);
@@ -63,7 +63,7 @@ fn round_trip_with_zstd_compression() {
     let storage = InMemoryStorage::new();
     let cfg = cfg_from(storage.clone(), 16 * 1024, Compression::Zstd(3));
     let batch = make_batch(200_000);
-    let (ptr, md) = maybe_externalize_batch(&batch, None, &cfg)
+    let (ptr, md) = maybe_externalize_batch(&batch, batch.schema().as_ref(), None, &cfg)
         .unwrap()
         .unwrap();
     let (resolved, _) = resolve_external_location(&ptr, &md, &cfg).unwrap();
@@ -79,9 +79,10 @@ fn caller_metadata_preserved_through_externalization() {
         "x-custom".to_string(),
         "value".to_string(),
     )]);
-    let (ptr, md) = maybe_externalize_batch(&batch, Some(&caller_md), &cfg)
-        .unwrap()
-        .unwrap();
+    let (ptr, md) =
+        maybe_externalize_batch(&batch, batch.schema().as_ref(), Some(&caller_md), &cfg)
+            .unwrap()
+            .unwrap();
     assert!(md.iter().any(|(k, v)| k == "x-custom" && v == "value"));
     let _ = ptr; // pointer batch is a zero-row, zero-schema batch
 }
@@ -100,10 +101,12 @@ fn externalized_bytes_are_counted_at_the_upload_choke_point() {
 
     let scope = ExternalizedScope::new();
     // Below the threshold: nothing is uploaded, so nothing is counted.
-    assert!(maybe_externalize_batch(&make_batch(1), None, &cfg)
-        .unwrap()
-        .is_none());
-    let (ptr, _) = maybe_externalize_batch(&batch, None, &cfg)
+    assert!(
+        maybe_externalize_batch(&make_batch(1), make_batch(1).schema().as_ref(), None, &cfg)
+            .unwrap()
+            .is_none()
+    );
+    let (ptr, _) = maybe_externalize_batch(&batch, batch.schema().as_ref(), None, &cfg)
         .expect("externalize")
         .expect("threshold exceeded");
     let one = scope.finish();
@@ -113,7 +116,7 @@ fn externalized_bytes_are_counted_at_the_upload_choke_point() {
     // The total accumulates across every upload the call makes.
     let scope = ExternalizedScope::new();
     for _ in 0..2 {
-        maybe_externalize_batch(&batch, None, &cfg)
+        maybe_externalize_batch(&batch, batch.schema().as_ref(), None, &cfg)
             .expect("externalize")
             .expect("threshold exceeded");
     }

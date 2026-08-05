@@ -593,10 +593,37 @@ fn read_message_bytes(r: &mut impl Read, max_bytes: usize) -> Result<Option<RawM
 /// Serialize one record batch as a complete IPC stream
 /// (schema + batch + EOS), with optional custom metadata on the batch.
 pub fn write_one_batch(batch: &RecordBatch, metadata: Option<&Metadata>) -> Result<Vec<u8>> {
-    let schema = batch.schema();
+    write_one_batch_as(batch, batch.schema().as_ref(), metadata)
+}
+
+/// Like [`write_one_batch`] but declares `schema` on the stream instead of
+/// the batch's own schema, writing the batch's buffers unchanged.
+///
+/// [`StreamWriter::write`] never reconciles a batch against the schema its
+/// stream was opened with — it encodes the buffers and the reader decodes
+/// them under the declared schema. So a batch that differs from its
+/// enclosing stream's schema only cosmetically (field nullability,
+/// dictionary encoding, schema-level metadata) round-trips invisibly while
+/// it stays inline.
+///
+/// That stops being true the moment the batch is lifted onto a *standalone*
+/// stream, as external-location payloads are: the payload declares its own
+/// schema, and a peer that validates it against the schema it was promised
+/// (the enclosing stream's) sees a hard mismatch over a difference that
+/// never mattered before. Passing the enclosing schema here keeps the two
+/// delivery routes indistinguishable.
+///
+/// Deliberately not a cast: the buffers are emitted as-is, so this cannot
+/// silently do nothing the way an "equivalent schemas" fast path in a cast
+/// helper would, and it cannot change the bytes either.
+pub fn write_one_batch_as(
+    batch: &RecordBatch,
+    schema: &Schema,
+    metadata: Option<&Metadata>,
+) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     {
-        let mut w = StreamWriter::new(&mut buf, schema.as_ref())?;
+        let mut w = StreamWriter::new(&mut buf, schema)?;
         w.write(batch, metadata)?;
         w.finish()?;
     }

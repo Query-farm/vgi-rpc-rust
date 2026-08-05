@@ -100,6 +100,8 @@ def _start_rust_http_with_storage(
     *,
     externalize_threshold: int | None = None,
     max_request_bytes: int | None = None,
+    max_response_bytes: int | None = None,
+    max_externalized_response_bytes: int | None = None,
 ) -> tuple[subprocess.Popen, int]:
     args = [RUST_WORKER, "--http-with-storage", storage_url or ""]
     if zstd:
@@ -108,7 +110,23 @@ def _start_rust_http_with_storage(
         args += ["--externalize-threshold", str(externalize_threshold)]
     if max_request_bytes is not None:
         args += ["--max-request-bytes", str(max_request_bytes)]
+    if max_response_bytes is not None:
+        args += ["--max-response-bytes", str(max_response_bytes)]
+    if max_externalized_response_bytes is not None:
+        args += [
+            "--max-externalized-response-bytes",
+            str(max_externalized_response_bytes),
+        ]
     return _spawn_read_port(args)
+
+
+# The externalised-cap fixture's two numbers. Tight external cap, *generous*
+# body cap: an externalised payload leaves only a pointer batch on the wire,
+# so if the body cap were tight too it would fail first and
+# ``TestExternalizedResponseCap`` would pass while proving nothing about the
+# external channel. Mirrors the reference's conftest fixture.
+_EXT_CAP_MAX_EXTERNALIZED_BYTES = 64 * 1024
+_EXT_CAP_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
 # Shared AEAD key for the sticky peer pair. Both workers can open each other's
@@ -183,6 +201,19 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
             return _spawn_read_port(args, expect_port=port)
         if variant == "strict":
             return _spawn_read_port([_VENV_PY, _PY_SERVE_STRICT])
+        if variant == "externalized_cap":
+            return _spawn_read_port(
+                [
+                    _VENV_PY,
+                    _PY_SERVE_STRICT,
+                    "--fake-storage",
+                    storage_url or "",
+                    "--max-externalized-response-bytes",
+                    str(_EXT_CAP_MAX_EXTERNALIZED_BYTES),
+                    "--max-response-bytes",
+                    str(_EXT_CAP_MAX_RESPONSE_BYTES),
+                ]
+            )
         if variant == "auth":
             port = _free_port()
             return _spawn_read_port([_VENV_PY, _PY_SERVE_AUTH, "--port", str(port)], expect_port=port)
@@ -201,6 +232,21 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
             )
         if variant == "strict":
             return _spawn_read_port([RUST_WORKER, "--http", "--strict"])
+        if variant == "externalized_cap":
+            # Storage mode, because the cap under test only bites on the
+            # external channel. `--externalize-threshold 4096` matches the
+            # reference fixture's default so a payload comfortably under the
+            # cap still externalizes (that's the group's control case), and
+            # the request cap is opened up so the *request* body of an
+            # oversized echo isn't what fails.
+            return _start_rust_http_with_storage(
+                storage_url,
+                zstd=False,
+                externalize_threshold=4096,
+                max_request_bytes=_EXT_CAP_MAX_RESPONSE_BYTES,
+                max_response_bytes=_EXT_CAP_MAX_RESPONSE_BYTES,
+                max_externalized_response_bytes=_EXT_CAP_MAX_EXTERNALIZED_BYTES,
+            )
         if variant == "auth":
             return _spawn_read_port([RUST_WORKER, "--http-auth"])
         if variant == "auth_reason":
@@ -417,6 +463,31 @@ def conformance_http_externalize_always_port(conformance_fake_storage: str) -> I
 def conformance_http_strict_cap_port() -> Iterator[int]:
     """HTTP server with strict body + externalised response caps."""
     yield from _http_variant_fixture("strict")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_externalized_cap_port(conformance_fake_storage: str) -> Iterator[int]:
+    """Worker whose *external-channel* cap is the one that bites.
+
+    Backs the shared ``TestExternalizedResponseCap`` group, which asserts
+    that ``max_externalized_response_bytes`` is enforced rather than merely
+    advertised in ``VGI-Max-Externalized-Response-Bytes``.
+
+    Three settings make this fixture mean what it says:
+
+    * storage is wired, so responses can travel the external channel at all;
+    * ``--max-externalized-response-bytes`` is tight (64 KiB), so an
+      externalised response overshoots it;
+    * ``--max-response-bytes`` is deliberately *generous* (8 MiB). An
+      externalised payload leaves only a pointer batch on the wire, so the
+      body cap must never be what fails here — with both caps tight the
+      group would pass while proving nothing about the external cap.
+
+    ``--externalize-threshold`` is set to the reference's 4 KiB default (the
+    Rust worker's storage mode otherwise defaults to 16 KiB) so the group's
+    under-cap control still travels the external channel.
+    """
+    yield from _http_variant_fixture("externalized_cap", conformance_fake_storage)
 
 
 @pytest.fixture(scope="session")

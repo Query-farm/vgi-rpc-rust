@@ -89,8 +89,8 @@ pub const MAX_IPC_MESSAGE_BYTES: usize = u32::MAX as usize;
 /// Growing rather than pre-sizing also keeps the *read* side out of the
 /// trouble [`ChunkedWriter`] fixes on the write side: `impl Read for
 /// &UnixStream` calls `recv(2)` with the length unclamped, exactly as
-/// its `Write` counterpart calls `send(2)`, so handing it a single
-/// >2 GiB spare region would earn the same `EINVAL`. Doubling from here
+/// its `Write` counterpart calls `send(2)`, so handing it a single spare
+/// region past 2 GiB would earn the same `EINVAL`. Doubling from here
 /// means the largest slice ever offered is about half the body — a
 /// 1 GiB read for a 2 GiB message — and never reaches `INT_MAX`.
 const BODY_PREALLOC_LIMIT: usize = 8 * 1024 * 1024;

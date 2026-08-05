@@ -207,21 +207,50 @@ jobs:
       # satisfies every rule that governs it, so the whole payload contract
       # goes unchecked. --require-request-data makes that absence a failure.
       #
-      # No --filter: the suite's zero-parameter methods (void*) send an empty
-      # schema and no row, and they are the exact case a row-demanding
-      # validator gets wrong (v0.36.1 shipped that bug). Do not add a filter
-      # that excludes them. This is also the only step that runs the
-      # `large_payload` group, including the >2 GiB `echo_binary_over_int32_max`
-      # — hence the raised wall-clock budget: moving 2 GiB there and back on a
-      # shared runner takes tens of seconds even when nothing is wrong, and
-      # this test must fail on wrong bytes, never on the stopwatch.
+      # The runner-driven suite with no access log attached. This is where the
+      # `large_payload` group runs, including the >2 GiB
+      # `echo_binary_over_int32_max` that vgi-rpc 0.42.0 made required — the
+      # pytest step above carries no such tests, so the category is reachable
+      # only through `vgi-rpc-test`. The budget is 600s against the
+      # reference's own 300s for that one test: moving 2 GiB there and back on
+      # a shared runner takes tens of seconds even when nothing is wrong, and
+      # it must fail on wrong bytes, never on the stopwatch.
+      - name: Run conformance suite (large payloads included)
+        if: matrix.role == 'server' && matrix.server == 'rust'
+        run: timeout 600 vgi-rpc-test --cmd "${{ github.workspace }}/conformance-worker-rust"
+
+      # Access-log conformance was verified by hand for months and drifted
+      # anyway — four people checked it by inspection and the rule was still
+      # wrong. It runs here now so it cannot silently rot again.
+      #
+      # --access-log-debug is not optional: at INFO the worker omits
+      # `request_data`, and a log that never carries the field trivially
+      # satisfies every rule that governs it, so the whole payload contract
+      # goes unchecked. --require-request-data makes that absence a failure.
+      #
+      # `large_payload` is excluded here, and only here. At --access-log-debug
+      # a record embeds the whole request payload, so both tests in that group
+      # overshoot the emitter's per-record cap; it sheds `request_data` and
+      # marks the record truncated, exactly as access-log-spec §5b prescribes,
+      # and --require-request-data then reports those records as missing the
+      # field. The >2 GiB one is worse than that — a multi-gigabyte JSONL line
+      # to write and schema-validate, which killed the worker outright and
+      # broke every test after it. The group still runs, in the step above.
+      # This step's job is the log's *shape*, which the ordinary payloads
+      # exercise just as well.
+      #
+      # Nothing else is filtered: the suite's zero-parameter methods (void*)
+      # send an empty schema and no row, and they are the exact case a
+      # row-demanding validator gets wrong (v0.36.1 shipped that bug). Do not
+      # add a filter that excludes them.
       - name: Verify access log against the spec
         if: matrix.role == 'server' && matrix.server == 'rust'
         run: |
-          timeout 600 vgi-rpc-test \
+          timeout 300 vgi-rpc-test \
             --cmd "${{ github.workspace }}/conformance-worker-rust --access-log $RUNNER_TEMP/access-log.jsonl --access-log-debug" \
             --access-log "$RUNNER_TEMP/access-log.jsonl" \
-            --require-request-data
+            --require-request-data \
+            --filter '!large_payload'
 
   msrv:
     runs-on: ubuntu-latest

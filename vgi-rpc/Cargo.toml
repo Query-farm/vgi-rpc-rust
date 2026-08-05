@@ -25,7 +25,12 @@ stream-codec = ["dep:bincode"]
 http = ["external", "stream-codec", "dep:axum", "dep:tower-http", "dep:tokio", "dep:hmac", "dep:base64", "dep:rand", "dep:bincode", "dep:chacha20poly1305", "dep:flate2"]
 jwt = []
 jwt-jsonwebtoken = ["jwt", "dep:jsonwebtoken", "dep:reqwest"]
-oauth-pkce = []
+# `auth::pkce` needs base64 (URL-safe challenge/cookie encoding), hmac (state
+# cookie signature) and rand (verifier/nonce entropy). They must be declared
+# here, not inherited from `http`: `oauth-pkce` is usable standalone (a client
+# doing the browser flow without the server stack), and CI's --all-features
+# build masked the missing deps until the narrow-feature matrix was added.
+oauth-pkce = ["dep:base64", "dep:hmac", "dep:rand"]
 oauth-pkce-server = ["oauth-pkce", "http", "dep:reqwest", "dep:urlencoding"]
 mtls-pem = ["dep:x509-parser", "dep:percent-encoding"]
 otel = []
@@ -50,11 +55,84 @@ tracing-subscriber.workspace = true
 trybuild = "1"
 proptest = "1"
 
-# `external_integration` uses `InMemoryStorage`, which is gated on
-# `test-utils` so it doesn't leak into the public crate surface.
+# Integration tests and examples that need a non-default feature must say so.
+# Without `required-features` cargo builds every target under
+# `--all-targets --no-default-features` and the build fails on missing items
+# rather than skipping the target — which is the intended behaviour here.
+# CI only ever runs --all-features, so these were invisible until the
+# narrow-feature matrix was added.
+
+# `external_integration` uses `InMemoryStorage`, gated on `test-utils` so it
+# doesn't leak into the public crate surface, plus the `external` module itself.
 [[test]]
 name = "external_integration"
-required-features = ["test-utils"]
+required-features = ["test-utils", "external"]
+
+# axum/tower router tests: need the server stack.
+[[test]]
+name = "access_log_egress"
+required-features = ["http"]
+
+[[test]]
+name = "http_auth"
+required-features = ["http"]
+
+[[test]]
+name = "http_init_metadata"
+required-features = ["http"]
+
+[[test]]
+name = "http_introspect"
+required-features = ["http"]
+
+[[test]]
+name = "http_load_balance"
+required-features = ["http"]
+
+[[test]]
+name = "http_panic"
+required-features = ["http"]
+
+[[test]]
+name = "http_polish"
+required-features = ["http"]
+
+# Derive-macro tests: need `macros` (and the router, where they serve).
+[[test]]
+name = "arrow_derive"
+required-features = ["macros"]
+
+[[test]]
+name = "stream_state_derive"
+required-features = ["macros", "stream-codec"]
+
+[[test]]
+name = "macro_async"
+required-features = ["macros", "http"]
+
+[[test]]
+name = "macro_smoke"
+required-features = ["macros", "http"]
+
+# The trybuild harness itself compiles bare, but its UI fixtures use
+# `vgi_rpc::service`, `#[derive(StreamState)]` and `vgi_rpc::stream_codec`.
+# Without those the fixtures emit extra unresolved-item errors and the
+# recorded .stderr files no longer match, so gate the target too.
+[[test]]
+name = "macro_compile_fail"
+required-features = ["macros", "stream-codec"]
+
+[[example]]
+name = "hello_unary"
+required-features = ["macros", "http"]
+
+[[example]]
+name = "hello_stream"
+required-features = ["macros", "http"]
+
+[[example]]
+name = "load_balanced"
+required-features = ["macros", "http"]
 
 [dependencies]
 flatbuffers = "25"

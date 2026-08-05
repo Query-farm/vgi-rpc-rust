@@ -33,7 +33,13 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-features --locked
 
+      # The workflow-level `RUSTFLAGS: -D warnings` does not reach rustdoc, so
+      # doc warnings (broken intra-doc links, public items linking to private
+      # ones) scrolled past green for as long as they existed. RUSTDOCFLAGS is
+      # what actually gates them.
       - name: cargo doc
+        env:
+          RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps --all-features --locked
 
       # trybuild creates per-fixture `target/tests/<name>/` sandboxes
@@ -44,6 +50,47 @@ jobs:
       - name: Tidy trybuild sandboxes before cache
         if: always()
         run: rm -rf target/tests
+
+  # Every other job builds --all-features, where each optional dependency is
+  # present no matter which feature pulled it in. That makes it structurally
+  # impossible to catch a feature that fails to declare the crates its own
+  # code uses: `oauth-pkce = []` shipped for months while `auth::pkce` used
+  # base64, hmac and rand, and nothing was red. This job is the only place
+  # narrow feature sets get compiled.
+  feature-matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (MSRV 1.97)
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Enumerated from cargo metadata rather than hard-coded, so a feature
+      # added later is covered without anyone remembering to list it here.
+      - name: Build each vgi-rpc feature in isolation
+        run: |
+          set -euo pipefail
+          echo "::group::--no-default-features"
+          cargo build -p vgi-rpc --no-default-features --locked
+          echo "::endgroup::"
+          feats=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "vgi-rpc") | .features | keys[]')
+          for f in $feats; do
+            echo "::group::--no-default-features --features $f"
+            cargo build -p vgi-rpc --no-default-features --features "$f" --locked
+            echo "::endgroup::"
+          done
+
+      # `--all-targets` under a narrow feature set builds every test, example
+      # and bench. Any that needs a non-default feature must declare
+      # `required-features` so cargo skips it; without that the target is
+      # compiled anyway and fails on items that were configured out.
+      - name: Clippy all targets with no default features
+        run: cargo clippy -p vgi-rpc --no-default-features --all-targets --locked -- -D warnings
 
   conformance:
     runs-on: ubuntu-latest

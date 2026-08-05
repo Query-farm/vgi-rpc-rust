@@ -83,6 +83,10 @@ const SESSION_ENDPOINT: &str = "__session__";
 /// Response bodies smaller than this are never zstd-compressed: below it the
 /// frame overhead dominates and often enlarges the payload, so the CPU and
 /// allocation cost of compressing isn't repaid.
+///
+/// Private, so the public `HttpStateBuilder::response_compression_level` docs
+/// spell the number out rather than link here (a public->private intra-doc
+/// link is a rustdoc warning). Keep the two in sync if this changes.
 const MIN_ZSTD_COMPRESS_BYTES: usize = 1024;
 
 /// zstd level used for response compression when the builder is not told
@@ -592,7 +596,8 @@ impl HttpStateBuilder {
     /// Response compression is **on by default** at
     /// [`DEFAULT_RESPONSE_COMPRESSION_LEVEL`]; this only changes the level.
     /// It applies when the client offers zstd in `X-VGI-Accept-Encoding` or
-    /// `Accept-Encoding` and the body clears [`MIN_ZSTD_COMPRESS_BYTES`].
+    /// `Accept-Encoding` and the body is at least 1024 bytes (bodies below
+    /// that threshold are sent uncompressed).
     /// Use [`HttpStateBuilder::disable_response_compression`] to turn it off.
     pub fn response_compression_level(mut self, level: i32) -> Self {
         self.response_compression_level = Some(Some(level));

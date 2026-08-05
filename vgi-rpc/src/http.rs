@@ -1811,7 +1811,7 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
 
 async fn postprocess_middleware(
     axum::extract::State(state): axum::extract::State<Arc<HttpState>>,
-    req: axum::http::Request<axum::body::Body>,
+    mut req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Response {
     use axum::body::to_bytes;
@@ -1831,15 +1831,25 @@ async fn postprocess_middleware(
         .headers()
         .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
         .cloned();
-    // Echo the caller's correlation id, or mint one. Captured here because
-    // the request is consumed below; set on the way out so it rides every
-    // exit path, including the errors anybody actually looks up.
-    let req_request_id = req
+    // Echo the caller's correlation id, or mint one. Resolved *before* the
+    // handler runs and written back onto the request headers, so a handler
+    // (and the access-log record it produces) sees exactly the value the
+    // response will carry — including the minted case. An id that is on the
+    // response but names a different request in the log is worse than none:
+    // it looks like a working trail right up to the moment someone follows
+    // it. Set on the way out so it rides every exit path, including the
+    // errors anybody actually looks up.
+    let request_id = req
         .headers()
         .get(REQUEST_ID_RESPONSE_HEADER)
         .and_then(|v| v.to_str().ok())
         .filter(|v| !v.is_empty() && v.len() <= 128)
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .unwrap_or_else(new_session_id);
+    if let Ok(v) = HeaderValue::from_str(&request_id) {
+        req.headers_mut()
+            .insert(HeaderName::from_static(REQUEST_ID_RESPONSE_HEADER), v);
+    }
     let req_encoding = pick_response_encoding(req.headers(), state.response_compression_level);
     let req_method = req.method().clone();
     let req_path = req.uri().path();
@@ -1915,7 +1925,6 @@ async fn postprocess_middleware(
     // large responses that matter most.
     attach_cors_headers(&state, &mut parts.headers, req_acrh.as_ref(), false);
     attach_capability_headers(&state, &mut parts.headers, &req_method);
-    let request_id = req_request_id.unwrap_or_else(new_session_id);
     if let Ok(v) = HeaderValue::from_str(&request_id) {
         parts
             .headers
@@ -2662,6 +2671,23 @@ fn cap_error_response(
     (StatusCode::OK, headers, buf).into_response()
 }
 
+/// Stamp `X-VGI-RPC-Error: true` on a 200 whose Arrow body carries an
+/// EXCEPTION batch rather than a result.
+///
+/// A failed RPC answers **200**: the call reached the method and the method
+/// raised, so the failure is application-level and rides the body. The status
+/// line therefore says nothing, and this header is the only signal a client
+/// has short of parsing the stream. It must discriminate — a flag on every
+/// response carries no information, which is the same outage as never
+/// setting it — so call this only on the error paths.
+///
+/// Transport-level rejections (400/404/415/401) keep their status and do
+/// *not* carry the flag; it marks a 200 that is really a failure.
+fn stamp_rpc_error(resp: &mut Response) {
+    resp.headers_mut()
+        .insert(RPC_ERROR_HEADER, HeaderValue::from_static("true"));
+}
+
 fn plain_error(status: StatusCode, msg: String) -> Response {
     (status, msg).into_response()
 }
@@ -3168,6 +3194,19 @@ async fn handle_unary(
         ctx.set_sticky(s);
     }
     let mut dispatch_info = crate::hooks::DispatchInfo::from_request(&server, &req, "unary", &auth);
+    // Log the HTTP correlation id, not the Arrow-level one. `X-Request-ID`
+    // on the response and `request_id` in the record have to name the same
+    // request or the trail cannot be joined; `postprocess_middleware`
+    // normalizes the inbound header to the value it will stamp on the way
+    // out, so reading it here is what makes the two agree. Falls back to the
+    // wire request id for a handler reached without that middleware.
+    if let Some(id) = headers
+        .get(REQUEST_ID_RESPONSE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+    {
+        dispatch_info.request_id = id.to_string();
+    }
     let hook = server.dispatch_hook.clone();
     // Records cannot be written here: response compression runs after this
     // handler returns, so the on-wire size is not known yet. Park them in a
@@ -3286,6 +3325,11 @@ async fn handle_unary(
         }
     }
     let mut resp = arrow_response(StatusCode::OK, buf);
+    if app_err.is_some() {
+        // The handler raised (or externalisation failed): the body is an
+        // EXCEPTION batch behind a 200, so flag it.
+        stamp_rpc_error(&mut resp);
+    }
     if let Some(s) = sticky_sink.as_ref() {
         stamp_session_headers(&mut resp, &state, s);
     }
@@ -3364,10 +3408,12 @@ async fn handle_stream_init(
     let sr = match init_result {
         Ok(s) => s,
         Err(err) => {
-            return arrow_response(
+            let mut resp = arrow_response(
                 StatusCode::OK,
                 error_stream_bytes(&empty_schema(), &err, &server.server_id, &req.request_id),
             );
+            stamp_rpc_error(&mut resp);
+            return resp;
         }
     };
 
@@ -3397,7 +3443,9 @@ async fn handle_stream_init(
     let stream_id = new_session_id();
 
     let mut finished = false;
-    let mut init_error: Option<RpcError> = None;
+    // Set when the body ends up carrying an EXCEPTION envelope — either the
+    // producer's first turn raised, or the state token could not be minted.
+    let mut wrote_error = false;
     {
         let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
         if header.is_none() {
@@ -3411,7 +3459,7 @@ async fn handle_stream_init(
             // The producer's first turn folds into this /init request, so the
             // init request's custom metadata is what the pipe transports
             // would have delivered on the first tick batch.
-            finished = run_producer(
+            let turn = run_producer(
                 &mut sw,
                 &mut ss,
                 &output_schema,
@@ -3421,6 +3469,8 @@ async fn handle_stream_init(
                 sticky_sink.as_ref(),
                 Some(req.metadata.as_ref()),
             );
+            finished = turn.finished;
+            wrote_error |= turn.errored;
         }
         if !finished {
             match build_init_tokens(
@@ -3446,15 +3496,19 @@ async fn handle_stream_init(
                     // instead of a hung stream.
                     let md = build_error_metadata(&err, &server.server_id, &req.request_id);
                     let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
-                    init_error = Some(err);
+                    wrote_error = true;
                 }
             }
         }
         let _ = sw.finish();
     }
-    let _ = init_error; // surfaced via error envelope already
 
     let mut resp = arrow_response(StatusCode::OK, body_buf);
+    if wrote_error {
+        // The body is an EXCEPTION envelope behind a 200; without the flag a
+        // client reads the failure as a result.
+        stamp_rpc_error(&mut resp);
+    }
     if let Some(s) = sticky_sink.as_ref() {
         stamp_session_headers(&mut resp, &state, s);
     }
@@ -3511,6 +3565,19 @@ fn build_cursor_token(
     Ok(state.pack_cursor_token(auth, &state_bytes, call_id))
 }
 
+/// Outcome of one HTTP producer turn.
+///
+/// `errored` is separate from `finished` because a raising `produce` ends the
+/// turn exactly like a clean completion does: both stop the loop, but only one
+/// leaves an EXCEPTION envelope in the body, and that is the case the enclosing
+/// 200 must be flagged for.
+struct ProducerTurn {
+    /// The stream is over — no continuation token should be minted.
+    finished: bool,
+    /// The turn wrote an EXCEPTION envelope rather than data.
+    errored: bool,
+}
+
 /// `first_tick_md` is surfaced as [`CallContext::tick_metadata`] on the FIRST
 /// `produce` call only. On the pipe transports a producer's first turn is a
 /// distinct tick batch whose custom metadata reaches the worker; over HTTP
@@ -3528,7 +3595,7 @@ fn run_producer<W: std::io::Write>(
     limit: usize,
     sticky: Option<&Arc<crate::sticky::StickySinkImpl>>,
     first_tick_md: Option<&Metadata>,
-) -> bool {
+) -> ProducerTurn {
     // Continuation producers run without auth context (session-bound).
     let mut ctx = CallContext::for_request(server, req);
     if let Some(s) = sticky {
@@ -3562,7 +3629,10 @@ fn run_producer<W: std::io::Write>(
         if let Err(err) = result {
             let md = build_error_metadata(&err, &server.server_id, &req.request_id);
             let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
-            return true;
+            return ProducerTurn {
+                finished: true,
+                errored: true,
+            };
         }
         let finished = out.finished();
         let mut emitted_data = false;
@@ -3582,14 +3652,23 @@ fn run_producer<W: std::io::Write>(
             batches_written += 1;
         }
         if finished {
-            return true;
+            return ProducerTurn {
+                finished: true,
+                errored: false,
+            };
         }
         if !emitted_data {
             // Guard against degenerate producers that neither emit nor finish.
-            return true;
+            return ProducerTurn {
+                finished: true,
+                errored: false,
+            };
         }
     }
-    false
+    ProducerTurn {
+        finished: false,
+        errored: false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3713,12 +3792,12 @@ async fn handle_stream_exchange(
 
     if matches!(ss, StreamStateKind::Producer(_)) {
         // Producer continuation.
-        let finished;
+        let mut wrote_error = false;
         {
             let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
             // A continuation turn is not the producer's first tick, so it
             // carries no first-tick metadata.
-            finished = run_producer(
+            let turn = run_producer(
                 &mut sw,
                 &mut ss,
                 &output_schema,
@@ -3728,7 +3807,8 @@ async fn handle_stream_exchange(
                 sticky_sink.as_ref(),
                 None,
             );
-            if !finished {
+            wrote_error |= turn.errored;
+            if !turn.finished {
                 match build_cursor_token(&state, &auth, &ss, &unpacked.call_id) {
                     Ok(new_token) => {
                         let md = Metadata::from([(STATE_KEY.to_string(), new_token)]);
@@ -3737,12 +3817,16 @@ async fn handle_stream_exchange(
                     Err(err) => {
                         let md = build_error_metadata(&err, &server.server_id, &req.request_id);
                         let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                        wrote_error = true;
                     }
                 }
             }
             let _ = sw.finish();
         }
         let mut resp = arrow_response(StatusCode::OK, body_buf);
+        if wrote_error {
+            stamp_rpc_error(&mut resp);
+        }
         if let Some(s) = sticky_sink.as_ref() {
             stamp_session_headers(&mut resp, &state, s);
         }
@@ -3759,7 +3843,9 @@ async fn handle_stream_exchange(
                 let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                 let _ = sw.finish();
                 drop(sw);
-                return arrow_response(StatusCode::OK, body_buf);
+                let mut resp = arrow_response(StatusCode::OK, body_buf);
+                stamp_rpc_error(&mut resp);
+                return resp;
             }
         },
         _ => batch,
@@ -3771,6 +3857,7 @@ async fn handle_stream_exchange(
         _ => unreachable!(),
     };
 
+    let mut wrote_error = false;
     {
         let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
         for log in ctx.drain_logs() {
@@ -3780,6 +3867,7 @@ async fn handle_stream_exchange(
         if let Err(err) = res {
             let md = build_error_metadata(&err, &server.server_id, &req.request_id);
             let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+            wrote_error = true;
         } else {
             let new_token = match build_cursor_token(&state, &auth, &ss, &unpacked.call_id) {
                 Ok(t) => t,
@@ -3788,7 +3876,9 @@ async fn handle_stream_exchange(
                     let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                     let _ = sw.finish();
                     drop(sw);
-                    return arrow_response(StatusCode::OK, body_buf);
+                    let mut resp = arrow_response(StatusCode::OK, body_buf);
+                    stamp_rpc_error(&mut resp);
+                    return resp;
                 }
             };
             let mut wrote_data = false;
@@ -3822,6 +3912,11 @@ async fn handle_stream_exchange(
         &server.server_id,
         "",
     );
+    if wrote_error {
+        // The handler raised; the envelope is in the body behind a 200.
+        // (A cap overshoot is already flagged by `cap_error_response`.)
+        stamp_rpc_error(&mut resp);
+    }
     if let Some(s) = sticky_sink.as_ref() {
         stamp_session_headers(&mut resp, &state, s);
     }

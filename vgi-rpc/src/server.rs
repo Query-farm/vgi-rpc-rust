@@ -90,9 +90,10 @@ impl ConnectionShm {
 
 #[cfg(not(feature = "shm"))]
 impl ConnectionShm {
-    #[inline]
-    fn refresh(&mut self, _req_md: &Metadata) {}
-
+    // No `refresh` counterpart: both call sites live inside the
+    // `#[cfg(feature = "shm")]` arm of `read_request`, so a no-op stub here
+    // is dead code — and CI builds with `-D warnings`, which `--all-features`
+    // structurally cannot catch.
     #[inline]
     fn segment(&self) -> Option<&ShmSegment> {
         None

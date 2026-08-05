@@ -352,6 +352,38 @@ def conformance_http_cold_call_cache_port() -> Iterator[int]:
 
 
 @pytest.fixture(scope="session")
+def conformance_http_access_log(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[int, Path]]:
+    """HTTP conformance server writing JSONL access records; yields ``(port, path)``.
+
+    Backs the shared ``TestRequestId`` correlation case. Asserting that the
+    ``X-Request-ID`` on a response equals the ``request_id`` in the record
+    means reading back what the server logged for a request the suite made —
+    nothing observable on the wire alone can stand in for it, which is why
+    the case is gated on a fixture rather than derived.
+
+    The fixture name is load-bearing: the shared suite looks it up with
+    ``getfixturevalue`` and skips the correlation case if it is missing.
+
+    Wired for ``SERVER == "rust"`` only. The Python reference grew
+    ``--access-log`` on its serve script in 0.37.1, so an older checkout would
+    spawn a worker that swallows the flag and writes nothing — a silent pass
+    of an assertion that never ran, which is the failure mode this whole group
+    exists to prevent.
+    """
+    if SERVER != "rust":
+        pytest.skip(f"access-log worker not wired for SERVER={SERVER}")
+    log_path = tmp_path_factory.mktemp("accesslog") / "conformance.jsonl"
+    proc, port = _spawn_read_port([*_worker_cmd("http"), "--access-log", str(log_path)])
+    try:
+        yield port, log_path
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
 def conformance_fake_storage() -> Iterator[str]:
     """Run the in-memory ``vgi_rpc.conformance.fake_storage`` HTTP service."""
     from vgi_rpc.conformance.fake_storage import serve_in_thread

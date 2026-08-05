@@ -1770,9 +1770,11 @@ pub async fn serve_with_shutdown(
 }
 
 /// Absolute ceiling on a buffered HTTP response body in the
-/// post-processing middleware. Mirrors `wire::MAX_IPC_MESSAGE_BYTES` —
-/// large enough for any reasonable Arrow batch, small enough that the
-/// middleware can never be driven to exhaust the heap.
+/// post-processing middleware — large enough for any reasonable Arrow
+/// batch, small enough that the middleware can never be driven to
+/// exhaust the heap. Deliberately *not* tied to
+/// `wire::MAX_IPC_MESSAGE_BYTES`, which is a sanity bound on a claimed
+/// frame size rather than a policy limit on a response.
 ///
 /// This is **distinct** from the operator's `max_response_bytes`, which
 /// is a *soft* producer-side cap: a producer is allowed to overshoot it

@@ -22,9 +22,11 @@
 //! [`StreamReader::new`] pre-validates the schema-message length prefix
 //! against [`MAX_IPC_SCHEMA_BYTES`] *before* allocating; a remote
 //! client cannot trigger a multi-gigabyte alloc by sending a crafted
-//! 4-byte payload. Each subsequent message body is also bounded by
-//! [`MAX_IPC_MESSAGE_BYTES`] before we allocate, mitigating the
-//! flatbuffer-`bodyLength` overshoot that the fuzz harness surfaced.
+//! 4-byte payload. A per-batch message body is bounded twice: an absurd
+//! `bodyLength` is refused outright against [`MAX_IPC_MESSAGE_BYTES`],
+//! and what survives that is buffered as the peer actually delivers it
+//! rather than on the strength of the claim — so the flatbuffer
+//! overshoot the fuzz harness surfaced costs a few MiB and an EOF.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -61,17 +63,113 @@ pub fn md_get<'a>(md: &'a Metadata, key: &str) -> Option<&'a str> {
 pub const MAX_IPC_SCHEMA_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum permitted total size of any per-batch IPC message (header
-/// flatbuffer + body bytes). Default 256 MiB — large enough for any
-/// reasonable Arrow batch, small enough to refuse the
-/// `bodyLength = 0x4000000100000` overshoot the fuzz harness
-/// surfaced.
-pub const MAX_IPC_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+/// flatbuffer + body bytes) — the sanity ceiling that refuses the
+/// `bodyLength = 0x4000000100000` overshoot the fuzz harness surfaced.
+///
+/// This used to be 256 MiB, which also made it a hard limit on
+/// *legitimate* payloads: a >2 GiB `large_binary` round-trip is well
+/// within what the Python reference accepts, and the
+/// `large_payload.echo_binary_over_int32_max` conformance test sends
+/// exactly that. Refusing it was a conformance defect, not a defence.
+///
+/// The ceiling no longer carries the anti-OOM job on its own —
+/// `read_message_bytes` grows the body buffer from the bytes that
+/// actually arrive (see `BODY_PREALLOC_LIMIT`), so a crafted length
+/// costs a few MiB and an EOF rather than the amount it claimed.
+/// `u32::MAX` keeps the constant expressible on 32-bit targets, where
+/// it saturates to `usize::MAX` and the allocation guard is the only
+/// one that can meaningfully apply anyway.
+pub const MAX_IPC_MESSAGE_BYTES: usize = u32::MAX as usize;
+
+/// Bytes reserved up front for a message body before any of it has
+/// arrived. Beyond this the buffer grows amortised as the peer actually
+/// delivers, so a header claiming a petabyte cannot turn a 4-byte frame
+/// into a multi-gigabyte allocation.
+///
+/// Growing rather than pre-sizing also keeps the *read* side out of the
+/// trouble [`ChunkedWriter`] fixes on the write side: `impl Read for
+/// &UnixStream` calls `recv(2)` with the length unclamped, exactly as
+/// its `Write` counterpart calls `send(2)`, so handing it a single
+/// >2 GiB spare region would earn the same `EINVAL`. Doubling from here
+/// means the largest slice ever offered is about half the body — a
+/// 1 GiB read for a 2 GiB message — and never reaches `INT_MAX`.
+const BODY_PREALLOC_LIMIT: usize = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Writer
 // ---------------------------------------------------------------------------
 
 const CONTINUATION_MARKER: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+
+/// Largest slice offered to a single underlying `write` call.
+///
+/// Sits well under `INT_MAX`, which is where the two macOS failure modes
+/// live (see [`ChunkedWriter`]). Slicing is free, so the whole cost of
+/// the clamp is one extra syscall per gigabyte.
+const MAX_WRITE_CHUNK: usize = 1 << 30; // 1 GiB
+
+/// Clamp every `write` to [`MAX_WRITE_CHUNK`] so a large payload
+/// survives the syscall underneath.
+///
+/// Every raw transport writer here is unbuffered on purpose, so one
+/// `write` maps onto one `write(2)` / `send(2)`. That syscall is not
+/// obliged to accept the whole buffer, and above 2 GiB on macOS it
+/// refuses to — in one of two different ways depending on what is
+/// underneath:
+///
+/// * **pipes** return a short count of exactly `INT_MAX` with *no
+///   error*, so a writer that trusts the return value silently drops
+///   the tail and the peer blocks forever waiting for bytes the Arrow
+///   IPC header promised. The symptom is a deadlock, not an exception.
+/// * **sockets** (Unix domain and TCP) fail outright with `EINVAL`.
+///
+/// Both halves are needed. `io::Write::write_all` already loops on the
+/// returned count, and `std`'s file-descriptor writer clamps to
+/// `INT_MAX` for us — but `impl Write for &UnixStream` and `&TcpStream`
+/// do *not* go through it. They call `send(2)` with
+/// `cmp::min(buf.len(), wrlen_t::MAX)`, and `wrlen_t` is `usize` on
+/// unix, so the length reaches the kernel unclamped and a >2 GiB Arrow
+/// IPC body dies with `EINVAL`. Clamping here is what makes the socket
+/// transports behave like the pipe ones.
+///
+/// Deliberately does *not* forward `write_vectored`: the default
+/// implementation routes back through `write`, which is where the clamp
+/// lives.
+struct ChunkedWriter<W: Write> {
+    inner: W,
+    limit: usize,
+}
+
+impl<W: Write> ChunkedWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            limit: MAX_WRITE_CHUNK,
+        }
+    }
+
+    /// Same behaviour with a smaller clamp, so the chunking can be
+    /// exercised without allocating a gigabyte.
+    #[cfg(test)]
+    fn with_limit(inner: W, limit: usize) -> Self {
+        Self { inner, limit }
+    }
+
+    fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+}
+
+impl<W: Write> Write for ChunkedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let end = buf.len().min(self.limit);
+        self.inner.write(&buf[..end])
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 /// A streaming IPC writer that supports per-batch custom metadata.
 ///
@@ -81,8 +179,13 @@ const CONTINUATION_MARKER: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
 /// Each call to [`write`](Self::write) emits one record-batch message
 /// (preceded by any newly-needed dictionary messages) with its
 /// `custom_metadata` attached at the IPC Message level.
+///
+/// Every byte the crate puts on a transport passes through here, which
+/// is why the `ChunkedWriter` clamp lives at this level rather than in
+/// each transport: `serve` takes an arbitrary `W`, so a worker that
+/// hands it a raw socket gets the same protection as `serve_unix` does.
 pub struct StreamWriter<W: Write> {
-    writer: W,
+    writer: ChunkedWriter<W>,
     schema: SchemaRef,
     opts: IpcWriteOptions,
     data_gen: IpcDataGenerator,
@@ -96,7 +199,8 @@ pub struct StreamWriter<W: Write> {
 
 impl<W: Write> StreamWriter<W> {
     /// Create a new writer and emit the schema message.
-    pub fn new(mut writer: W, schema: &Schema) -> Result<Self> {
+    pub fn new(writer: W, schema: &Schema) -> Result<Self> {
+        let mut writer = ChunkedWriter::new(writer);
         let opts = IpcWriteOptions::default();
         let data_gen = IpcDataGenerator::default();
         let mut dict_tracker = DictionaryTracker::new(false);
@@ -167,7 +271,7 @@ impl<W: Write> StreamWriter<W> {
     }
 
     pub fn get_mut(&mut self) -> &mut W {
-        &mut self.writer
+        self.writer.get_mut()
     }
 }
 
@@ -522,6 +626,13 @@ fn read_exact(r: &mut impl Read, buf: &mut [u8]) -> Result<bool> {
 /// Read one IPC message off `r`, capping the header and body at
 /// `max_bytes` so a crafted length prefix or flatbuffer
 /// `bodyLength` cannot trigger an unbounded allocation.
+///
+/// The header flatbuffer has to be buffered whole before it can be
+/// parsed, so its length prefix is checked against `max_bytes` and
+/// allocated outright. The body is not: it is grown from the bytes the
+/// peer actually delivers, so the ceiling can be generous enough for a
+/// legitimate multi-gigabyte batch without a lying `bodyLength` costing
+/// more than [`BODY_PREALLOC_LIMIT`] and an EOF.
 fn read_message_bytes(r: &mut impl Read, max_bytes: usize) -> Result<Option<RawMessage>> {
     let mut prefix = [0u8; 4];
     if !read_exact(r, &mut prefix)? {
@@ -554,9 +665,9 @@ fn read_message_bytes(r: &mut impl Read, max_bytes: usize) -> Result<Option<RawM
     if !read_exact(r, &mut message_bytes)? {
         return Err(RpcError::new("IOError", "unexpected EOF in message body"));
     }
-    // Parse just enough to learn the body length, then cap it the same
-    // way before allocating. This blocks the `bodyLength = 1 TB`
-    // attack vector even when the header itself is small.
+    // Parse just enough to learn the body length, then refuse an absurd
+    // claim outright. This blocks the `bodyLength = 1 TB` attack vector
+    // even when the header itself is small.
     let msg = root_as_message(&message_bytes)
         .map_err(|e| RpcError::new("IPC", format!("parse message header: {e}")))?;
     let body_length_signed = msg.bodyLength();
@@ -566,19 +677,31 @@ fn read_message_bytes(r: &mut impl Read, max_bytes: usize) -> Result<Option<RawM
             format!("IPC message has negative bodyLength ({body_length_signed})"),
         ));
     }
-    let body_length = body_length_signed as usize;
-    if body_length > max_bytes {
+    // Compare in u64: on a 32-bit target the claim can exceed anything
+    // `usize` can hold, and truncating first would let it wrap under the
+    // cap.
+    if body_length_signed as u64 > max_bytes as u64 {
         return Err(RpcError::new(
             "IPC",
             format!(
-                "IPC message bodyLength {body_length} bytes exceeds cap {max_bytes} — \
+                "IPC message bodyLength {body_length_signed} bytes exceeds cap {max_bytes} — \
                  refusing to allocate before parsing"
             ),
         ));
     }
-    let mut body = vec![0u8; body_length];
-    if body_length > 0 && !read_exact(r, &mut body)? {
-        return Err(RpcError::new("IOError", "unexpected EOF in message body"));
+    let body_length = body_length_signed as usize;
+    // Reserve only what a normal batch needs; past that the buffer grows
+    // as the bytes arrive, so the peer pays for the size it claimed
+    // before we do.
+    let mut body = Vec::with_capacity(body_length.min(BODY_PREALLOC_LIMIT));
+    if body_length > 0 {
+        let read = (&mut *r)
+            .take(body_length as u64)
+            .read_to_end(&mut body)
+            .map_err(RpcError::from)?;
+        if read != body_length {
+            return Err(RpcError::new("IOError", "unexpected EOF in message body"));
+        }
     }
     Ok(Some(RawMessage {
         message_bytes,
@@ -710,6 +833,68 @@ mod tests {
     use super::*;
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field};
+
+    /// Records what each `write` call was *offered* and honours a
+    /// caller-chosen short-count, so both halves of the large-payload
+    /// contract can be observed: the clamp and the retry.
+    struct SabotageWriter {
+        offered: Vec<usize>,
+        accept: usize,
+        sink: Vec<u8>,
+    }
+
+    impl Write for SabotageWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.offered.push(buf.len());
+            let n = buf.len().min(self.accept);
+            self.sink.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn chunked_writer_clamps_and_retries() {
+        // A macOS pipe answers a >2 GiB write with a short count and no
+        // error; a macOS socket answers it with EINVAL. Surviving both
+        // needs the clamp *and* the loop, so assert both here rather
+        // than trusting `write_all` alone.
+        let mut w = ChunkedWriter::with_limit(
+            SabotageWriter {
+                offered: Vec::new(),
+                accept: 3,
+                sink: Vec::new(),
+            },
+            8,
+        );
+        let payload: Vec<u8> = (0..50u8).collect();
+        w.write_all(&payload).unwrap();
+        let inner = w.get_mut();
+        assert!(
+            inner.offered.iter().all(|n| *n <= 8),
+            "a write was offered more than the clamp: {:?}",
+            inner.offered
+        );
+        assert_eq!(inner.sink, payload, "short writes lost bytes");
+    }
+
+    #[test]
+    fn write_chunk_stays_under_int_max() {
+        // The clamp is only worth anything if it lands below the size at
+        // which macOS starts rejecting or truncating.
+        assert!(MAX_WRITE_CHUNK < i32::MAX as usize);
+    }
+
+    #[test]
+    fn oversized_body_claim_costs_nothing_to_refuse() {
+        // The ceiling is generous enough for a legitimate multi-gigabyte
+        // batch, so the flatbuffer overshoot the fuzzer found has to be
+        // refused by the cap and not by a lucky allocation failure.
+        assert!(MAX_IPC_MESSAGE_BYTES as u64 > (1u64 << 31) + 1);
+        assert!((0x4000000100000u64) > MAX_IPC_MESSAGE_BYTES as u64);
+    }
 
     #[test]
     fn roundtrip_with_metadata() {

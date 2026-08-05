@@ -152,6 +152,12 @@ jobs:
         #   that stopped rejecting zero-parameter calls. An older vgi-rpc has
         #   no such flag, so the access-log step below would either not parse
         #   or enforce nothing.
+        # 0.42.0: the `large_payload` group, and specifically
+        #   `echo_binary_over_int32_max` running unconditionally rather than
+        #   behind an env gate. It crosses INT_MAX, which is where a single
+        #   pipe/socket write stops accepting a whole buffer; the failure it
+        #   catches presents as a hang, not an error, so a suite that skips
+        #   it proves nothing.
         # The `conformance` extra pulls jsonschema, which `vgi-rpc-test
         # --access-log` needs to check records against access_log.schema.json.
         run: |
@@ -159,7 +165,7 @@ jobs:
           if [ "${{ matrix.server }}" = "python" ]; then
             pip install -e "./vgi-python[http,cli,external,conformance]" pytest pytest-timeout httpx
           else
-            pip install "vgi-rpc[http,cli,external,conformance]>=0.37.0" pytest pytest-timeout httpx
+            pip install "vgi-rpc[http,cli,external,conformance]>=0.42.0" pytest pytest-timeout httpx
           fi
 
       - name: Build conformance worker (+ client-driver for the client role)
@@ -204,11 +210,15 @@ jobs:
       # No --filter: the suite's zero-parameter methods (void*) send an empty
       # schema and no row, and they are the exact case a row-demanding
       # validator gets wrong (v0.36.1 shipped that bug). Do not add a filter
-      # that excludes them.
+      # that excludes them. This is also the only step that runs the
+      # `large_payload` group, including the >2 GiB `echo_binary_over_int32_max`
+      # — hence the raised wall-clock budget: moving 2 GiB there and back on a
+      # shared runner takes tens of seconds even when nothing is wrong, and
+      # this test must fail on wrong bytes, never on the stopwatch.
       - name: Verify access log against the spec
         if: matrix.role == 'server' && matrix.server == 'rust'
         run: |
-          timeout 120 vgi-rpc-test \
+          timeout 600 vgi-rpc-test \
             --cmd "${{ github.workspace }}/conformance-worker-rust --access-log $RUNNER_TEMP/access-log.jsonl --access-log-debug" \
             --access-log "$RUNNER_TEMP/access-log.jsonl" \
             --require-request-data

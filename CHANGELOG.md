@@ -70,6 +70,25 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
   `access_sink`, and now implements `Default` so a later field addition does
   not break struct literals.
 
+### Fixed
+
+- **Payloads over 2 GiB survive the unix and TCP transports.** `impl Write for
+  &UnixStream` / `&TcpStream` hand the full length to `send(2)` without the
+  `INT_MAX` clamp `std`'s file-descriptor writer applies, so on macOS a >2 GiB
+  Arrow IPC body died with `EINVAL` on both socket transports (pipes were
+  already fine). Every write out of `wire::StreamWriter` is now clamped to
+  1 GiB, which covers the transports the crate ships *and* a worker that hands
+  `serve` a socket of its own. Linux hides the whole class — it caps a single
+  transfer at `0x7ffff000` and returns a short count `write_all` absorbs — so
+  the Linux CI could not have found this.
+- **`wire::MAX_IPC_MESSAGE_BYTES` no longer caps legitimate payloads at
+  256 MiB.** It was doing two jobs: refusing an absurd `bodyLength` before
+  allocating on it, and — incidentally — imposing a hard size limit the Python
+  reference does not have, which made a >2 GiB round-trip a conformance
+  failure. The anti-OOM job now belongs to the reader, which buffers a body
+  from the bytes that actually arrive rather than from the claim, so a crafted
+  length costs a few MiB and an EOF. The ceiling moves to `u32::MAX`.
+
 ## [0.17.0] — 2026-07-27
 
 ### Added

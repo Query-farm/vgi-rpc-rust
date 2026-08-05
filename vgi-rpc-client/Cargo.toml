@@ -23,7 +23,7 @@ unix = []
 shm = ["vgi-rpc/shm"]
 
 [dependencies]
-vgi-rpc = { path = "../vgi-rpc", version = "0.17.0", default-features = false }
+vgi-rpc = { path = "../vgi-rpc", version = "0.18.0", default-features = false }
 arrow-array.workspace = true
 arrow-schema.workspace = true
 arrow-ipc.workspace = true
@@ -39,6 +39,6 @@ sha2 = { workspace = true, optional = true }
 [dev-dependencies]
 arrow-cast.workspace = true
 # Spin up a real axum HTTP server in-process for round-trip tests.
-vgi-rpc = { path = "../vgi-rpc", version = "0.17.0", features = ["http"] }
+vgi-rpc = { path = "../vgi-rpc", version = "0.18.0", features = ["http"] }
 tokio = { workspace = true }
 axum = { workspace = true }

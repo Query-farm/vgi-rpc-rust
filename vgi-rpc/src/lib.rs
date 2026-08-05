@@ -41,6 +41,7 @@ pub mod stream_codec;
 pub mod tcp;
 pub mod transport;
 pub mod transport_options;
+pub mod unauthorized;
 #[cfg(unix)]
 pub mod unix;
 pub(crate) mod util;
@@ -63,7 +64,10 @@ pub use errors::{Result, RpcError};
 pub use external::{
     upload_url_params_schema, upload_url_response_schema, MAX_UPLOAD_URL_COUNT, UPLOAD_URL_METHOD,
 };
-pub use hooks::{CallStatistics, ChainHook, DispatchHook, DispatchInfo, HookToken, SharedHook};
+pub use hooks::{
+    AccessSink, CallStatistics, ChainHook, DeferredRecord, DispatchHook, DispatchInfo, HookToken,
+    SharedHook,
+};
 pub use intermediary::{
     build_error_stream, find_protocol_version, find_state_token, read_request, read_unary_result,
     write_request, write_unary_result,

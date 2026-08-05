@@ -28,6 +28,49 @@ use crate::errors::{Result, RpcError};
 use crate::metadata::{LOCATION_FETCH_MS_KEY, LOCATION_KEY, LOCATION_SHA256_KEY};
 use crate::wire::{bytes_to_hex, empty_batch, md_get, write_one_batch, Metadata, StreamReader};
 
+thread_local! {
+    /// Bytes uploaded to external storage during the call in flight.
+    ///
+    /// Externalised payloads never appear in the response body — only a
+    /// pointer batch does — so they are invisible to any accounting done at
+    /// the transport, and for egress they are usually the larger number by
+    /// orders of magnitude. Incremented at the single upload choke point in
+    /// [`maybe_externalize_batch`], so a new upload path cannot drift from
+    /// the total; scoped and read by [`ExternalizedScope`].
+    static EXTERNALIZED_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Per-call accounting scope for externalised uploads.
+///
+/// Reads the total on [`finish`](Self::finish) and restores whatever the
+/// enclosing scope had accumulated, so a nested dispatch cannot swallow its
+/// caller's count. Uploads run synchronously on the dispatch thread (the HTTP
+/// path enters them via `block_in_place`), which is what makes a thread-local
+/// the right carrier here — but it also means the scope must not straddle an
+/// `.await`.
+pub struct ExternalizedScope {
+    outer: u64,
+}
+
+impl ExternalizedScope {
+    /// Begin counting this call's uploads from zero.
+    pub fn new() -> Self {
+        let outer = EXTERNALIZED_BYTES.with(|c| c.replace(0));
+        Self { outer }
+    }
+
+    /// Bytes uploaded within this scope; restores the enclosing total.
+    pub fn finish(self) -> u64 {
+        EXTERNALIZED_BYTES.with(|c| c.replace(self.outer))
+    }
+}
+
+impl Default for ExternalizedScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Optional body compression for externalized payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Compression {
@@ -479,6 +522,10 @@ pub fn maybe_externalize_batch(
     }
     let sha = sha256_hex(&ipc_bytes);
     let payload = compress(&ipc_bytes, cfg.compression)?;
+    // Counted here rather than at the call sites: this is the one function
+    // every externalised payload passes through, so the total cannot drift
+    // from reality because someone added a new upload path.
+    EXTERNALIZED_BYTES.with(|c| c.set(c.get() + payload.len() as u64));
     let upload = cfg.storage.upload(&payload, cfg.compression)?;
     // Validator runs over the final URL.
     (cfg.url_validator)(&upload.url)?;

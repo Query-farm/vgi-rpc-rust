@@ -414,7 +414,13 @@ pub fn proof_authenticate(
                     // any detail would reflect attacker-supplied text. The
                     // reason goes to logs only.
                     tracing_reason(err.reason);
-                    return Err(RpcError::permission_error("proxy proof required"));
+                    // Absent, malformed, and bad-MAC proofs are indistinguishable
+                    // to the caller — the uniform-rejection rule of the
+                    // proxy-proof spec.
+                    return Err(RpcError::auth_failure(
+                        crate::unauthorized::AuthReason::ProxyRequired,
+                        "proxy proof required",
+                    ));
                 }
                 vec![
                     ("verified".to_string(), "false".to_string()),

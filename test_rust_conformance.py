@@ -116,12 +116,18 @@ def _start_rust_http_with_storage(
 # the server_id comparison, not from a decrypt failure.
 _STICKY_PEER_TOKEN_KEY = "5f" * 32
 
+# The one origin the CORS worker grants. Fixed by the shared suite: TestCors
+# preflights with exactly this value, so a worker configured with any other
+# would answer every probe with a refusal that reads as "CORS unimplemented".
+_CORS_ORIGIN = "https://conformance.example"
+
 
 def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[subprocess.Popen, int]:
     """Spawn an HTTP conformance server of `variant` for the current SERVER.
 
     variant ∈ {plain, no_compression, storage, zstd_storage, externalize_always,
-    strict, auth, sticky_short_ttl, sticky_peer_a, sticky_peer_b, sticky_auth}.
+    strict, auth, sticky_short_ttl, sticky_peer_a, sticky_peer_b, sticky_auth,
+    cors, introspect}.
     Raises ``pytest.skip`` for (server, variant) combinations not wired here
     (the Go conformance binary doesn't expose the storage/strict/auth modes).
 
@@ -136,6 +142,10 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
             return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http"])
         if variant == "no_compression":
             return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--no-compression"])
+        if variant == "cold_call_cache":
+            return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--no-call-state-cache"])
+        if variant == "auth_reason":
+            return _spawn_read_port([_VENV_PY, _PY_SERVE_AUTH, "--port", str(_free_port())])
         if variant == "sticky_short_ttl":
             return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--sticky-ttl", "1"])
         if variant in ("sticky_peer_a", "sticky_peer_b"):
@@ -146,6 +156,23 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
             )
         if variant == "sticky_auth":
             return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--sticky-auth"])
+        if variant == "cors":
+            port = _free_port()
+            return _spawn_read_port(
+                [
+                    _VENV_PY,
+                    _PY_SERVE_HTTP,
+                    "--port",
+                    str(port),
+                    "--fake-storage",
+                    storage_url or "",
+                    "--cors-origin",
+                    _CORS_ORIGIN,
+                ],
+                expect_port=port,
+            )
+        if variant == "introspect":
+            return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--introspect"])
         if variant in ("storage", "zstd_storage", "externalize_always"):
             port = _free_port()
             args = [_VENV_PY, _PY_SERVE_HTTP, "--port", str(port), "--fake-storage", storage_url or ""]
@@ -176,6 +203,11 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
             return _spawn_read_port([RUST_WORKER, "--http", "--strict"])
         if variant == "auth":
             return _spawn_read_port([RUST_WORKER, "--http-auth"])
+        if variant == "auth_reason":
+            # The reject-all worker already honours X-Conformance-Auth-Reason.
+            return _spawn_read_port([RUST_WORKER, "--http-auth"])
+        if variant == "cold_call_cache":
+            return _spawn_read_port([*_worker_cmd("http"), "--no-call-state-cache"])
         if variant == "sticky_short_ttl":
             return _spawn_read_port([RUST_WORKER, "--http", "--sticky-ttl", "1"])
         if variant in ("sticky_peer_a", "sticky_peer_b"):
@@ -195,6 +227,18 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
             # NOT --http-auth: that one is reject-all and moves the prefix
             # to /vgi. This is the plain worker plus a principal resolver.
             return _spawn_read_port([RUST_WORKER, "--http", "--sticky-auth"])
+        if variant == "cors":
+            return _spawn_read_port(
+                [
+                    RUST_WORKER,
+                    "--http-with-storage",
+                    storage_url or "",
+                    "--cors-origin",
+                    _CORS_ORIGIN,
+                ]
+            )
+        if variant == "introspect":
+            return _spawn_read_port([RUST_WORKER, "--http", "--introspect"])
     else:  # go
         if variant == "plain":
             return _spawn_read_port(_worker_cmd("http"))
@@ -271,6 +315,72 @@ def conformance_http_no_compression_port() -> Iterator[int]:
     ``getfixturevalue`` and silently skips if it is missing.
     """
     yield from _http_variant_fixture("no_compression")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_auth_reason_port() -> Iterator[int]:
+    """HTTP worker that honours ``X-Conformance-Auth-Reason``.
+
+    Backs the shared ``TestUnauthorized`` reason-code tests. Membership in
+    the closed set is not enough on its own — a server answering every 401
+    with ``unauthorized`` satisfies that. These tests prove the codes are
+    *discriminated*, which is what makes them worth branching on.
+    """
+    yield from _http_variant_fixture("auth_reason")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_cold_call_cache_port() -> Iterator[int]:
+    """HTTP conformance server booted with the call-state cache disabled.
+
+    Backs the shared ``TestColdCallStateCache`` group, which pins the rule
+    that a client echoes the call token on every continuation. With the
+    cache warm the server can resolve a call it already saw, so a client
+    that never echoes still works — and only breaks once a continuation
+    lands on a process with no cached entry. Disabling the cache makes
+    every turn take that path.
+
+    Only the Python reference server splits its stream state into call +
+    cursor tokens today, so the variant is wired for ``SERVER == "python"``
+    alone; the Rust and Go servers keep everything in the cursor and the
+    group skips against them.
+
+    The fixture name is load-bearing: the shared suite looks it up with
+    ``getfixturevalue`` and silently skips if it is missing.
+    """
+    yield from _http_variant_fixture("cold_call_cache")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_access_log(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[int, Path]]:
+    """HTTP conformance server writing JSONL access records; yields ``(port, path)``.
+
+    Backs the shared ``TestRequestId`` correlation case. Asserting that the
+    ``X-Request-ID`` on a response equals the ``request_id`` in the record
+    means reading back what the server logged for a request the suite made —
+    nothing observable on the wire alone can stand in for it, which is why
+    the case is gated on a fixture rather than derived.
+
+    The fixture name is load-bearing: the shared suite looks it up with
+    ``getfixturevalue`` and skips the correlation case if it is missing.
+
+    Wired for ``SERVER == "rust"`` only. The Python reference grew
+    ``--access-log`` on its serve script in 0.37.1, so an older checkout would
+    spawn a worker that swallows the flag and writes nothing — a silent pass
+    of an assertion that never ran, which is the failure mode this whole group
+    exists to prevent.
+    """
+    if SERVER != "rust":
+        pytest.skip(f"access-log worker not wired for SERVER={SERVER}")
+    log_path = tmp_path_factory.mktemp("accesslog") / "conformance.jsonl"
+    proc, port = _spawn_read_port([*_worker_cmd("http"), "--access-log", str(log_path)])
+    try:
+        yield port, log_path
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
 
 
 @pytest.fixture(scope="session")
@@ -395,6 +505,46 @@ def conformance_http_sticky_auth_port() -> Iterator[int]:
     worker reachable as two identities.
     """
     yield from _http_variant_fixture("sticky_auth")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_cors_port(conformance_fake_storage: str) -> Iterator[int]:
+    """HTTP worker that grants ``_CORS_ORIGIN`` cross-origin access.
+
+    Backs the shared ``TestCors`` group, which is the one thing the rest of
+    the suite structurally cannot check: every other test drives the server
+    with a client that ignores CORS, so a capability header the server never
+    exposes still passes everywhere else while being invisible to a browser.
+
+    Needs its own worker because the plain one must stay CORS-off —
+    ``TestCorsOffMode`` runs against that one and asserts it grants nothing.
+    The fixture name is load-bearing: the shared suite looks it up with
+    ``getfixturevalue`` and skips the whole group if it is missing.
+
+    Storage mode is deliberate: the derived exposure check can only catch a
+    missing entry for a header the worker actually advertises, so a *plain*
+    worker here would silently skip the conditional half of the capability
+    set -- the size caps and the upload-URL trio -- which are exactly the
+    exposures a port is most likely to miss.
+    """
+    yield from _http_variant_fixture("cors", conformance_fake_storage)
+
+
+@pytest.fixture(scope="session")
+def conformance_http_introspect_port() -> Iterator[int]:
+    """HTTP worker with token introspection enabled.
+
+    Backs the shared ``TestTokenIntrospection`` group. It needs its own worker
+    because the endpoint is absent unless explicitly enabled — which
+    ``TestTokenIntrospectionOffMode`` asserts against the plain worker, and
+    which is the guard that stops a worker growing a credential-to-identity
+    oracle by upgrading a dependency.
+
+    The worker is configured with the exact constants the shared suite posts
+    (``_INTROSPECTOR`` / ``_SUBJECT_TOKEN`` / ``_SUBJECT_PRINCIPAL`` /
+    ``_JWS_TRAP_TOKEN``); see ``introspect_fixture`` in the Rust worker.
+    """
+    yield from _http_variant_fixture("introspect")
 
 
 def _short_unix_path(name: str) -> str:

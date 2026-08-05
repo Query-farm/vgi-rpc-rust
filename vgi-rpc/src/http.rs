@@ -27,13 +27,17 @@ use base64::Engine;
 use rand::RngCore;
 
 use crate::errors::{Result, RpcError};
-use crate::metadata::{CANCEL_KEY, REQUEST_ID_KEY, STATE_KEY};
+use std::collections::HashMap;
+
+use crate::metadata::{CALL_STATE_KEY, CANCEL_KEY, REQUEST_ID_KEY, STATE_KEY};
 use crate::server::{
     build_error_metadata, build_log_metadata, cast_batch, CallContext, MethodType, Request,
     RpcServer,
 };
 use crate::stream::{empty_schema, Emitted, OutputCollector, StreamResult, StreamStateKind};
+use crate::unauthorized::{AuthReason, AUTH_PROXY_REQUIRED_HEADER, AUTH_REASON_HEADER};
 use crate::wire::{bytes_to_hex, empty_batch, md_get, Metadata, StreamReader, StreamWriter};
+use axum::http::HeaderName;
 
 pub const ARROW_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 
@@ -79,6 +83,10 @@ const SESSION_ENDPOINT: &str = "__session__";
 /// Response bodies smaller than this are never zstd-compressed: below it the
 /// frame overhead dominates and often enlarges the payload, so the CPU and
 /// allocation cost of compressing isn't repaid.
+///
+/// Private, so the public `HttpStateBuilder::response_compression_level` docs
+/// spell the number out rather than link here (a public->private intra-doc
+/// link is a rustdoc warning). Keep the two in sync if this changes.
 const MIN_ZSTD_COMPRESS_BYTES: usize = 1024;
 
 /// zstd level used for response compression when the builder is not told
@@ -317,6 +325,20 @@ fn encode_response_body(encoding: ResponseEncoding, body: &[u8], level: i32) -> 
 pub struct HttpState {
     server: Arc<RpcServer>,
     token_key: [u8; 32],
+    /// Operator-declared proxy-injected headers a custom authenticator
+    /// depends on — the escape hatch for authenticators the framework
+    /// cannot introspect.
+    extra_proxy_auth_headers: Vec<String>,
+    /// Whether the proxy-proof gate runs in require mode. Only then does it
+    /// contribute its header to the §5 note.
+    proxy_proof_required: bool,
+    /// Size of the call-state cache; `0` disables it.
+    call_state_cache_entries: usize,
+    /// Accelerates the fixed half of a stream's state, keyed on the
+    /// authenticated `call_id` paired with the caller's identity. Purely an
+    /// accelerator: a miss reopens the call token the client echoed, so
+    /// correctness never depends on a hit. See [`HttpState::resolve_call`].
+    call_states: std::sync::Mutex<HashMap<String, (u64, Arc<ResolvedCall>)>>,
     producer_batch_limit: usize,
     token_ttl: std::time::Duration,
     max_body_size: usize,
@@ -344,6 +366,10 @@ pub struct HttpState {
     upload_url_provider: Option<Arc<dyn crate::external::UploadUrlProvider>>,
     /// Sticky-session context, `Some` when the server is sticky-enabled.
     sticky: Option<Arc<crate::sticky::StickyContext>>,
+    /// Token-introspection endpoint, `Some` only when an operator supplied a
+    /// resolver. `None` leaves `{prefix}/__introspect_token__` answering a
+    /// fixed `404 not_enabled` that looks nothing up.
+    introspect: Option<Arc<crate::auth::introspect::TokenIntrospector>>,
     /// Producer for the standardized landing contract (`describe.json` +
     /// lazy columns). `Some` mounts the describe routes; `None` leaves the
     /// server serving only the shared `landing.html` at `GET {prefix}/`.
@@ -397,6 +423,12 @@ pub struct HttpStateBuilder {
     sticky_echo_headers: Vec<(String, String)>,
     describe_provider: Option<Arc<dyn DescribeProvider>>,
     proxy_proof_required: Option<bool>,
+    extra_proxy_auth_headers: Vec<String>,
+    call_state_cache_entries: Option<usize>,
+    introspect_resolver: Option<crate::auth::introspect::TokenResolver>,
+    introspect_principals: Vec<String>,
+    introspect_default_ttl_seconds: Option<u64>,
+    introspect_rate_limit: Option<u32>,
 }
 
 impl HttpStateBuilder {
@@ -465,6 +497,18 @@ impl HttpStateBuilder {
     /// Maximum age of a state token. Continuation requests with a token
     /// older than this are rejected. Default `5 minutes`. Set to
     /// `Duration::ZERO` to disable TTL enforcement.
+    /// Size the per-process call-state cache; `0` disables it.
+    ///
+    /// The cache is a pure accelerator — a miss reopens the call token the
+    /// client echoed, so correctness never depends on a hit. Disabling it is
+    /// the supported way to prove that: every continuation then takes the
+    /// miss path, so a client that fails to echo the call token fails
+    /// immediately instead of only once the cache goes cold in production.
+    pub fn call_state_cache_entries(mut self, n: usize) -> Self {
+        self.call_state_cache_entries = Some(n);
+        self
+    }
+
     pub fn token_ttl(mut self, ttl: std::time::Duration) -> Self {
         self.token_ttl = Some(ttl);
         self
@@ -500,6 +544,18 @@ impl HttpStateBuilder {
     /// Advertisement only — it enables and enforces nothing. The gate rides
     /// in through [`Self::authenticate`] as an opaque callback the builder
     /// cannot introspect, so the operator states the posture here.
+    /// Declare proxy-injected headers this service's authentication depends
+    /// on, for a custom authenticator the framework cannot introspect. The
+    /// built-in proxy-proof gate registers its own header in require mode.
+    pub fn proxy_auth_headers<I, S>(mut self, headers: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.extra_proxy_auth_headers = headers.into_iter().map(Into::into).collect();
+        self
+    }
+
     pub fn proxy_proof_required(mut self, required: bool) -> Self {
         self.proxy_proof_required = Some(required);
         self
@@ -540,7 +596,8 @@ impl HttpStateBuilder {
     /// Response compression is **on by default** at
     /// [`DEFAULT_RESPONSE_COMPRESSION_LEVEL`]; this only changes the level.
     /// It applies when the client offers zstd in `X-VGI-Accept-Encoding` or
-    /// `Accept-Encoding` and the body clears [`MIN_ZSTD_COMPRESS_BYTES`].
+    /// `Accept-Encoding` and the body is at least 1024 bytes (bodies below
+    /// that threshold are sent uncompressed).
     /// Use [`HttpStateBuilder::disable_response_compression`] to turn it off.
     pub fn response_compression_level(mut self, level: i32) -> Self {
         self.response_compression_level = Some(Some(level));
@@ -663,6 +720,57 @@ impl HttpStateBuilder {
         self
     }
 
+    /// Enable `POST {prefix}/__introspect_token__`, which resolves an opaque
+    /// bearer credential to a principal for a reverse proxy that must know the
+    /// caller's identity before it can authorize.
+    ///
+    /// Off by default: the route answers a fixed `404 not_enabled` and holds no
+    /// resolver, so no worker grows a credential-to-identity oracle by
+    /// upgrading a dependency. It stays definitive rather than unrouted because
+    /// a caller that classifies `401/403/404` as final and everything else as
+    /// transient would retry a generic `415` forever.
+    ///
+    /// Requires [`introspect_principals`](Self::introspect_principals). See
+    /// [`crate::auth::introspect`] for the guards and why it is deliberately
+    /// *not* a replay through the server's own authenticate chain.
+    pub fn introspect_resolver(mut self, resolver: crate::auth::introspect::TokenResolver) -> Self {
+        self.introspect_resolver = Some(resolver);
+        self
+    }
+
+    /// Principals permitted to introspect.
+    ///
+    /// Required alongside [`introspect_resolver`](Self::introspect_resolver),
+    /// with **no permissive default**: authentication and introspection are
+    /// different capabilities, and a deployment where any valid credential may
+    /// introspect lets any user resolve any other user's credential to its
+    /// owner.
+    pub fn introspect_principals<I, S>(mut self, principals: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.introspect_principals = principals.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Cache window advertised as `ttl_seconds` for a resolution that does not
+    /// name its own. Default 300 s. Treat it as an authorization window: for
+    /// any path the asker serves without re-presenting the credential, it is
+    /// exactly that.
+    pub fn introspect_default_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.introspect_default_ttl_seconds = Some(ttl.as_secs());
+        self
+    }
+
+    /// Introspection requests allowed per caller per second (default 20).
+    /// Bounds, rather than closes, the oracle an allowlisted-but-compromised
+    /// caller still has.
+    pub fn introspect_rate_limit(mut self, per_second: u32) -> Self {
+        self.introspect_rate_limit = Some(per_second);
+        self
+    }
+
     pub fn build(self) -> Arc<HttpState> {
         let server = self.server.expect("HttpStateBuilder::server is required");
         // A wildcard CORS origin combined with a credentialed auth
@@ -705,6 +813,28 @@ impl HttpStateBuilder {
         } else {
             None
         };
+        // Introspection is resolved here, before any route exists, so a
+        // misconfiguration fails at construction rather than at the first proxy
+        // preflight.
+        let introspect = match self.introspect_resolver {
+            Some(resolver) => Some(Arc::new(crate::auth::introspect::TokenIntrospector::new(
+                resolver,
+                self.introspect_principals,
+                self.introspect_default_ttl_seconds
+                    .unwrap_or(crate::auth::introspect::DEFAULT_INTROSPECT_TTL_SECONDS),
+                self.introspect_rate_limit
+                    .unwrap_or(crate::auth::introspect::DEFAULT_INTROSPECT_RATE_LIMIT),
+            ))),
+            None => {
+                assert!(
+                    self.introspect_principals.is_empty(),
+                    "introspect_principals was given without introspect_resolver; the \
+                     route stays disabled, so the allowlist would have no effect. Pass \
+                     both or neither."
+                );
+                None
+            }
+        };
         let cors_allow_origin = self
             .cors_origins
             .as_deref()
@@ -725,8 +855,15 @@ impl HttpStateBuilder {
                 sticky: sticky.as_deref(),
                 response_compression_level,
                 proxy_proof_required: self.proxy_proof_required.unwrap_or(false),
+                introspect_enabled: introspect.is_some(),
             });
         Arc::new(HttpState {
+            extra_proxy_auth_headers: self.extra_proxy_auth_headers.clone(),
+            proxy_proof_required: self.proxy_proof_required.unwrap_or(false),
+            call_state_cache_entries: self
+                .call_state_cache_entries
+                .unwrap_or(CALL_STATE_CACHE_ENTRIES),
+            call_states: std::sync::Mutex::new(HashMap::new()),
             server,
             token_key,
             producer_batch_limit: self.producer_batch_limit.unwrap_or(1),
@@ -751,6 +888,7 @@ impl HttpStateBuilder {
             max_response_bytes: self.max_response_bytes,
             upload_url_provider: self.upload_url_provider,
             sticky,
+            introspect,
             describe_provider: self.describe_provider,
             capability_headers,
             capability_has_any,
@@ -772,21 +910,37 @@ struct CapabilityInputs<'a> {
     sticky: Option<&'a crate::sticky::StickyContext>,
     response_compression_level: Option<i32>,
     proxy_proof_required: bool,
+    introspect_enabled: bool,
 }
 
 /// Response headers a browser client must be able to read that are *not*
 /// capability headers, and so cannot be derived from the capability map:
 /// the two content-coding stampings (`X-VGI-Content-Encoding` is how a
 /// `fetch()` client learns it must decompress the body itself), the RPC
-/// error marker, and the auth challenge. `Content-Encoding` and
-/// `WWW-Authenticate` are technically CORS-safelisted already; listing them
-/// costs nothing and keeps the set explicit.
-const CORS_EXPOSE_FIXED: [&str; 4] = [
+/// error marker, the auth challenge, and the two 401 discriminators. The
+/// latter ride only rejection responses, so nothing on `/health` implies
+/// them — yet a browser that cannot read `VGI-Auth-Reason` is back to
+/// matching on message text, which is exactly what the reason code exists to
+/// replace. `Content-Encoding` and `WWW-Authenticate` are technically
+/// CORS-safelisted already; listing them costs nothing and keeps the set
+/// explicit.
+const CORS_EXPOSE_FIXED: [&str; 7] = [
     "Content-Encoding",
     VGI_CONTENT_ENCODING_HEADER,
     RPC_ERROR_HEADER,
     "WWW-Authenticate",
+    AUTH_REASON_HEADER,
+    AUTH_PROXY_REQUIRED_HEADER,
+    // Rides every response including the failures, and is never advertised
+    // on /health, so a check derived from advertisements cannot reach it.
+    // It is what lets a browser client quote an id this server's own log can
+    // be searched for.
+    REQUEST_ID_RESPONSE_HEADER,
 ];
+
+/// Per-request correlation id, echoed from the caller when supplied and
+/// generated otherwise.
+pub const REQUEST_ID_RESPONSE_HEADER: &str = "x-request-id";
 
 /// Precompute the immutable capability response headers once, mirroring the
 /// per-response logic that `attach_capability_headers` used to run. Returns
@@ -804,6 +958,7 @@ fn build_capability_headers(inputs: CapabilityInputs<'_>) -> (HeaderMap, bool, H
         sticky,
         response_compression_level,
         proxy_proof_required,
+        introspect_enabled,
     } = inputs;
     let mut out = HeaderMap::new();
     let mut any = false;
@@ -861,6 +1016,18 @@ fn build_capability_headers(inputs: CapabilityInputs<'_>) -> (HeaderMap, bool, H
     if proxy_proof_required {
         out.insert(
             crate::auth::proof::PROOF_REQUIRED_HEADER,
+            HeaderValue::from_static("true"),
+        );
+        any = true;
+    }
+    // Token introspection. Positive form only — absence is the answer when the
+    // route is disabled, and the point of the advert is that a fronting proxy
+    // preflights at boot rather than discovering at first login that the worker
+    // it depends on cannot resolve credentials. Riding the capability map means
+    // it lands in `Access-Control-Expose-Headers` for free below.
+    if introspect_enabled {
+        out.insert(
+            crate::auth::introspect::INTROSPECT_ENABLED_HEADER,
             HeaderValue::from_static("true"),
         );
         any = true;
@@ -949,40 +1116,216 @@ impl HttpState {
     /// token issued under one identity fails decryption when presented
     /// by another — same anti-replay guarantee as the prior HMAC subkey
     /// derivation, expressed via AAD instead of key derivation.
-    pub(crate) fn pack_state_token(
+    pub(crate) fn pack_cursor_token(
         &self,
         auth: &crate::auth::AuthContext,
         state_bytes: &[u8],
-        output_schema_bytes: &[u8],
-        input_schema_bytes: &[u8],
-        stream_id: &str,
+        call_id: &[u8; CALL_ID_LEN],
     ) -> String {
         let aad = compute_aad(auth);
-        pack_state_token(
+        pack_cursor_token(
             &self.token_key,
             &aad,
             state_bytes,
-            output_schema_bytes,
-            input_schema_bytes,
-            stream_id,
+            call_id,
             current_unix_secs(),
         )
     }
 
-    /// Open a v4 state token, decrypting under the current caller's
-    /// identity-derived AAD and enforcing TTL after authenticity.
-    pub(crate) fn unpack_state_token(
+    /// Mint a stream's call token and warm the cache with what we already
+    /// hold, so the stream's first continuation need not open the token it
+    /// was just handed.
+    pub(crate) fn pack_call_token(
         &self,
         auth: &crate::auth::AuthContext,
-        token: &str,
-    ) -> Result<UnpackedToken> {
-        let ttl = if self.token_ttl.is_zero() {
+        call_id: &[u8; CALL_ID_LEN],
+        output_schema_bytes: &[u8],
+        input_schema_bytes: &[u8],
+        stream_id: &str,
+    ) -> String {
+        let aad = compute_call_aad(auth);
+        let token = pack_call_token(
+            &self.token_key,
+            &aad,
+            call_id,
+            output_schema_bytes,
+            input_schema_bytes,
+            stream_id,
+            current_unix_secs(),
+        );
+        self.cache_call(
+            auth,
+            call_id,
+            Arc::new(ResolvedCall {
+                output_schema_bytes: output_schema_bytes.to_vec(),
+                input_schema_bytes: input_schema_bytes.to_vec(),
+                stream_id: stream_id.to_string(),
+            }),
+        );
+        token
+    }
+
+    fn token_ttl_opt(&self) -> Option<std::time::Duration> {
+        if self.token_ttl.is_zero() {
             None
         } else {
             Some(self.token_ttl)
-        };
+        }
+    }
+
+    /// Open a cursor token, decrypting under the current caller's
+    /// identity-derived AAD and enforcing TTL after authenticity.
+    pub(crate) fn unpack_cursor_token(
+        &self,
+        auth: &crate::auth::AuthContext,
+        token: &str,
+    ) -> Result<UnpackedCursor> {
         let aad = compute_aad(auth);
-        unpack_state_token(&self.token_key, &aad, token, ttl)
+        unpack_cursor_token(&self.token_key, &aad, token, self.token_ttl_opt())
+    }
+
+    /// The proxy-injected headers this server's authentication depends on,
+    /// or empty when it depends on none.
+    ///
+    /// Derived from configuration rather than from what failed on this
+    /// request, so every 401 says the same thing (spec §5) and the note
+    /// discloses nothing about which stage rejected a given attempt. A
+    /// proxy-proof gate contributes only in require mode: in allow mode an
+    /// absent proof never denies, so the note would misdirect.
+    fn proxy_auth_headers(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.proxy_proof_required {
+            out.push(crate::auth::proof::PROOF_HEADER.to_string());
+        }
+        out.extend(self.extra_proxy_auth_headers.iter().cloned());
+        out
+    }
+
+    /// Render the standardized 401 of spec §4: the reason header, a
+    /// no-store cache directive, the proxy note when this service's auth
+    /// depends on a proxy, and the JSON envelope.
+    ///
+    /// §4.2 lets a service skip the HTML page and always answer with JSON;
+    /// what it must never do is answer a non-HTML request with HTML. This
+    /// port takes the JSON-only option.
+    pub(crate) fn unauthorized_response(
+        &self,
+        mut headers: HeaderMap,
+        reason: AuthReason,
+        detail: &str,
+    ) -> Response {
+        let proxy_headers = self.proxy_auth_headers();
+        let hint = if proxy_headers.is_empty() {
+            None
+        } else {
+            Some(crate::unauthorized::proxy_hint(&proxy_headers))
+        };
+        if hint.is_some() {
+            headers.insert(
+                HeaderName::from_static(AUTH_PROXY_REQUIRED_HEADER),
+                HeaderValue::from_static("true"),
+            );
+        }
+        if let Ok(hv) = HeaderValue::from_str(reason.as_str()) {
+            headers.insert(HeaderName::from_static(AUTH_REASON_HEADER), hv);
+        }
+        // A 401 is per-request and flips to 200 on the next attempt with a
+        // credential, so it must never be held by a shared cache.
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let body = crate::unauthorized::envelope(reason, detail, hint.as_deref());
+        (StatusCode::UNAUTHORIZED, headers, body).into_response()
+    }
+
+    /// Render the caller-identity half of a cache key.
+    fn cache_identity(auth: &crate::auth::AuthContext) -> String {
+        if !auth.authenticated {
+            "\u{0}anonymous".to_string()
+        } else {
+            format!("{}\u{0}{}", auth.domain, auth.principal)
+        }
+    }
+
+    fn cache_key(auth: &crate::auth::AuthContext, call_id: &[u8; CALL_ID_LEN]) -> String {
+        format!("{:02x?}\u{0}{}", call_id, Self::cache_identity(auth))
+    }
+
+    fn cache_call(
+        &self,
+        auth: &crate::auth::AuthContext,
+        call_id: &[u8; CALL_ID_LEN],
+        call: Arc<ResolvedCall>,
+    ) {
+        if self.call_state_cache_entries == 0 {
+            return;
+        }
+        let mut cache = self.call_states.lock().unwrap();
+        let key = Self::cache_key(auth, call_id);
+        if cache.len() >= self.call_state_cache_entries && !cache.contains_key(&key) {
+            // Cheap bound: this is an accelerator, and a miss simply reopens
+            // the client's token, so evicting wholesale costs correctness
+            // nothing and keeps the map from growing without limit.
+            cache.clear();
+        }
+        cache.insert(key, (current_unix_secs(), call));
+    }
+
+    /// Resolve a stream's fixed half for an already-authenticated cursor.
+    ///
+    /// Order matters here, and it is the whole security argument for the
+    /// cache. The cursor is opened first by the caller; its AEAD tag covers
+    /// the `call_id` and its AAD covers the caller's identity. Only then is
+    /// that authenticated `call_id` used as a cache key. A client cannot
+    /// name a call id the server did not mint for it, so a cache hit can
+    /// never hand back another principal's call state — and on a hit the
+    /// presented call token is not consulted at all, which is exactly the
+    /// work we are trying to avoid.
+    ///
+    /// On a miss (cold process, evicted entry, or a request load-balanced to
+    /// a node that never saw this stream's `/init`) the client-supplied call
+    /// token is opened and verified, and its embedded `call_id` must match
+    /// the one the cursor named.
+    pub(crate) fn resolve_call(
+        &self,
+        auth: &crate::auth::AuthContext,
+        cursor: &UnpackedCursor,
+        call_token: Option<&str>,
+    ) -> Result<Arc<ResolvedCall>> {
+        let key = Self::cache_key(auth, &cursor.call_id);
+        let ttl = self.token_ttl_opt();
+        {
+            let mut cache = self.call_states.lock().unwrap();
+            if let Some((stored_at, call)) = cache.get(&key).cloned() {
+                let fresh = match ttl {
+                    Some(t) => current_unix_secs().saturating_sub(stored_at) <= t.as_secs(),
+                    None => true,
+                };
+                if fresh {
+                    return Ok(call);
+                }
+                cache.remove(&key);
+            }
+        }
+
+        let Some(call_token) = call_token else {
+            return Err(RpcError::runtime_error(
+                "Missing call token in exchange request",
+            ));
+        };
+        let aad = compute_call_aad(auth);
+        let (call_id, resolved) = unpack_call_token(&self.token_key, &aad, call_token, ttl)?;
+        if call_id != cursor.call_id {
+            // The cursor named a different call. Uniform message: reachable
+            // only by pairing two tokens the same principal legitimately
+            // holds, so it carries nothing worth distinguishing.
+            return Err(RpcError::runtime_error("Malformed state token"));
+        }
+        let resolved = Arc::new(resolved);
+        self.cache_call(auth, &cursor.call_id, resolved.clone());
+        Ok(resolved)
     }
 }
 
@@ -991,7 +1334,19 @@ impl HttpState {
 /// callers produce distinct AAD strings so a token minted in one
 /// context cannot be opened in another. Mirrors Python's `_compute_aad`.
 fn compute_aad(auth: &crate::auth::AuthContext) -> Vec<u8> {
-    let prefix = b"vgi_rpc.state.v4\x00";
+    compute_aad_with(b"vgi_rpc.state.v4\x00", auth)
+}
+
+/// [`compute_aad`]'s counterpart for call tokens. The prefix differs
+/// deliberately, so a call token and a cursor token are not interchangeable
+/// even for the same principal: presenting one where the other is expected
+/// fails the AEAD tag check rather than decoding into a payload the reader
+/// would misinterpret.
+fn compute_call_aad(auth: &crate::auth::AuthContext) -> Vec<u8> {
+    compute_aad_with(b"vgi_rpc.call.v1\x00", auth)
+}
+
+fn compute_aad_with(prefix: &[u8], auth: &crate::auth::AuthContext) -> Vec<u8> {
     if !auth.authenticated {
         let mut out = Vec::with_capacity(prefix.len() + b"\x00anonymous".len());
         out.extend_from_slice(prefix);
@@ -1008,18 +1363,110 @@ fn compute_aad(auth: &crate::auth::AuthContext) -> Vec<u8> {
     out
 }
 
-/// Token version supported by this crate.
-pub(crate) const STATE_TOKEN_VERSION: u8 = 0x04;
+/// On-wire version bytes. The cursor and call tokens carry independent
+/// version lines because they change for independent reasons.
+///
+/// Cursor history: v4 = AEAD over the framed plaintext; v5 = AEAD over a
+/// codec-tagged, compressed payload; v6 = cursor-only, with the schemas and
+/// stream id moved into the call token.
+///
+/// Each bump matters for rolling deploys: an older plaintext frames
+/// differently, so a newer reader would mis-parse it. Rejecting the old
+/// version outright turns that into the same clean failure as any other
+/// stale token.
+pub(crate) const CURSOR_TOKEN_VERSION: u8 = 0x06;
+pub(crate) const CALL_TOKEN_VERSION: u8 = 0x01;
+
+/// Length of the random per-stream id minted at `/init` that binds a call
+/// token to its cursors.
+pub(crate) const CALL_ID_LEN: usize = 16;
+
+/// Bounds the per-process call-state cache.
+const CALL_STATE_CACHE_ENTRIES: usize = 4096;
+
+/// Codec tags for the token payload, written as the first plaintext byte
+/// inside the seal. See [`pack_token_payload`].
+const TOKEN_CODEC_RAW: u8 = 0x00;
+const TOKEN_CODEC_ZSTD: u8 = 0x01;
+
+/// Matches the Python reference's choice. At token payload sizes this
+/// measures the same speed as level 1 and slightly smaller, while the levels
+/// that compress materially better cost many times the CPU for a few hundred
+/// bytes.
+const TOKEN_ZSTD_LEVEL: i32 = 3;
+
+/// Bounds decompression. The payload is authenticated before it is ever
+/// decompressed, so this guards against a framework bug rather than an
+/// attacker — but an unbounded decompress on a request path is not worth
+/// having.
+const MAX_TOKEN_PLAINTEXT_BYTES: usize = 64 << 20;
+
+/// Compress a token payload and tag which codec was used.
+///
+/// Compression happens *inside* the seal, and the order is the whole point:
+/// once sealed, a token is ciphertext, so the HTTP body codec can no longer
+/// find any redundancy in it — it recovers only the slack base64 adds, never
+/// the state's own structure. Compressing first reaches the real redundancy.
+///
+/// Compression is skipped when it does not pay, so a small token never grows
+/// beyond its plaintext plus the one tag byte; the tag means the reader never
+/// has to guess.
+fn pack_token_payload(plaintext: &[u8]) -> Vec<u8> {
+    if let Ok(packed) = zstd::bulk::compress(plaintext, TOKEN_ZSTD_LEVEL) {
+        if packed.len() < plaintext.len() {
+            let mut out = Vec::with_capacity(1 + packed.len());
+            out.push(TOKEN_CODEC_ZSTD);
+            out.extend_from_slice(&packed);
+            return out;
+        }
+    }
+    let mut out = Vec::with_capacity(1 + plaintext.len());
+    out.push(TOKEN_CODEC_RAW);
+    out.extend_from_slice(plaintext);
+    out
+}
+
+/// Reverse [`pack_token_payload`].
+///
+/// An unknown tag or a body that will not decompress means a token this
+/// server did not mint, so both surface as the same uniform error every other
+/// token failure uses.
+fn unpack_token_payload(data: &[u8]) -> Result<Vec<u8>> {
+    let (tag, body) = data
+        .split_first()
+        .ok_or_else(|| RpcError::runtime_error("Malformed state token"))?;
+    match *tag {
+        TOKEN_CODEC_RAW => Ok(body.to_vec()),
+        TOKEN_CODEC_ZSTD => zstd::bulk::decompress(body, MAX_TOKEN_PLAINTEXT_BYTES)
+            .map_err(|_| RpcError::runtime_error("Malformed state token")),
+        _ => Err(RpcError::runtime_error("Malformed state token")),
+    }
+}
 
 /// Decomposed contents of a v4 state token after AEAD authentication.
 #[derive(Debug, Clone)]
-pub(crate) struct UnpackedToken {
+pub(crate) struct UnpackedCursor {
     pub state_bytes: Vec<u8>,
-    pub output_schema_bytes: Vec<u8>,
-    pub input_schema_bytes: Vec<u8>,
-    pub stream_id: String,
+    /// The call token this cursor belongs to. Recovered from inside the
+    /// cursor's ciphertext, so it is authenticated before it is trusted.
+    pub call_id: [u8; CALL_ID_LEN],
     #[allow(dead_code)]
     pub created_at: u64,
+}
+
+/// The half of a stream's state that is fixed for the life of the call —
+/// what a cursor's `call_id` resolves to, from cache or from the client's
+/// echoed call token.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedCall {
+    pub output_schema_bytes: Vec<u8>,
+    pub input_schema_bytes: Vec<u8>,
+    /// Chain-correlation id, stable across a stream's init and its
+    /// continuations. Carried so the token round-trips it faithfully; this
+    /// port does not yet surface it on the continuation dispatch path the
+    /// way the Go port does.
+    #[allow(dead_code)]
+    pub stream_id: String,
 }
 
 /// Current time as seconds since the UNIX epoch.
@@ -1056,18 +1503,40 @@ fn current_unix_secs() -> u64 {
 /// The AEAD envelope (version byte + nonce + ciphertext+tag) is owned by
 /// [`crypto`]; only the *plaintext* framing inside the ciphertext is this
 /// function's concern.
-pub(crate) fn pack_state_token(
+pub(crate) fn pack_cursor_token(
     token_key: &[u8; 32],
     aad: &[u8],
     state_bytes: &[u8],
+    call_id: &[u8; CALL_ID_LEN],
+    created_at: u64,
+) -> String {
+    let mut plaintext = Vec::with_capacity(8 + CALL_ID_LEN + 4 + state_bytes.len());
+    plaintext.extend_from_slice(&created_at.to_le_bytes());
+    plaintext.extend_from_slice(call_id);
+    plaintext.extend_from_slice(&(state_bytes.len() as u32).to_le_bytes());
+    plaintext.extend_from_slice(state_bytes);
+
+    crate::crypto::seal_base64(
+        &pack_token_payload(&plaintext),
+        token_key,
+        aad,
+        CURSOR_TOKEN_VERSION,
+    )
+}
+
+/// Seal the half of a stream's state that is fixed for the life of the call.
+/// Minted once, by `/init`; never re-issued.
+pub(crate) fn pack_call_token(
+    token_key: &[u8; 32],
+    aad: &[u8],
+    call_id: &[u8; CALL_ID_LEN],
     output_schema_bytes: &[u8],
     input_schema_bytes: &[u8],
     stream_id: &str,
     created_at: u64,
 ) -> String {
     let mut plaintext = Vec::with_capacity(
-        8 + 4
-            + state_bytes.len()
+        8 + CALL_ID_LEN
             + 4
             + output_schema_bytes.len()
             + 4
@@ -1076,8 +1545,7 @@ pub(crate) fn pack_state_token(
             + stream_id.len(),
     );
     plaintext.extend_from_slice(&created_at.to_le_bytes());
-    plaintext.extend_from_slice(&(state_bytes.len() as u32).to_le_bytes());
-    plaintext.extend_from_slice(state_bytes);
+    plaintext.extend_from_slice(call_id);
     plaintext.extend_from_slice(&(output_schema_bytes.len() as u32).to_le_bytes());
     plaintext.extend_from_slice(output_schema_bytes);
     plaintext.extend_from_slice(&(input_schema_bytes.len() as u32).to_le_bytes());
@@ -1085,30 +1553,34 @@ pub(crate) fn pack_state_token(
     plaintext.extend_from_slice(&(stream_id.len() as u32).to_le_bytes());
     plaintext.extend_from_slice(stream_id.as_bytes());
 
-    crate::crypto::seal_base64(&plaintext, token_key, aad, STATE_TOKEN_VERSION)
+    crate::crypto::seal_base64(
+        &pack_token_payload(&plaintext),
+        token_key,
+        aad,
+        CALL_TOKEN_VERSION,
+    )
 }
 
-/// Open and verify a v4 state token. [`crypto::open_bytes`] authenticates
-/// the payload; every malformed, wrong-version, tampered, wrong-key, or
-/// AAD-mismatched (e.g. cross-principal replay) token surfaces as the same
-/// uniform signature-verification error so callers cannot distinguish
-/// failure modes via timing or message content. Only a base64 decode
-/// failure — observable before any crypto work — stays a distinct
-/// "Malformed state token".
-pub(crate) fn unpack_state_token(
+/// Open the AEAD envelope, decompress, and check the TTL. Shared by both
+/// token kinds; returns the framed plaintext and its `created_at`.
+fn open_token_plaintext(
     token_key: &[u8; 32],
     aad: &[u8],
     token: &str,
+    version: u8,
     token_ttl: Option<std::time::Duration>,
-) -> Result<UnpackedToken> {
+) -> Result<(Vec<u8>, u64)> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(token.as_bytes())
         .map_err(|_| RpcError::runtime_error("Malformed state token"))?;
 
-    let plaintext = crate::crypto::open_bytes(&raw, token_key, aad, STATE_TOKEN_VERSION)
+    let sealed = crate::crypto::open_bytes(&raw, token_key, aad, version)
         .map_err(|_| RpcError::runtime_error("State token signature verification failed"))?;
+    // Decompress only after authentication: nothing an attacker supplies
+    // reaches the decoder without the token key.
+    let plaintext = unpack_token_payload(&sealed)?;
 
-    if plaintext.len() < 8 {
+    if plaintext.len() < 8 + CALL_ID_LEN {
         return Err(RpcError::runtime_error("Malformed state token"));
     }
     let created_at = u64::from_le_bytes(plaintext[0..8].try_into().unwrap());
@@ -1130,8 +1602,56 @@ pub(crate) fn unpack_state_token(
         }
     }
 
-    let mut pos = 8;
+    Ok((plaintext, created_at))
+}
+
+/// Open and verify a cursor token. [`crypto::open_bytes`] authenticates the
+/// payload; every malformed, wrong-version, tampered, wrong-key, or
+/// AAD-mismatched (e.g. cross-principal replay) token surfaces as the same
+/// uniform signature-verification error so callers cannot distinguish
+/// failure modes via timing or message content. Only a base64 decode
+/// failure — observable before any crypto work — stays a distinct
+/// "Malformed state token".
+pub(crate) fn unpack_cursor_token(
+    token_key: &[u8; 32],
+    aad: &[u8],
+    token: &str,
+    token_ttl: Option<std::time::Duration>,
+) -> Result<UnpackedCursor> {
+    let (plaintext, created_at) =
+        open_token_plaintext(token_key, aad, token, CURSOR_TOKEN_VERSION, token_ttl)?;
+
+    let mut call_id = [0u8; CALL_ID_LEN];
+    call_id.copy_from_slice(&plaintext[8..8 + CALL_ID_LEN]);
+
+    let mut pos = 8 + CALL_ID_LEN;
     let state_bytes = read_segment(&plaintext, &mut pos)?;
+    if pos != plaintext.len() {
+        return Err(RpcError::runtime_error("Malformed state token"));
+    }
+
+    Ok(UnpackedCursor {
+        state_bytes,
+        call_id,
+        created_at,
+    })
+}
+
+/// Open and verify a call token, returning it paired with its embedded
+/// `call_id` so the caller can check it against the cursor that named it.
+pub(crate) fn unpack_call_token(
+    token_key: &[u8; 32],
+    aad: &[u8],
+    token: &str,
+    token_ttl: Option<std::time::Duration>,
+) -> Result<([u8; CALL_ID_LEN], ResolvedCall)> {
+    let (plaintext, _created_at) =
+        open_token_plaintext(token_key, aad, token, CALL_TOKEN_VERSION, token_ttl)?;
+
+    let mut call_id = [0u8; CALL_ID_LEN];
+    call_id.copy_from_slice(&plaintext[8..8 + CALL_ID_LEN]);
+
+    let mut pos = 8 + CALL_ID_LEN;
     let output_schema_bytes = read_segment(&plaintext, &mut pos)?;
     let input_schema_bytes = read_segment(&plaintext, &mut pos)?;
     let stream_id_bytes = read_segment(&plaintext, &mut pos)?;
@@ -1141,13 +1661,14 @@ pub(crate) fn unpack_state_token(
     let stream_id = String::from_utf8(stream_id_bytes)
         .map_err(|_| RpcError::runtime_error("Malformed state token"))?;
 
-    Ok(UnpackedToken {
-        state_bytes,
-        output_schema_bytes,
-        input_schema_bytes,
-        stream_id,
-        created_at,
-    })
+    Ok((
+        call_id,
+        ResolvedCall {
+            output_schema_bytes,
+            input_schema_bytes,
+            stream_id,
+        },
+    ))
 }
 
 fn read_segment(buf: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
@@ -1295,7 +1816,7 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
 
 async fn postprocess_middleware(
     axum::extract::State(state): axum::extract::State<Arc<HttpState>>,
-    req: axum::http::Request<axum::body::Body>,
+    mut req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Response {
     use axum::body::to_bytes;
@@ -1315,6 +1836,25 @@ async fn postprocess_middleware(
         .headers()
         .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
         .cloned();
+    // Echo the caller's correlation id, or mint one. Resolved *before* the
+    // handler runs and written back onto the request headers, so a handler
+    // (and the access-log record it produces) sees exactly the value the
+    // response will carry — including the minted case. An id that is on the
+    // response but names a different request in the log is worse than none:
+    // it looks like a working trail right up to the moment someone follows
+    // it. Set on the way out so it rides every exit path, including the
+    // errors anybody actually looks up.
+    let request_id = req
+        .headers()
+        .get(REQUEST_ID_RESPONSE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty() && v.len() <= 128)
+        .map(str::to_owned)
+        .unwrap_or_else(new_session_id);
+    if let Ok(v) = HeaderValue::from_str(&request_id) {
+        req.headers_mut()
+            .insert(HeaderName::from_static(REQUEST_ID_RESPONSE_HEADER), v);
+    }
     let req_encoding = pick_response_encoding(req.headers(), state.response_compression_level);
     let req_method = req.method().clone();
     let req_path = req.uri().path();
@@ -1390,6 +1930,11 @@ async fn postprocess_middleware(
     // large responses that matter most.
     attach_cors_headers(&state, &mut parts.headers, req_acrh.as_ref(), false);
     attach_capability_headers(&state, &mut parts.headers, &req_method);
+    if let Ok(v) = HeaderValue::from_str(&request_id) {
+        parts
+            .headers
+            .insert(HeaderName::from_static(REQUEST_ID_RESPONSE_HEADER), v);
+    }
 
     if is_arrow {
         if let (Some(level), Some((encoding, used_custom))) =
@@ -1419,14 +1964,31 @@ async fn postprocess_middleware(
                         parts
                             .headers
                             .insert(name, HeaderValue::from_static(encoding.as_str()));
+                        let compressed_len = compressed.len() as u64;
                         let body_new = axum::body::Body::from(compressed);
+                        emit_deferred_access_records(&mut parts, compressed_len);
                         return Response::from_parts(parts, body_new);
                     }
                 }
             }
         }
     }
+    let body_len = bytes.len() as u64;
+    emit_deferred_access_records(&mut parts, body_len);
     Response::from_parts(parts, axum::body::Body::from(bytes))
+}
+
+/// Emit the request's access-log records now that the body is final.
+///
+/// This runs after compression, which is the whole point: a record written
+/// where the handler finished could only ever report the uncompressed size,
+/// and the two differ by orders of magnitude on a compressible Arrow body.
+/// The cost is that a crash between handler and response loses the record;
+/// the alternative is a permanently wrong number.
+fn emit_deferred_access_records(parts: &mut axum::http::response::Parts, response_bytes: u64) {
+    if let Some(sink) = parts.extensions.remove::<crate::hooks::AccessSink>() {
+        sink.emit(Some(response_bytes));
+    }
 }
 
 /// Attach `VGI-Max-Request-Bytes`, `VGI-Upload-URL-Support`,
@@ -1481,6 +2043,16 @@ fn build_router_inner(state: Arc<HttpState>) -> Router {
     } else {
         api
     };
+
+    // Always routed, but only ever an oracle when a resolver exists. With
+    // introspection off the handler holds nothing and looks nothing up; it is
+    // there so a caller gets a definitive 404 instead of the 415 the generic
+    // `/:method` route answers a JSON body with — which a caller classifying
+    // 401/403/404 as final reads as "retry later" and spins on forever.
+    let api = api.route(
+        crate::auth::introspect::INTROSPECT_ENDPOINT,
+        post(handle_introspect_token).options(handle_preflight),
+    );
 
     let mut app = if prefix.is_empty() {
         api
@@ -1563,6 +2135,103 @@ async fn handle_delete_session(
             (StatusCode::NO_CONTENT, h).into_response()
         }
     }
+}
+
+/// `POST {prefix}/__introspect_token__` — opaque credential to principal.
+///
+/// Two rejection axes, deliberately distinguishable from each other and
+/// deliberately uniform within themselves: `403` says the *caller* may not
+/// introspect, `404` says the *subject* credential did not resolve. Both are
+/// definitive and may be negative-cached; anything transient reaches the caller
+/// as `503` so it is retried instead.
+async fn handle_introspect_token(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Response {
+    use crate::auth::introspect::{IntrospectOutcome, MAX_INTROSPECT_BODY_BYTES};
+
+    let Some(introspector) = state.introspect.as_ref() else {
+        // Deliberately no authentication of its own: "this worker does not do
+        // introspection" is not a secret, and a caller needs to learn it at
+        // preflight rather than after arranging credentials.
+        return introspect_refusal(StatusCode::NOT_FOUND, "not_enabled", None);
+    };
+    let auth = match authenticate_request(
+        &state,
+        crate::auth::introspect::INTROSPECT_ENDPOINT,
+        &headers,
+    ) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    // Bounded here rather than by the global body limit: the only legitimate
+    // content is one credential, and an over-length body collapses onto the
+    // same answer an unknown one gets.
+    let bytes = axum::body::to_bytes(body, MAX_INTROSPECT_BODY_BYTES)
+        .await
+        .unwrap_or_default();
+
+    match introspector.introspect(&auth, &bytes) {
+        IntrospectOutcome::Resolved {
+            principal,
+            token_name,
+            ttl_seconds,
+        } => {
+            // A closed set of three keys. A `claims` field would let this
+            // worker choose its caller's tenant routing, row scope and policy
+            // branch; the asker derives what it needs from the principal alone.
+            let body = serde_json::json!({
+                "principal": principal,
+                "token_name": token_name,
+                "ttl_seconds": ttl_seconds,
+            })
+            .to_string();
+            introspect_json(StatusCode::OK, body, None)
+        }
+        IntrospectOutcome::NotAnIntrospector => {
+            introspect_refusal(StatusCode::FORBIDDEN, "not_an_introspector", None)
+        }
+        IntrospectOutcome::Unresolved => {
+            introspect_refusal(StatusCode::NOT_FOUND, "unresolved", None)
+        }
+        IntrospectOutcome::RateLimited => {
+            introspect_refusal(StatusCode::TOO_MANY_REQUESTS, "rate_limited", Some(1))
+        }
+        IntrospectOutcome::Unavailable {
+            retry_after_seconds,
+        } => introspect_refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            Some(retry_after_seconds),
+        ),
+    }
+}
+
+/// A rejection carrying no detail about why beyond the coarse code.
+fn introspect_refusal(status: StatusCode, error: &str, retry_after: Option<u32>) -> Response {
+    introspect_json(
+        status,
+        serde_json::json!({ "error": error }).to_string(),
+        retry_after,
+    )
+}
+
+fn introspect_json(status: StatusCode, body: String, retry_after: Option<u32>) -> Response {
+    let mut h = HeaderMap::new();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    // A credential's resolution can change; nothing here may sit in a shared
+    // cache.
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Some(secs) = retry_after {
+        if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
+            h.insert(header::RETRY_AFTER, v);
+        }
+    }
+    (status, h, body).into_response()
 }
 
 async fn handle_preflight(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> Response {
@@ -1754,9 +2423,15 @@ fn attach_cors_headers(
                 header::ACCESS_CONTROL_ALLOW_HEADERS,
                 // `X-VGI-Accept-Encoding` is how a browser states a codec
                 // preference at all: `fetch()` cannot set `Accept-Encoding`
-                // (forbidden header name), so it must be allowed here.
+                // (forbidden header name), so it must be allowed here. The
+                // three `VGI-*` request headers fail quietly when omitted:
+                // the browser simply drops them, taking out sticky sessions
+                // and every call behind a proof gate while plain calls keep
+                // working.
                 HeaderValue::from_static(
-                    "Content-Type, Authorization, Cookie, Accept-Encoding, X-VGI-Accept-Encoding",
+                    "Content-Type, Authorization, Cookie, Accept-Encoding, \
+                     X-VGI-Accept-Encoding, VGI-Session, VGI-Session-Accept, \
+                     VGI-Proxy-Proof",
                 ),
             );
         }
@@ -1768,6 +2443,13 @@ fn attach_cors_headers(
     out.insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
         state.cors_expose_headers.clone(),
+    );
+    // A server that has opted into serving cross-origin callers has, by
+    // construction, opted into being embeddable by them: without this a
+    // caller under COEP require-corp has the response blocked outright.
+    out.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("cross-origin"),
     );
     if is_preflight {
         if let Ok(v) = HeaderValue::from_str(&state.cors_max_age.to_string()) {
@@ -1846,6 +2528,29 @@ fn authenticate_request(
     };
     match (cb)(&req) {
         Ok(ctx) => Ok(ctx),
+        Err(err) if err.is_auth_unavailable() => {
+            // Not a rejection: the authority could not be reached. A 401 here
+            // tells every caller to re-authenticate against a service that is
+            // simply down, and invites them to negative-cache an outage.
+            tracing::warn!(
+                target: "vgi_rpc.http",
+                error = %err.message,
+                "authentication unavailable"
+            );
+            let mut h = HeaderMap::new();
+            let retry_after = err
+                .retry_after_seconds
+                .unwrap_or(crate::errors::DEFAULT_AUTH_RETRY_AFTER_SECONDS);
+            if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
+                h.insert(header::RETRY_AFTER, v);
+            }
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                h,
+                "authentication service unavailable",
+            )
+                .into_response())
+        }
         Err(err) => {
             let status = match err.error_type.as_str() {
                 "PermissionError" | "ValueError" => StatusCode::UNAUTHORIZED,
@@ -1858,7 +2563,7 @@ fn authenticate_request(
             // keep that in the logs, return a generic body. A 500 from
             // the auth callback (e.g. a JWKS fetch failure) is purely
             // internal and gets the same treatment.
-            let body = if status == StatusCode::UNAUTHORIZED {
+            if status == StatusCode::UNAUTHORIZED {
                 if let Some(wa) = state.www_authenticate.as_deref() {
                     if let Ok(hv) = HeaderValue::from_str(wa) {
                         h.insert(header::WWW_AUTHENTICATE, hv);
@@ -1869,8 +2574,31 @@ fn authenticate_request(
                     error = %err.message,
                     "request authentication rejected"
                 );
-                "authentication failed"
-            } else {
+                // A classified failure names its own reason; otherwise guess
+                // from the error's *type*, mirroring the Python reference —
+                // PermissionError means the caller got as far as being
+                // identified. Guessing more finely would mean matching on
+                // message text, which misclassifies on any rewording.
+                let reason = err
+                    .auth_reason
+                    .unwrap_or(if err.error_type == "PermissionError" {
+                        AuthReason::InsufficientScope
+                    } else {
+                        AuthReason::Unauthorized
+                    });
+                // Echo the detail only when the authenticator classified the
+                // failure, i.e. chose that text deliberately. An unclassified
+                // message is an arbitrary verifier/library string that may
+                // carry attacker-supplied input (a `kid`, say), and spec §2
+                // keeps that out of the body — it stays in the log above.
+                let detail = if err.auth_reason.is_some() {
+                    err.message.as_str()
+                } else {
+                    ""
+                };
+                return Err(state.unauthorized_response(h, reason, detail));
+            }
+            let body = {
                 tracing::error!(
                     target: "vgi_rpc.http",
                     error = %err.message,
@@ -1946,6 +2674,23 @@ fn cap_error_response(
     );
     headers.insert(RPC_ERROR_HEADER, HeaderValue::from_static("true"));
     (StatusCode::OK, headers, buf).into_response()
+}
+
+/// Stamp `X-VGI-RPC-Error: true` on a 200 whose Arrow body carries an
+/// EXCEPTION batch rather than a result.
+///
+/// A failed RPC answers **200**: the call reached the method and the method
+/// raised, so the failure is application-level and rides the body. The status
+/// line therefore says nothing, and this header is the only signal a client
+/// has short of parsing the stream. It must discriminate — a flag on every
+/// response carries no information, which is the same outage as never
+/// setting it — so call this only on the error paths.
+///
+/// Transport-level rejections (400/404/415/401) keep their status and do
+/// *not* carry the flag; it marks a 200 that is really a failure.
+fn stamp_rpc_error(resp: &mut Response) {
+    resp.headers_mut()
+        .insert(RPC_ERROR_HEADER, HeaderValue::from_static("true"));
 }
 
 fn plain_error(status: StatusCode, msg: String) -> Response {
@@ -2383,6 +3128,10 @@ async fn handle_unary(
     let cookies = parse_cookies(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let server = state.server.clone();
 
+    // Measured before decompression: this is what the peer actually sent,
+    // which is the number an egress bill is computed from. `input_bytes`
+    // below counts logical Arrow buffers and is a different question.
+    let request_wire_bytes = body.len() as u64;
     let body = match maybe_decompress(&headers, &body, state.max_body_size) {
         Ok(b) => b,
         Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
@@ -2449,9 +3198,39 @@ async fn handle_unary(
     if let Some(s) = sticky_sink.clone() {
         ctx.set_sticky(s);
     }
-    let dispatch_info = crate::hooks::DispatchInfo::from_request(&server, &req, "unary", &auth);
+    let mut dispatch_info = crate::hooks::DispatchInfo::from_request(&server, &req, "unary", &auth);
+    // Log the HTTP correlation id, not the Arrow-level one. `X-Request-ID`
+    // on the response and `request_id` in the record have to name the same
+    // request or the trail cannot be joined; `postprocess_middleware`
+    // normalizes the inbound header to the value it will stamp on the way
+    // out, so reading it here is what makes the two agree. Falls back to the
+    // wire request id for a handler reached without that middleware.
+    if let Some(id) = headers
+        .get(REQUEST_ID_RESPONSE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+    {
+        dispatch_info.request_id = id.to_string();
+    }
     let hook = server.dispatch_hook.clone();
+    // Records cannot be written here: response compression runs after this
+    // handler returns, so the on-wire size is not known yet. Park them in a
+    // sink the post-processing middleware drains once the body is final.
+    let access_sink = hook.as_ref().map(|_| crate::hooks::AccessSink::new());
+    if hook.is_some() {
+        dispatch_info.request_bytes = Some(request_wire_bytes);
+        dispatch_info.access_sink = access_sink.clone();
+        // Best-effort self-contained IPC bytes of the request batch for
+        // `request_data`; a failure here must not abort dispatch.
+        if let Ok(bytes) = crate::server::serialize_request_batch(&req.batch) {
+            dispatch_info.request_data = bytes;
+        }
+    }
     let hook_token = hook.as_ref().map(|h| h.on_dispatch_start(&dispatch_info));
+    // Externalised uploads never reach the HTTP body, so they are counted
+    // where they happen. No `.await` runs between here and the read below,
+    // which is what keeps a thread-local honest on an async handler.
+    let externalized = crate::external::ExternalizedScope::new();
 
     let mut stats = crate::hooks::CallStatistics {
         input_batches: 1,
@@ -2515,6 +3294,7 @@ async fn handle_unary(
         let _ = sw.finish();
     }
 
+    dispatch_info.externalized_bytes = externalized.finish();
     if let Some(hook) = hook {
         hook.on_dispatch_end(
             hook_token.unwrap_or(0),
@@ -2545,14 +3325,35 @@ async fn handle_unary(
             if let Some(s) = sticky_sink.as_ref() {
                 stamp_session_headers(&mut resp, &state, s);
             }
+            attach_access_sink(&mut resp, access_sink);
             return resp;
         }
     }
     let mut resp = arrow_response(StatusCode::OK, buf);
+    if app_err.is_some() {
+        // The handler raised (or externalisation failed): the body is an
+        // EXCEPTION batch behind a 200, so flag it.
+        stamp_rpc_error(&mut resp);
+    }
     if let Some(s) = sticky_sink.as_ref() {
         stamp_session_headers(&mut resp, &state, s);
     }
+    attach_access_sink(&mut resp, access_sink);
     resp
+}
+
+/// Hand the request's deferred access-log records to the response, so
+/// `postprocess_middleware` can emit them once the final body exists.
+///
+/// Response extensions rather than a task-local: the records ride the same
+/// value the middleware is already holding, and a response that never
+/// reaches the middleware still emits when the sink is dropped.
+fn attach_access_sink(resp: &mut Response, sink: Option<crate::hooks::AccessSink>) {
+    if let Some(sink) = sink {
+        if !sink.is_empty() {
+            resp.extensions_mut().insert(sink);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2612,10 +3413,12 @@ async fn handle_stream_init(
     let sr = match init_result {
         Ok(s) => s,
         Err(err) => {
-            return arrow_response(
+            let mut resp = arrow_response(
                 StatusCode::OK,
                 error_stream_bytes(&empty_schema(), &err, &server.server_id, &req.request_id),
             );
+            stamp_rpc_error(&mut resp);
+            return resp;
         }
     };
 
@@ -2645,7 +3448,9 @@ async fn handle_stream_init(
     let stream_id = new_session_id();
 
     let mut finished = false;
-    let mut init_error: Option<RpcError> = None;
+    // Set when the body ends up carrying an EXCEPTION envelope — either the
+    // producer's first turn raised, or the state token could not be minted.
+    let mut wrote_error = false;
     {
         let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
         if header.is_none() {
@@ -2659,7 +3464,7 @@ async fn handle_stream_init(
             // The producer's first turn folds into this /init request, so the
             // init request's custom metadata is what the pipe transports
             // would have delivered on the first tick batch.
-            finished = run_producer(
+            let turn = run_producer(
                 &mut sw,
                 &mut ss,
                 &output_schema,
@@ -2669,9 +3474,11 @@ async fn handle_stream_init(
                 sticky_sink.as_ref(),
                 Some(req.metadata.as_ref()),
             );
+            finished = turn.finished;
+            wrote_error |= turn.errored;
         }
         if !finished {
-            match build_continuation_token(
+            match build_init_tokens(
                 &state,
                 &auth_for_token,
                 &ss,
@@ -2679,8 +3486,13 @@ async fn handle_stream_init(
                 input_schema.as_ref(),
                 &stream_id,
             ) {
-                Ok(token) => {
-                    let md = Metadata::from([(STATE_KEY.to_string(), token)]);
+                Ok((token, call_token)) => {
+                    // /init is the one response that hands over the call
+                    // token; continuations re-mint the cursor alone.
+                    let md = Metadata::from([
+                        (STATE_KEY.to_string(), token),
+                        (CALL_STATE_KEY.to_string(), call_token),
+                    ]);
                     let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                 }
                 Err(err) => {
@@ -2689,15 +3501,19 @@ async fn handle_stream_init(
                     // instead of a hung stream.
                     let md = build_error_metadata(&err, &server.server_id, &req.request_id);
                     let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
-                    init_error = Some(err);
+                    wrote_error = true;
                 }
             }
         }
         let _ = sw.finish();
     }
-    let _ = init_error; // surfaced via error envelope already
 
     let mut resp = arrow_response(StatusCode::OK, body_buf);
+    if wrote_error {
+        // The body is an EXCEPTION envelope behind a 200; without the flag a
+        // client reads the failure as a result.
+        stamp_rpc_error(&mut resp);
+    }
     if let Some(s) = sticky_sink.as_ref() {
         stamp_session_headers(&mut resp, &state, s);
     }
@@ -2707,27 +3523,33 @@ async fn handle_stream_init(
 /// Encode a `StreamStateKind` into a signed state token. The token is
 /// bound to `auth` so a different identity replaying it will fail HMAC
 /// verification on the next continuation request.
-fn build_continuation_token(
+/// Mint a stream's pair of tokens at `/init`: the call token, which carries
+/// everything fixed for the life of the call, and the first cursor.
+fn build_init_tokens(
     state: &Arc<HttpState>,
     auth: &crate::auth::AuthContext,
     ss: &StreamStateKind,
     output_schema: &SchemaRef,
     input_schema: Option<&SchemaRef>,
     stream_id: &str,
-) -> Result<String> {
+) -> Result<(String, String)> {
     let out_schema_bytes = write_schema_bytes(output_schema.as_ref())?;
     let in_schema_bytes = match input_schema {
         Some(s) => write_schema_bytes(s.as_ref())?,
         None => Vec::new(),
     };
-    build_continuation_token_from_bytes(
-        state,
+    let mut call_id = [0u8; CALL_ID_LEN];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut call_id);
+
+    let call_token = state.pack_call_token(
         auth,
-        ss,
+        &call_id,
         &out_schema_bytes,
         &in_schema_bytes,
         stream_id,
-    )
+    );
+    let cursor = build_cursor_token(state, auth, ss, &call_id)?;
+    Ok((cursor, call_token))
 }
 
 /// Like [`build_continuation_token`] but takes the already-serialized schema
@@ -2735,25 +3557,30 @@ fn build_continuation_token(
 /// token, so re-serializing the `SchemaRef`s (a decode→re-encode round trip,
 /// plus two `empty_batch` builds) on every turn is pure waste — thread the
 /// bytes straight through instead.
-fn build_continuation_token_from_bytes(
+fn build_cursor_token(
     state: &Arc<HttpState>,
     auth: &crate::auth::AuthContext,
     ss: &StreamStateKind,
-    out_schema_bytes: &[u8],
-    in_schema_bytes: &[u8],
-    stream_id: &str,
+    call_id: &[u8; CALL_ID_LEN],
 ) -> Result<String> {
     let state_bytes = match ss {
         StreamStateKind::Producer(p) => p.encode_state()?,
         StreamStateKind::Exchange(e) => e.encode_state()?,
     };
-    Ok(state.pack_state_token(
-        auth,
-        &state_bytes,
-        out_schema_bytes,
-        in_schema_bytes,
-        stream_id,
-    ))
+    Ok(state.pack_cursor_token(auth, &state_bytes, call_id))
+}
+
+/// Outcome of one HTTP producer turn.
+///
+/// `errored` is separate from `finished` because a raising `produce` ends the
+/// turn exactly like a clean completion does: both stop the loop, but only one
+/// leaves an EXCEPTION envelope in the body, and that is the case the enclosing
+/// 200 must be flagged for.
+struct ProducerTurn {
+    /// The stream is over — no continuation token should be minted.
+    finished: bool,
+    /// The turn wrote an EXCEPTION envelope rather than data.
+    errored: bool,
 }
 
 /// `first_tick_md` is surfaced as [`CallContext::tick_metadata`] on the FIRST
@@ -2773,7 +3600,7 @@ fn run_producer<W: std::io::Write>(
     limit: usize,
     sticky: Option<&Arc<crate::sticky::StickySinkImpl>>,
     first_tick_md: Option<&Metadata>,
-) -> bool {
+) -> ProducerTurn {
     // Continuation producers run without auth context (session-bound).
     let mut ctx = CallContext::for_request(server, req);
     if let Some(s) = sticky {
@@ -2807,7 +3634,10 @@ fn run_producer<W: std::io::Write>(
         if let Err(err) = result {
             let md = build_error_metadata(&err, &server.server_id, &req.request_id);
             let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
-            return true;
+            return ProducerTurn {
+                finished: true,
+                errored: true,
+            };
         }
         let finished = out.finished();
         let mut emitted_data = false;
@@ -2827,14 +3657,23 @@ fn run_producer<W: std::io::Write>(
             batches_written += 1;
         }
         if finished {
-            return true;
+            return ProducerTurn {
+                finished: true,
+                errored: false,
+            };
         }
         if !emitted_data {
             // Guard against degenerate producers that neither emit nor finish.
-            return true;
+            return ProducerTurn {
+                finished: true,
+                errored: false,
+            };
         }
     }
-    false
+    ProducerTurn {
+        finished: false,
+        errored: false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2878,21 +3717,30 @@ async fn handle_stream_exchange(
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, "");
     };
     let cancelled = md_get(&metadata, CANCEL_KEY).is_some();
+    let call_token = md_get(&metadata, CALL_STATE_KEY).map(str::to_owned);
 
-    let unpacked = match state.unpack_state_token(&auth, &token) {
+    // Open the cursor FIRST: its AEAD tag covers the call id and its AAD
+    // covers the caller, so the id is authenticated before it is used to
+    // resolve anything. See HttpState::resolve_call for why that ordering is
+    // the whole security argument for the cache.
+    let unpacked = match state.unpack_cursor_token(&auth, &token) {
         Ok(u) => u,
         Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
     };
+    let call = match state.resolve_call(&auth, &unpacked, call_token.as_deref()) {
+        Ok(c) => c,
+        Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
+    };
 
-    // Reconstruct schemas from token-carried IPC bytes.
-    let output_schema = match read_schema_bytes(&unpacked.output_schema_bytes) {
+    // Reconstruct schemas from the call token's IPC bytes.
+    let output_schema = match read_schema_bytes(&call.output_schema_bytes) {
         Ok(s) => s,
         Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
     };
-    let input_schema: Option<SchemaRef> = if unpacked.input_schema_bytes.is_empty() {
+    let input_schema: Option<SchemaRef> = if call.input_schema_bytes.is_empty() {
         None
     } else {
-        match read_schema_bytes(&unpacked.input_schema_bytes) {
+        match read_schema_bytes(&call.input_schema_bytes) {
             Ok(s) => Some(s),
             Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
         }
@@ -2949,12 +3797,12 @@ async fn handle_stream_exchange(
 
     if matches!(ss, StreamStateKind::Producer(_)) {
         // Producer continuation.
-        let finished;
+        let mut wrote_error = false;
         {
             let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
             // A continuation turn is not the producer's first tick, so it
             // carries no first-tick metadata.
-            finished = run_producer(
+            let turn = run_producer(
                 &mut sw,
                 &mut ss,
                 &output_schema,
@@ -2964,15 +3812,9 @@ async fn handle_stream_exchange(
                 sticky_sink.as_ref(),
                 None,
             );
-            if !finished {
-                match build_continuation_token_from_bytes(
-                    &state,
-                    &auth,
-                    &ss,
-                    &unpacked.output_schema_bytes,
-                    &unpacked.input_schema_bytes,
-                    &unpacked.stream_id,
-                ) {
+            wrote_error |= turn.errored;
+            if !turn.finished {
+                match build_cursor_token(&state, &auth, &ss, &unpacked.call_id) {
                     Ok(new_token) => {
                         let md = Metadata::from([(STATE_KEY.to_string(), new_token)]);
                         let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
@@ -2980,12 +3822,16 @@ async fn handle_stream_exchange(
                     Err(err) => {
                         let md = build_error_metadata(&err, &server.server_id, &req.request_id);
                         let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                        wrote_error = true;
                     }
                 }
             }
             let _ = sw.finish();
         }
         let mut resp = arrow_response(StatusCode::OK, body_buf);
+        if wrote_error {
+            stamp_rpc_error(&mut resp);
+        }
         if let Some(s) = sticky_sink.as_ref() {
             stamp_session_headers(&mut resp, &state, s);
         }
@@ -3002,7 +3848,9 @@ async fn handle_stream_exchange(
                 let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                 let _ = sw.finish();
                 drop(sw);
-                return arrow_response(StatusCode::OK, body_buf);
+                let mut resp = arrow_response(StatusCode::OK, body_buf);
+                stamp_rpc_error(&mut resp);
+                return resp;
             }
         },
         _ => batch,
@@ -3014,6 +3862,7 @@ async fn handle_stream_exchange(
         _ => unreachable!(),
     };
 
+    let mut wrote_error = false;
     {
         let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
         for log in ctx.drain_logs() {
@@ -3023,22 +3872,18 @@ async fn handle_stream_exchange(
         if let Err(err) = res {
             let md = build_error_metadata(&err, &server.server_id, &req.request_id);
             let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+            wrote_error = true;
         } else {
-            let new_token = match build_continuation_token_from_bytes(
-                &state,
-                &auth,
-                &ss,
-                &unpacked.output_schema_bytes,
-                &unpacked.input_schema_bytes,
-                &unpacked.stream_id,
-            ) {
+            let new_token = match build_cursor_token(&state, &auth, &ss, &unpacked.call_id) {
                 Ok(t) => t,
                 Err(err) => {
                     let md = build_error_metadata(&err, &server.server_id, &req.request_id);
                     let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                     let _ = sw.finish();
                     drop(sw);
-                    return arrow_response(StatusCode::OK, body_buf);
+                    let mut resp = arrow_response(StatusCode::OK, body_buf);
+                    stamp_rpc_error(&mut resp);
+                    return resp;
                 }
             };
             let mut wrote_data = false;
@@ -3072,6 +3917,11 @@ async fn handle_stream_exchange(
         &server.server_id,
         "",
     );
+    if wrote_error {
+        // The handler raised; the envelope is in the body behind a 200.
+        // (A cap overshoot is already flagged by `cap_error_response`.)
+        stamp_rpc_error(&mut resp);
+    }
     if let Some(s) = sticky_sink.as_ref() {
         stamp_session_headers(&mut resp, &state, s);
     }
@@ -3103,9 +3953,102 @@ mod tests {
             .build()
     }
 
+    const TEST_CALL_ID: [u8; CALL_ID_LEN] = [9u8; CALL_ID_LEN];
+
     fn sample_schema_bytes() -> Vec<u8> {
         use arrow_schema::{DataType, Field, Schema};
         write_schema_bytes(&Schema::new(vec![Field::new("x", DataType::Int64, false)])).unwrap()
+    }
+
+    // Token payloads are compressed *inside* the seal. The ordering is the
+    // whole point: once a token is sealed it is ciphertext, so the HTTP body
+    // codec can find no redundancy in it — it recovers only the slack base64
+    // adds, never the state's own structure. Compressing before sealing
+    // reaches the real redundancy.
+    //
+    // None of this is visible on the wire, so the cross-language conformance
+    // suite cannot reach it; docs/WIRE_PROTOCOL.md in the reference repo
+    // makes it normative and asks each port to pin it with a language-local
+    // test like these.
+
+    #[test]
+    fn token_payload_compresses_when_redundant() {
+        let plaintext = b"vgi-rpc-state-".repeat(1000);
+        let packed = pack_token_payload(&plaintext);
+        assert_eq!(packed[0], TOKEN_CODEC_ZSTD, "expected the zstd codec tag");
+        assert!(
+            packed.len() < plaintext.len() / 4,
+            "expected real compression on a redundant payload, got {} from {}",
+            packed.len(),
+            plaintext.len()
+        );
+    }
+
+    #[test]
+    fn token_payload_stays_raw_when_incompressible() {
+        // A counter pattern with no repeats gives the codec nothing to find.
+        // Skipping is what keeps the guarantee one-directional: a token may
+        // get smaller, never larger than its plaintext plus the one tag byte.
+        let plaintext: Vec<u8> = (0u8..=255).collect();
+        let packed = pack_token_payload(&plaintext);
+        assert_eq!(packed[0], TOKEN_CODEC_RAW, "expected the raw codec tag");
+        assert_eq!(
+            packed.len(),
+            plaintext.len() + 1,
+            "raw payload must not grow beyond the tag byte"
+        );
+    }
+
+    #[test]
+    fn token_payload_round_trips_under_either_codec() {
+        let incompressible: Vec<u8> = (0u8..=255).collect();
+        let cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"x".to_vec(),
+            incompressible,
+            b"vgi-rpc-state-".repeat(500),
+        ];
+        for plaintext in cases {
+            let packed = pack_token_payload(&plaintext);
+            let got = unpack_token_payload(&packed).expect("round trip");
+            assert_eq!(got, plaintext, "round trip changed the payload");
+        }
+    }
+
+    #[test]
+    fn token_payload_rejects_malformed_input() {
+        // An unknown tag, an empty payload, or a body that will not
+        // decompress all mean a token this server did not mint, so all three
+        // surface as the same uniform error the caller maps to 400.
+        assert!(unpack_token_payload(&[]).is_err(), "empty payload");
+        assert!(
+            unpack_token_payload(&[0x7f, b'p', b'a', b'y']).is_err(),
+            "unknown codec tag"
+        );
+        let mut corrupt = vec![TOKEN_CODEC_ZSTD];
+        corrupt.extend_from_slice(b"not-a-zstd-frame");
+        assert!(unpack_token_payload(&corrupt).is_err(), "corrupt zstd body");
+    }
+
+    #[tokio::test]
+    async fn sealed_token_shrinks_with_a_compressible_state() {
+        // End to end: compression inside the seal shrinks the token itself.
+        // Guards the ordering rather than the codec — a token sealed around
+        // an uncompressed payload comes out *larger* than its input once
+        // base64 inflation is counted, which is the regression this catches.
+        let s = state_with_key();
+        let auth = crate::auth::AuthContext::anonymous();
+        let state_bytes = b"vgi-rpc-call-state-".repeat(400);
+        let token = s.pack_cursor_token(&auth, &state_bytes, &TEST_CALL_ID);
+        assert!(
+            token.len() < state_bytes.len() / 4,
+            "sealed token ({}B) should be far smaller than its state ({}B)",
+            token.len(),
+            state_bytes.len()
+        );
+
+        let unpacked = s.unpack_cursor_token(&auth, &token).unwrap();
+        assert_eq!(unpacked.state_bytes, state_bytes, "state survived the seal");
     }
 
     #[tokio::test]
@@ -3115,19 +4058,24 @@ mod tests {
         let state_bytes = b"state-payload";
         let out_sch = sample_schema_bytes();
         let in_sch = sample_schema_bytes();
-        let token = s.pack_state_token(&auth, state_bytes, &out_sch, &in_sch, "sid-123");
-        let unpacked = s.unpack_state_token(&auth, &token).unwrap();
+        let token = s.pack_cursor_token(&auth, state_bytes, &TEST_CALL_ID);
+        let unpacked = s.unpack_cursor_token(&auth, &token).unwrap();
         assert_eq!(unpacked.state_bytes, state_bytes);
-        assert_eq!(unpacked.output_schema_bytes, out_sch);
-        assert_eq!(unpacked.input_schema_bytes, in_sch);
-        assert_eq!(unpacked.stream_id, "sid-123");
+        assert_eq!(unpacked.call_id, TEST_CALL_ID);
+
+        // The schemas and stream id ride the call token now, not the cursor.
+        let call_token = s.pack_call_token(&auth, &TEST_CALL_ID, &out_sch, &in_sch, "sid-123");
+        let call = s.resolve_call(&auth, &unpacked, Some(&call_token)).unwrap();
+        assert_eq!(call.output_schema_bytes, out_sch);
+        assert_eq!(call.input_schema_bytes, in_sch);
+        assert_eq!(call.stream_id, "sid-123");
     }
 
     #[tokio::test]
     async fn unpack_rejects_tampered_ciphertext() {
         let s = state_with_key();
         let auth = crate::auth::AuthContext::anonymous();
-        let token = s.pack_state_token(&auth, b"s", b"o", b"i", "sid");
+        let token = s.pack_cursor_token(&auth, b"s", &TEST_CALL_ID);
         let mut bytes = base64::engine::general_purpose::STANDARD
             .decode(token.as_bytes())
             .unwrap();
@@ -3136,34 +4084,34 @@ mod tests {
         let cipher_idx = 1 + 24;
         bytes[cipher_idx] ^= 0x01;
         let tampered = base64::engine::general_purpose::STANDARD.encode(bytes);
-        assert!(s.unpack_state_token(&auth, &tampered).is_err());
+        assert!(s.unpack_cursor_token(&auth, &tampered).is_err());
     }
 
     #[tokio::test]
     async fn unpack_rejects_tampered_nonce() {
         let s = state_with_key();
         let auth = crate::auth::AuthContext::anonymous();
-        let token = s.pack_state_token(&auth, b"s", b"o", b"i", "sid");
+        let token = s.pack_cursor_token(&auth, b"s", &TEST_CALL_ID);
         let mut bytes = base64::engine::general_purpose::STANDARD
             .decode(token.as_bytes())
             .unwrap();
         // Flip the first nonce byte; AEAD decryption must reject.
         bytes[1] ^= 0x01;
         let tampered = base64::engine::general_purpose::STANDARD.encode(bytes);
-        assert!(s.unpack_state_token(&auth, &tampered).is_err());
+        assert!(s.unpack_cursor_token(&auth, &tampered).is_err());
     }
 
     #[tokio::test]
     async fn unpack_rejects_unknown_version() {
         let s = state_with_key();
         let auth = crate::auth::AuthContext::anonymous();
-        let token = s.pack_state_token(&auth, b"s", b"o", b"i", "sid");
+        let token = s.pack_cursor_token(&auth, b"s", &TEST_CALL_ID);
         let mut bytes = base64::engine::general_purpose::STANDARD
             .decode(token.as_bytes())
             .unwrap();
         bytes[0] = 0x99;
         let tampered = base64::engine::general_purpose::STANDARD.encode(bytes);
-        let err = s.unpack_state_token(&auth, &tampered).unwrap_err();
+        let err = s.unpack_cursor_token(&auth, &tampered).unwrap_err();
         // Wrong-version tokens map to the same uniform error as every other
         // bad-token mode — callers cannot distinguish failure modes.
         assert!(err.message.contains("signature verification failed"));
@@ -3173,7 +4121,7 @@ mod tests {
     async fn unpack_rejects_malformed_base64() {
         let s = state_with_key();
         let auth = crate::auth::AuthContext::anonymous();
-        let err = s.unpack_state_token(&auth, "not!base64!").unwrap_err();
+        let err = s.unpack_cursor_token(&auth, "not!base64!").unwrap_err();
         assert!(err.message.contains("Malformed"));
     }
 
@@ -3190,8 +4138,8 @@ mod tests {
             .token_key(&[2u8; 32])
             .build();
         let auth = crate::auth::AuthContext::anonymous();
-        let tok = a.pack_state_token(&auth, b"s", b"o", b"i", "sid");
-        assert!(b.unpack_state_token(&auth, &tok).is_err());
+        let tok = a.pack_cursor_token(&auth, b"s", &TEST_CALL_ID);
+        assert!(b.unpack_cursor_token(&auth, &tok).is_err());
     }
 
     #[tokio::test]
@@ -3201,8 +4149,8 @@ mod tests {
         // Pack a token whose created_at is far in the past, using the
         // same AAD the server will reconstruct for an anonymous caller.
         let aad = compute_aad(&auth);
-        let stale = pack_state_token(&[7u8; 32], &aad, b"s", b"o", b"i", "sid", 0);
-        let err = s.unpack_state_token(&auth, &stale).unwrap_err();
+        let stale = pack_cursor_token(&[7u8; 32], &aad, b"s", &TEST_CALL_ID, 0);
+        let err = s.unpack_cursor_token(&auth, &stale).unwrap_err();
         assert!(err.message.contains("expired"), "got: {}", err.message);
     }
 
@@ -3211,11 +4159,11 @@ mod tests {
         let s = state_with_key();
         let alice = crate::auth::AuthContext::for_principal("bearer", "alice");
         let bob = crate::auth::AuthContext::for_principal("bearer", "bob");
-        let tok = s.pack_state_token(&alice, b"s", b"o", b"i", "sid");
-        assert!(s.unpack_state_token(&alice, &tok).is_ok());
-        assert!(s.unpack_state_token(&bob, &tok).is_err());
+        let tok = s.pack_cursor_token(&alice, b"s", &TEST_CALL_ID);
+        assert!(s.unpack_cursor_token(&alice, &tok).is_ok());
+        assert!(s.unpack_cursor_token(&bob, &tok).is_err());
         let anon = crate::auth::AuthContext::anonymous();
-        assert!(s.unpack_state_token(&anon, &tok).is_err());
+        assert!(s.unpack_cursor_token(&anon, &tok).is_err());
     }
 
     #[tokio::test]
@@ -3223,8 +4171,8 @@ mod tests {
         let s = state_with_key();
         let anon = crate::auth::AuthContext::anonymous();
         let alice = crate::auth::AuthContext::for_principal("bearer", "alice");
-        let tok = s.pack_state_token(&anon, b"s", b"o", b"i", "sid");
-        assert!(s.unpack_state_token(&alice, &tok).is_err());
+        let tok = s.pack_cursor_token(&anon, b"s", &TEST_CALL_ID);
+        assert!(s.unpack_cursor_token(&alice, &tok).is_err());
     }
 
     #[tokio::test]
@@ -3232,8 +4180,8 @@ mod tests {
         let s = state_with_key();
         let bearer_alice = crate::auth::AuthContext::for_principal("bearer", "alice");
         let mtls_alice = crate::auth::AuthContext::for_principal("mtls", "alice");
-        let tok = s.pack_state_token(&bearer_alice, b"s", b"o", b"i", "sid");
-        assert!(s.unpack_state_token(&mtls_alice, &tok).is_err());
+        let tok = s.pack_cursor_token(&bearer_alice, b"s", &TEST_CALL_ID);
+        assert!(s.unpack_cursor_token(&mtls_alice, &tok).is_err());
     }
 
     #[tokio::test]
@@ -3579,8 +4527,11 @@ mod tests {
             .token_key_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
             .build();
         let auth = crate::auth::AuthContext::anonymous();
-        let tok = a.pack_state_token(&auth, b"s", b"o", b"i", "sid");
-        assert_eq!(b.unpack_state_token(&auth, &tok).unwrap().stream_id, "sid");
+        let tok = a.pack_cursor_token(&auth, b"s", &TEST_CALL_ID);
+        assert_eq!(
+            b.unpack_cursor_token(&auth, &tok).unwrap().call_id,
+            TEST_CALL_ID
+        );
     }
 
     #[test]

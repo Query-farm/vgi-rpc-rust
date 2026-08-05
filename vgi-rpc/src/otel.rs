@@ -238,23 +238,11 @@ mod tests {
             method: method.into(),
             method_type: "unary",
             server_id: "srv".into(),
-            protocol: String::new(),
-            request_id: String::new(),
             transport_metadata: Arc::new(std::collections::HashMap::from([(
                 "traceparent".into(),
                 "00-aaaa-bbbb-01".into(),
             )])),
-            principal: String::new(),
-            auth_domain: String::new(),
-            authenticated: false,
-            remote_addr: String::new(),
-            http_status: 0,
-            request_data: Vec::new(),
-            stream_id: String::new(),
-            cancelled: false,
-            claims: std::collections::BTreeMap::new(),
-            protocol_hash: String::new(),
-            protocol_version: String::new(),
+            ..Default::default()
         }
     }
 

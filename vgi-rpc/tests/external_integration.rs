@@ -85,3 +85,41 @@ fn caller_metadata_preserved_through_externalization() {
     assert!(md.iter().any(|(k, v)| k == "x-custom" && v == "value"));
     let _ = ptr; // pointer batch is a zero-row, zero-schema batch
 }
+
+/// Externalised payloads leave only a pointer batch on the wire, so a call
+/// that ships 10 GB looks like a few hundred bytes to any transport-level
+/// accounting. The counter therefore sits at the upload choke point, and a
+/// scope reads it per call.
+#[test]
+fn externalized_bytes_are_counted_at_the_upload_choke_point() {
+    use vgi_rpc::external::ExternalizedScope;
+
+    let storage = InMemoryStorage::new();
+    let cfg = cfg_from(storage.clone(), 64 * 1024, Compression::None);
+    let batch = make_batch(100_000);
+
+    let scope = ExternalizedScope::new();
+    // Below the threshold: nothing is uploaded, so nothing is counted.
+    assert!(maybe_externalize_batch(&make_batch(1), None, &cfg)
+        .unwrap()
+        .is_none());
+    let (ptr, _) = maybe_externalize_batch(&batch, None, &cfg)
+        .expect("externalize")
+        .expect("threshold exceeded");
+    let one = scope.finish();
+    assert!(one >= 800_000, "counted {one} for an 800 KB batch");
+    assert_eq!(ptr.num_rows(), 0, "only a pointer batch reaches the wire");
+
+    // The total accumulates across every upload the call makes.
+    let scope = ExternalizedScope::new();
+    for _ in 0..2 {
+        maybe_externalize_batch(&batch, None, &cfg)
+            .expect("externalize")
+            .expect("threshold exceeded");
+    }
+    assert_eq!(scope.finish(), 2 * one);
+
+    // A fresh scope starts from zero: the count is per call, not per process.
+    let scope = ExternalizedScope::new();
+    assert_eq!(scope.finish(), 0);
+}

@@ -43,28 +43,37 @@ pub const ARROW_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 
 /// The shared, self-contained VGI landing page, vendored byte-identically
 /// from `vgi-web-frontend/public/landing.html`. Served at `GET {prefix}/`
-/// for browsers; it fetches `{prefix}/describe.json` same-origin and renders
-/// the worker's catalogs. Carries the `vgi-landing-asset` marker the
-/// cross-language conformance harness asserts on.
+/// for browsers; it reads the worker's catalogs by speaking the VGI protocol
+/// through [`CLIENT_BUNDLE`], imported same-origin from
+/// `{prefix}/vgi-client.js`.
 const LANDING_HTML: &str = include_str!("landing.html");
 
-/// Producer for the standardized VGI landing contract (see
-/// `~/Development/vgi/docs/http-landing-contract.md`). The HTTP transport
-/// owns the routes, the shared `landing.html`, and the runtime-derived
-/// `oauth` / `server_id`; the application (the VGI worker) supplies the
-/// catalog-introspection JSON via this trait. Mirrors the split in the
-/// Python reference (`vgi/http/describe_json.py` produces the document; the
-/// transport serves it).
-pub trait DescribeProvider: Send + Sync {
-    /// Build the full `describe.json` document. `oauth` and `server_id` are
-    /// supplied by the transport (they depend on runtime config, not the
-    /// worker). Returns a serialized JSON string.
-    fn describe_json(&self, oauth: bool, server_id: &str) -> String;
+/// Browser build of the `@query-farm/vgi` JS client, vendored from
+/// `vgi-web-frontend` (`bun run build:landing-client`) and served at
+/// `GET {prefix}/vgi-client.js`.
+///
+/// The worker serves it rather than the page importing it from a CDN: the page
+/// is same-origin with an authenticated worker and carries its session cookie,
+/// so third-party script there would run with full access to that origin — and
+/// a CDN dependency would break air-gapped deployments, which today need
+/// nothing but the worker. Vendored and released as a pair with the page.
+const CLIENT_BUNDLE: &str = include_str!("vgi-client.js");
 
-    /// Build the lazy per-object column payload for
-    /// `GET {prefix}/describe/{catalog}/{schema}/{table}.json`. Returns the
-    /// serialized JSON string, or `None` when the object is unknown (→ 404).
-    fn columns_json(&self, catalog: &str, schema: &str, table: &str) -> Option<String>;
+/// Worker identity for the standardized VGI landing surface.
+///
+/// The shared `landing.html` reads catalog metadata by speaking the VGI
+/// protocol through the client bundle the worker serves beside it, so nothing
+/// about the catalog belongs here. What the protocol has no method for — which
+/// worker this is, what it is called, what version it runs — rides on the JSON
+/// status document at `GET {prefix}/?format=json`.
+#[derive(Clone, Debug, Default)]
+pub struct LandingInfo {
+    /// Worker name shown as the page heading.
+    pub name: String,
+    /// One-line description shown under the heading.
+    pub doc: String,
+    /// Worker version string shown in the footer.
+    pub version: String,
 }
 
 // Sticky-session header conventions (HTTP-only). Header names are
@@ -385,7 +394,7 @@ pub struct HttpState {
     /// Producer for the standardized landing contract (`describe.json` +
     /// lazy columns). `Some` mounts the describe routes; `None` leaves the
     /// server serving only the shared `landing.html` at `GET {prefix}/`.
-    describe_provider: Option<Arc<dyn DescribeProvider>>,
+    landing_info: Option<LandingInfo>,
     /// Capability response headers precomputed from immutable config at
     /// build time, cloned into each response instead of re-formatting the
     /// numeric caps (`n.to_string()` + `HeaderValue::from_str`) per request.
@@ -433,7 +442,7 @@ pub struct HttpStateBuilder {
     enable_sticky: Option<bool>,
     sticky_default_ttl: Option<std::time::Duration>,
     sticky_echo_headers: Vec<(String, String)>,
-    describe_provider: Option<Arc<dyn DescribeProvider>>,
+    landing_info: Option<LandingInfo>,
     proxy_proof_required: Option<bool>,
     extra_proxy_auth_headers: Vec<String>,
     call_state_cache_entries: Option<usize>,
@@ -722,13 +731,12 @@ impl HttpStateBuilder {
         self
     }
 
-    /// Install a [`DescribeProvider`]. When set, the server mounts
-    /// `GET {prefix}/describe.json` and
-    /// `GET {prefix}/describe/{catalog}/{schema}/{table}.json`, backed by the
-    /// worker's catalog introspection. Without it, only the shared
-    /// `landing.html` is served at `GET {prefix}/`.
-    pub fn describe_provider(mut self, provider: Arc<dyn DescribeProvider>) -> Self {
-        self.describe_provider = Some(provider);
+    /// Supply the worker's identity for the standardized landing surface.
+    /// When set, `GET {prefix}/` serves the shared `landing.html` plus a JSON
+    /// status document carrying this identity, and `GET {prefix}/vgi-client.js`
+    /// serves the browser client build the page reads the catalog with.
+    pub fn landing_info(mut self, info: LandingInfo) -> Self {
+        self.landing_info = Some(info);
         self
     }
 
@@ -902,7 +910,7 @@ impl HttpStateBuilder {
             upload_url_provider: self.upload_url_provider,
             sticky,
             introspect,
-            describe_provider: self.describe_provider,
+            landing_info: self.landing_info,
             capability_headers,
             capability_has_any,
             cors_expose_headers,
@@ -2109,19 +2117,13 @@ fn build_router_inner(state: Arc<HttpState>) -> Router {
             axum::routing::get(handle_describe_page),
         );
     }
-    // Standardized landing contract: the versioned `describe.json` document
-    // plus lazy per-object columns. Mounted only when the application wired a
-    // `DescribeProvider` (the shared `landing.html` fetches these).
-    if state.describe_provider.is_some() {
-        app = app
-            .route(
-                &format!("{prefix}/describe.json"),
-                axum::routing::get(handle_describe_json),
-            )
-            .route(
-                &format!("{prefix}/describe/:catalog/:schema/:table"),
-                axum::routing::get(handle_describe_columns),
-            );
+    // The browser client build the shared `landing.html` imports. Mounted
+    // alongside the page whenever the application supplied its identity.
+    if state.landing_info.is_some() {
+        app = app.route(
+            &format!("{prefix}/vgi-client.js"),
+            axum::routing::get(handle_client_bundle),
+        );
     }
 
     app.with_state(state)
@@ -2297,10 +2299,19 @@ async fn handle_landing(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
+        // Worker identity is not catalog data and has no protocol method, so
+        // the page reads it from here.
+        let info = state.landing_info.clone().unwrap_or_default();
         let body = serde_json::json!({
             "status": "ok",
             "server_id": state.server.server_id,
             "protocol": state.server.protocol_name(),
+            "worker": info.name,
+            "doc": info.doc,
+            "version": info.version,
+            "lang": "rust",
+            "oauth": state.oauth_metadata.is_some(),
+            "cupola_base": "https://cupola.query-farm.services",
         })
         .to_string();
         return (StatusCode::OK, h, body).into_response();
@@ -2318,46 +2329,20 @@ fn query_has_format_json(raw: &str) -> bool {
         .any(|pair| pair == "format=json" || pair.strip_prefix("format=") == Some("json"))
 }
 
-/// `GET {prefix}/describe.json` — the versioned landing contract.
-async fn handle_describe_json(State(state): State<Arc<HttpState>>) -> Response {
-    let Some(provider) = state.describe_provider.as_ref() else {
-        return (StatusCode::NOT_FOUND, "").into_response();
-    };
-    let oauth = state.oauth_metadata.is_some();
-    let body = provider.describe_json(oauth, &state.server.server_id);
+/// `GET {prefix}/vgi-client.js` — the browser client build the page imports.
+async fn handle_client_bundle() -> Response {
     let mut h = HeaderMap::new();
     h.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
+        HeaderValue::from_static("text/javascript; charset=utf-8"),
     );
-    (StatusCode::OK, h, body).into_response()
-}
-
-/// `GET {prefix}/describe/{catalog}/{schema}/{table}.json` — lazy per-object
-/// columns (404 when the object is unknown). The `.json` suffix is stripped
-/// from the final path segment.
-async fn handle_describe_columns(
-    State(state): State<Arc<HttpState>>,
-    Path((catalog, schema, table)): Path<(String, String, String)>,
-) -> Response {
-    let Some(provider) = state.describe_provider.as_ref() else {
-        return (StatusCode::NOT_FOUND, "").into_response();
-    };
-    let table = table.strip_suffix(".json").unwrap_or(&table);
-    let mut h = HeaderMap::new();
+    // Immutable for a given worker build: the page and the bundle are vendored
+    // and released together.
     h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=3600"),
     );
-    match provider.columns_json(&catalog, &schema, table) {
-        Some(body) => (StatusCode::OK, h, body).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            h,
-            r#"{"error":"object not found"}"#.to_string(),
-        )
-            .into_response(),
-    }
+    (StatusCode::OK, h, CLIENT_BUNDLE).into_response()
 }
 
 async fn handle_describe_page(State(state): State<Arc<HttpState>>) -> Response {

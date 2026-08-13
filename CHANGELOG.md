@@ -2,6 +2,21 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.21.1] — 2026-08-13
+
+### Changed
+
+- **The logo is transparent.** Both copies of the mark — `assets/vgi-logo.png`,
+  which the crate READMEs link, and the `data:` URI inlined in the landing page
+  `vgi-rpc` serves — were the old export on a white background with no alpha, so
+  both wore a white rectangle wherever the page behind them was not white. Both
+  are now cut from a committed master by `scripts/regenerate_logo_assets.py`.
+  The inlined copy is palettized to 256 colours, which for flat artwork is
+  visually indistinguishable from truecolour and holds the base64 compiled into
+  every dependent binary at 20 KiB rather than 99 KiB.
+
+No API or wire change; this is a patch.
+
 ## [0.20.0] — 2026-08-05
 
 ### Added

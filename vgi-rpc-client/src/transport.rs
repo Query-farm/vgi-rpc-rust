@@ -87,6 +87,16 @@ impl SubprocessTransport {
     }
 }
 
+/// How long [`SubprocessTransport::close`] lets a worker exit on its own before
+/// killing it.
+///
+/// Generous enough that a worker finishing a flush is never killed for it,
+/// short enough that a wedged one cannot stall a caller.
+const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Poll interval while waiting out [`CLOSE_GRACE`].
+const CLOSE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
 impl Transport for SubprocessTransport {
     fn split(&mut self) -> (&mut dyn Read, &mut dyn Write) {
         // `stdin` is always `Some` between `spawn` and `close`.
@@ -95,17 +105,40 @@ impl Transport for SubprocessTransport {
     }
 
     fn close(&mut self) -> Result<()> {
-        // Drop stdin to send EOF, then reap the child (best-effort kill on a
-        // wait error so we never leak a zombie).
+        // Drop stdin to send EOF, then reap the child — but never wait for it
+        // unboundedly.
+        //
+        // EOF is a *request* to exit, and a worker that cannot read is under no
+        // obligation to notice it. The case that bites is a scan abandoned
+        // mid-stream: the worker is blocked writing into a stdout pipe nobody
+        // drains any more, so it never reaches its read, never sees the EOF,
+        // and `wait()` blocks forever. Both sides are then stuck — a deadlock
+        // that presents as a process pinned at 0% CPU with a live child, which
+        // is exactly how it was found (a test harness stalling partway through
+        // a long run, at a position that moved between runs).
+        //
+        // So: give it a short grace period to exit on its own, then kill it.
+        // A cooperative worker pays a couple of polls; a wedged one costs
+        // `CLOSE_GRACE` and dies.
         drop(self.stdin.take());
-        match self.child.wait() {
-            Ok(_) => Ok(()),
-            Err(_) => {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                Ok(())
+
+        let deadline = std::time::Instant::now() + CLOSE_GRACE;
+        loop {
+            match self.child.try_wait() {
+                // Exited on its own.
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(CLOSE_POLL);
+                }
+                // Out of grace, or the child is unwaitable (already reaped by a
+                // SIGCHLD handler, say). Either way stop waiting.
+                _ => break,
             }
         }
+
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        Ok(())
     }
 }
 

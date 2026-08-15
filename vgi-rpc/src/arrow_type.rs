@@ -683,7 +683,7 @@ where
 // Map: Vec<(K, V)>
 //
 // Mirrors the Python wire layout for `dict[K, V]`:
-// `Map(entries{keys: K, values: V (nullable)})`.
+// `Map(entries{key: K, value: V (nullable)})` — the pyarrow/canonical spelling.
 // Only string-keyed maps are supported in V1 because that's what the
 // Python canonical's dataclass introspection emits.
 // ---------------------------------------------------------------------------
@@ -694,12 +694,18 @@ where
     V: VgiArrow,
 {
     fn arrow_data_type() -> DataType {
+        // The entries struct children are `key`/`value` — the spelling pyarrow's
+        // `pa.map_()` produces and therefore what the canonical Python protocol,
+        // the C++ extension and the Go worker all carry. arrow-rs's own
+        // `MapBuilder` defaults to `keys`/`values`, which is where the earlier
+        // mismatch came from; the read path below is positional, so only the
+        // advertised names change.
         let entries = Field::new(
             "entries",
             DataType::Struct(
                 vec![
-                    Field::new("keys", DataType::Utf8, false),
-                    Field::new("values", V::arrow_data_type(), true),
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", V::arrow_data_type(), true),
                 ]
                 .into(),
             ),
@@ -737,10 +743,12 @@ where
             let refs: Vec<&dyn Array> = singletons.iter().map(|a| a.as_ref()).collect();
             arrow_select::concat::concat(&refs).map_err(RpcError::from)?
         };
+        // Must match `arrow_data_type()` above exactly, or `RecordBatch::try_new`
+        // rejects the array as mismatching its own schema.
         let entries_struct = arrow_array::StructArray::from(vec![
-            (Arc::new(Field::new("keys", DataType::Utf8, false)), key_arr),
+            (Arc::new(Field::new("key", DataType::Utf8, false)), key_arr),
             (
-                Arc::new(Field::new("values", V::arrow_data_type(), true)),
+                Arc::new(Field::new("value", V::arrow_data_type(), true)),
                 value_arr,
             ),
         ]);

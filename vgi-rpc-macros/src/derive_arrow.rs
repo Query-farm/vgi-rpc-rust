@@ -66,7 +66,16 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
     for f in fields {
         let ident = f.ident.as_ref().expect("named field");
+        // A field whose wire name collides with a Rust keyword must be written
+        // `r#type`, but `Ident::to_string()` keeps the `r#` prefix — which would
+        // put a column literally named "r#type" on the wire. Strip it so the
+        // Arrow column keeps its protocol spelling, matching how serde and the
+        // rest of the ecosystem treat raw identifiers.
         let ident_str = ident.to_string();
+        let ident_str = ident_str
+            .strip_prefix("r#")
+            .unwrap_or(&ident_str)
+            .to_string();
         let ty = &f.ty;
 
         field_idents.push(ident.clone());
@@ -103,7 +112,14 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     // Reconstruct field idents for use after the build closures.
     let build_pairs = fields.iter().map(|f| {
         let ident = f.ident.as_ref().unwrap();
+        // Same raw-identifier stripping as above — this is the second place a
+        // field name reaches Arrow, and the two must agree or `RecordBatch`
+        // construction fails on a schema/array mismatch.
         let ident_str = ident.to_string();
+        let ident_str = ident_str
+            .strip_prefix("r#")
+            .unwrap_or(&ident_str)
+            .to_string();
         let ty = &f.ty;
         let build_field_ident = format_ident!("__field_{}", ident);
         quote! {

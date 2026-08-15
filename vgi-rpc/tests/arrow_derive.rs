@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use vgi_rpc::{Bytes, VgiArrow};
 
 fn round_trip<T: VgiArrow + std::fmt::Debug + PartialEq>(value: T) -> T {
@@ -174,6 +174,47 @@ fn all_types_roundtrip() {
         annotated_float32: 2.5,
         nested_list: vec![vec![1, 2], vec![3], vec![]],
         dict_str_str: vec![("a".into(), "1".into()), ("b".into(), "2".into())],
+    };
+    assert_eq!(round_trip(v.clone()), v);
+}
+
+// ---------------------------------------------------------------------------
+// Raw identifiers
+// ---------------------------------------------------------------------------
+
+/// A field whose wire name collides with a Rust keyword.
+///
+/// The VGI protocol has several of these — `catalog_schema_contents_functions`
+/// and friends carry a `type` column selecting which kind to list — so the
+/// generated params structs must spell them `r#type`. `Ident::to_string()`
+/// keeps the `r#`, which would put a column literally named `"r#type"` on the
+/// wire and make every such request unreadable by a Python or C++ peer.
+#[derive(VgiArrow, Debug, PartialEq, Clone)]
+struct RawIdentFields {
+    r#type: String,
+    r#match: i64,
+    normal: bool,
+}
+
+#[test]
+fn raw_identifiers_keep_their_protocol_spelling() {
+    let DataType::Struct(fields) = RawIdentFields::arrow_data_type() else {
+        panic!("expected a struct type");
+    };
+    let names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["type", "match", "normal"],
+        "raw identifiers must lose their `r#` prefix in the Arrow column name",
+    );
+}
+
+#[test]
+fn raw_identifier_struct_round_trips() {
+    let v = RawIdentFields {
+        r#type: "scalar".into(),
+        r#match: 7,
+        normal: true,
     };
     assert_eq!(round_trip(v.clone()), v);
 }

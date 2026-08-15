@@ -2,6 +2,37 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.22.0] — 2026-08-14
+
+### Fixed
+
+- **A field named with a Rust keyword reached the wire with its `r#` prefix.**
+  `#[derive(VgiArrow)]` took each column name from `Ident::to_string()`, which
+  keeps the raw-identifier marker: a field that has to be spelled `r#type`
+  produced an Arrow column literally named `"r#type"`. The VGI protocol has
+  such a column — `catalog_schema_contents_functions` and `_macros` carry a
+  `type` selector — so those methods could not be called by a Python, C++ or Go
+  peer, which all send `type`. The prefix is now stripped on both the schema and
+  the array-building path, matching how serde and the rest of the ecosystem
+  treat raw identifiers.
+
+- **Map columns used arrow-rs's child names rather than the protocol's.** The
+  `Vec<(String, V)>` implementation built its entries struct as
+  `keys`/`values` — arrow-rs's `MapBuilder` default — where pyarrow, the
+  canonical Python protocol, the C++ extension and the Go worker all use
+  `key`/`value`. Any map-valued field (`tags`, `options`, `estimated_object_count`)
+  therefore went out with non-canonical child names. The read path was already
+  positional, so only what is written changes.
+
+### Wire compatibility
+
+Both fixes change bytes on the wire, which is why this is a minor bump rather
+than a patch. Both move Rust *toward* the canonical Python protocol, so a Rust
+worker talking to a Python, C++ or Go peer is strictly more correct after
+upgrading — one of the two methods above did not work at all before. A
+Rust-to-Rust pair is unaffected in the map case, since that decoder reads
+entries positionally.
+
 ## [0.21.1] — 2026-08-13
 
 ### Changed

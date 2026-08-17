@@ -81,13 +81,28 @@ mod introspect_fixture {
     /// as unknown and passes the test for the wrong reason. Made resolvable,
     /// the guard is the only thing that can produce a rejection.
     pub const JWS_TRAP_TOKEN: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl";
+    /// The credential whose resolution is *unknowable* rather than unknown. The
+    /// shared suite posts it to check that a backing-store outage surfaces as a
+    /// transient `503` and not as the endpoint's own definitive `404` — which a
+    /// caller may negative-cache, so a briefly unreachable store would be
+    /// remembered as a bad credential for the cache's lifetime.
+    pub const UNAVAILABLE_TOKEN: &str = "conformance-unavailable-token";
 }
 
-/// Resolve the one fixed subject credential the shared tests post.
+/// Resolve the fixed credentials the shared tests post.
+///
+/// Three answers, deliberately: an identity, `Ok(None)` for "does not resolve",
+/// and `Err` for "I could not find out". The third is not a flavour of the
+/// second — `Ok(None)` becomes the definitive `404` a caller may negative-cache.
 fn conformance_resolve_token(
     token: &str,
 ) -> Result<Option<vgi_rpc::auth::introspect::TokenIdentity>, vgi_rpc::RpcError> {
     use introspect_fixture::*;
+    if token == UNAVAILABLE_TOKEN {
+        return Err(vgi_rpc::RpcError::auth_unavailable(
+            "conformance: mapping store unreachable",
+        ));
+    }
     Ok(
         (token == SUBJECT_TOKEN || token == JWS_TRAP_TOKEN).then(|| {
             vgi_rpc::auth::introspect::TokenIdentity::new(SUBJECT_PRINCIPAL)

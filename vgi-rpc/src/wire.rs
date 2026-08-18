@@ -47,6 +47,12 @@ use crate::errors::{Result, RpcError};
 /// semantics.
 pub type Metadata = HashMap<String, String>;
 
+/// Internal marker inserted when a fully framed record-batch message carried
+/// invalid UTF-8 in custom metadata. The reader sanitizes only its private
+/// header copy so it can preserve the next stream boundary; request validation
+/// rejects this marker before dispatch.
+pub(crate) const INVALID_UTF8_METADATA_KEY: &str = "\0vgi_rpc.invalid_utf8_metadata";
+
 /// Look up a key in a [`Metadata`] map, returning the value as `&str`.
 #[inline]
 pub fn md_get<'a>(md: &'a Metadata, key: &str) -> Option<&'a str> {
@@ -396,6 +402,11 @@ impl<R: Read> StreamReader<R> {
     pub fn new(mut reader: R) -> Result<Self> {
         let msg = read_message_bytes(&mut reader, MAX_IPC_SCHEMA_BYTES)?
             .ok_or_else(|| RpcError::new("IPC", "empty IPC stream (no schema)"))?;
+        if msg.had_invalid_utf8 {
+            return Err(RpcError::protocol_error(
+                "Invalid UTF-8 in IPC schema metadata",
+            ));
+        }
         let msg_fb = root_as_message(&msg.message_bytes)
             .map_err(|e| RpcError::new("IPC", format!("parse schema message: {e}")))?;
         if msg_fb.header_type() != MessageHeader::Schema {
@@ -520,7 +531,10 @@ impl<R: Read> StreamReader<R> {
                         )
                     })?
                     .map_err(RpcError::from)?;
-                    let metadata = parse_custom_metadata(&msg_fb);
+                    let mut metadata = parse_custom_metadata(&msg_fb);
+                    if msg.had_invalid_utf8 {
+                        metadata.insert(INVALID_UTF8_METADATA_KEY.into(), "true".into());
+                    }
                     return Ok(Some((batch, metadata)));
                 }
                 MessageHeader::Schema => {
@@ -603,6 +617,7 @@ fn decode_guard<T>(what: &str, f: impl FnOnce() -> T) -> Result<T> {
 struct RawMessage {
     message_bytes: Vec<u8>,
     body: Vec<u8>,
+    had_invalid_utf8: bool,
 }
 
 fn read_exact(r: &mut impl Read, buf: &mut [u8]) -> Result<bool> {
@@ -666,10 +681,25 @@ fn read_message_bytes(r: &mut impl Read, max_bytes: usize) -> Result<Option<RawM
         return Err(RpcError::new("IOError", "unexpected EOF in message body"));
     }
     // Parse just enough to learn the body length, then refuse an absurd
-    // claim outright. This blocks the `bodyLength = 1 TB` attack vector
-    // even when the header itself is small.
-    let msg = root_as_message(&message_bytes)
-        .map_err(|e| RpcError::new("IPC", format!("parse message header: {e}")))?;
+    // claim outright. Invalid UTF-8 in custom metadata is a semantic request
+    // error, not broken framing: Flatbuffers reports its exact byte range
+    // after validating the surrounding offsets, so replace only that range in
+    // our private header copy and remember to reject it before dispatch.
+    let mut had_invalid_utf8 = false;
+    let msg = loop {
+        match root_as_message(&message_bytes) {
+            Ok(msg) => break msg,
+            Err(flatbuffers::InvalidFlatbuffer::Utf8Error { range, .. })
+                if !range.is_empty() && range.end <= message_bytes.len() =>
+            {
+                message_bytes[range].fill(b'?');
+                had_invalid_utf8 = true;
+            }
+            Err(e) => {
+                return Err(RpcError::new("IPC", format!("parse message header: {e}")));
+            }
+        }
+    };
     let body_length_signed = msg.bodyLength();
     if body_length_signed < 0 {
         return Err(RpcError::new(
@@ -706,6 +736,7 @@ fn read_message_bytes(r: &mut impl Read, max_bytes: usize) -> Result<Option<RawM
     Ok(Some(RawMessage {
         message_bytes,
         body,
+        had_invalid_utf8,
     }))
 }
 

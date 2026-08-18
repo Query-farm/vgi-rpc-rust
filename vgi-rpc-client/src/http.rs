@@ -31,8 +31,8 @@ use reqwest::{Method, StatusCode};
 
 use vgi_rpc::errors::{Result, RpcError};
 use vgi_rpc::external::{
-    any_url_validator, Compression, ExternalLocationConfig, ExternalStorage, Fetcher, UploadResult,
-    UrlValidator,
+    any_url_validator, validate_external_url, Compression, ExternalLocationConfig, ExternalStorage,
+    FetchedPayload, Fetcher, UploadResult, UrlValidator,
 };
 use vgi_rpc::introspect::DESCRIBE_METHOD_NAME;
 use vgi_rpc::metadata::{CALL_STATE_KEY, CANCEL_KEY, LOCATION_KEY, REQUEST_ID_KEY, STATE_KEY};
@@ -143,6 +143,17 @@ struct ClientHttpFetcher {
     client: HttpInner,
 }
 
+fn redact_external_url(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return "<invalid external URL>".to_string();
+    };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.to_string()
+}
+
 impl Fetcher for ClientHttpFetcher {
     fn fetch(&self, url: &str, _compression: Compression, max_bytes: usize) -> Result<Vec<u8>> {
         let mut resp = self
@@ -183,6 +194,89 @@ impl Fetcher for ClientHttpFetcher {
                 .map_err(|e| RpcError::runtime_error(format!("zstd decode external body: {e}")))?;
         }
         Ok(out)
+    }
+
+    fn fetch_with_policy(
+        &self,
+        url: &str,
+        _compression: Compression,
+        max_bytes: usize,
+        validator: &UrlValidator,
+        max_redirects: usize,
+    ) -> Result<FetchedPayload> {
+        use reqwest::header::{CONTENT_ENCODING, LOCATION};
+
+        validate_external_url(validator, url)?;
+        let mut current = reqwest::Url::parse(url)
+            .map_err(|_| RpcError::value_error("URL rejected: invalid external URL"))?;
+        let mut redirects = 0usize;
+        loop {
+            let mut resp = self.client.get(current.clone()).send().map_err(|_| {
+                RpcError::runtime_error(format!(
+                    "external GET failed for {}",
+                    redact_external_url(current.as_str())
+                ))
+            })?;
+            if resp.status().is_redirection() {
+                if redirects >= max_redirects {
+                    return Err(RpcError::runtime_error(format!(
+                        "external fetch redirect limit ({max_redirects}) exceeded"
+                    )));
+                }
+                let location = resp
+                    .headers()
+                    .get(LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| RpcError::runtime_error("external redirect missing Location"))?;
+                let next = current.join(location).map_err(|_| {
+                    RpcError::runtime_error("external redirect has invalid Location")
+                })?;
+                validate_external_url(validator, next.as_str())?;
+                current = next;
+                redirects += 1;
+                continue;
+            }
+            if !resp.status().is_success() {
+                return Err(RpcError::runtime_error(format!(
+                    "external GET returned {} for {}",
+                    resp.status(),
+                    redact_external_url(current.as_str())
+                )));
+            }
+            if let Some(len) = resp.content_length() {
+                if len > max_bytes as u64 {
+                    return Err(RpcError::runtime_error(format!(
+                        "external payload Content-Length {len} exceeds max_fetch_bytes={max_bytes}"
+                    )));
+                }
+            }
+            let compression = resp
+                .headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| value.eq_ignore_ascii_case("zstd"))
+                .map_or(Compression::None, |_| Compression::Zstd(0));
+            let mut out = Vec::new();
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = resp
+                    .read(&mut buf)
+                    .map_err(|_| RpcError::runtime_error("external GET body read failed"))?;
+                if n == 0 {
+                    break;
+                }
+                if out.len() + n > max_bytes {
+                    return Err(RpcError::runtime_error(format!(
+                        "external payload exceeds max_fetch_bytes={max_bytes}"
+                    )));
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            return Ok(FetchedPayload {
+                bytes: out,
+                compression,
+            });
+        }
     }
 }
 

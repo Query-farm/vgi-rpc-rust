@@ -164,6 +164,28 @@ pub trait UploadUrlProvider: Send + Sync {
 /// `Err` to reject the URL with a typed [`RpcError`].
 pub type UrlValidator = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
 
+/// Run a URL validator while ensuring a rejection cannot echo signed URL
+/// credentials through its message or traceback.
+pub fn validate_external_url(validator: &UrlValidator, raw: &str) -> Result<()> {
+    validator(raw).map_err(|mut err| {
+        let redacted = redact_external_url(raw);
+        err.message = err.message.replace(raw, &redacted);
+        err.traceback = err.traceback.replace(raw, &redacted);
+        err
+    })
+}
+
+fn redact_external_url(raw: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(raw) else {
+        return "<invalid external URL>".to_string();
+    };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.to_string()
+}
+
 /// Pluggable fetcher used to resolve pointer batches back into data.
 ///
 /// Takes a URL (and the declared compression) and returns the still-encoded
@@ -177,6 +199,31 @@ pub type UrlValidator = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
 /// before decompression's own cap is ever reached.
 pub trait Fetcher: Send + Sync {
     fn fetch(&self, url: &str, compression: Compression, max_bytes: usize) -> Result<Vec<u8>>;
+
+    /// Fetch with the resolver's complete safety policy. Implementations that
+    /// follow redirects should override this method, validate every target
+    /// before issuing the next request, and return the response's actual
+    /// content coding. The default preserves redirect-free custom fetchers.
+    fn fetch_with_policy(
+        &self,
+        url: &str,
+        compression: Compression,
+        max_bytes: usize,
+        validator: &UrlValidator,
+        _max_redirects: usize,
+    ) -> Result<FetchedPayload> {
+        validate_external_url(validator, url)?;
+        self.fetch(url, compression, max_bytes)
+            .map(|bytes| FetchedPayload { bytes, compression })
+    }
+}
+
+/// Encoded bytes returned by a fetcher plus the coding observed on that
+/// response. This lets inbound pointers use the storage response's coding
+/// instead of assuming it matches the local writer configuration.
+pub struct FetchedPayload {
+    pub bytes: Vec<u8>,
+    pub compression: Compression,
 }
 
 /// Externalization configuration.
@@ -205,6 +252,11 @@ pub struct ExternalLocationConfig {
     /// output would OOM the client. Default 1 GiB. Set to `usize::MAX`
     /// to disable.
     pub max_decompressed_bytes: usize,
+    /// Hard ceiling on bytes received from storage before decompression.
+    /// Default 1 GiB, matching the historical combined ceiling.
+    pub max_encoded_bytes: usize,
+    /// Maximum number of redirect hops. Default 5.
+    pub max_redirects: usize,
 }
 
 impl std::fmt::Debug for ExternalLocationConfig {
@@ -228,9 +280,9 @@ pub fn https_only_validator() -> UrlValidator {
         if url.starts_with("https://") {
             Ok(())
         } else {
-            Err(RpcError::value_error(format!(
-                "external location URL must be https:// ({url})"
-            )))
+            Err(RpcError::value_error(
+                "external location URL must be https://",
+            ))
         }
     })
 }
@@ -346,6 +398,8 @@ impl ExternalLocationConfig {
             fetcher,
             url_validator: safe_https_validator(),
             max_decompressed_bytes: 1024 * 1024 * 1024,
+            max_encoded_bytes: 1024 * 1024 * 1024,
+            max_redirects: 5,
         }
     }
 
@@ -368,6 +422,18 @@ impl ExternalLocationConfig {
     /// Pass `usize::MAX` to disable. Default is 1 GiB.
     pub fn with_max_decompressed_bytes(mut self, n: usize) -> Self {
         self.max_decompressed_bytes = n;
+        self
+    }
+
+    /// Override the hard ceiling on encoded bytes read from storage.
+    pub fn with_max_encoded_bytes(mut self, n: usize) -> Self {
+        self.max_encoded_bytes = n;
+        self
+    }
+
+    /// Override the maximum number of redirect hops.
+    pub fn with_max_redirects(mut self, n: usize) -> Self {
+        self.max_redirects = n;
         self
     }
 }
@@ -400,11 +466,18 @@ pub fn fetch_external_ipc_bytes(
     let Some(url) = md_get(metadata, LOCATION_KEY) else {
         return Ok(None);
     };
-    (cfg.url_validator)(url)?;
-    let compressed = cfg
-        .fetcher
-        .fetch(url, cfg.compression, cfg.max_decompressed_bytes)?;
-    let ipc_bytes = decompress(&compressed, cfg.compression, cfg.max_decompressed_bytes)?;
+    let fetched = cfg.fetcher.fetch_with_policy(
+        url,
+        cfg.compression,
+        cfg.max_encoded_bytes,
+        &cfg.url_validator,
+        cfg.max_redirects,
+    )?;
+    let ipc_bytes = decompress(
+        &fetched.bytes,
+        fetched.compression,
+        cfg.max_decompressed_bytes,
+    )?;
     if let Some(expected) = md_get(metadata, LOCATION_SHA256_KEY) {
         let actual = sha256_hex(&ipc_bytes);
         if expected != actual.as_str() {
@@ -642,7 +715,7 @@ pub fn upload_prepared(
     EXTERNALIZED_BYTES.with(|c| c.set(c.get() + payload.len() as u64));
     let upload = cfg.storage.upload(&payload, cfg.compression)?;
     // Validator runs over the final URL.
-    (cfg.url_validator)(&upload.url)?;
+    validate_external_url(&cfg.url_validator, &upload.url)?;
     md.insert(LOCATION_KEY.to_string(), upload.url);
     md.insert(LOCATION_SHA256_KEY.to_string(), sha);
     Ok((ptr, md))
@@ -693,17 +766,19 @@ pub fn resolve_external_location(
     let Some(url) = md_get(metadata, LOCATION_KEY) else {
         return Ok((batch.clone(), metadata.clone()));
     };
-    (cfg.url_validator)(url)?;
-
     let start = std::time::Instant::now();
-    // Cap the fetched (still-encoded) payload at `max_decompressed_bytes`:
-    // any well-formed compressed body is smaller than its decompressed
-    // form, so this is a safe ceiling that also bounds the uncompressed
-    // case. `decompress` enforces the post-decompression cap on top.
-    let compressed = cfg
-        .fetcher
-        .fetch(url, cfg.compression, cfg.max_decompressed_bytes)?;
-    let ipc_bytes = decompress(&compressed, cfg.compression, cfg.max_decompressed_bytes)?;
+    let fetched = cfg.fetcher.fetch_with_policy(
+        url,
+        cfg.compression,
+        cfg.max_encoded_bytes,
+        &cfg.url_validator,
+        cfg.max_redirects,
+    )?;
+    let ipc_bytes = decompress(
+        &fetched.bytes,
+        fetched.compression,
+        cfg.max_decompressed_bytes,
+    )?;
 
     // Integrity check.
     if let Some(expected) = md_get(metadata, LOCATION_SHA256_KEY) {

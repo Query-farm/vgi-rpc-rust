@@ -198,6 +198,14 @@ jobs:
           fi
           python -m pytest test_rust_conformance.py --timeout=20 --timeout-method=signal -v
 
+      - name: Verify native Rust client typed serialization against Python
+        if: matrix.role == 'client' && matrix.server == 'python'
+        env:
+          VGI_RPC_PYTHON: python
+        run: >-
+          cargo test -p vgi-rpc-client --test python_native_client
+          -- --ignored --nocapture
+
       # Access-log conformance was verified by hand for months and drifted
       # anyway — four people checked it by inspection and the rule was still
       # wrong. It runs here now so it cannot silently rot again.

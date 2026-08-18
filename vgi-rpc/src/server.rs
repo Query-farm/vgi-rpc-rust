@@ -101,7 +101,9 @@ impl ConnectionShm {
     }
 }
 use crate::stream::{empty_schema, Emitted, OutputCollector, StreamResult, StreamStateKind};
-use crate::wire::{empty_batch, md_get, Metadata, StreamReader, StreamWriter};
+use crate::wire::{
+    empty_batch, md_get, Metadata, StreamReader, StreamWriter, INVALID_UTF8_METADATA_KEY,
+};
 
 /// Serialize a parsed request batch back to a self-contained Arrow IPC
 /// stream (one schema message + one record batch + EOS) for inclusion in
@@ -357,6 +359,11 @@ impl Request {
         metadata: Metadata,
         require_method: bool,
     ) -> Result<Self> {
+        if metadata.contains_key(INVALID_UTF8_METADATA_KEY) {
+            return Err(RpcError::protocol_error(
+                "Invalid UTF-8 in request batch custom_metadata",
+            ));
+        }
         let method = if require_method {
             md_get(&metadata, RPC_METHOD_KEY)
                 .ok_or_else(|| {
@@ -937,9 +944,23 @@ impl RpcServer {
         w: &mut W,
         mut shm_cache: Option<&mut ConnectionShm>,
     ) -> Result<bool> {
-        let (req, request_used_shm) = match self.read_request(r, shm_cache.as_deref_mut())? {
-            Some(rq) => rq,
-            None => return Ok(false),
+        let (batch, metadata, request_used_shm) =
+            match self.read_request(r, shm_cache.as_deref_mut())? {
+                Some(frame) => frame,
+                None => return Ok(false),
+            };
+        // At this point the IPC request was fully framed and drained, so a
+        // dispatch-contract failure must not poison the persistent
+        // connection. Return a typed error stream and leave the next request
+        // boundary intact. Frame/decode/I/O errors still propagate from
+        // `read_request` above and terminate the connection.
+        let request_id = md_get(&metadata, REQUEST_ID_KEY).unwrap_or("").to_string();
+        let req = match Request::from_read_batch(batch, metadata, true) {
+            Ok(req) => req,
+            Err(err) => {
+                write_error_stream(w, &empty_schema(), &err, &self.server_id, &request_id)?;
+                return Ok(true);
+            }
         };
 
         // __transport_options__ — framework transport-capability handshake,
@@ -1127,7 +1148,7 @@ impl RpcServer {
         &self,
         r: &mut R,
         shm_cache: Option<&mut ConnectionShm>,
-    ) -> Result<Option<(Request, bool)>> {
+    ) -> Result<Option<(RecordBatch, Metadata, bool)>> {
         let mut reader = match StreamReader::new(r) {
             Ok(r) => r,
             Err(e) => {
@@ -1183,10 +1204,7 @@ impl RpcServer {
         };
         #[cfg(not(feature = "shm"))]
         let _ = shm_cache;
-        Ok(Some((
-            Request::from_read_batch(batch, metadata, true)?,
-            request_used_shm,
-        )))
+        Ok(Some((batch, metadata, request_used_shm)))
     }
 
     #[allow(clippy::too_many_arguments)]

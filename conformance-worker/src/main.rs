@@ -239,6 +239,7 @@ fn main() {
             parse_usize_flag(&args, "--max-response-bytes"),
             parse_usize_flag(&args, "--max-externalized-response-bytes"),
             no_compression,
+            args.iter().any(|a| a == "--external-security"),
         );
         return;
     }
@@ -429,6 +430,7 @@ fn run_http_with_storage(
     max_response_bytes: Option<usize>,
     max_externalized_response_bytes: Option<usize>,
     no_compression: bool,
+    external_security: bool,
 ) {
     use std::sync::Arc as StdArc;
     use vgi_rpc::external::{Compression, ExternalLocationConfig};
@@ -442,6 +444,24 @@ fn run_http_with_storage(
     let mut cfg = ExternalLocationConfig::new(storage_as_ext, fetcher)
         .with_threshold_bytes(threshold)
         .with_url_validator(vgi_rpc::external::any_url_validator());
+    if external_security {
+        cfg = cfg
+            .with_max_encoded_bytes(4 * 1024)
+            .with_max_decompressed_bytes(8 * 1024)
+            .with_url_validator(StdArc::new(|raw| {
+                let parsed = reqwest::Url::parse(raw)
+                    .map_err(|_| vgi_rpc::RpcError::value_error("URL rejected: invalid URL"))?;
+                if parsed
+                    .host_str()
+                    .is_some_and(|host| host.eq_ignore_ascii_case("localhost"))
+                {
+                    return Err(vgi_rpc::RpcError::value_error(
+                        "URL rejected: localhost is not allowed",
+                    ));
+                }
+                Ok(())
+            }));
+    }
     if zstd {
         cfg = cfg.with_compression(Compression::Zstd(0));
     }

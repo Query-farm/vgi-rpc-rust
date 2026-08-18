@@ -105,6 +105,7 @@ def _start_rust_http_with_storage(
     max_request_bytes: int | None = None,
     max_response_bytes: int | None = None,
     max_externalized_response_bytes: int | None = None,
+    external_security: bool = False,
 ) -> tuple[subprocess.Popen, int]:
     args = [RUST_WORKER, "--http-with-storage", storage_url or ""]
     if zstd:
@@ -120,6 +121,8 @@ def _start_rust_http_with_storage(
             "--max-externalized-response-bytes",
             str(max_externalized_response_bytes),
         ]
+    if external_security:
+        args.append("--external-security")
     return _spawn_read_port(args)
 
 
@@ -229,6 +232,13 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
             return _start_rust_http_with_storage(storage_url, zstd=False)
         if variant == "zstd_storage":
             return _start_rust_http_with_storage(storage_url, zstd=True)
+        if variant == "external_security":
+            return _start_rust_http_with_storage(
+                storage_url,
+                zstd=False,
+                max_request_bytes=1024 * 1024,
+                external_security=True,
+            )
         if variant == "externalize_always":
             return _start_rust_http_with_storage(
                 storage_url, zstd=False, externalize_threshold=1, max_request_bytes=1024 * 1024
@@ -454,6 +464,12 @@ def conformance_http_with_storage_port(conformance_fake_storage: str) -> Iterato
 def conformance_http_with_zstd_storage_port(conformance_fake_storage: str) -> Iterator[int]:
     """HTTP server wired to fake storage with zstd compression."""
     yield from _http_variant_fixture("zstd_storage", conformance_fake_storage)
+
+
+@pytest.fixture(scope="session")
+def conformance_http_external_security_port(conformance_fake_storage: str) -> Iterator[int]:
+    """Rust worker with independent fetch caps and per-hop URL validation."""
+    yield from _http_variant_fixture("external_security", conformance_fake_storage)
 
 
 @pytest.fixture(scope="session")

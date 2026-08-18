@@ -9,7 +9,10 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-import httpx
+try:
+    import httpx
+except ModuleNotFoundError:  # the Python reference moved to the httpx2 fork
+    import httpx2 as httpx
 import pytest
 
 from vgi_rpc.conformance import ConformanceService

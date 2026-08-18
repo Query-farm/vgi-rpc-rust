@@ -43,6 +43,7 @@ quote = "1"
 proc-macro2 = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 rust_decimal = { version = "1", default-features = false }
+socket2 = "0.6"
 
 [profile.release]
 opt-level = 3

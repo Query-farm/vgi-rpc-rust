@@ -2,6 +2,36 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## Unreleased
+
+### Performance
+
+- **A Unix socket got 8 KiB of kernel buffer, and so ran at half the pipe's
+  throughput.** macOS defaults `net.local.stream.sendspace` to 8192 bytes —
+  against ~64 KiB for a pipe — so a megabyte of Arrow crossed the kernel in 128
+  trips instead of a handful. `unix::widen_socket_buffers` now requests 1 MiB,
+  and `serve_unix` and `vgi-rpc-client`'s `UnixTransport::connect` both call it.
+
+  Both ends have to: an `AF_UNIX` write is bounded by space in the *receiver's*
+  buffer, so a tuned server still feeds an untuned client 8 KiB at a time.
+  Fixing only the client end, against an already-tuned C++ worker, took echo
+  throughput from 4,994 to **18,597 MB/s** at a 1 MiB payload (3.7x), 2,613 to
+  4,438 at 64 KiB, and 2,373 to 5,369 at 16 MiB. The pipe control column moved
+  3% across those runs, so that is the change rather than the machine.
+
+  `TcpTransport` deliberately does not get the same call: TCP already starts at
+  128 KiB and grows, an explicit `SO_RCVBUF` *disables* Linux's receive-window
+  auto-tuning and pins the window at whatever constant we guessed, and an A/B
+  on loopback showed no gain either way.
+
+  Adds `socket2` as a `cfg(unix)` dependency of `vgi-rpc` and `vgi-rpc-client`.
+
+### Fixed
+
+- The conformance harness imported `httpx`, which the Python reference no
+  longer installs — it moved to the `httpx2` fork. `test_rust_conformance.py`
+  now accepts either, so collection stops failing before any test runs.
+
 ## [0.22.0] — 2026-08-14
 
 ### Fixed

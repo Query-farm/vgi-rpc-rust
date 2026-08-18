@@ -267,6 +267,10 @@ mod unix_impl {
             let stream = UnixStream::connect(path.as_ref()).map_err(|e| {
                 RpcError::new("TransportError", format!("connect unix socket: {e}"))
             })?;
+            // Both ends have to ask, not just the server: an AF_UNIX write is
+            // bounded by space in the *receiver's* buffer, so a tuned worker
+            // still feeds an untuned client 8 KiB at a time.
+            vgi_rpc::unix::widen_socket_buffers(&stream);
             if let Some(t) = read_timeout {
                 stream.set_read_timeout(Some(t)).map_err(|e| {
                     RpcError::new("TransportError", format!("set unix read timeout: {e}"))

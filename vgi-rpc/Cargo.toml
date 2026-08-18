@@ -185,5 +185,11 @@ rust_decimal.workspace = true
 # Windows-only shared-memory backend for the `shm` feature. Target-gated so
 # `shm = ["dep:libc", "dep:windows-sys"]` pulls windows-sys only on Windows;
 # on unix/wasm the shm code uses the `#[cfg(unix)]` libc path instead.
+# AF_UNIX socket-buffer tuning (see `unix::widen_socket_buffers`).  Unix only,
+# and not optional: the default buffer is small enough to halve throughput, so
+# a build that silently skipped it would be a performance trap.
+[target.'cfg(unix)'.dependencies]
+socket2.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", optional = true, features = ["Win32_Foundation", "Win32_System_Memory", "Win32_Security"] }

@@ -28,6 +28,35 @@ use std::time::{Duration, Instant};
 
 use crate::RpcServer;
 
+/// Socket buffer requested on both ends of an `AF_UNIX` connection.
+///
+/// macOS defaults `net.local.stream.sendspace` to 8192 bytes — against ~64 KiB
+/// for a pipe — so a megabyte of Arrow crosses the kernel in 128 trips instead
+/// of a handful. Widening it takes a Unix socket from roughly half the pipe's
+/// throughput to ahead of it at 1 MiB and 16 MiB payloads.
+///
+/// TCP deliberately does not get the same treatment: it already starts at
+/// 128 KiB and grows, and an explicit `SO_RCVBUF` *disables* Linux's
+/// receive-window auto-tuning, pinning the window at whatever constant we
+/// guessed.
+pub const UNIX_SOCKET_BUFFER_BYTES: usize = 1 << 20;
+
+/// Request [`UNIX_SOCKET_BUFFER_BYTES`] of send and receive buffer on `sock`.
+///
+/// Both ends must do this to get the benefit: an `AF_UNIX` write is bounded by
+/// space in the *receiver's* buffer, so a tuned server still hands every
+/// response to an untuned client one 8 KiB chunk at a time. [`serve_unix`]
+/// calls it on each accepted connection; `vgi-rpc-client`'s `UnixTransport`
+/// calls it on connect.
+///
+/// Best effort. The kernel clamps the request to its own maximum, and a
+/// refusal is not worth failing a connection over.
+pub fn widen_socket_buffers<S: std::os::fd::AsFd>(sock: &S) {
+    let sock = socket2::SockRef::from(sock);
+    let _ = sock.set_send_buffer_size(UNIX_SOCKET_BUFFER_BYTES);
+    let _ = sock.set_recv_buffer_size(UNIX_SOCKET_BUFFER_BYTES);
+}
+
 /// Shared idle bookkeeping: how many connections are live, and — when zero —
 /// the instant at which the worker should self-terminate.
 struct IdleState {
@@ -93,6 +122,7 @@ pub fn serve_unix<F: FnOnce()>(
         match listener.accept() {
             Ok((mut conn, _)) => {
                 conn.set_nonblocking(false).ok();
+                widen_socket_buffers(&conn);
                 {
                     let mut st = lock(&state);
                     st.conn_count += 1;

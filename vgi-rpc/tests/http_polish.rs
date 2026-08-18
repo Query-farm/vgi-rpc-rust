@@ -10,14 +10,15 @@ use axum::http::{header, Request, StatusCode};
 use tower::ServiceExt;
 
 use vgi_rpc::http::{HttpState, ARROW_CONTENT_TYPE};
-use vgi_rpc::metadata::{REQUEST_VERSION, REQUEST_VERSION_KEY};
+use vgi_rpc::metadata::{REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY};
 use vgi_rpc::wire::{Metadata, StreamWriter};
 use vgi_rpc::{MethodInfo, RpcServer};
 
 /// Encode a valid unary HTTP request body: one IPC stream carrying `batch`
-/// with the request-version metadata (the method is derived from the URL).
+/// with the method and request-version metadata.
 fn encode_unary_body(schema: &Schema, batch: &RecordBatch) -> Vec<u8> {
     let mut md = Metadata::new();
+    md.insert(RPC_METHOD_KEY.into(), "big".into());
     md.insert(REQUEST_VERSION_KEY.into(), REQUEST_VERSION.into());
     let mut buf = Vec::new();
     {

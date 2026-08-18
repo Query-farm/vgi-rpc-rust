@@ -409,7 +409,7 @@ pub fn fetch_external_ipc_bytes(
         let actual = sha256_hex(&ipc_bytes);
         if expected != actual.as_str() {
             return Err(RpcError::runtime_error(format!(
-                "external location SHA-256 mismatch (expected {expected}, got {actual})"
+                "external location checksum: SHA-256 mismatch (expected {expected}, got {actual})"
             )));
         }
     }
@@ -710,7 +710,7 @@ pub fn resolve_external_location(
         let actual = sha256_hex(&ipc_bytes);
         if expected != actual.as_str() {
             return Err(RpcError::runtime_error(format!(
-                "external location SHA-256 mismatch (expected {expected}, got {actual})"
+                "external location checksum: SHA-256 mismatch (expected {expected}, got {actual})"
             )));
         }
     }

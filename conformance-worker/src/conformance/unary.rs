@@ -185,12 +185,13 @@ impl UnarySvc {
 
     /// Echo an enum value.
     ///
-    /// The `Status` enum is carried over the wire as `Utf8`; the
-    /// describe metadata names it `"Status"` to match Python.
+    /// Python carries enum parameters as dictionary-encoded Utf8. The
+    /// `DictString` newtype selects that exact wire schema while the describe
+    /// metadata names it `"Status"`.
     #[unary]
     #[param(name = "status", arrow_type = "Status")]
-    fn echo_enum(&self, status: String) -> Result<String> {
-        Ok(status)
+    fn echo_enum(&self, status: DictString) -> Result<String> {
+        Ok(status.0)
     }
 
     /// Echo a list of strings.

@@ -40,15 +40,24 @@ impl ExternalStorage for FakeStorage {
             .and_then(|r| r.error_for_status())
             .and_then(|r| r.json())
             .map_err(|e| RpcError::runtime_error(format!("fake-storage alloc failed: {e}")))?;
-        let url = alloc_resp
+        let legacy_url = alloc_resp
             .get("object_url")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| RpcError::runtime_error("alloc response missing object_url"))?
+            .ok_or_else(|| RpcError::runtime_error("alloc response missing object_url"))?;
+        let upload_url = alloc_resp
+            .get("upload_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or(legacy_url)
+            .to_string();
+        let download_url = alloc_resp
+            .get("download_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or(legacy_url)
             .to_string();
 
         let mut req = self
             .client
-            .put(&url)
+            .put(&upload_url)
             .body(ipc_bytes.to_vec())
             .header("content-type", "application/vnd.apache.arrow.stream");
         if matches!(compression, Compression::Zstd(_)) {
@@ -59,7 +68,7 @@ impl ExternalStorage for FakeStorage {
             .map_err(|e| RpcError::runtime_error(format!("fake-storage PUT failed: {e}")))?;
 
         Ok(UploadResult {
-            url,
+            url: download_url,
             sha256: String::new(),
         })
     }
@@ -77,21 +86,29 @@ impl UploadUrlProvider for FakeStorage {
             .and_then(|r| r.error_for_status())
             .and_then(|r| r.json())
             .map_err(|e| RpcError::runtime_error(format!("fake-storage alloc failed: {e}")))?;
-        let url = alloc_resp
+        let legacy_url = alloc_resp
             .get("object_url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| RpcError::runtime_error("alloc response missing object_url"))?
             .to_string();
-        // Same path used for both PUT and GET (HTTP method disambiguation,
-        // no presigning per method) — mirrors the Python adapter.
+        let upload_url = alloc_resp
+            .get("upload_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&legacy_url)
+            .to_string();
+        let download_url = alloc_resp
+            .get("download_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&legacy_url)
+            .to_string();
         let now_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as i64)
             .unwrap_or(0);
         let expires_at_micros = now_us + 60 * 60 * 1_000_000; // +1h
         Ok(UploadUrl {
-            upload_url: url.clone(),
-            download_url: url,
+            upload_url,
+            download_url,
             expires_at_micros,
         })
     }

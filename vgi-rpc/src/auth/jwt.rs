@@ -132,7 +132,8 @@ struct JwksCache {
 ///   - `Anonymous()` when the `Authorization: Bearer` header is missing.
 ///   - `Err(PermissionError)` when a token is present but verification fails.
 ///   - `Ok(ctx)` with `principal` populated from the configured claim when
-///     verification succeeds.
+///     verification succeeds. The claim must exist and contain a non-blank
+///     JSON string.
 ///
 /// **Without the `jwt-jsonwebtoken` feature** this crate stays agnostic
 /// to the crypto library: the default fetcher and verifier both error,
@@ -322,8 +323,15 @@ fn validate_token(
 
     let principal = claims
         .get(&cfg.principal_claim)
-        .map(json_claim_to_string)
-        .unwrap_or_default();
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            RpcError::permission_error(format!(
+                "JWT principal claim '{}' must be a non-blank string",
+                cfg.principal_claim
+            ))
+        })?
+        .to_owned();
     let mut ctx = AuthContext::for_principal(format!("jwt:{}", cfg.issuer), principal);
     for (k, v) in claims.into_iter() {
         ctx = ctx.with_claim(k, json_claim_to_string(&v));
@@ -670,6 +678,108 @@ mod tests {
             ctx.claims.get("iss").map(String::as_str),
             Some("https://iss")
         );
+    }
+
+    #[test]
+    fn custom_principal_claim_issues_authenticated_ctx() {
+        let claims = json!({
+            "iss": "https://iss",
+            "aud": "https://api",
+            "tenant_id": "tenant-a",
+            "exp": future_exp(),
+        });
+        let auth = auth_with_claims(
+            JwtConfig::new("https://iss")
+                .with_audience("https://api")
+                .with_principal_claim("tenant_id"),
+            claims.as_object().unwrap().clone(),
+        );
+
+        let ctx = call(&auth, &fake_token_with_kid("k1")).unwrap();
+
+        assert!(ctx.authenticated);
+        assert_eq!(ctx.principal, "tenant-a");
+    }
+
+    #[test]
+    fn missing_default_principal_claim_is_rejected() {
+        let claims = json!({
+            "iss": "https://iss",
+            "aud": "https://api",
+            "exp": future_exp(),
+        });
+        let auth = auth_with_claims(
+            JwtConfig::new("https://iss").with_audience("https://api"),
+            claims.as_object().unwrap().clone(),
+        );
+
+        let err = call(&auth, &fake_token_with_kid("k1")).unwrap_err();
+
+        assert_eq!(err.error_type, "PermissionError");
+        assert!(
+            err.message.contains("principal claim 'sub'"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn missing_custom_principal_claim_is_rejected() {
+        let claims = json!({
+            "iss": "https://iss",
+            "aud": "https://api",
+            "sub": "alice",
+            "exp": future_exp(),
+        });
+        let auth = auth_with_claims(
+            JwtConfig::new("https://iss")
+                .with_audience("https://api")
+                .with_principal_claim("tenant_id"),
+            claims.as_object().unwrap().clone(),
+        );
+
+        let err = call(&auth, &fake_token_with_kid("k1")).unwrap_err();
+
+        assert_eq!(err.error_type, "PermissionError");
+        assert!(
+            err.message.contains("principal claim 'tenant_id'"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn malformed_principal_claims_are_rejected() {
+        let cases = [
+            ("null", serde_json::Value::Null),
+            ("number", json!(42)),
+            ("boolean", json!(true)),
+            ("array", json!(["alice"])),
+            ("object", json!({"name": "alice"})),
+            ("whitespace", json!(" \t\n")),
+        ];
+
+        for (case, invalid_principal) in cases {
+            let claims = json!({
+                "iss": "https://iss",
+                "aud": "https://api",
+                "sub": invalid_principal,
+                "exp": future_exp(),
+            });
+            let auth = auth_with_claims(
+                JwtConfig::new("https://iss").with_audience("https://api"),
+                claims.as_object().unwrap().clone(),
+            );
+
+            let err = call(&auth, &fake_token_with_kid("k1")).unwrap_err();
+
+            assert_eq!(err.error_type, "PermissionError", "case: {case}");
+            assert!(
+                err.message.contains("non-blank string"),
+                "case {case}: {}",
+                err.message
+            );
+        }
     }
 
     #[test]

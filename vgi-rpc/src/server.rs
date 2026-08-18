@@ -13,8 +13,9 @@ use crate::log::{LogLevel, LogMessage};
 #[cfg(feature = "shm")]
 use crate::metadata::SHM_SEGMENT_SIZE_KEY;
 use crate::metadata::{
-    CANCEL_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY, REQUEST_ID_KEY, REQUEST_VERSION,
-    REQUEST_VERSION_KEY, RPC_METHOD_KEY, SERVER_ID_KEY, SHM_OFFSET_KEY, SHM_SEGMENT_NAME_KEY,
+    CANCEL_KEY, LOCATION_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY, REQUEST_ID_KEY,
+    REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY, SERVER_ID_KEY, SHM_OFFSET_KEY,
+    SHM_SEGMENT_NAME_KEY,
 };
 #[cfg(feature = "shm")]
 use crate::shm::{is_shm_pointer_batch, maybe_write_to_shm, resolve_shm_batch, ShmSegment};
@@ -349,8 +350,8 @@ impl Request {
     /// `vgi_rpc.request_version` metadata.
     ///
     /// `require_method` controls whether a missing `vgi_rpc.method` key is
-    /// an error (pipe/unix transports require it; HTTP already derives the
-    /// method from the URL path and may leave the key absent).
+    /// an error. All dispatching transports require it; the option remains
+    /// for intermediary readers that intentionally inspect partial frames.
     pub(crate) fn from_read_batch(
         batch: RecordBatch,
         metadata: Metadata,
@@ -379,7 +380,12 @@ impl Request {
                 version, REQUEST_VERSION
             )));
         }
-        if require_method && !batch.schema().fields().is_empty() && batch.num_rows() != 1 {
+        let external_pointer = md_get(&metadata, LOCATION_KEY).is_some();
+        if require_method
+            && !batch.schema().fields().is_empty()
+            && batch.num_rows() != 1
+            && !external_pointer
+        {
             return Err(RpcError::protocol_error(format!(
                 "Expected 1 row in request batch, got {}",
                 batch.num_rows()
@@ -393,6 +399,27 @@ impl Request {
             metadata: Arc::new(metadata),
         })
     }
+}
+
+/// Enforce the declared method-parameter contract before handler dispatch.
+///
+/// Field order, names, types, and nullability are all wire-visible. Treating
+/// a request as a best-effort name lookup silently turns missing parameters
+/// into defaults and lets malformed schemas reach application code.
+pub(crate) fn validate_parameter_batch(batch: &RecordBatch, expected: &Schema) -> Result<()> {
+    if batch.schema().fields() != expected.fields() {
+        return Err(RpcError::type_error(format!(
+            "parameter schema mismatch: expected {expected:?}, got {:?}",
+            batch.schema()
+        )));
+    }
+    if !expected.fields().is_empty() && batch.num_rows() != 1 {
+        return Err(RpcError::protocol_error(format!(
+            "Expected 1 row in request batch, got {}",
+            batch.num_rows()
+        )));
+    }
+    Ok(())
 }
 
 /// Identifies the dispatch kind of a registered method.
@@ -993,6 +1020,17 @@ impl RpcServer {
             )?;
             return Ok(true);
         };
+
+        if let Err(err) = validate_parameter_batch(&req.batch, &info.params_schema) {
+            write_error_stream(
+                w,
+                &info.result_schema,
+                &err,
+                &self.server_id,
+                &req.request_id,
+            )?;
+            return Ok(true);
+        }
 
         let method_type = match info.method_type {
             MethodType::Unary => "unary",

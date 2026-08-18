@@ -31,8 +31,8 @@ use std::collections::HashMap;
 
 use crate::metadata::{CALL_STATE_KEY, CANCEL_KEY, REQUEST_ID_KEY, STATE_KEY};
 use crate::server::{
-    build_error_metadata, build_log_metadata, cast_batch, CallContext, MethodType, Request,
-    RpcServer,
+    build_error_metadata, build_log_metadata, cast_batch, validate_parameter_batch, CallContext,
+    MethodType, Request, RpcServer,
 };
 use crate::stream::{empty_schema, Emitted, OutputCollector, StreamResult, StreamStateKind};
 use crate::unauthorized::{AuthReason, AUTH_PROXY_REQUIRED_HEADER, AUTH_REASON_HEADER};
@@ -1880,17 +1880,14 @@ async fn postprocess_middleware(
     }
     let req_encoding = pick_response_encoding(req.headers(), state.response_compression_level);
     let req_method = req.method().clone();
-    let req_path = req.uri().path();
+    let req_path = req.uri().path().to_owned();
 
     // Enforce server-advertised max_request_bytes before invoking the
-    // handler. Exempt the upload-URL flow itself and `/health` so
-    // clients can still discover capabilities and request URLs even if
-    // their next request would exceed the limit.
+    // handler. The upload-URL control body is client-controlled and must be
+    // capped before it can allocate storage; only payload-free health routes
+    // are exempt.
     if let Some(limit) = state.max_request_bytes {
-        let exempt = req_path.ends_with("/__upload_url__/init")
-            || req_path.contains("/__upload_url__/")
-            || req_path == "/health"
-            || req_path.ends_with("/health");
+        let exempt = req_path == "/health" || req_path.ends_with("/health");
         if !exempt {
             if let Some(cl) = req
                 .headers()
@@ -1914,6 +1911,44 @@ async fn postprocess_middleware(
                         .into_response();
                 }
             }
+
+            // Content-Length is only a fast rejection. Chunked bodies have
+            // no declared length, and a peer can otherwise stream an
+            // arbitrarily large upload-control request through the advertised
+            // cap. Buffer under limit+1 and restore the body for the handler;
+            // handlers already consume complete Arrow bodies, so this adds no
+            // new whole-body buffering behavior.
+            let (parts, body) = req.into_parts();
+            let bounded = to_bytes(body, limit.saturating_add(1)).await;
+            let body = match bounded {
+                Ok(body) if body.len() <= limit => body,
+                Ok(body) => {
+                    let mut h = HeaderMap::new();
+                    attach_capability_headers(&state, &mut h, &req_method);
+                    attach_cors_headers(&state, &mut h, req_acrh.as_ref(), false);
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        h,
+                        format!(
+                            "Request body of {} bytes exceeds advertised max_request_bytes={limit}",
+                            body.len()
+                        ),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    let mut h = HeaderMap::new();
+                    attach_capability_headers(&state, &mut h, &req_method);
+                    attach_cors_headers(&state, &mut h, req_acrh.as_ref(), false);
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        h,
+                        format!("Request body exceeds advertised max_request_bytes={limit}"),
+                    )
+                        .into_response();
+                }
+            };
+            req = axum::http::Request::from_parts(parts, axum::body::Body::from(body));
         }
     }
 
@@ -2834,7 +2869,7 @@ fn parse_request_from_body(body: &[u8]) -> Result<Request> {
         .read_next()?
         .ok_or_else(|| RpcError::protocol_error("empty IPC stream"))?;
     r.drain()?;
-    Request::from_read_batch(batch, metadata, false)
+    Request::from_read_batch(batch, metadata, true)
 }
 
 fn error_stream_bytes(
@@ -2987,7 +3022,9 @@ fn new_session_id() -> String {
 
 // The method name, count cap, and response schema are the public wire contract;
 // they live in `crate::external` so intermediaries share one definition.
-use crate::external::{upload_url_response_schema, MAX_UPLOAD_URL_COUNT, UPLOAD_URL_METHOD};
+use crate::external::{
+    upload_url_params_schema, upload_url_response_schema, MAX_UPLOAD_URL_COUNT, UPLOAD_URL_METHOD,
+};
 
 async fn handle_upload_url(
     State(state): State<Arc<HttpState>>,
@@ -3018,11 +3055,14 @@ async fn handle_upload_url(
         Ok(r) => r,
         Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
     };
-    if !req.method.is_empty() && req.method != UPLOAD_URL_METHOD {
+    if req.method != UPLOAD_URL_METHOD {
         let err = RpcError::protocol_error(format!(
             "Method mismatch: expected '{UPLOAD_URL_METHOD}', got '{}'",
             req.method
         ));
+        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+    }
+    if let Err(err) = validate_parameter_batch(&req.batch, &upload_url_params_schema()) {
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
     // Pull `count` from the int64 column (default 1, clamped to [1, MAX]).
@@ -3154,6 +3194,13 @@ async fn handle_unary(
         Ok(r) => r,
         Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
     };
+    if req.method != method {
+        let err = RpcError::protocol_error(format!(
+            "Method mismatch: route names '{method}', request metadata names '{}'",
+            req.method
+        ));
+        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+    }
 
     // If the request batch is an external-location pointer (zero rows +
     // `vgi_rpc.location` metadata), fetch the referenced bytes and use
@@ -3171,7 +3218,12 @@ async fn handle_unary(
                     req.batch = inner_batch;
                 }
                 Err(err) => {
-                    return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+                    return cap_error_response(
+                        &Schema::empty(),
+                        &err,
+                        &server.server_id,
+                        &req.request_id,
+                    );
                 }
             }
         }
@@ -3207,6 +3259,9 @@ async fn handle_unary(
         let err = RpcError::attribute_error(format!("Unknown method: '{}'", method));
         return arrow_error(&state, StatusCode::NOT_FOUND, &err, &req.request_id);
     };
+    if let Err(err) = validate_parameter_batch(&req.batch, &info.params_schema) {
+        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+    }
 
     let mut ctx = CallContext::with_auth_cookies(&server, &req, auth.clone(), cookies);
     if let Some(s) = sticky_sink.clone() {
@@ -3448,10 +3503,39 @@ async fn handle_stream_init(
         Ok(b) => b,
         Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
     };
-    let req = match parse_request_from_body(&body) {
+    let mut req = match parse_request_from_body(&body) {
         Ok(r) => r,
         Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
     };
+    if req.method != method {
+        let err = RpcError::protocol_error(format!(
+            "Method mismatch: route names '{method}', request metadata names '{}'",
+            req.method
+        ));
+        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+    }
+
+    // Stream initialization accepts the same externalized parameter shape as
+    // unary calls. Keep routing metadata from the pointer request and replace
+    // only the parameter batch with the fetched batch.
+    if md_get(&req.metadata, crate::metadata::LOCATION_KEY).is_some() {
+        if let Some(cfg) = server.external_config().as_ref() {
+            let resolved = tokio::task::block_in_place(|| {
+                crate::external::resolve_external_location(&req.batch, &req.metadata, cfg)
+            });
+            match resolved {
+                Ok((inner_batch, _user_md)) => req.batch = inner_batch,
+                Err(err) => {
+                    return cap_error_response(
+                        &Schema::empty(),
+                        &err,
+                        &server.server_id,
+                        &req.request_id,
+                    );
+                }
+            }
+        }
+    }
 
     let Some(info) = server
         .method(&method)
@@ -3460,6 +3544,9 @@ async fn handle_stream_init(
         let err = RpcError::attribute_error(format!("Unknown stream method: '{}'", method));
         return arrow_error(&state, StatusCode::NOT_FOUND, &err, &req.request_id);
     };
+    if let Err(err) = validate_parameter_batch(&req.batch, &info.params_schema) {
+        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+    }
 
     let mut ctx = CallContext::with_auth_cookies(&server, &req, auth, cookies);
     if let Some(s) = sticky_sink.clone() {
@@ -3880,10 +3967,30 @@ async fn handle_stream_exchange(
         Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
     };
     // Parse input batch (may be empty-schema for cancel / producer continuation).
-    let (batch, metadata) = match read_input_batch(&body) {
+    let (mut batch, mut metadata) = match read_input_batch(&body) {
         Ok(x) => x,
         Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
     };
+
+    // Resolve externally uploaded exchange input before reading state tokens
+    // or dispatching. The resolver merges outer and inner metadata, preserving
+    // cursor/call tokens regardless of which side of the pointer carried them.
+    if md_get(&metadata, crate::metadata::LOCATION_KEY).is_some() {
+        if let Some(cfg) = server.external_config().as_ref() {
+            let resolved = tokio::task::block_in_place(|| {
+                crate::external::resolve_external_location(&batch, &metadata, cfg)
+            });
+            match resolved {
+                Ok((inner_batch, inner_metadata)) => {
+                    batch = inner_batch;
+                    metadata = inner_metadata;
+                }
+                Err(err) => {
+                    return cap_error_response(&Schema::empty(), &err, &server.server_id, "");
+                }
+            }
+        }
+    }
 
     let Some(token) = md_get(&metadata, STATE_KEY).map(str::to_owned) else {
         let err = RpcError::runtime_error("Missing state token in exchange request");

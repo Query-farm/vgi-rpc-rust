@@ -69,9 +69,17 @@ use vgi_rpc::external::UPLOAD_URL_METHOD;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
+const DEFAULT_MAX_ENCODED_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_MAX_DECODED_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 /// The only coding this client can produce for request bodies. Also the
 /// assumed server capability when `VGI-Supported-Encodings` is absent.
 const DEFAULT_REQUEST_ENCODING: &str = "zstd";
+
+fn zstd_window_log_for_limit(max_size: usize) -> u32 {
+    let bounded = max_size.max(1 << 10);
+    let ceil_log = usize::BITS - bounded.saturating_sub(1).leading_zeros();
+    ceil_log.clamp(10, 31)
+}
 
 /// Server capabilities advertised on `OPTIONS {prefix}/health`.
 #[derive(Debug, Clone)]
@@ -137,8 +145,8 @@ pub struct UploadUrl {
 // Client-side HTTPS fetcher for external-location resolution
 // ---------------------------------------------------------------------------
 
-/// Reqwest-blocking `Fetcher` that transparently decompresses a `zstd`
-/// `Content-Encoding` (mirrors httpx) and caps the buffered body.
+/// Reqwest-blocking `Fetcher` that returns the still-encoded body under a hard
+/// cap. The shared external-location resolver performs bounded decoding.
 struct ClientHttpFetcher {
     client: HttpInner,
 }
@@ -156,29 +164,25 @@ fn redact_external_url(url: &str) -> String {
 
 impl Fetcher for ClientHttpFetcher {
     fn fetch(&self, url: &str, _compression: Compression, max_bytes: usize) -> Result<Vec<u8>> {
-        let mut resp = self
-            .client
-            .get(url)
-            .send()
-            .map_err(|e| RpcError::runtime_error(format!("external GET failed: {e}")))?;
+        let mut resp = self.client.get(url).send().map_err(|_| {
+            RpcError::runtime_error(format!(
+                "external GET failed for {}",
+                redact_external_url(url)
+            ))
+        })?;
         if !resp.status().is_success() {
             return Err(RpcError::runtime_error(format!(
-                "external GET returned {} for {url}",
-                resp.status()
+                "external GET returned {} for {}",
+                resp.status(),
+                redact_external_url(url)
             )));
         }
-        let zstd_encoded = resp
-            .headers()
-            .get(reqwest::header::CONTENT_ENCODING)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.eq_ignore_ascii_case("zstd"))
-            .unwrap_or(false);
         let mut out = Vec::new();
         let mut buf = [0u8; 64 * 1024];
         loop {
             let n = resp
                 .read(&mut buf)
-                .map_err(|e| RpcError::runtime_error(format!("external GET body: {e}")))?;
+                .map_err(|_| RpcError::runtime_error("external GET body read failed"))?;
             if n == 0 {
                 break;
             }
@@ -188,10 +192,6 @@ impl Fetcher for ClientHttpFetcher {
                 )));
             }
             out.extend_from_slice(&buf[..n]);
-        }
-        if zstd_encoded {
-            out = zstd::stream::decode_all(Cursor::new(out))
-                .map_err(|e| RpcError::runtime_error(format!("zstd decode external body: {e}")))?;
         }
         Ok(out)
     }
@@ -309,6 +309,8 @@ pub struct HttpClientBuilder {
     retry: RetryConfig,
     compression_level: Option<i32>,
     external_validator: Option<UrlValidator>,
+    max_encoded_response_bytes: usize,
+    max_decoded_response_bytes: usize,
 }
 
 impl HttpClientBuilder {
@@ -370,6 +372,21 @@ impl HttpClientBuilder {
         self
     }
 
+    /// Hard ceiling on response bytes read from the network, before content
+    /// decoding. Applies with or without `Content-Length` (default 256 MiB).
+    pub fn max_encoded_response_bytes(mut self, n: usize) -> Self {
+        self.max_encoded_response_bytes = n;
+        self
+    }
+
+    /// Hard ceiling on a response after content decoding (default 256 MiB).
+    /// This is independent from the encoded-byte ceiling, so a small zstd
+    /// response cannot expand without bound.
+    pub fn max_decoded_response_bytes(mut self, n: usize) -> Self {
+        self.max_decoded_response_bytes = n;
+        self
+    }
+
     /// Enable transparent external-location response resolution, validating
     /// fetched URLs with `validator` (use [`any_url_validator`] for trusted /
     /// test storage, [`safe_https_validator`](vgi_rpc::external::safe_https_validator)
@@ -423,6 +440,8 @@ impl HttpClientBuilder {
             protocol_version: self.protocol_version,
             retry: self.retry,
             compression_level: self.compression_level,
+            max_encoded_response_bytes: self.max_encoded_response_bytes,
+            max_decoded_response_bytes: self.max_decoded_response_bytes,
             external,
             caps: RefCell::new(None),
             send_compressed: RefCell::new(self.compression_level.is_some()),
@@ -458,6 +477,8 @@ pub struct HttpClient {
     protocol_version: Option<String>,
     retry: RetryConfig,
     compression_level: Option<i32>,
+    max_encoded_response_bytes: usize,
+    max_decoded_response_bytes: usize,
     external: Option<ExternalLocationConfig>,
     caps: RefCell<Option<HttpServerCapabilities>>,
     /// Whether to zstd-compress request bodies (disabled after a 415).
@@ -484,6 +505,8 @@ impl HttpClient {
             retry: RetryConfig::default(),
             compression_level: Some(DEFAULT_COMPRESSION_LEVEL),
             external_validator: None,
+            max_encoded_response_bytes: DEFAULT_MAX_ENCODED_RESPONSE_BYTES,
+            max_decoded_response_bytes: DEFAULT_MAX_DECODED_RESPONSE_BYTES,
         }
     }
 
@@ -649,15 +672,41 @@ impl HttpClient {
                         .and_then(|v| v.to_str().ok())
                         .map(|v| v.eq_ignore_ascii_case("zstd"))
                         .unwrap_or(false);
-                    let raw = resp.bytes().map_err(|e| {
-                        RpcError::new("TransportError", format!("read http body: {e}"))
-                    })?;
+                    let raw = read_bounded_response(resp, self.max_encoded_response_bytes)?;
                     let decoded = if zstd_resp {
-                        zstd::stream::decode_all(Cursor::new(raw.as_ref())).map_err(|e| {
-                            RpcError::new("TransportError", format!("zstd decode response: {e}"))
-                        })?
+                        let mut decoder =
+                            zstd::Decoder::new(Cursor::new(raw.as_slice())).map_err(|e| {
+                                RpcError::new(
+                                    "TransportError",
+                                    format!("zstd decode response: {e}"),
+                                )
+                            })?;
+                        decoder
+                            .window_log_max(zstd_window_log_for_limit(
+                                self.max_decoded_response_bytes,
+                            ))
+                            .map_err(|e| {
+                                RpcError::new(
+                                    "TransportError",
+                                    format!("zstd response window limit: {e}"),
+                                )
+                            })?;
+                        read_bounded(
+                            decoder,
+                            self.max_decoded_response_bytes,
+                            "decoded HTTP response (max_decoded_response_bytes)",
+                        )?
                     } else {
-                        raw.to_vec()
+                        if raw.len() > self.max_decoded_response_bytes {
+                            return Err(RpcError::new(
+                                "TransportError",
+                                format!(
+                                    "decoded HTTP response exceeds max_decoded_response_bytes={}",
+                                    self.max_decoded_response_bytes
+                                ),
+                            ));
+                        }
+                        raw
                     };
                     return Ok((resp_headers, decoded, status));
                 }
@@ -970,24 +1019,73 @@ impl HttpClient {
             .next()
             .ok_or_else(|| RpcError::new("ProtocolError", "server returned no upload URLs"))?;
         // PUT the inline body to the upload URL.
-        let put = self
-            .inner
-            .put(&url.upload_url)
-            .header(CONTENT_TYPE, ARROW_CONTENT_TYPE)
-            .body(body.to_vec())
-            .send()
-            .map_err(|e| RpcError::new("ExternalUploadFailed", format!("PUT upload URL: {e}")))?;
-        if !put.status().is_success() {
-            return Err(RpcError::new(
-                "ExternalUploadFailed",
-                format!("PUT to upload URL failed: HTTP {}", put.status()),
-            ));
-        }
+        put_external_body(&self.inner, &url.upload_url, body)?;
         // Build the pointer body: zero-row batch (original schema) + original
         // dispatch metadata + vgi_rpc.location.
         md.insert(LOCATION_KEY.to_string(), url.download_url);
         let pointer = empty_batch(batch.schema().as_ref())?;
         write_one_batch(&pointer, Some(&md))
+    }
+}
+
+fn put_external_body(client: &HttpInner, url: &str, body: &[u8]) -> Result<()> {
+    let response = client
+        .put(url)
+        .header(CONTENT_TYPE, ARROW_CONTENT_TYPE)
+        .body(body.to_vec())
+        .send()
+        .map_err(|_| {
+            RpcError::new(
+                "ExternalUploadFailed",
+                format!("PUT to upload URL failed for {}", redact_external_url(url)),
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err(RpcError::new(
+            "ExternalUploadFailed",
+            format!("PUT to upload URL failed: HTTP {}", response.status()),
+        ));
+    }
+    Ok(())
+}
+
+fn read_bounded_response(
+    mut response: reqwest::blocking::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(RpcError::new(
+            "TransportError",
+            format!("encoded HTTP response exceeds max_encoded_response_bytes={max_bytes}"),
+        ));
+    }
+    read_bounded(
+        &mut response,
+        max_bytes,
+        "encoded HTTP response (max_encoded_response_bytes)",
+    )
+}
+
+fn read_bounded(mut reader: impl Read, max_bytes: usize, description: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| RpcError::new("TransportError", format!("read {description}: {e}")))?;
+        if n == 0 {
+            return Ok(out);
+        }
+        if out.len().checked_add(n).is_none_or(|size| size > max_bytes) {
+            return Err(RpcError::new(
+                "TransportError",
+                format!("{description} exceeds configured limit={max_bytes}"),
+            ));
+        }
+        out.extend_from_slice(&buf[..n]);
     }
 }
 
@@ -1617,5 +1715,25 @@ mod tests {
             HttpServerCapabilities::default().supported_encodings,
             vec!["zstd".to_string()]
         );
+    }
+
+    #[test]
+    fn external_upload_connection_error_redacts_signed_query() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let secret = "UPLOAD_QUERY_SECRET_7f33";
+        let url = format!("http://{address}/upload?signature={secret}");
+        let client = HttpInner::builder()
+            .timeout(Duration::from_millis(250))
+            .build()
+            .unwrap();
+        let error = put_external_body(&client, &url, b"body").unwrap_err();
+        let rendered = format!("{error:?}");
+        assert!(
+            !rendered.contains(secret),
+            "leaked signed query: {rendered}"
+        );
+        assert!(rendered.contains("/upload"));
     }
 }

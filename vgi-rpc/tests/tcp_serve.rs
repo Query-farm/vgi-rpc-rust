@@ -102,3 +102,34 @@ fn tcp_worker_serves_then_idle_exits() {
         "exit must be from idle timeout, not the shutdown flag"
     );
 }
+
+#[test]
+fn tcp_shutdown_interrupts_a_stalled_connection() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (bound_tx, bound_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let server_shutdown = shutdown.clone();
+    let handle = std::thread::spawn(move || {
+        vgi_rpc::tcp::serve_tcp(
+            Arc::new(RpcServer::new("tcp-shutdown-test")),
+            "127.0.0.1",
+            0,
+            None,
+            server_shutdown,
+            move |host, port| {
+                bound_tx.send((host.to_string(), port)).unwrap();
+            },
+        )
+        .unwrap();
+        done_tx.send(()).unwrap();
+    });
+    let (host, port) = bound_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let stalled = TcpStream::connect((host.as_str(), port)).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    shutdown.store(true, Ordering::Relaxed);
+    done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("shutdown must interrupt a connection stalled before its first frame");
+    handle.join().unwrap();
+    drop(stalled);
+}

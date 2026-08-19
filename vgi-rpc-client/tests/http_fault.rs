@@ -42,6 +42,46 @@ fn drain_request(stream: &TcpStream) {
     }
 }
 
+fn read_one_request(stream: &mut TcpStream) -> std::io::Result<()> {
+    let mut request = Vec::new();
+    let header_end = loop {
+        if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed before request headers",
+            ));
+        }
+        request.extend_from_slice(&buf[..n]);
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            line.split_once(':').and_then(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+        })
+        .unwrap_or(0);
+    while request.len() - header_end < content_length {
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed before request body",
+            ));
+        }
+        request.extend_from_slice(&buf[..n]);
+    }
+    Ok(())
+}
+
 /// A valid HTTP 200 carrying an Arrow unary response (`result` = 42).
 fn ok_response() -> Vec<u8> {
     let schema = Arc::new(Schema::new(vec![Field::new(
@@ -146,6 +186,209 @@ fn http_body(status: &str, body: &[u8]) -> Vec<u8> {
     .into_bytes();
     resp.extend_from_slice(body);
     resp
+}
+
+fn capped_response(body: &[u8], encoding: Option<&str>, chunked: bool) -> Vec<u8> {
+    let mut response =
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apache.arrow.stream\r\n".to_vec();
+    if let Some(encoding) = encoding {
+        write!(response, "Content-Encoding: {encoding}\r\n").unwrap();
+    }
+    if chunked {
+        response.extend_from_slice(b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+        for chunk in body.chunks(37) {
+            write!(response, "{:x}\r\n", chunk.len()).unwrap();
+            response.extend_from_slice(chunk);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+    } else {
+        write!(
+            response,
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        response.extend_from_slice(body);
+    }
+    response
+}
+
+fn assert_response_cap_then_recovery(
+    oversized_body: Vec<u8>,
+    encoding: Option<&'static str>,
+    chunked: bool,
+    max_encoded: usize,
+    max_decoded: usize,
+    expected_error: &str,
+) {
+    let url = mock_server(move |attempt, mut stream| {
+        drain_request(&stream);
+        let response = if attempt == 1 {
+            capped_response(&oversized_body, encoding, chunked)
+        } else {
+            ok_response()
+        };
+        stream.write_all(&response).unwrap();
+        stream.flush().unwrap();
+    });
+    let mut client = HttpClient::connect(url)
+        .retry(RetryConfig::disabled())
+        .max_encoded_response_bytes(max_encoded)
+        .max_decoded_response_bytes(max_decoded)
+        .build()
+        .unwrap();
+    let err = client
+        .call_unary("echo_int", &echo_params(), None)
+        .expect_err("oversized response must be rejected");
+    assert!(err.message.contains(expected_error), "got: {err:?}");
+
+    let (batch, _) = client
+        .call_unary("echo_int", &echo_params(), None)
+        .expect("client must recover after rejecting an oversized response");
+    assert_eq!(batch.column(0).as_primitive::<Int64Type>().value(0), 42);
+}
+
+#[test]
+fn identity_known_length_encoded_response_is_bounded_and_recovers() {
+    assert_response_cap_then_recovery(
+        vec![b'x'; 2048],
+        None,
+        false,
+        1024,
+        4096,
+        "max_encoded_response_bytes",
+    );
+}
+
+#[test]
+fn identity_chunked_encoded_response_is_bounded_and_recovers() {
+    assert_response_cap_then_recovery(
+        vec![b'x'; 2048],
+        None,
+        true,
+        1024,
+        4096,
+        "max_encoded_response_bytes",
+    );
+}
+
+#[test]
+fn identity_decoded_response_has_an_independent_cap_and_recovers() {
+    assert_response_cap_then_recovery(
+        vec![b'x'; 2048],
+        None,
+        false,
+        4096,
+        1024,
+        "max_decoded_response_bytes",
+    );
+}
+
+#[test]
+fn zstd_known_length_decoded_response_is_bounded_and_recovers() {
+    let encoded = zstd::encode_all(&vec![b'x'; 16 * 1024][..], 1).unwrap();
+    assert!(encoded.len() < 1024);
+    assert_response_cap_then_recovery(
+        encoded,
+        Some("zstd"),
+        false,
+        1024,
+        1024,
+        "max_decoded_response_bytes",
+    );
+}
+
+#[test]
+fn zstd_chunked_decoded_response_is_bounded_and_recovers() {
+    let encoded = zstd::encode_all(&vec![b'x'; 16 * 1024][..], 1).unwrap();
+    assert!(encoded.len() < 1024);
+    assert_response_cap_then_recovery(
+        encoded,
+        Some("zstd"),
+        true,
+        1024,
+        1024,
+        "max_decoded_response_bytes",
+    );
+}
+
+#[test]
+fn zstd_large_window_is_rejected_even_for_tiny_output_and_recovers() {
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
+    encoder.window_log(20).unwrap();
+    encoder.include_contentsize(false).unwrap();
+    encoder.write_all(b"tiny").unwrap();
+    let frame = encoder.finish().unwrap();
+    assert!(frame.len() < 1024);
+    assert_response_cap_then_recovery(
+        frame,
+        Some("zstd"),
+        false,
+        1024,
+        1024,
+        "max_decoded_response_bytes",
+    );
+}
+
+#[test]
+fn known_length_oversize_keep_alive_response_is_discarded_before_recovery() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (reuse_tx, reuse_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        read_one_request(&mut first).unwrap();
+        // Advertise an oversized body but deliberately do not send it. The
+        // cap is knowable from headers, and this keeps the body genuinely
+        // unread so dropping/reconnecting (rather than opportunistic full-body
+        // buffering) is the only safe recovery path.
+        first
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apache.arrow.stream\r\nContent-Length: 2048\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .unwrap();
+        first.flush().unwrap();
+
+        // If the client wrongly keeps an unread oversized response in its
+        // pool, the recovery request arrives here and is protocol-confused by
+        // the unread body. Correct behavior drops this socket and reconnects.
+        let reused = read_one_request(&mut first).is_ok();
+        reuse_tx.send(reused).unwrap();
+        if reused {
+            first.write_all(&ok_response()).unwrap();
+            first.flush().unwrap();
+        } else {
+            let (mut second, _) = listener.accept().unwrap();
+            second
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            read_one_request(&mut second).unwrap();
+            second.write_all(&ok_response()).unwrap();
+            second.flush().unwrap();
+        }
+    });
+
+    let mut client = HttpClient::connect(format!("http://127.0.0.1:{port}"))
+        .timeout(Some(Duration::from_secs(5)))
+        .retry(RetryConfig::disabled())
+        .max_encoded_response_bytes(1024)
+        .max_decoded_response_bytes(4096)
+        .build()
+        .unwrap();
+    let error = client
+        .call_unary("echo_int", &echo_params(), None)
+        .expect_err("known oversized response must be rejected before reading");
+    assert!(error.message.contains("max_encoded_response_bytes"));
+    let (batch, _) = client
+        .call_unary("echo_int", &echo_params(), None)
+        .expect("recovery must reconnect and succeed");
+    assert_eq!(batch.column(0).as_primitive::<Int64Type>().value(0), 42);
+    assert!(!reuse_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+    server.join().unwrap();
 }
 
 #[test]

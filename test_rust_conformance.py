@@ -150,7 +150,7 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
     """Spawn an HTTP conformance server of `variant` for the current SERVER.
 
     variant ∈ {plain, no_compression, storage, zstd_storage, externalize_always,
-    strict, auth, sticky_short_ttl, sticky_peer_a, sticky_peer_b, sticky_auth,
+    strict, small_request_cap, auth, sticky_short_ttl, sticky_peer_a, sticky_peer_b, sticky_auth,
     cors, introspect}.
     Raises ``pytest.skip`` for (server, variant) combinations not wired here
     (the Go conformance binary doesn't expose the storage/strict/auth modes).
@@ -245,6 +245,10 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
             )
         if variant == "strict":
             return _spawn_read_port([RUST_WORKER, "--http", "--strict"])
+        if variant == "small_request_cap":
+            return _spawn_read_port(
+                [RUST_WORKER, "--http", "--max-request-bytes", str(4 * 1024)]
+            )
         if variant == "externalized_cap":
             # Storage mode, because the cap under test only bites on the
             # external channel. `--externalize-threshold 4096` matches the
@@ -482,6 +486,14 @@ def conformance_http_externalize_always_port(conformance_fake_storage: str) -> I
 def conformance_http_strict_cap_port() -> Iterator[int]:
     """HTTP server with strict body + externalised response caps."""
     yield from _http_variant_fixture("strict")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_small_request_cap_port() -> Iterator[int]:
+    """Rust HTTP worker advertising a 4 KiB encoded and decoded request cap."""
+    if SERVER != "rust":
+        pytest.skip(f"small request-cap worker not wired for SERVER={SERVER}")
+    yield from _http_variant_fixture("small_request_cap")
 
 
 @pytest.fixture(scope="session")

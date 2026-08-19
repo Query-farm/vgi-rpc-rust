@@ -2,9 +2,11 @@
 //!
 //! Rather than pulling `aws-sdk-s3` (and its ~1-minute transitive compile
 //! surface) into the core, this crate ships a pluggable pre-signed URL
-//! factory. The caller produces a short-lived PUT URL for each upload
-//! (typically via `aws-sdk-s3::Client::presigned_put_object`); we do the
-//! blocking HTTPS transfer via `reqwest::blocking`.
+//! factory. The caller produces short-lived PUT and GET URLs for each object
+//! (typically via the corresponding `aws-sdk-s3` presign operations); we do the
+//! blocking HTTPS transfer via `reqwest::blocking`. Upload and download URLs
+//! are method-bound and generated as a pair for the same object key: publishing
+//! a PUT URL as the external-location pointer is both incorrect and unsafe.
 //!
 //! Fetching mirrors the pattern: the `Fetcher` accepts any HTTPS URL the
 //! server wrote into a pointer batch.
@@ -20,8 +22,12 @@
 //!     "my-bucket",
 //!     "vgi-rpc/",
 //!     Arc::new(|bucket: &str, key: &str| {
-//!         // Your AWS SDK call here — return a short-lived PUT URL.
-//!         Ok(format!("https://{bucket}.s3.amazonaws.com/{key}?X-Amz-Signature=..."))
+//!         // Your AWS SDK calls here — presign PUT and GET independently.
+//!         Ok(vgi_rpc::external::UploadUrl {
+//!             upload_url: format!("https://{bucket}.s3.amazonaws.com/{key}?put-signature=..."),
+//!             download_url: format!("https://{bucket}.s3.amazonaws.com/{key}?get-signature=..."),
+//!             expires_at_micros: 0,
+//!         })
 //!     }),
 //! );
 //! let fetcher = HttpFetcher::new();
@@ -33,7 +39,7 @@ use std::sync::Arc;
 
 use vgi_rpc::external::{
     validate_external_url, Compression, ExternalStorage, FetchedPayload, Fetcher, UploadResult,
-    UrlValidator,
+    UploadUrl, UploadUrlProvider, UrlValidator,
 };
 use vgi_rpc::{Result, RpcError};
 
@@ -67,9 +73,9 @@ fn redact_url(url: &str) -> String {
     parsed.to_string()
 }
 
-/// User-supplied factory: given `(bucket, key)`, return a short-lived
-/// pre-signed HTTPS PUT URL.
-pub type PresignUrlFactory = Arc<dyn Fn(&str, &str) -> Result<String> + Send + Sync>;
+/// User-supplied factory: given `(bucket, key)`, return independently signed
+/// upload (PUT) and download (GET) URLs for that same object.
+pub type PresignUrlPairFactory = Arc<dyn Fn(&str, &str) -> Result<UploadUrl> + Send + Sync>;
 
 /// Generic `ExternalStorage` that PUTs objects via a caller-supplied
 /// pre-signed URL factory. Shared between S3 and GCS backends — the only
@@ -78,7 +84,7 @@ pub struct PresignedPutStorage {
     label: &'static str,
     bucket: String,
     prefix: String,
-    factory: PresignUrlFactory,
+    factory: PresignUrlPairFactory,
     client: reqwest::blocking::Client,
 }
 
@@ -87,7 +93,7 @@ impl PresignedPutStorage {
         label: &'static str,
         bucket: impl Into<String>,
         prefix: impl Into<String>,
-        factory: PresignUrlFactory,
+        factory: PresignUrlPairFactory,
     ) -> Self {
         Self {
             label,
@@ -110,15 +116,19 @@ impl PresignedPutStorage {
         let id = uuid::Uuid::new_v4();
         format!("{}{id}.arrow", self.prefix)
     }
+
+    fn generate_pair(&self) -> Result<UploadUrl> {
+        let key = self.object_key();
+        (self.factory)(&self.bucket, &key)
+    }
 }
 
 impl ExternalStorage for PresignedPutStorage {
     fn upload(&self, ipc_bytes: &[u8], compression: Compression) -> Result<UploadResult> {
-        let key = self.object_key();
-        let url = (self.factory)(&self.bucket, &key)?;
+        let urls = self.generate_pair()?;
         let mut req = self
             .client
-            .put(&url)
+            .put(&urls.upload_url)
             .body(ipc_bytes.to_vec())
             .header("content-type", "application/vnd.apache.arrow.stream");
         if let Compression::Zstd(_) = compression {
@@ -127,20 +137,26 @@ impl ExternalStorage for PresignedPutStorage {
         let label = self.label;
         let resp = req
             .send()
-            .map_err(|e| RpcError::runtime_error(format!("{label} PUT failed: {e}")))?;
+            .map_err(|_| RpcError::runtime_error(format!("{label} PUT failed")))?;
         if !resp.status().is_success() {
             return Err(RpcError::runtime_error(format!(
                 "{label} PUT returned {} for {}",
                 resp.status(),
-                redact_url(&url)
+                redact_url(&urls.upload_url)
             )));
         }
         // sha256 is computed by ExternalLocationConfig's caller; return an
         // empty string here as the field is populated upstream.
         Ok(UploadResult {
-            url,
+            url: urls.download_url,
             sha256: String::new(),
         })
+    }
+}
+
+impl UploadUrlProvider for PresignedPutStorage {
+    fn generate_upload_url(&self) -> Result<UploadUrl> {
+        self.generate_pair()
     }
 }
 
@@ -151,7 +167,7 @@ impl PresignedS3Storage {
     pub fn new(
         bucket: impl Into<String>,
         prefix: impl Into<String>,
-        factory: PresignUrlFactory,
+        factory: PresignUrlPairFactory,
     ) -> Self {
         Self(PresignedPutStorage::new("s3", bucket, prefix, factory))
     }
@@ -173,6 +189,12 @@ impl PresignedS3Storage {
 impl ExternalStorage for PresignedS3Storage {
     fn upload(&self, ipc_bytes: &[u8], compression: Compression) -> Result<UploadResult> {
         self.0.upload(ipc_bytes, compression)
+    }
+}
+
+impl UploadUrlProvider for PresignedS3Storage {
+    fn generate_upload_url(&self) -> Result<UploadUrl> {
+        self.0.generate_upload_url()
     }
 }
 
@@ -199,11 +221,9 @@ impl Default for HttpFetcher {
 impl Fetcher for HttpFetcher {
     fn fetch(&self, url: &str, _compression: Compression, max_bytes: usize) -> Result<Vec<u8>> {
         use std::io::Read;
-        let mut resp = self
-            .client
-            .get(url)
-            .send()
-            .map_err(|e| RpcError::runtime_error(format!("external GET failed: {e}")))?;
+        let mut resp = self.client.get(url).send().map_err(|_| {
+            RpcError::runtime_error(format!("external GET failed for {}", redact_url(url)))
+        })?;
         if !resp.status().is_success() {
             return Err(RpcError::runtime_error(format!(
                 "external GET returned {} for {}",
@@ -227,7 +247,7 @@ impl Fetcher for HttpFetcher {
         loop {
             let n = resp
                 .read(&mut buf)
-                .map_err(|e| RpcError::runtime_error(format!("external GET body: {e}")))?;
+                .map_err(|_| RpcError::runtime_error("external GET body read failed"))?;
             if n == 0 {
                 break;
             }
@@ -329,13 +349,57 @@ impl Fetcher for HttpFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn read_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut received = Vec::new();
+        let header_end = loop {
+            if let Some(pos) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            assert_ne!(n, 0, "request ended before headers");
+            received.extend_from_slice(&buf[..n]);
+        };
+        let head = String::from_utf8(received[..header_end].to_vec()).unwrap();
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+            })
+            .unwrap_or(0);
+        while received.len() - header_end < content_length {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            assert_ne!(n, 0, "request ended before body");
+            received.extend_from_slice(&buf[..n]);
+        }
+        (
+            head.lines().next().unwrap().to_string(),
+            received[header_end..header_end + content_length].to_vec(),
+        )
+    }
 
     #[test]
     fn object_key_uses_prefix() {
         let storage = PresignedS3Storage::new(
             "bkt",
             "tenant-a/vgi/",
-            Arc::new(|_, _| Ok(String::from("https://example/"))),
+            Arc::new(|_, _| {
+                Ok(UploadUrl {
+                    upload_url: String::from("https://example/upload"),
+                    download_url: String::from("https://example/download"),
+                    expires_at_micros: 0,
+                })
+            }),
         );
         let k = storage.object_key();
         assert!(k.starts_with("tenant-a/vgi/"));
@@ -353,5 +417,77 @@ mod tests {
             .upload(&[1, 2, 3], Compression::None)
             .expect_err("should fail");
         assert!(err.message.contains("nope"));
+    }
+
+    #[test]
+    fn fetch_connection_error_redacts_signed_query() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let secret = "FETCH_QUERY_SECRET_91ad";
+        let url = format!("http://{address}/download?signature={secret}");
+        let error = HttpFetcher::new()
+            .fetch(&url, Compression::None, 1024)
+            .unwrap_err();
+        let rendered = format!("{error:?}");
+        assert!(
+            !rendered.contains(secret),
+            "leaked signed query: {rendered}"
+        );
+        assert!(rendered.contains("/download"));
+    }
+
+    #[test]
+    fn method_bound_url_pair_round_trips_locally() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = b"method-bound-arrow-payload".to_vec();
+        let expected = payload.clone();
+        let server = std::thread::spawn(move || {
+            let (mut put, _) = listener.accept().unwrap();
+            let (line, body) = read_request(&mut put);
+            assert!(line.starts_with("PUT /upload?put-secret=1 "), "got {line}");
+            assert_eq!(body, expected);
+            put.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+
+            let (mut get, _) = listener.accept().unwrap();
+            let (line, body) = read_request(&mut get);
+            assert!(
+                line.starts_with("GET /download?get-secret=2 "),
+                "got {line}"
+            );
+            assert!(body.is_empty());
+            write!(
+                get,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                expected.len()
+            )
+            .unwrap();
+            get.write_all(&expected).unwrap();
+        });
+
+        let upload_url = format!("http://{addr}/upload?put-secret=1");
+        let download_url = format!("http://{addr}/download?get-secret=2");
+        let expected_download = download_url.clone();
+        let storage = PresignedS3Storage::new(
+            "bucket",
+            "prefix/",
+            Arc::new(move |_, _| {
+                Ok(UploadUrl {
+                    upload_url: upload_url.clone(),
+                    download_url: download_url.clone(),
+                    expires_at_micros: 123,
+                })
+            }),
+        );
+
+        let uploaded = storage.upload(&payload, Compression::None).unwrap();
+        assert_eq!(uploaded.url, expected_download);
+        let fetched = HttpFetcher::new()
+            .fetch(&uploaded.url, Compression::None, 1024)
+            .unwrap();
+        assert_eq!(fetched, payload);
+        server.join().unwrap();
     }
 }

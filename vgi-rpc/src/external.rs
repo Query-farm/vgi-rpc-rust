@@ -506,6 +506,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
     bytes_to_hex(&Sha256::digest(bytes))
 }
 
+/// Zstd's decoder allocates its history window independently from emitted
+/// output. Bound that window to the smallest power of two covering the output
+/// cap (subject to zstd's 1 KiB minimum and 2 GiB maximum).
+fn zstd_window_log_for_limit(max_size: usize) -> u32 {
+    let bounded = max_size.max(1 << 10);
+    let ceil_log = usize::BITS - bounded.saturating_sub(1).leading_zeros();
+    ceil_log.clamp(10, 31)
+}
+
 fn compress(ipc_bytes: &[u8], compression: Compression) -> Result<Vec<u8>> {
     match compression {
         Compression::None => Ok(ipc_bytes.to_vec()),
@@ -543,6 +552,9 @@ fn decompress(bytes: &[u8], compression: Compression, max_size: usize) -> Result
             use std::io::Read;
             let mut decoder = zstd::Decoder::new(bytes)
                 .map_err(|e| RpcError::runtime_error(format!("zstd decode: {e}")))?;
+            decoder
+                .window_log_max(zstd_window_log_for_limit(max_size))
+                .map_err(|e| RpcError::runtime_error(format!("zstd window limit: {e}")))?;
             let mut out = Vec::new();
             let mut buf = [0u8; 64 * 1024];
             loop {
@@ -967,6 +979,21 @@ mod tests {
             .unwrap();
         let (resolved, _) = resolve_external_location(&ptr, &md, &cfg).unwrap();
         assert_eq!(resolved.num_rows(), batch.num_rows());
+    }
+
+    #[test]
+    fn zstd_rejects_large_window_even_when_output_is_tiny() {
+        use std::io::Write;
+
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.window_log(20).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        encoder.write_all(b"tiny").unwrap();
+        let frame = encoder.finish().unwrap();
+
+        let err = decompress(&frame, Compression::Zstd(1), 1024)
+            .expect_err("a 1 MiB window must exceed a 1 KiB decode budget");
+        assert!(err.message.contains("window") || err.message.contains("memory"));
     }
 
     // An externalised payload is a standalone IPC stream and declares its own

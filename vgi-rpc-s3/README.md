@@ -20,10 +20,13 @@ use std::sync::Arc;
 use vgi_rpc::external::{ExternalLocationConfig, Compression};
 use vgi_rpc_s3::{PresignedS3Storage, HttpFetcher};
 
-// Produce a short-lived PUT URL for each upload — typically via
-// aws-sdk-s3::Client::presigned_put_object(...).
+// Produce method-bound PUT and GET URLs for the same object key.
 let factory = Arc::new(|bucket: &str, key: &str| {
-    Ok(format!("https://{bucket}.s3.amazonaws.com/{key}?X-Amz-Signature=..."))
+    Ok(vgi_rpc::external::UploadUrl {
+        upload_url: format!("https://{bucket}.s3.amazonaws.com/{key}?put-signature=..."),
+        download_url: format!("https://{bucket}.s3.amazonaws.com/{key}?get-signature=..."),
+        expires_at_micros: 0, // Set to the actual signing expiry.
+    })
 });
 
 let storage = PresignedS3Storage::new("my-bucket", "vgi-rpc/", factory);
@@ -42,6 +45,14 @@ let cfg = ExternalLocationConfig::new(Arc::new(storage), Arc::new(fetcher))
 For MinIO / LocalStack testing, use
 `with_url_validator(vgi_rpc::external::any_url_validator())` so
 `http://` URLs are accepted.
+
+## Migrating from the single-URL callback
+
+The URL factory API intentionally changed incompatibly: callbacks must now
+return `vgi_rpc::external::UploadUrl` with separately signed PUT and GET URLs.
+Code returning one `String` must add a GET presign operation and populate
+`download_url`; reusing the PUT URL is not supported because method-bound cloud
+signatures cannot be downloaded with GET.
 
 ## License
 

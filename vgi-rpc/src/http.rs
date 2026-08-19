@@ -2768,6 +2768,28 @@ fn maybe_decompress(headers: &HeaderMap, body: &Bytes, max_size: usize) -> Resul
     decode_content_encoding(body.as_ref(), enc, Some(max_size))
 }
 
+fn zstd_window_log_for_limit(max_size: usize) -> u32 {
+    let bounded = max_size.max(1 << 10);
+    let ceil_log = usize::BITS - bounded.saturating_sub(1).leading_zeros();
+    ceil_log.clamp(10, 31)
+}
+
+fn request_decode_limit(state: &HttpState) -> usize {
+    state
+        .max_request_bytes
+        .unwrap_or(state.max_body_size)
+        .min(state.max_body_size)
+}
+
+fn request_decode_error(state: &Arc<HttpState>, error: &RpcError) -> Response {
+    let status = if error.message.contains("exceeds max size") {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    arrow_error(state, status, error, "")
+}
+
 /// Most codings [`decode_content_encoding`] will apply from one
 /// `Content-Encoding` header. Real bodies carry one; the cap bounds the decode
 /// work an attacker can buy with a single bounded request body.
@@ -2815,13 +2837,14 @@ pub fn decode_content_encoding(
     let mut result = data.to_vec();
     for name in codings.rev() {
         result = match name.as_str() {
-            "zstd" => decode_bounded(
-                zstd::Decoder::new(result.as_slice())
-                    .map_err(|e| RpcError::runtime_error(format!("zstd decode: {e}")))?,
-                result.len(),
-                max_size,
-                "zstd",
-            )?,
+            "zstd" => {
+                let mut decoder = zstd::Decoder::new(result.as_slice())
+                    .map_err(|e| RpcError::runtime_error(format!("zstd decode: {e}")))?;
+                decoder
+                    .window_log_max(zstd_window_log_for_limit(max_size))
+                    .map_err(|e| RpcError::runtime_error(format!("zstd window limit: {e}")))?;
+                decode_bounded(decoder, result.len(), max_size, "zstd")?
+            }
             "gzip" => decode_bounded(
                 flate2::read::GzDecoder::new(result.as_slice()),
                 result.len(),
@@ -3047,9 +3070,9 @@ async fn handle_upload_url(
         None => return plain_error(StatusCode::NOT_FOUND, "upload-url not enabled".into()),
     };
 
-    let body = match maybe_decompress(&headers, &body, state.max_body_size) {
+    let body = match maybe_decompress(&headers, &body, request_decode_limit(&state)) {
         Ok(b) => b,
-        Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
+        Err(e) => return request_decode_error(&state, &e),
     };
     let req = match parse_request_from_body(&body) {
         Ok(r) => r,
@@ -3186,9 +3209,9 @@ async fn handle_unary(
     // which is the number an egress bill is computed from. `input_bytes`
     // below counts logical Arrow buffers and is a different question.
     let request_wire_bytes = body.len() as u64;
-    let body = match maybe_decompress(&headers, &body, state.max_body_size) {
+    let body = match maybe_decompress(&headers, &body, request_decode_limit(&state)) {
         Ok(b) => b,
-        Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
+        Err(e) => return request_decode_error(&state, &e),
     };
     let mut req = match parse_request_from_body(&body) {
         Ok(r) => r,
@@ -3499,9 +3522,9 @@ async fn handle_stream_init(
     let auth_for_token = auth.clone();
     let cookies = parse_cookies(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let server = state.server.clone();
-    let body = match maybe_decompress(&headers, &body, state.max_body_size) {
+    let body = match maybe_decompress(&headers, &body, request_decode_limit(&state)) {
         Ok(b) => b,
-        Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
+        Err(e) => return request_decode_error(&state, &e),
     };
     let mut req = match parse_request_from_body(&body) {
         Ok(r) => r,
@@ -3962,9 +3985,9 @@ async fn handle_stream_exchange(
     };
 
     let server = state.server.clone();
-    let body = match maybe_decompress(&headers, &body, state.max_body_size) {
+    let body = match maybe_decompress(&headers, &body, request_decode_limit(&state)) {
         Ok(b) => b,
-        Err(e) => return arrow_error(&state, StatusCode::BAD_REQUEST, &e, ""),
+        Err(e) => return request_decode_error(&state, &e),
     };
     // Parse input batch (may be empty-schema for cancel / producer continuation).
     let (mut batch, mut metadata) = match read_input_batch(&body) {

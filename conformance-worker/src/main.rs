@@ -643,6 +643,11 @@ fn run_http(
         if let Some(n) = max_ext {
             builder = builder.max_externalized_response_bytes(n);
         }
+        if let Some(n) =
+            parse_usize_flag(&std::env::args().collect::<Vec<_>>(), "--max-request-bytes")
+        {
+            builder = builder.max_request_bytes(n);
+        }
         // Sticky sessions on by default (matches Python's
         // serve_conformance_http.py) so the canonical TestSticky group
         // runs. A fixed marker echo header gives

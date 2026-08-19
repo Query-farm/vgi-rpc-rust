@@ -65,7 +65,7 @@ const UPLOAD_URL_HEADER: &str = "VGI-Upload-URL-Support";
 const SESSION_ENDPOINT: &str = "__session__";
 // The upload-URL method name is a shared public wire contract, not a
 // client-local literal.
-use vgi_rpc::external::UPLOAD_URL_METHOD;
+use vgi_rpc::external::{upload_url_params_schema, UPLOAD_URL_METHOD};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
@@ -916,12 +916,7 @@ impl HttpClient {
     /// Request `count` pre-signed upload URLs from `__upload_url__/init`.
     pub fn request_upload_urls(&mut self, count: usize) -> Result<Vec<UploadUrl>> {
         use arrow_array::{Int64Array, RecordBatch as RB};
-        use arrow_schema::{DataType, Field};
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "count",
-            DataType::Int64,
-            false,
-        )]));
+        let schema = upload_url_params_schema();
         let batch = RB::try_new(schema, vec![Arc::new(Int64Array::from(vec![count as i64]))])?;
         let (_id, md) = self.req_md(UPLOAD_URL_METHOD, None);
         let body = write_one_batch(&batch, Some(&md))?;
@@ -1718,6 +1713,15 @@ mod tests {
             HttpServerCapabilities::default().supported_encodings,
             vec!["zstd".to_string()]
         );
+    }
+
+    #[test]
+    fn upload_url_request_uses_shared_nullable_count_schema() {
+        let schema = upload_url_params_schema();
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).name(), "count");
+        assert_eq!(schema.field(0).data_type(), &arrow_schema::DataType::Int64);
+        assert!(schema.field(0).is_nullable());
     }
 
     #[test]

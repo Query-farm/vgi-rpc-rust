@@ -2769,9 +2769,14 @@ fn maybe_decompress(headers: &HeaderMap, body: &Bytes, max_size: usize) -> Resul
 }
 
 fn zstd_window_log_for_limit(max_size: usize) -> u32 {
-    let bounded = max_size.max(1 << 10);
+    // Streaming encoders do not know the eventual content size and zstd's
+    // level-1 profile therefore advertises a 512 KiB history window even for
+    // tiny frames. Keep that bounded interoperability floor while still
+    // refusing larger attacker-selected windows for small output budgets.
+    const INTEROPERABLE_WINDOW_LOG_FLOOR: u32 = 19;
+    let bounded = max_size.max(1 << INTEROPERABLE_WINDOW_LOG_FLOOR);
     let ceil_log = usize::BITS - bounded.saturating_sub(1).leading_zeros();
-    ceil_log.clamp(10, 31)
+    ceil_log.clamp(INTEROPERABLE_WINDOW_LOG_FLOOR, 31)
 }
 
 fn request_decode_limit(state: &HttpState) -> usize {
@@ -4553,6 +4558,25 @@ mod tests {
         let compressed = zstd::encode_all(small.as_slice(), 1).unwrap();
         let out = super::decode_content_encoding(&compressed, Some("zstd"), Some(1024)).unwrap();
         assert_eq!(out, small);
+    }
+
+    #[test]
+    fn zstd_bounded_rejects_large_window_for_small_output() {
+        use std::io::Write;
+
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.window_log(20).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        encoder.write_all(b"tiny").unwrap();
+        let frame = encoder.finish().unwrap();
+
+        let err = super::decode_content_encoding(&frame, Some("zstd"), Some(1024))
+            .expect_err("a 1 MiB history window must exceed the 512 KiB decoder floor");
+        assert!(
+            err.message.contains("window") || err.message.contains("memory"),
+            "expected window-limit error, got: {}",
+            err.message
+        );
     }
 
     fn gzip(data: &[u8]) -> Vec<u8> {

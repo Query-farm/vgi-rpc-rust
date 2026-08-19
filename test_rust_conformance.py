@@ -7,7 +7,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 try:
     import httpx
@@ -18,7 +18,7 @@ import pytest
 from vgi_rpc.conformance import ConformanceService
 from vgi_rpc.http import http_connect
 from vgi_rpc.log import Message
-from vgi_rpc.rpc import SubprocessTransport, UnixTransport, _RpcProxy, unix_connect
+from vgi_rpc.rpc import SubprocessTransport, UnixTransport, _RpcProxy, tcp_connect, unix_connect
 
 RUST_WORKER = os.environ.get(
     "RUST_CONFORMANCE_WORKER",
@@ -85,7 +85,12 @@ def _free_port() -> int:
     return port
 
 
-def _spawn_read_port(args: list[str], *, expect_port: int | None = None) -> tuple[subprocess.Popen, int]:
+def _spawn_read_port(
+    args: list[str],
+    *,
+    expect_port: int | None = None,
+    tcp_only_ready: bool = False,
+) -> tuple[subprocess.Popen, int]:
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert proc.stdout is not None
     line = proc.stdout.readline().decode().strip()
@@ -93,7 +98,10 @@ def _spawn_read_port(args: list[str], *, expect_port: int | None = None) -> tupl
     port = int(line.split(":", 1)[1])
     if expect_port is not None:
         assert port == expect_port, f"expected PORT:{expect_port}, got {port}"
-    _wait_for_http(port)
+    if tcp_only_ready:
+        _wait_for_tcp("127.0.0.1", port)
+    else:
+        _wait_for_http(port)
     return proc, port
 
 
@@ -673,6 +681,18 @@ def _wait_for_unix(path: str, timeout: float = 5.0) -> None:
     raise TimeoutError(f"Unix socket at {path} did not start within {timeout}s")
 
 
+def _wait_for_tcp(host: str, port: int, timeout: float = 5.0) -> None:
+    """Poll until a raw TCP or HTTP listener accepts connections."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise TimeoutError(f"TCP socket at {host}:{port} did not start within {timeout}s")
+
+
 @pytest.fixture(scope="session")
 def rust_unix_path() -> Iterator[str]:
     """Start Rust conformance Unix socket server."""
@@ -691,6 +711,93 @@ def rust_unix_path() -> Iterator[str]:
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+class _KindProbe(Protocol):
+    def report_transport_kind(self) -> str: ...
+
+
+@pytest.fixture(scope="class")
+def conformance_http_serve_start_fail_once_port() -> Iterator[int]:
+    """Rust HTTP worker whose first startup hook panics, then retries."""
+    if ROLE != "server" or SERVER != "rust":
+        pytest.skip("serve-start lifecycle fixture validates the Rust server role")
+    proc, port = _spawn_read_port(
+        [RUST_WORKER, "--http", "--fail-serve-start-once"],
+        tcp_only_ready=True,
+    )
+    try:
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="class")
+def conformance_transport_kind_probes() -> tuple[tuple[str, Callable[[], str]], ...]:
+    """Real Rust-worker probes for pipe, HTTP, Unix, and TCP kinds."""
+    if ROLE != "server" or SERVER != "rust":
+        pytest.skip("transport-kind probes validate the Rust server role")
+
+    def probe_pipe() -> str:
+        transport = SubprocessTransport([RUST_WORKER, "--transport-kind-probe"])
+        try:
+            return str(_RpcProxy(_KindProbe, transport, None).report_transport_kind())
+        finally:
+            transport.close()
+
+    def probe_http() -> str:
+        proc, port = _spawn_read_port([RUST_WORKER, "--http", "--transport-kind-probe"])
+        try:
+            with http_connect(_KindProbe, f"http://127.0.0.1:{port}") as proxy:
+                return str(proxy.report_transport_kind())
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def probe_unix() -> str:
+        path = _short_unix_path("kind")
+        proc = subprocess.Popen(
+            [RUST_WORKER, "--unix", path, "--transport-kind-probe"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            assert proc.stdout is not None
+            line = proc.stdout.readline().decode().strip()
+            assert line == f"UNIX:{path}", f"Expected UNIX:{path}, got: {line!r}"
+            _wait_for_unix(path)
+            with unix_connect(_KindProbe, path) as proxy:
+                return str(proxy.report_transport_kind())
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def probe_tcp() -> str:
+        proc = subprocess.Popen(
+            [RUST_WORKER, "--tcp", "127.0.0.1:0", "--transport-kind-probe"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            assert proc.stdout is not None
+            line = proc.stdout.readline().decode().strip()
+            assert line.startswith("TCP:"), f"Expected TCP:<host>:<port>, got: {line!r}"
+            host, _, raw_port = line[len("TCP:") :].rpartition(":")
+            port = int(raw_port)
+            _wait_for_tcp(host, port)
+            with tcp_connect(_KindProbe, host, port) as proxy:
+                return str(proxy.report_transport_kind())
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    return (
+        ("pipe", probe_pipe),
+        ("http", probe_http),
+        ("unix", probe_unix),
+        ("tcp", probe_tcp),
+    )
 
 
 ConnFactory = Callable[..., contextlib.AbstractContextManager[Any]]

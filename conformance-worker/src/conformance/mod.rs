@@ -44,7 +44,15 @@ pub fn build_server() -> RpcServer {
 /// asserts anything else — otherwise a token that supposedly "belongs to the
 /// other worker" belongs to this one, and the test proves nothing.
 pub fn build_server_with_id(server_id: Option<&str>) -> RpcServer {
-    build_server_with_external(None, server_id)
+    build_server_with_external_and_hook(None, server_id, None)
+}
+
+/// Build a conformance server with an explicit transport-start hook.
+pub fn build_server_with_id_and_hook(
+    server_id: Option<&str>,
+    hook: vgi_rpc::ServeStartHook,
+) -> RpcServer {
+    build_server_with_external_and_hook(None, server_id, Some(hook))
 }
 
 /// Build an `RpcServer` with all conformance methods registered, optionally
@@ -53,6 +61,14 @@ pub fn build_server_with_id(server_id: Option<&str>) -> RpcServer {
 pub fn build_server_with_external(
     external: Option<vgi_rpc::external::ExternalLocationConfig>,
     server_id: Option<&str>,
+) -> RpcServer {
+    build_server_with_external_and_hook(external, server_id, None)
+}
+
+fn build_server_with_external_and_hook(
+    external: Option<vgi_rpc::external::ExternalLocationConfig>,
+    server_id: Option<&str>,
+    serve_start_hook: Option<vgi_rpc::ServeStartHook>,
 ) -> RpcServer {
     let mut builder = RpcServer::builder()
         .server_id(server_id.unwrap_or("rust-conf-0001"))
@@ -63,6 +79,9 @@ pub fn build_server_with_external(
 
     if let Some(cfg) = external {
         builder = builder.with_external_location(cfg);
+    }
+    if let Some(hook) = serve_start_hook {
+        builder = builder.on_serve_start(hook);
     }
 
     // When VGI_ACCESS_LOG is set, emit JSON-per-call access records to that

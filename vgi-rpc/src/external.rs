@@ -508,11 +508,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Zstd's decoder allocates its history window independently from emitted
 /// output. Bound that window to the smallest power of two covering the output
-/// cap (subject to zstd's 1 KiB minimum and 2 GiB maximum).
+/// cap, with a 512 KiB floor for zstd's streaming level-1 profile and a 2 GiB
+/// maximum.
 fn zstd_window_log_for_limit(max_size: usize) -> u32 {
-    let bounded = max_size.max(1 << 10);
+    const INTEROPERABLE_WINDOW_LOG_FLOOR: u32 = 19;
+    let bounded = max_size.max(1 << INTEROPERABLE_WINDOW_LOG_FLOOR);
     let ceil_log = usize::BITS - bounded.saturating_sub(1).leading_zeros();
-    ceil_log.clamp(10, 31)
+    ceil_log.clamp(INTEROPERABLE_WINDOW_LOG_FLOOR, 31)
 }
 
 fn compress(ipc_bytes: &[u8], compression: Compression) -> Result<Vec<u8>> {

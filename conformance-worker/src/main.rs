@@ -23,6 +23,41 @@ mod fake_storage;
 use std::io::{self, Write};
 use std::sync::Arc;
 
+struct TransportKindProbe;
+
+#[vgi_rpc::service]
+impl TransportKindProbe {
+    #[unary]
+    fn report_transport_kind(&self, ctx: &vgi_rpc::CallContext) -> vgi_rpc::Result<String> {
+        ctx.kind
+            .map(|kind| kind.as_str().to_string())
+            .ok_or_else(|| vgi_rpc::RpcError::runtime_error("transport kind is not bound"))
+    }
+}
+
+fn build_plain_server(args: &[String]) -> vgi_rpc::RpcServer {
+    if args.iter().any(|arg| arg == "--transport-kind-probe") {
+        let mut server = vgi_rpc::RpcServer::builder()
+            .protocol_name("TransportKindProbe")
+            .build();
+        TransportKindProbe::register_with(&mut server, Arc::new(TransportKindProbe));
+        return server;
+    }
+
+    let server_id = parse_str_flag(args, "--server-id");
+    if args.iter().any(|arg| arg == "--fail-serve-start-once") {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_attempts = attempts.clone();
+        let hook: vgi_rpc::ServeStartHook = Arc::new(move |_, _| {
+            if hook_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                panic!("conformance injected on_serve_start failure");
+            }
+        });
+        return conformance::build_server_with_id_and_hook(server_id.as_deref(), hook);
+    }
+    conformance::build_server_with_id(server_id.as_deref())
+}
+
 /// Header letting a conformance request name the reason it wants refused
 /// with, so the suite can prove this server *discriminates* between reason
 /// codes rather than stamping one constant on every 401.
@@ -164,9 +199,7 @@ fn main() {
     let no_compression = args.iter().any(|a| a == "--no-compression");
 
     if args.len() > 1 && args[1] == "--http" {
-        let server = Arc::new(conformance::build_server_with_id(
-            parse_str_flag(&args, "--server-id").as_deref(),
-        ));
+        let server = Arc::new(build_plain_server(&args));
         let strict = args.iter().any(|a| a == "--strict");
         let max_resp = parse_usize_flag(&args, "--max-response-bytes");
         let max_ext = parse_usize_flag(&args, "--max-externalized-response-bytes");
@@ -245,7 +278,7 @@ fn main() {
     }
 
     if args.len() > 2 && args[1] == "--unix" {
-        let server = Arc::new(conformance::build_server());
+        let server = Arc::new(build_plain_server(&args));
         server.notify_transport(
             vgi_rpc::TransportKind::Unix,
             vgi_rpc::TransportCapabilities::none(),
@@ -263,7 +296,7 @@ fn main() {
         // Raw TCP transport: same Arrow-IPC framing as `--unix`, only the
         // listening socket differs. No auth/TLS — trusted networks only; the
         // host defaults to loopback (127.0.0.1).
-        let server = Arc::new(conformance::build_server());
+        let server = Arc::new(build_plain_server(&args));
         server.notify_transport(
             vgi_rpc::TransportKind::Tcp,
             vgi_rpc::TransportCapabilities::none(),
@@ -284,7 +317,7 @@ fn main() {
     // generous `BufWriter` so the IPC writer's many small `write_all`
     // calls coalesce into a few large writes. `stdin().lock()` already
     // has an 8 KB buffer; bump it for symmetry on large inbound batches.
-    let server = Arc::new(conformance::build_server());
+    let server = Arc::new(build_plain_server(&args));
     // SHM is opportunistic per-request; the worker is built against
     // `vgi-rpc[shm]` so the capability is always present here.
     server.notify_transport(

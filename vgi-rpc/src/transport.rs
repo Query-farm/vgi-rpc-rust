@@ -74,10 +74,10 @@ impl TransportCapabilities {
 /// on each (kind, capabilities) combination.
 ///
 /// Register via [`crate::RpcServerBuilder::on_serve_start`]. Hooks run
-/// synchronously on the thread that first observes the transport, after
-/// the framework has recorded the binding but before any handler runs.
-/// A hook that panics aborts the serve path; if you want errors to be
-/// recoverable, catch them inside the closure.
+/// synchronously on the thread that first observes the transport, before
+/// the framework commits the binding and before any handler runs. A hook that
+/// panics aborts that serve attempt; the binding remains uncommitted so a later
+/// request retries the hook.
 pub type ServeStartHook =
     Arc<dyn Fn(TransportKind, &TransportCapabilities) + Send + Sync + 'static>;
 
@@ -170,6 +170,28 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(fire_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn failed_hook_does_not_commit_and_retry_refires() {
+        let fire_count = Arc::new(AtomicUsize::new(0));
+        let counter = fire_count.clone();
+        let hook: ServeStartHook = Arc::new(move |_, _| {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("transient startup failure");
+            }
+        });
+        let server = RpcServer::builder().on_serve_start(hook).build();
+
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            server.notify_transport(TransportKind::Http, TransportCapabilities::none());
+        }));
+        assert!(first.is_err());
+        assert_eq!(server.transport_kind(), None);
+
+        server.notify_transport(TransportKind::Http, TransportCapabilities::none());
+        assert_eq!(fire_count.load(Ordering::SeqCst), 2);
+        assert_eq!(server.transport_kind(), Some(TransportKind::Http));
     }
 
     #[test]

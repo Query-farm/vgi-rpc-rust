@@ -528,6 +528,7 @@ impl RpcServerBuilder {
             describe_enabled: self.enable_describe,
             dispatch_hook: self.dispatch_hook,
             on_serve_start: self.on_serve_start,
+            transport_notify: Mutex::new(()),
             transport_state: Mutex::new(None),
             #[cfg(feature = "http")]
             external_config: self.external_config,
@@ -685,6 +686,10 @@ pub struct RpcServer {
     /// Optional one-shot lifecycle hook fired on the first
     /// [`notify_transport`](Self::notify_transport) per (kind, caps).
     on_serve_start: Option<crate::transport::ServeStartHook>,
+    /// Serializes the lifecycle check/hook/commit transaction without holding
+    /// `transport_state` while user code runs. Hooks may inspect
+    /// `transport_kind()`, so using the state mutex itself would deadlock.
+    transport_notify: Mutex<()>,
     /// Coarse identifier of the bound transport, populated by
     /// [`notify_transport`](Self::notify_transport).
     transport_state: Mutex<
@@ -781,19 +786,21 @@ impl RpcServer {
         kind: crate::transport::TransportKind,
         caps: crate::transport::TransportCapabilities,
     ) {
-        let hook = {
-            let mut guard = lock_ok(&self.transport_state);
+        let _notify = lock_ok(&self.transport_notify);
+        {
+            let guard = lock_ok(&self.transport_state);
             if let Some((cur_kind, cur_caps)) = guard.as_ref() {
                 if *cur_kind == kind && *cur_caps == caps {
                     return;
                 }
             }
-            *guard = Some((kind, caps));
-            self.on_serve_start.clone()
-        };
-        if let Some(h) = hook {
+        }
+        if let Some(h) = self.on_serve_start.clone() {
             h(kind, &caps);
         }
+        // Commit only after the hook succeeds. If it panics, unwinding skips
+        // this assignment and a later request re-runs the startup hook.
+        *lock_ok(&self.transport_state) = Some((kind, caps));
     }
 
     /// Register a method described by a [`MethodInfo`].

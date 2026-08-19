@@ -76,9 +76,12 @@ const DEFAULT_MAX_DECODED_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_REQUEST_ENCODING: &str = "zstd";
 
 fn zstd_window_log_for_limit(max_size: usize) -> u32 {
-    let bounded = max_size.max(1 << 10);
+    // A level-1 streaming encoder advertises a 512 KiB history window even
+    // for tiny frames whose content size was unknown to the encoder.
+    const INTEROPERABLE_WINDOW_LOG_FLOOR: u32 = 19;
+    let bounded = max_size.max(1 << INTEROPERABLE_WINDOW_LOG_FLOOR);
     let ceil_log = usize::BITS - bounded.saturating_sub(1).leading_zeros();
-    ceil_log.clamp(10, 31)
+    ceil_log.clamp(INTEROPERABLE_WINDOW_LOG_FLOOR, 31)
 }
 
 /// Server capabilities advertised on `OPTIONS {prefix}/health`.

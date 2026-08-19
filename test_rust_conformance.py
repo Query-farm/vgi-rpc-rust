@@ -205,13 +205,23 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
             )
         if variant == "introspect":
             return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--introspect"])
-        if variant in ("storage", "zstd_storage", "externalize_always"):
+        if variant in ("storage", "zstd_storage", "externalize_always", "external_security"):
             port = _free_port()
             args = [_VENV_PY, _PY_SERVE_HTTP, "--port", str(port), "--fake-storage", storage_url or ""]
             if variant == "zstd_storage":
                 args += ["--compression", "zstd"]
             if variant == "externalize_always":
                 args += ["--externalize-threshold", "1", "--max-request-bytes", "1048576"]
+            if variant == "external_security":
+                args += [
+                    "--max-request-bytes",
+                    "1048576",
+                    "--max-fetch-bytes",
+                    "4096",
+                    "--max-decompressed-fetch-bytes",
+                    "8192",
+                    "--reject-localhost-redirects",
+                ]
             return _spawn_read_port(args, expect_port=port)
         if variant == "strict":
             return _spawn_read_port([_VENV_PY, _PY_SERVE_STRICT])

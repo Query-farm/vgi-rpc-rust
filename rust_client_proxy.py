@@ -422,9 +422,13 @@ def _target_and_headers(base_url: Any, client: Any) -> tuple[Any, dict[str, str]
     """
     if client is None:
         return base_url, {}
-    import httpx
+    try:
+        import httpx
+    except ModuleNotFoundError:
+        import httpx2 as httpx
 
-    stock = {k.lower() for k in httpx.Client().headers}
+    with httpx.Client() as stock_client:
+        stock = {k.lower() for k in stock_client.headers}
     headers = {k: v for k, v in client.headers.items() if k.lower() not in stock}
     return str(client.base_url), headers
 
@@ -476,7 +480,8 @@ def rust_http_capabilities(base_url: Any = None, *, prefix: Any = None, client: 
 def rust_request_upload_urls(
     base_url: Any = None, *, count: int = 1, prefix: Any = None, client: Any = None, **_kw: Any
 ) -> list:
-    proxy = RustClientProxy("http", base_url)
+    target, headers = _target_and_headers(base_url, client)
+    proxy = RustClientProxy("http", target, headers=headers)
     try:
         return [_UploadUrl(u) for u in proxy._admin("request_upload_urls", count=count)["urls"]]
     finally:

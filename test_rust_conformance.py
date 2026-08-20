@@ -380,6 +380,43 @@ def conformance_http_port(rust_http_port: int) -> int:
     return rust_http_port
 
 
+@pytest.fixture
+def conformance_resource_soak_target() -> Iterator[Any]:
+    """Expose one isolated Rust HTTP worker to the shared resource soak."""
+    if ROLE != "server" or SERVER != "rust":
+        pytest.skip("resource soak measures the Rust server role only")
+
+    from vgi_rpc.conformance._resource_soak_pytest import (
+        ResourceSoakLimits,
+        ResourceSoakTarget,
+    )
+
+    proc, port = _spawn_http_variant("plain")
+    try:
+        def connect() -> contextlib.AbstractContextManager[Any]:
+            return http_connect(ConformanceService, f"http://127.0.0.1:{port}")
+
+        yield ResourceSoakTarget(
+            name="rust-http",
+            pid=proc.pid,
+            connect=connect,
+            limits=ResourceSoakLimits(
+                rss_growth_bytes=32 * 1024 * 1024,
+                rss_slope_bytes_per_epoch=2 * 1024 * 1024,
+                descriptor_growth=3,
+                thread_growth=2,
+                child_growth=0,
+            ),
+        )
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
 @pytest.fixture(scope="session")
 def conformance_http_no_compression_port() -> Iterator[int]:
     """HTTP conformance server booted with response compression disabled.

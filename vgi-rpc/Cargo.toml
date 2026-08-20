@@ -22,7 +22,13 @@ external = ["dep:zstd"]
 # the core dispatch path, so it must be enableable without `http` (keeps the crate
 # wasm-buildable). `http` re-includes it.
 stream-codec = ["dep:bincode"]
-http = ["external", "stream-codec", "dep:axum", "dep:tower-http", "dep:tokio", "dep:hmac", "dep:base64", "dep:rand", "dep:bincode", "dep:chacha20poly1305", "dep:flate2"]
+# Generic XChaCha20-Poly1305 seal/open envelope (`crypto`). AEAD + RNG + base64
+# only — no server stack. Downstream crates seal their own tokens with it (the
+# `vgi` worker framework's split tokens are not an HTTP concern), so like
+# `stream-codec` it must be enableable without `http` to keep those crates
+# wasm-buildable. `http` re-includes it for the sticky streaming-state token.
+crypto = ["dep:base64", "dep:chacha20poly1305", "dep:rand"]
+http = ["external", "stream-codec", "crypto", "dep:axum", "dep:tower-http", "dep:tokio", "dep:hmac", "dep:base64", "dep:rand", "dep:bincode", "dep:chacha20poly1305", "dep:flate2"]
 jwt = []
 jwt-jsonwebtoken = ["jwt", "dep:jsonwebtoken", "dep:reqwest"]
 # `auth::pkce` needs base64 (URL-safe challenge/cookie encoding), hmac (state
@@ -168,7 +174,7 @@ chacha20poly1305 = { workspace = true, optional = true }
 jsonwebtoken = { version = "9.3", optional = true, default-features = false, features = ["use_pem"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }
 urlencoding = { version = "2", optional = true }
-vgi-rpc-macros = { path = "../vgi-rpc-macros", version = "0.22.0", optional = true }
+vgi-rpc-macros = { path = "../vgi-rpc-macros", version = "0.23.0", optional = true }
 x509-parser = { version = "0.16", optional = true }
 percent-encoding = { version = "2", optional = true }
 libc = { version = "0.2", optional = true }

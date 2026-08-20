@@ -31,8 +31,8 @@ use std::collections::HashMap;
 
 use crate::metadata::{CALL_STATE_KEY, CANCEL_KEY, REQUEST_ID_KEY, STATE_KEY};
 use crate::server::{
-    build_error_metadata, build_log_metadata, cast_batch, validate_parameter_batch, CallContext,
-    MethodType, Request, RpcServer,
+    build_error_metadata, build_log_metadata, cast_batch, validate_parameter_batch,
+    validate_protocol_version, CallContext, MethodType, Request, RpcServer,
 };
 use crate::stream::{empty_schema, Emitted, OutputCollector, StreamResult, StreamStateKind};
 use crate::unauthorized::{AuthReason, AUTH_PROXY_REQUIRED_HEADER, AUTH_REASON_HEADER};
@@ -3090,6 +3090,9 @@ async fn handle_upload_url(
         ));
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
+    if let Err(err) = validate_protocol_version(state.server.protocol_version(), &req.metadata) {
+        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+    }
     if let Err(err) = validate_parameter_batch(&req.batch, &upload_url_params_schema()) {
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
@@ -3227,6 +3230,9 @@ async fn handle_unary(
             "Method mismatch: route names '{method}', request metadata names '{}'",
             req.method
         ));
+        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+    }
+    if let Err(err) = validate_protocol_version(server.protocol_version(), &req.metadata) {
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
 
@@ -3542,6 +3548,9 @@ async fn handle_stream_init(
         ));
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
+    if let Err(err) = validate_protocol_version(server.protocol_version(), &req.metadata) {
+        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+    }
 
     // Stream initialization accepts the same externalized parameter shape as
     // unary calls. Keep routing metadata from the pointer request and replace
@@ -3740,10 +3749,11 @@ fn build_cursor_token(
     ss: &StreamStateKind,
     call_id: &[u8; CALL_ID_LEN],
 ) -> Result<String> {
-    let state_bytes = match ss {
-        StreamStateKind::Producer(p) => p.encode_state()?,
-        StreamStateKind::Exchange(e) => e.encode_state()?,
-    };
+    let state_bytes = crate::server::call_guard(|| match ss {
+        StreamStateKind::Producer(p) => p.encode_state(),
+        StreamStateKind::Exchange(e) => e.encode_state(),
+    })
+    .and_then(|result| result)?;
     Ok(state.pack_cursor_token(auth, &state_bytes, call_id))
 }
 
@@ -3873,7 +3883,17 @@ fn run_producer<W: std::io::Write>(
     };
     // A resumable producer may cap its own per-response batch count (so it
     // yields a continuation instead of draining the whole shared work queue).
-    let limit = producer.batch_limit().unwrap_or(limit);
+    let limit = match crate::server::call_guard(|| producer.batch_limit()) {
+        Ok(producer_limit) => producer_limit.unwrap_or(limit),
+        Err(err) => {
+            let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+            let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+            return ProducerTurn {
+                finished: true,
+                errored: true,
+            };
+        }
+    };
     let mut batches_written = 0usize;
     // Bytes this turn has pushed to external storage. Resets per HTTP turn,
     // matching the reference: each turn is one response and the cap is a
@@ -3881,7 +3901,8 @@ fn run_producer<W: std::io::Write>(
     let mut cumulative_external = 0usize;
     while limit == 0 || batches_written < limit {
         let mut out = OutputCollector::new(output_schema.clone(), true);
-        let result = producer.produce(&mut out, &ctx);
+        let result = crate::server::call_guard(|| producer.produce(&mut out, &ctx))
+            .and_then(|result| result);
         // First-tick metadata is delivered to the first produce call only —
         // later turns within this response are not the producer's first tick.
         if first_tick {
@@ -4069,7 +4090,9 @@ async fn handle_stream_exchange(
         ));
         return arrow_error(&state, StatusCode::INTERNAL_SERVER_ERROR, &err, "");
     };
-    let mut ss = match decoder(&unpacked.state_bytes) {
+    let mut ss = match crate::server::call_guard(|| decoder(&unpacked.state_bytes))
+        .and_then(|result| result)
+    {
         Ok(s) => s,
         Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
     };
@@ -4088,15 +4111,26 @@ async fn handle_stream_exchange(
     let mut body_buf = Vec::new();
 
     if cancelled {
-        match &mut ss {
+        let cancel_result = crate::server::call_guard(|| match &mut ss {
             StreamStateKind::Producer(p) => p.on_cancel(&ctx),
             StreamStateKind::Exchange(e) => e.on_cancel(&ctx),
-        }
+        });
         {
             let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
+            for log in ctx.drain_logs() {
+                let md = build_log_metadata(&log, &server.server_id, &req.request_id);
+                let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+            }
+            if let Err(err) = &cancel_result {
+                let md = build_error_metadata(err, &server.server_id, &req.request_id);
+                let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+            }
             let _ = sw.finish();
         }
         let mut resp = arrow_response(StatusCode::OK, body_buf);
+        if cancel_result.is_err() {
+            stamp_rpc_error(&mut resp);
+        }
         if let Some(s) = sticky_sink.as_ref() {
             stamp_session_headers(&mut resp, &state, s);
         }
@@ -4166,10 +4200,11 @@ async fn handle_stream_exchange(
     };
 
     let mut out = OutputCollector::new(output_schema.clone(), false);
-    let res = match &mut ss {
+    let res = crate::server::call_guard(|| match &mut ss {
         StreamStateKind::Exchange(e) => e.exchange(&casted, &mut out, &ctx),
         _ => unreachable!(),
-    };
+    })
+    .and_then(|result| result);
 
     let mut wrote_error = false;
     {

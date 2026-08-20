@@ -9,6 +9,11 @@
 use std::time::Duration;
 
 /// Configuration for a retry schedule.
+///
+/// Retries are disabled by default because an RPC may have side effects and a
+/// connection failure does not reveal whether the server applied the call.
+/// Set [`max_attempts`](Self::max_attempts) above `1` to opt into replaying
+/// eligible HTTP requests.
 #[derive(Clone, Debug)]
 pub struct RetryConfig {
     /// Maximum number of attempts (including the first one). `1` disables retries.
@@ -27,7 +32,7 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_attempts: 3,
+            max_attempts: 1,
             base_delay: Duration::from_millis(100),
             max_delay: Duration::from_secs(10),
             multiplier: 2.0,
@@ -155,6 +160,11 @@ mod tests {
         let cfg = RetryConfig::disabled();
         let delays: Vec<Duration> = cfg.schedule().collect();
         assert_eq!(delays, vec![Duration::ZERO]);
+    }
+
+    #[test]
+    fn retries_are_opt_in() {
+        assert_eq!(RetryConfig::default().max_attempts, 1);
     }
 
     #[test]

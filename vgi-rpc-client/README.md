@@ -22,8 +22,8 @@ canonical Python client: you build the request parameters as a one-row Arrow
   timeout for untrusted peers). *(feature `unix`)*
 - **HTTP** — `reqwest`-blocking, with the full production surface:
   external-location resolution, sticky sessions, 413 request-externalization,
-  415/zstd codec negotiation, a request timeout, and connection-level retry on
-  idempotent calls. *(feature `http`, default)*
+  415/zstd codec negotiation, a request timeout, and opt-in connection-level
+  retries. *(feature `http`, default)*
 - **POSIX shared memory** — the `shm` side-channel for large batches.
   *(feature `shm`)*
 

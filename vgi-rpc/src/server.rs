@@ -13,9 +13,9 @@ use crate::log::{LogLevel, LogMessage};
 #[cfg(feature = "shm")]
 use crate::metadata::SHM_SEGMENT_SIZE_KEY;
 use crate::metadata::{
-    CANCEL_KEY, LOCATION_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY, REQUEST_ID_KEY,
-    REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY, SERVER_ID_KEY, SHM_OFFSET_KEY,
-    SHM_SEGMENT_NAME_KEY,
+    CANCEL_KEY, LOCATION_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY, PROTOCOL_VERSION_KEY,
+    REQUEST_ID_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY, SERVER_ID_KEY,
+    SHM_OFFSET_KEY, SHM_SEGMENT_NAME_KEY,
 };
 #[cfg(feature = "shm")]
 use crate::shm::{is_shm_pointer_batch, maybe_write_to_shm, resolve_shm_batch, ShmSegment};
@@ -137,6 +137,33 @@ fn lock_ok<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub(crate) fn call_guard<T>(f: impl FnOnce() -> T) -> Result<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
         .map_err(|_| RpcError::new("RuntimeError", "handler panicked"))
+}
+
+/// Validate the optional application protocol version carried by a request.
+///
+/// An absent client version remains compatible for backward compatibility.
+/// When both sides provide a version, only the major component is a breaking
+/// boundary. This helper is shared by the pipe/unix and HTTP dispatch paths so
+/// their behavior cannot drift.
+pub(crate) fn validate_protocol_version(
+    server_version: &str,
+    request_metadata: &Metadata,
+) -> Result<()> {
+    if server_version.is_empty() {
+        return Ok(());
+    }
+    let Some(client_version) = md_get(request_metadata, PROTOCOL_VERSION_KEY) else {
+        return Ok(());
+    };
+    let client_major = client_version.split('.').next().unwrap_or("");
+    let server_major = server_version.split('.').next().unwrap_or("");
+    if client_major != server_major {
+        return Err(RpcError::version_error(format!(
+            "protocol_version mismatch: client {:?} is incompatible with server {:?}",
+            client_version, server_version
+        )));
+    }
+    Ok(())
 }
 
 /// Context supplied to each handler invocation.
@@ -988,21 +1015,11 @@ impl RpcServer {
             return Ok(true);
         }
 
-        // Enforce application protocol-version compatibility: the client sends
-        // its `vgi_rpc.protocol_version`; if its MAJOR differs from the
-        // server's enforced version, reject (mirrors the Python framework).
-        if !self.protocol_version.is_empty() {
-            if let Some(client_v) = md_get(&req.metadata, crate::metadata::PROTOCOL_VERSION_KEY) {
-                let major = |v: &str| v.split('.').next().unwrap_or("").to_string();
-                if major(client_v) != major(&self.protocol_version) {
-                    let err = RpcError::version_error(format!(
-                        "protocol_version mismatch: client {:?} is incompatible with server {:?}",
-                        client_v, self.protocol_version
-                    ));
-                    write_error_stream(w, &empty_schema(), &err, &self.server_id, &req.request_id)?;
-                    return Ok(true);
-                }
-            }
+        // Enforce application protocol-version compatibility (the transport
+        // capability handshake above remains available for negotiation).
+        if let Err(err) = validate_protocol_version(&self.protocol_version, &req.metadata) {
+            write_error_stream(w, &empty_schema(), &err, &self.server_id, &req.request_id)?;
+            return Ok(true);
         }
 
         let ctx = CallContext::for_request(self, &req);
@@ -1423,9 +1440,18 @@ impl RpcServer {
             // Cancellation signal.
             if is_cancel {
                 cancelled = true;
-                match &mut state {
+                let cancel_result = call_guard(|| match &mut state {
                     StreamStateKind::Producer(p) => p.on_cancel(ctx),
                     StreamStateKind::Exchange(e) => e.on_cancel(ctx),
+                });
+                for log in ctx.drain_logs() {
+                    let md = envelope.log(&log);
+                    out_writer.write(&empty_out, Some(md))?;
+                }
+                if let Err(err) = cancel_result {
+                    let md = envelope.error(&err);
+                    out_writer.write(&empty_out, Some(md))?;
+                    *app_err = Some(err);
                 }
                 break;
             }

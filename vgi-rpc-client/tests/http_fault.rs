@@ -178,6 +178,27 @@ fn retries_then_succeeds() {
     assert_eq!(batch.column(0).as_primitive::<Int64Type>().value(0), 42);
 }
 
+#[test]
+fn unary_connection_failure_is_not_retried_by_default() {
+    let seen = Arc::new(AtomicUsize::new(0));
+    let server_seen = seen.clone();
+    let url = mock_server(move |_attempt, stream| {
+        server_seen.fetch_add(1, Ordering::SeqCst);
+        drain_request(&stream);
+        // Drop the connection without a response. The client cannot know
+        // whether a side-effecting unary handler ran, so it must not replay.
+    });
+    let mut client = HttpClient::connect(url)
+        .timeout(Some(Duration::from_millis(500)))
+        .build()
+        .unwrap();
+    let err = client
+        .call_unary("echo_int", &echo_params(), None)
+        .expect_err("the single attempt should fail");
+    assert_eq!(err.error_type, "TransportError");
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+}
+
 fn http_body(status: &str, body: &[u8]) -> Vec<u8> {
     let mut resp = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/vnd.apache.arrow.stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

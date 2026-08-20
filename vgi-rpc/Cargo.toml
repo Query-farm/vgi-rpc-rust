@@ -94,6 +94,10 @@ name = "http_panic"
 required-features = ["http"]
 
 [[test]]
+name = "http_protocol_version"
+required-features = ["http"]
+
+[[test]]
 name = "http_polish"
 required-features = ["http"]
 

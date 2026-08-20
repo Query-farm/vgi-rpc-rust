@@ -360,9 +360,9 @@ impl HttpClientBuilder {
         self
     }
 
-    /// Retry policy for connection-level failures on idempotent requests
-    /// (unary / init / describe / capabilities / producer continuation).
-    /// Exchange is never retried.
+    /// Opt into replaying eligible requests after connection-level failures.
+    /// Retries are disabled by default because unary and init handlers may
+    /// have side effects. Exchange requests are never retried.
     pub fn retry(mut self, cfg: RetryConfig) -> Self {
         self.retry = cfg;
         self
@@ -581,7 +581,7 @@ impl HttpClient {
     }
 
     /// POST an Arrow body, with codec negotiation (415), request
-    /// externalization (413), connection retry (idempotent ops only), and
+    /// externalization (413), explicitly configured connection replay, and
     /// sticky-session header capture. Returns the response body bytes.
     fn post(&mut self, path: &str, body: Vec<u8>, retryable: bool) -> Result<Vec<u8>> {
         // Proactive externalization when caps are known and the body is large.
@@ -651,7 +651,7 @@ impl HttpClient {
         let url = self.url(path);
 
         let attempts = if retryable {
-            self.retry.max_attempts
+            self.retry.max_attempts.max(1)
         } else {
             1
         };

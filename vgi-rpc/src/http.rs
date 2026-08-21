@@ -4229,6 +4229,20 @@ async fn handle_stream_exchange(
         _ => batch,
     };
 
+    // This turn's input-batch metadata is what the pipe transports surface as
+    // `CallContext::tick_metadata`: server.rs's lockstep loop moves each input
+    // batch's own metadata into the context before dispatching the exchange.
+    // Over HTTP an exchange turn is a continuation POST, so that request's
+    // metadata plays the same role and has to be forwarded here — without it
+    // an identical worker sees its `vgi.cache.*` revalidators (and any other
+    // per-batch metadata) over subprocess and nothing at all over HTTP.
+    //
+    // The framework's own transport keys are stripped first, exactly as on the
+    // producer continuation turn: the pipe transports keep the stream cursor
+    // and call state in the CONNECTION rather than on a batch, and the cursor
+    // is an AEAD-sealed token that must not surface to application code.
+    ctx.set_tick_metadata(strip_framework_tick_metadata(&metadata));
+
     let mut out = OutputCollector::new(output_schema.clone(), false);
     let res = crate::server::call_guard(|| match &mut ss {
         StreamStateKind::Exchange(e) => e.exchange(&casted, &mut out, &ctx),

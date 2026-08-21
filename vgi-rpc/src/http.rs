@@ -3848,13 +3848,34 @@ struct ProducerTurn {
     errored: bool,
 }
 
+/// Metadata keys the HTTP transport itself puts on a stream continuation
+/// request. They are transport plumbing, not application metadata: the pipe
+/// transports carry the equivalent state in the connection rather than on the
+/// batch, so a worker must never see them on a tick. [`STATE_KEY`] in
+/// particular is a sealed cursor token.
+const FRAMEWORK_TICK_METADATA_KEYS: [&str; 3] = [STATE_KEY, CALL_STATE_KEY, CANCEL_KEY];
+
+/// Returns `md` with the framework's transport keys removed, so a continuation
+/// request's metadata can be surfaced to user code as that turn's tick
+/// metadata.
+fn strip_framework_tick_metadata(md: &Metadata) -> Metadata {
+    md.iter()
+        .filter(|(k, _)| !FRAMEWORK_TICK_METADATA_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// `first_tick_md` is surfaced as [`CallContext::tick_metadata`] on the FIRST
-/// `produce` call only. On the pipe transports a producer's first turn is a
-/// distinct tick batch whose custom metadata reaches the worker; over HTTP
-/// that turn folds into the /init request, so without this the metadata a
-/// client attached to /init (e.g. the VGI result cache's
-/// `vgi.cache.if_none_match` revalidators) would never be seen. Pass `None`
-/// on continuation turns — they are not the producer's first tick.
+/// `produce` call of this HTTP turn only. On the pipe transports every
+/// producer turn is a distinct tick batch whose custom metadata reaches the
+/// worker; over HTTP the first turn folds into the /init request and later
+/// turns are continuation POSTs, so callers pass the corresponding request's
+/// metadata (framework transport keys stripped by
+/// [`strip_framework_tick_metadata`]). That carries both the /init-time
+/// revalidators (`vgi.cache.if_none_match`) and DuckDB's between-tick
+/// dynamic-filter updates (`vgi_pushdown_filters`). If a byte/batch cap makes
+/// one turn emit several batches, the later ticks in that turn legitimately
+/// see empty metadata — the client has no opportunity to update mid-turn.
 #[allow(clippy::too_many_arguments)]
 fn run_producer<W: std::io::Write>(
     sw: &mut StreamWriter<W>,
@@ -4142,8 +4163,17 @@ async fn handle_stream_exchange(
         let mut wrote_error = false;
         {
             let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
-            // A continuation turn is not the producer's first tick, so it
-            // carries no first-tick metadata.
+            // The continuation request's custom metadata is this turn's tick
+            // metadata. On the pipe transports every producer turn is a tick
+            // batch whose metadata reaches the worker, and DuckDB uses that to
+            // push *updated* dynamic filters (`vgi_pushdown_filters` — Top-N
+            // boundary tightening, join-key IN sets) between ticks. Over HTTP
+            // a turn is a continuation POST, so its metadata has to be
+            // forwarded here or those updates are silently dropped. The
+            // framework's own transport keys are stripped first: the pipe
+            // transports never put them on a tick, and the stream-state value
+            // is a sealed cursor token that must not surface to user code.
+            let continuation_md = strip_framework_tick_metadata(&metadata);
             let turn = run_producer(
                 &mut sw,
                 &mut ss,
@@ -4153,7 +4183,7 @@ async fn handle_stream_exchange(
                 &req,
                 state.producer_batch_limit,
                 sticky_sink.as_ref(),
-                None,
+                Some(&continuation_md),
             );
             wrote_error |= turn.errored;
             if !turn.finished {

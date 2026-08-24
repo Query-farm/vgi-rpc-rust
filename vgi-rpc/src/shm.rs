@@ -58,6 +58,7 @@
 #[cfg(unix)]
 use std::ffi::CString;
 use std::io::Cursor;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 #[cfg(windows)]
@@ -70,10 +71,12 @@ use windows_sys::Win32::System::Memory::{
     FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 
-use arrow_array::RecordBatch;
-use arrow_ipc::reader::StreamReader as IpcStreamReader;
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_buffer::Buffer as ArrowBuffer;
+use arrow_ipc::reader::{self as ipc_reader, StreamReader as IpcStreamReader};
 use arrow_ipc::writer::StreamWriter as IpcStreamWriter;
-use arrow_schema::{DataType, Schema};
+use arrow_ipc::{root_as_message, MessageHeader};
+use arrow_schema::{DataType, Schema, SchemaRef};
 
 use crate::errors::{Result, RpcError};
 use crate::metadata::{LOG_LEVEL_KEY, SHM_LENGTH_KEY, SHM_OFFSET_KEY, SHM_SOURCE_KEY};
@@ -88,6 +91,17 @@ const VERSION: u32 = 1;
 
 const HEADER_FIXED_SIZE: usize = 24;
 const ALLOC_ENTRY_SIZE: usize = 16;
+
+/// Arrow IPC buffer alignment. SHM allocator entries are padded to this
+/// boundary so every stream, and therefore every record-batch body, starts at
+/// an address the Arrow decoder can alias without realigning into heap memory.
+const IPC_ALIGNMENT: usize = 64;
+
+fn align_ipc_allocation(length: usize) -> Option<usize> {
+    length
+        .checked_add(IPC_ALIGNMENT - 1)
+        .map(|n| n & !(IPC_ALIGNMENT - 1))
+}
 
 /// Maximum number of concurrent allocations the header can hold (4094,
 /// matching the Python implementation).
@@ -664,6 +678,151 @@ impl ShmAllocator {
 // ShmSegment — segment + allocator + zero-copy batch I/O
 // ---------------------------------------------------------------------------
 
+/// Owns the allocator slot behind an mmap-backed Arrow buffer. Arrow clones
+/// this owner along with every sliced column buffer, so the slot cannot be
+/// returned to the allocator until the last array view has been dropped.
+struct ShmBatchAnchor {
+    shm: Arc<OsShm>,
+    offset: u64,
+}
+
+impl Drop for ShmBatchAnchor {
+    fn drop(&mut self) {
+        if let Ok(allocator) = ShmAllocator::attach(self.shm.clone()) {
+            let _ = allocator.free(self.offset);
+        }
+    }
+}
+
+struct IpcFrameRange {
+    metadata_start: usize,
+    metadata_len: usize,
+    body_start: usize,
+    body_len: usize,
+    next: usize,
+}
+
+/// Parse one Arrow IPC stream frame without copying it. Both modern
+/// continuation-marker framing and the legacy four-byte length prefix are
+/// accepted, matching arrow-rs's stream reader.
+fn ipc_frame_range(
+    bytes: &[u8],
+    start: usize,
+    max_metadata: usize,
+) -> Result<Option<IpcFrameRange>> {
+    let first_end = start
+        .checked_add(4)
+        .ok_or_else(|| RpcError::new("IPC", "IPC frame prefix overflow"))?;
+    if first_end > bytes.len() {
+        return Err(RpcError::new("IPC", "truncated IPC frame prefix"));
+    }
+    let first = u32::from_le_bytes(bytes[start..first_end].try_into().unwrap());
+    let (metadata_start, metadata_len) = if first == u32::MAX {
+        let length_end = first_end
+            .checked_add(4)
+            .ok_or_else(|| RpcError::new("IPC", "IPC metadata prefix overflow"))?;
+        if length_end > bytes.len() {
+            return Err(RpcError::new("IPC", "truncated IPC metadata prefix"));
+        }
+        let length = u32::from_le_bytes(bytes[first_end..length_end].try_into().unwrap()) as usize;
+        (length_end, length)
+    } else {
+        (first_end, first as usize)
+    };
+
+    if metadata_len == 0 {
+        return Ok(None);
+    }
+    if metadata_len > max_metadata {
+        return Err(RpcError::new(
+            "IPC",
+            format!("IPC metadata length {metadata_len} exceeds limit {max_metadata}"),
+        ));
+    }
+    let metadata_end = metadata_start
+        .checked_add(metadata_len)
+        .ok_or_else(|| RpcError::new("IPC", "IPC metadata length overflow"))?;
+    if metadata_end > bytes.len() {
+        return Err(RpcError::new("IPC", "truncated IPC metadata"));
+    }
+    let message = root_as_message(&bytes[metadata_start..metadata_end])
+        .map_err(|e| RpcError::new("IPC", format!("parsing SHM IPC message: {e}")))?;
+    let signed_body_len = message.bodyLength();
+    if signed_body_len < 0 {
+        return Err(RpcError::new("IPC", "negative IPC message body length"));
+    }
+    let body_len = usize::try_from(signed_body_len)
+        .map_err(|_| RpcError::new("IPC", "IPC message body length overflow"))?;
+    if body_len > wire::MAX_IPC_MESSAGE_BYTES {
+        return Err(RpcError::new(
+            "IPC",
+            format!(
+                "IPC message body length {body_len} exceeds limit {}",
+                wire::MAX_IPC_MESSAGE_BYTES
+            ),
+        ));
+    }
+    let next = metadata_end
+        .checked_add(body_len)
+        .ok_or_else(|| RpcError::new("IPC", "IPC message body range overflow"))?;
+    if next > bytes.len() {
+        return Err(RpcError::new("IPC", "truncated IPC message body"));
+    }
+    Ok(Some(IpcFrameRange {
+        metadata_start,
+        metadata_len,
+        body_start: metadata_end,
+        body_len,
+        next,
+    }))
+}
+
+fn decode_non_dict_shm_stream(buffer: ArrowBuffer, schema: SchemaRef) -> Result<RecordBatch> {
+    let schema_frame = ipc_frame_range(&buffer, 0, wire::MAX_IPC_SCHEMA_BYTES)?
+        .ok_or_else(|| RpcError::new("IPC", "empty SHM IPC stream"))?;
+    let schema_message = root_as_message(
+        &buffer
+            [schema_frame.metadata_start..schema_frame.metadata_start + schema_frame.metadata_len],
+    )
+    .map_err(|e| RpcError::new("IPC", format!("parsing SHM schema message: {e}")))?;
+    if schema_message.header_type() != MessageHeader::Schema {
+        return Err(RpcError::new(
+            "IPC",
+            format!(
+                "expected SHM Schema message, got {:?}",
+                schema_message.header_type()
+            ),
+        ));
+    }
+
+    let batch_frame = ipc_frame_range(&buffer, schema_frame.next, wire::MAX_IPC_MESSAGE_BYTES)?
+        .ok_or_else(|| RpcError::new("IPC", "SHM IPC stream has no record batch"))?;
+    let batch_message = root_as_message(
+        &buffer[batch_frame.metadata_start..batch_frame.metadata_start + batch_frame.metadata_len],
+    )
+    .map_err(|e| RpcError::new("IPC", format!("parsing SHM record-batch message: {e}")))?;
+    if batch_message.header_type() != MessageHeader::RecordBatch {
+        return Err(RpcError::new(
+            "IPC",
+            format!(
+                "expected SHM RecordBatch message, got {:?}",
+                batch_message.header_type()
+            ),
+        ));
+    }
+    let record_batch = batch_message
+        .header_as_record_batch()
+        .ok_or_else(|| RpcError::new("IPC", "missing SHM RecordBatch header"))?;
+    wire::validate_record_batch_buffers(&record_batch, batch_frame.body_len)?;
+    let version = batch_message.version();
+    let body = buffer.slice_with_length(batch_frame.body_start, batch_frame.body_len);
+    let dictionaries = std::collections::HashMap::<i64, ArrayRef>::new();
+    wire::decode_guard("SHM record batch", || {
+        ipc_reader::read_record_batch(&body, record_batch, schema, &dictionaries, None, &version)
+    })?
+    .map_err(RpcError::from)
+}
+
 /// Shared-memory segment for zero-copy Arrow IPC batch transfer.
 pub struct ShmSegment {
     shm: Arc<OsShm>,
@@ -749,7 +908,9 @@ impl ShmSegment {
         if schema_has_dictionary(schema.as_ref()) {
             let bytes = serialize_for_shm(batch, schema.as_ref())?;
             let size = bytes.len();
-            let Some(offset) = self.allocator.allocate(size) else {
+            let allocation_size = align_ipc_allocation(size)
+                .ok_or_else(|| RpcError::new("ValueError", "shm allocation size overflow"))?;
+            let Some(offset) = self.allocator.allocate(allocation_size) else {
                 return Ok(None);
             };
             let off = offset as usize;
@@ -775,7 +936,9 @@ impl ShmSegment {
         // there's no contiguous gap that big, but capping here avoids a
         // pointless oversize ask.
         let max_region = self.shm.size.saturating_sub(HEADER_SIZE);
-        let reserve = reserve.min(max_region);
+        let reserve = align_ipc_allocation(reserve)
+            .filter(|size| *size <= max_region)
+            .unwrap_or(max_region & !(IPC_ALIGNMENT - 1));
         if reserve == 0 {
             return Ok(None);
         }
@@ -797,10 +960,10 @@ impl ShmSegment {
             let dst = &mut self.shm.as_mut_slice()[off..end];
             let mut cursor = Cursor::new(dst);
             let result: Result<u64> = (|| {
-                let mut w = IpcStreamWriter::try_new(&mut cursor, schema.as_ref())
-                    .map_err(RpcError::from)?;
-                w.write(batch).map_err(RpcError::from)?;
-                w.finish().map_err(RpcError::from)?;
+                let mut w = wire::StreamWriter::new(&mut cursor, schema.as_ref())?;
+                w.write(batch, None)?;
+                w.finish()?;
+                drop(w);
                 Ok(cursor.position())
             })();
             match result {
@@ -820,7 +983,9 @@ impl ShmSegment {
             }
         };
         let actual = written as usize;
-        self.allocator.shrink(offset, actual)?;
+        let allocation_size = align_ipc_allocation(actual)
+            .ok_or_else(|| RpcError::new("ValueError", "shm allocation size overflow"))?;
+        self.allocator.shrink(offset, allocation_size)?;
         Ok(Some((offset, actual)))
     }
 
@@ -850,17 +1015,22 @@ impl ShmSegment {
                 format!("shm region out of bounds: {off}..{end} > {}", self.shm.size),
             ));
         }
-        // Both the no-dict and dict paths read through
-        // `deserialize_from_shm`, which copies the region bytes into a
-        // synthetic IPC stream and decodes via upstream arrow-ipc.
-        // Earlier revisions kept a zero-copy fast path via
-        // `arrow_ipc::reader::BufferStreamReader`, but that type only
-        // exists on `rustyconover/arrow-rs feat/custom-metadata-and-buffer-reader`;
-        // dropping the patch for crates.io publication trades one
-        // extra mmap-to-Vec copy on the SHM read path for the ability
-        // to publish.
         let region: &[u8] = &self.shm.as_slice()[off..end];
-        deserialize_from_shm(region, schema)
+        if schema_has_dictionary(schema) {
+            return deserialize_from_shm(region, schema);
+        }
+
+        let ptr = NonNull::new(unsafe { self.shm.ptr.add(off) })
+            .ok_or_else(|| RpcError::new("ValueError", "null SHM region pointer"))?;
+        let owner = Arc::new(ShmBatchAnchor {
+            shm: self.shm.clone(),
+            offset,
+        });
+        // SAFETY: `off..end` was bounds-checked against the live mmap above,
+        // and `owner` retains that mmap until every derived Arrow buffer is
+        // dropped. Its Drop also releases the allocator slot exactly then.
+        let buffer = unsafe { ArrowBuffer::from_custom_allocation(ptr, length, owner) };
+        decode_non_dict_shm_stream(buffer, Arc::new(schema.clone()))
     }
 
     /// Free the region at `offset`.
@@ -1007,9 +1177,10 @@ pub struct ResolvedShm {
     /// added). When the input wasn't a pointer batch this is the input
     /// `md` unchanged.
     pub metadata: Metadata,
-    /// Offset of the resolved region, when the input *was* a pointer
-    /// batch. Use [`ShmSegment::free`] to release it after the handler
-    /// is done with `batch`.
+    /// Offset that still requires an explicit [`ShmSegment::free`]. This is
+    /// set for the copied dictionary path. Zero-copy batches retain an mmap
+    /// owner that releases the slot automatically when the final Arrow
+    /// buffer is dropped, so their value is `None`.
     pub release_offset: Option<u64>,
 }
 
@@ -1042,20 +1213,16 @@ pub fn resolve_shm_batch(
         .get(SHM_LENGTH_KEY)
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| RpcError::new("ValueError", "bad shm_length"))?;
+    let copied_dictionary_path = schema_has_dictionary(batch.schema().as_ref());
     let resolved = shm.read_batch(offset, length, batch.schema().as_ref())?;
     let mut new_md = md.clone();
     new_md.remove(SHM_OFFSET_KEY);
     new_md.remove(SHM_LENGTH_KEY);
     new_md.insert(SHM_SOURCE_KEY.into(), shm.name().to_string());
-    // Both paths copy the SHM region bytes out of the segment (the
-    // earlier zero-copy fast-path via `BufferStreamReader` is gone —
-    // see the comment in `read_batch`). The resolved batch no longer
-    // references the segment, so the caller may release the slot
-    // immediately on return.
     Ok(ResolvedShm {
         batch: resolved,
         metadata: new_md,
-        release_offset: Some(offset),
+        release_offset: copied_dictionary_path.then_some(offset),
     })
 }
 
@@ -1130,7 +1297,9 @@ pub fn maybe_write_to_shm(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{types::Int32Type, DictionaryArray, Int64Array, RecordBatch, StringArray};
+    use arrow_array::{
+        types::Int32Type, DictionaryArray, Int64Array, LargeBinaryArray, RecordBatch, StringArray,
+    };
     use arrow_schema::{DataType, Field, Schema};
 
     fn small_seg() -> ShmSegment {
@@ -1219,6 +1388,8 @@ mod tests {
         let (pointer, pointer_md) =
             maybe_write_to_shm(batch.clone(), Metadata::new(), Some(&seg)).unwrap();
         assert!(is_shm_pointer_batch(&pointer, &pointer_md));
+        let offset: usize = pointer_md[SHM_OFFSET_KEY].parse().unwrap();
+        let length: usize = pointer_md[SHM_LENGTH_KEY].parse().unwrap();
         let resolved = resolve_shm_batch(pointer, pointer_md, Some(&seg)).unwrap();
         assert_eq!(resolved.batch.num_rows(), 3);
         assert_eq!(resolved.batch.schema(), batch.schema());
@@ -1226,13 +1397,26 @@ mod tests {
             resolved.metadata.get(SHM_SOURCE_KEY).map(String::as_str),
             Some(seg.name()),
         );
-        // Both the dict and non-dict paths now copy the SHM region
-        // bytes into a fresh allocation (the upstream-stock arrow-ipc
-        // doesn't expose the buffer-aliasing reader the fork used).
-        // `release_offset` is therefore always set and the caller
-        // must free the slot.
-        let off = resolved.release_offset.expect("release_offset must be set");
-        let _ = seg.allocator().free(off);
+        assert!(resolved.release_offset.is_none());
+
+        // At least the primitive values buffer must point directly into the
+        // IPC stream's mapped allocation, rather than a heap copy.
+        let region_start = unsafe { seg.shm.ptr.add(offset) } as usize;
+        let region_end = region_start + length;
+        let values = resolved.batch.column(0).to_data();
+        assert!(values.buffers().iter().any(|buffer| {
+            let ptr = buffer.as_ptr() as usize;
+            ptr >= region_start && ptr < region_end
+        }));
+
+        // A cloned column keeps the allocator slot and mmap alive after the
+        // RecordBatch itself is gone; the final buffer drop releases it.
+        let retained_column = resolved.batch.column(0).clone();
+        drop(values);
+        drop(resolved);
+        assert_eq!(seg.allocator().num_allocs(), 1);
+        drop(retained_column);
+        assert_eq!(seg.allocator().num_allocs(), 0);
     }
 
     #[test]
@@ -1250,6 +1434,11 @@ mod tests {
         let resolved = resolve_shm_batch(pointer, pointer_md, Some(&seg)).unwrap();
         assert_eq!(resolved.batch.num_rows(), 5);
         assert_eq!(resolved.batch.schema(), batch.schema());
+        let off = resolved
+            .release_offset
+            .expect("dictionary path requires explicit release");
+        drop(resolved);
+        seg.allocator().free(off).unwrap();
     }
 
     #[test]
@@ -1382,6 +1571,37 @@ mod tests {
     }
 
     #[test]
+    fn direct_large_binary_write_is_stock_arrow_compatible() {
+        // This exact one-row LargeBinary shape takes wire.rs's direct payload
+        // writer. A stock arrow-ipc reader must still decode it, which pins
+        // cross-language compatibility without requiring the FlatBuffer
+        // builder to produce byte-identical metadata ordering.
+        let payload = vec![0x5a; 1024 * 1024];
+        let array = LargeBinaryArray::from_iter_values([payload.as_slice()]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::LargeBinary,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).expect("large batch");
+        let seg = ShmSegment::create(HEADER_SIZE + 3 * 1024 * 1024).unwrap();
+        let (offset, length) = seg
+            .allocate_and_write(&batch)
+            .unwrap()
+            .expect("direct SHM write");
+        let region = seg.read_bytes(offset, length).unwrap();
+        let decoded = deserialize_from_shm(&region, schema.as_ref()).unwrap();
+        let decoded = decoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(decoded.value(0), payload.as_slice());
+        seg.free(offset).unwrap();
+    }
+
+    #[test]
     fn inplace_write_falls_back_when_segment_too_small() {
         // Segment data region is only 4 KiB; a 200K-row batch can't fit.
         let seg = ShmSegment::create(HEADER_SIZE + 4 * 1024).unwrap();
@@ -1414,11 +1634,8 @@ mod tests {
         assert_eq!(seg.allocator().num_allocs(), 1);
         let resolved = resolve_shm_batch(pointer, pointer_md, Some(&seg)).unwrap();
         assert_eq!(resolved.batch.num_rows(), 1024);
-        // Both paths now require explicit free (the zero-copy anchor
-        // was tied to the dropped fork API).
-        let off = resolved.release_offset.expect("release_offset must be set");
+        assert!(resolved.release_offset.is_none());
         drop(resolved);
-        seg.allocator().free(off).unwrap();
         assert_eq!(seg.allocator().num_allocs(), 0);
     }
 

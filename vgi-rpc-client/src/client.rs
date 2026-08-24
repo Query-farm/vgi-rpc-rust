@@ -54,8 +54,9 @@ fn shm_request_md(shm: &ShmHandle, base: Option<&Metadata>) -> Option<Metadata> 
     base.cloned()
 }
 
-/// Resolve an inbound shm pointer batch and free the region (no-op without the
-/// `shm` feature or segment).
+/// Resolve an inbound shm pointer batch. Copied dictionary payloads are freed
+/// here; zero-copy payloads release their slot when the last Arrow buffer is
+/// dropped (no-op without the `shm` feature or segment).
 fn shm_resolve_inbound(
     batch: RecordBatch,
     md: Metadata,

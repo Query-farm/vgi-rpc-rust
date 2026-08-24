@@ -1214,8 +1214,9 @@ impl RpcServer {
                 }
             };
             let resolved = resolve_shm_batch(batch, metadata, seg)?;
-            // The resolved batch copies the region bytes out, so the slot
-            // is dead once materialized — free it for the client.
+            // Dictionary batches use the copied compatibility path and
+            // request an explicit release. Zero-copy batches keep the slot
+            // alive through their Arrow buffer owner and release on drop.
             if let (Some(off), Some(seg)) = (resolved.release_offset, seg) {
                 let _ = seg.free(off);
             }
@@ -1409,10 +1410,10 @@ impl RpcServer {
                 break;
             };
 
-            // Resolve SHM pointer batches before anything else — the
-            // schema cast / cancel check / handler all expect the real
-            // batch. Free the region as soon as it's been deserialized
-            // (we copy on read, so no live borrow remains).
+            // Resolve SHM pointer batches before anything else — the schema
+            // cast / cancel check / handler all expect the real batch.
+            // Copied dictionary batches request an explicit release;
+            // zero-copy batches release through their Arrow buffer owner.
             #[cfg(feature = "shm")]
             let (input_batch, input_md) = {
                 let resolved = resolve_shm_batch(input_batch, input_md, shm)?;

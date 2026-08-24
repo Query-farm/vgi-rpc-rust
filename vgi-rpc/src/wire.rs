@@ -716,7 +716,10 @@ fn parse_custom_metadata(msg: &arrow_ipc::Message) -> Metadata {
 /// overflow) on a crafted frame whose descriptors are inconsistent with
 /// the body it shipped. Catching that here turns a hostile frame into a
 /// clean `RpcError` instead of a thread panic.
-fn validate_record_batch_buffers(rb: &arrow_ipc::RecordBatch, body_len: usize) -> Result<()> {
+pub(crate) fn validate_record_batch_buffers(
+    rb: &arrow_ipc::RecordBatch,
+    body_len: usize,
+) -> Result<()> {
     if let Some(buffers) = rb.buffers() {
         for buf in buffers.iter() {
             let offset = buf.offset();
@@ -742,7 +745,7 @@ fn validate_record_batch_buffers(rb: &arrow_ipc::RecordBatch, body_len: usize) -
 /// `RpcError`. The descriptor pre-validation above catches the common
 /// crafted-frame cases; this is the defence-in-depth net for any other
 /// internal arrow-ipc invariant a hostile frame might trip.
-fn decode_guard<T>(what: &str, f: impl FnOnce() -> T) -> Result<T> {
+pub(crate) fn decode_guard<T>(what: &str, f: impl FnOnce() -> T) -> Result<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
         .map_err(|_| RpcError::new("IPC", format!("panic decoding {what} (malformed frame)")))
 }

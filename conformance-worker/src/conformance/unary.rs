@@ -13,8 +13,8 @@ use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use vgi_rpc::wire::StreamWriter;
 use vgi_rpc::{
-    service, Bytes, CallContext, Decimal20_4, DictString, FixedBinary, LargeBytes, LargeString,
-    LogLevel, LogMessage, Result, RpcError, RpcServer, UtcTimestamp,
+    service, Bytes, CallContext, Decimal20_4, DictString, FixedBinary, LargeBytesBuffer,
+    LargeString, LogLevel, LogMessage, Result, RpcError, RpcServer, UtcTimestamp,
 };
 
 use super::types;
@@ -168,7 +168,7 @@ impl UnarySvc {
 
     /// Echo a large_binary value.
     #[unary]
-    fn echo_large_binary(&self, value: LargeBytes) -> Result<LargeBytes> {
+    fn echo_large_binary(&self, value: LargeBytesBuffer) -> Result<LargeBytesBuffer> {
         Ok(value)
     }
 

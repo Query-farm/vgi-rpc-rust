@@ -54,7 +54,8 @@ pub mod sticky;
 
 pub use access_log::AccessLogHook;
 pub use arrow_type::{
-    Bytes, Decimal20_4, DictString, FixedBinary, LargeBytes, LargeString, UtcTimestamp, VgiArrow,
+    Bytes, Decimal20_4, DictString, FixedBinary, LargeBytes, LargeBytesBuffer, LargeString,
+    UtcTimestamp, VgiArrow,
 };
 
 pub use auth::oauth::OAuthResourceMetadata;

@@ -20,6 +20,7 @@ use arrow_array::{
     LargeStringArray, ListArray, MapArray, StringArray, UInt16Array, UInt32Array, UInt64Array,
     UInt8Array,
 };
+use arrow_buffer::{Buffer, OffsetBuffer};
 use arrow_schema::{DataType, Field};
 
 use crate::errors::{Result, RpcError};
@@ -346,8 +347,83 @@ impl VgiArrow for LargeBytes {
         ))
     }
     fn build_singleton(value: Self) -> Result<ArrayRef> {
-        let arr = LargeBinaryArray::from_iter_values([value.0.as_slice()]);
+        let len = i64::try_from(value.0.len())
+            .map_err(|_| RpcError::value_error("large_binary value exceeds i64 offsets"))?;
+        let offsets = OffsetBuffer::new(vec![0_i64, len].into());
+        // Take ownership of the Vec allocation instead of copying the payload
+        // into a builder-owned Arrow buffer.
+        let arr = LargeBinaryArray::new(offsets, Buffer::from_vec(value.0), None);
         Ok(Arc::new(arr))
+    }
+}
+
+/// Zero-copy `LargeBinary` wire value for payload-oriented handlers.
+///
+/// Unlike [`LargeBytes`], `read` retains a slice of the inbound Arrow buffer
+/// and `build_singleton` transfers that same buffer into the response array.
+/// Cloning this type is also zero-copy. Use [`AsRef::as_ref`] or dereference it
+/// to inspect the bytes, and [`to_vec`](Self::to_vec) only when owned mutable
+/// storage is actually required.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LargeBytesBuffer(pub Buffer);
+
+impl LargeBytesBuffer {
+    /// Copy the payload into an owned `Vec<u8>`.
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.0.as_slice().to_vec()
+    }
+}
+
+impl From<Vec<u8>> for LargeBytesBuffer {
+    fn from(value: Vec<u8>) -> Self {
+        Self(Buffer::from_vec(value))
+    }
+}
+
+impl From<Buffer> for LargeBytesBuffer {
+    fn from(value: Buffer) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<[u8]> for LargeBytesBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl std::ops::Deref for LargeBytesBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl VgiArrow for LargeBytesBuffer {
+    fn arrow_data_type() -> DataType {
+        DataType::LargeBinary
+    }
+
+    fn describe_name() -> String {
+        "bytes".into()
+    }
+
+    fn read(arr: &dyn Array, idx: usize) -> Result<Self> {
+        let arr = as_array::<LargeBinaryArray>(arr, "LargeBinary")?;
+        let offsets = arr.value_offsets();
+        let start = usize::try_from(offsets[idx])
+            .map_err(|_| RpcError::value_error("large_binary offset is negative"))?;
+        let end = usize::try_from(offsets[idx + 1])
+            .map_err(|_| RpcError::value_error("large_binary offset is negative"))?;
+        Ok(Self(arr.values().slice_with_length(start, end - start)))
+    }
+
+    fn build_singleton(value: Self) -> Result<ArrayRef> {
+        let len = i64::try_from(value.0.len())
+            .map_err(|_| RpcError::value_error("large_binary value exceeds i64 offsets"))?;
+        let offsets = OffsetBuffer::new(vec![0_i64, len].into());
+        Ok(Arc::new(LargeBinaryArray::new(offsets, value.0, None)))
     }
 }
 
@@ -825,6 +901,34 @@ mod tests {
             round_trip(Bytes(vec![1, 2, 3, 4, 5])),
             Bytes(vec![1, 2, 3, 4, 5])
         );
+    }
+
+    #[test]
+    fn large_bytes_build_reuses_vec_allocation() {
+        let payload = vec![1_u8; 1024];
+        let payload_ptr = payload.as_ptr();
+        let arr = LargeBytes::build_singleton(LargeBytes(payload)).unwrap();
+        let arr = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+
+        assert_eq!(arr.value(0).as_ptr(), payload_ptr);
+    }
+
+    #[test]
+    fn large_bytes_buffer_roundtrip_reuses_arrow_value_buffer() {
+        let input = LargeBinaryArray::from_iter_values([
+            b"prefix".as_slice(),
+            b"the payload remains in its Arrow buffer".as_slice(),
+        ]);
+        let input_ptr = input.value(1).as_ptr();
+
+        let value = LargeBytesBuffer::read(&input, 1).unwrap();
+        assert_eq!(value.as_ref(), input.value(1));
+        assert_eq!(value.as_ref().as_ptr(), input_ptr);
+
+        let output = LargeBytesBuffer::build_singleton(value).unwrap();
+        let output = output.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+        assert_eq!(output.value(0), input.value(1));
+        assert_eq!(output.value(0).as_ptr(), input_ptr);
     }
 
     #[test]

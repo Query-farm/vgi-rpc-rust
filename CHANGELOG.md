@@ -4,6 +4,27 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## Unreleased
 
+## [0.23.1] — 2026-08-24
+
+### Added
+
+- `LargeBytesBuffer` provides an immutable, reference-counted `LargeBinary`
+  handler value. Reading retains a slice of the inbound Arrow allocation and
+  returning it transfers that buffer into the response array without copying.
+
+### Performance
+
+- `LargeBytes(Vec<u8>)` response construction now transfers the vector's
+  allocation directly into Arrow instead of copying it through a builder.
+- Single-row `LargeBinary` batches write their value buffer directly to the
+  destination pipe, socket, HTTP body, or shared-memory serializer. This avoids
+  the additional payload-sized staging vector created by arrow-rs's general IPC
+  encoder while retaining canonical Arrow IPC framing and custom metadata.
+- The conformance worker's `echo_large_binary` method uses the zero-copy type.
+  Controlled local 16 MiB echo latency improved from 11.36 ms to 7.52 ms over
+  Unix sockets and from 14.13 ms to 10.07 ms over loopback TCP, with small-call
+  latency unchanged.
+
 ## [0.23.0] — 2026-08-23
 
 ### Added

@@ -32,12 +32,12 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, LargeBinaryArray, RecordBatch};
 use arrow_buffer::Buffer as ArrowBuffer;
 use arrow_ipc::reader as ipc_reader;
 use arrow_ipc::writer::{write_message, DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 use arrow_ipc::{convert as ipc_convert, root_as_message, MessageHeader};
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{DataType, Schema, SchemaRef};
 use flatbuffers::FlatBufferBuilder;
 
 use crate::errors::{Result, RpcError};
@@ -113,6 +113,11 @@ const CONTINUATION_MARKER: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
 /// live (see [`ChunkedWriter`]). Slicing is free, so the whole cost of
 /// the clamp is one extra syscall per gigabyte.
 const MAX_WRITE_CHUNK: usize = 1 << 30; // 1 GiB
+
+/// arrow-rs's default IPC alignment. `StreamWriter` always constructs default
+/// write options, so the direct large-binary path below uses the same layout.
+const IPC_ALIGNMENT: usize = 64;
+const IPC_PADDING: [u8; IPC_ALIGNMENT] = [0; IPC_ALIGNMENT];
 
 /// Clamp every `write` to [`MAX_WRITE_CHUNK`] so a large payload
 /// survives the syscall underneath.
@@ -231,6 +236,15 @@ impl<W: Write> StreamWriter<W> {
         if self.finished {
             return Err(RpcError::new("IOError", "writer already finished"));
         }
+        if write_single_large_binary_direct(
+            &mut self.writer,
+            &mut self.fbb,
+            batch,
+            metadata,
+            &self.opts,
+        )? {
+            return Ok(());
+        }
         let mut ctx = Default::default();
         let (dicts, data) = self
             .data_gen
@@ -279,6 +293,125 @@ impl<W: Write> StreamWriter<W> {
     pub fn get_mut(&mut self) -> &mut W {
         self.writer.get_mut()
     }
+}
+
+/// Write the hot-path shape used by large binary unary responses without
+/// copying the value buffer into `EncodedData::arrow_data` first.
+///
+/// `IpcDataGenerator` deliberately produces one contiguous body `Vec`, which
+/// is useful to callers that need encoded bytes but adds a payload-sized copy
+/// when the final destination is already a pipe or socket. A non-null,
+/// one-row, one-column LargeBinary batch has a fixed Arrow IPC layout, so its
+/// small validity and offsets buffers can be framed here while the value
+/// buffer is written directly to the transport.
+fn write_single_large_binary_direct<W: Write>(
+    writer: &mut ChunkedWriter<W>,
+    fbb: &mut FlatBufferBuilder<'static>,
+    batch: &RecordBatch,
+    metadata: Option<&Metadata>,
+    opts: &IpcWriteOptions,
+) -> Result<bool> {
+    use arrow_ipc::{
+        Buffer as IpcBuffer, FieldNode, KeyValue, KeyValueArgs, MessageBuilder, MetadataVersion,
+        RecordBatchBuilder,
+    };
+
+    if batch.num_rows() != 1
+        || batch.num_columns() != 1
+        || batch.schema().field(0).data_type() != &DataType::LargeBinary
+    {
+        return Ok(false);
+    }
+    let Some(array) = batch.column(0).as_any().downcast_ref::<LargeBinaryArray>() else {
+        return Ok(false);
+    };
+    if array.is_null(0) {
+        return Ok(false);
+    }
+
+    let value = array.value(0);
+    let value_len = i64::try_from(value.len())
+        .map_err(|_| RpcError::value_error("large_binary value exceeds i64 offsets"))?;
+    let value_padding = padding_to_alignment(value.len(), IPC_ALIGNMENT);
+    let body_len = 2usize
+        .checked_mul(IPC_ALIGNMENT)
+        .and_then(|prefix| prefix.checked_add(value.len()))
+        .and_then(|length| length.checked_add(value_padding))
+        .ok_or_else(|| RpcError::value_error("large_binary IPC body length overflow"))?;
+    let body_len_i64 = i64::try_from(body_len)
+        .map_err(|_| RpcError::value_error("large_binary IPC body exceeds i64 length"))?;
+
+    fbb.reset();
+    let nodes = fbb.create_vector(&[FieldNode::new(1, 0)]);
+    let buffers = fbb.create_vector(&[
+        IpcBuffer::new(0, 1),
+        IpcBuffer::new(IPC_ALIGNMENT as i64, 16),
+        IpcBuffer::new((2 * IPC_ALIGNMENT) as i64, value_len),
+    ]);
+    let record_batch = {
+        let mut builder = RecordBatchBuilder::new(fbb);
+        builder.add_length(1);
+        builder.add_nodes(nodes);
+        builder.add_buffers(buffers);
+        builder.finish()
+    };
+
+    let custom_metadata = metadata
+        .filter(|entries| !entries.is_empty())
+        .map(|entries| {
+            let entries: Vec<_> = entries
+                .iter()
+                .map(|(key, value)| {
+                    let key = fbb.create_string(key);
+                    let value = fbb.create_string(value);
+                    KeyValue::create(
+                        fbb,
+                        &KeyValueArgs {
+                            key: Some(key),
+                            value: Some(value),
+                        },
+                    )
+                })
+                .collect();
+            fbb.create_vector(&entries)
+        });
+
+    let message = {
+        let mut builder = MessageBuilder::new(fbb);
+        builder.add_version(MetadataVersion::V5);
+        builder.add_header_type(MessageHeader::RecordBatch);
+        builder.add_header(record_batch.as_union_value());
+        builder.add_bodyLength(body_len_i64);
+        if let Some(custom_metadata) = custom_metadata {
+            builder.add_custom_metadata(custom_metadata);
+        }
+        builder.finish()
+    };
+    fbb.finish(message, None);
+    let encoded = arrow_ipc::writer::EncodedData {
+        ipc_message: fbb.finished_data().to_vec(),
+        arrow_data: Vec::new(),
+    };
+    write_message(&mut *writer, encoded, opts).map_err(RpcError::from)?;
+
+    // Validity bitmap (one valid row), then its 64-byte alignment padding.
+    writer.write_all(&[0xff])?;
+    writer.write_all(&IPC_PADDING[..IPC_ALIGNMENT - 1])?;
+
+    // Rebased LargeBinary offsets [0, value_len], then alignment padding.
+    writer.write_all(&0_i64.to_le_bytes())?;
+    writer.write_all(&value_len.to_le_bytes())?;
+    writer.write_all(&IPC_PADDING[..IPC_ALIGNMENT - 16])?;
+
+    // The payload itself is never copied into an intermediate Vec.
+    writer.write_all(value)?;
+    writer.write_all(&IPC_PADDING[..value_padding])?;
+    Ok(true)
+}
+
+#[inline]
+fn padding_to_alignment(length: usize, alignment: usize) -> usize {
+    (alignment - (length % alignment)) % alignment
 }
 
 impl<W: Write> Drop for StreamWriter<W> {
@@ -956,6 +1089,45 @@ mod tests {
         assert_eq!(rb.num_rows(), 3);
         assert_eq!(md_get(&md, "vgi_rpc.method"), Some("echo_string"));
         assert!(r.read_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn single_large_binary_direct_write_roundtrips_sliced_value_and_metadata() {
+        use arrow_array::LargeBinaryArray;
+
+        let schema = Schema::new(vec![Field::new("result", DataType::LargeBinary, false)]);
+        let source = LargeBinaryArray::from_iter_values([
+            b"discarded prefix".as_slice(),
+            b"payload retained in the original Arrow allocation".as_slice(),
+        ]);
+        let sliced = source.slice(1, 1);
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(sliced)]).unwrap();
+        let mut metadata = Metadata::new();
+        metadata.insert("vgi_rpc.method".into(), "echo_large_binary".into());
+
+        let mut encoded = Vec::new();
+        {
+            let mut writer = StreamWriter::new(&mut encoded, &schema).unwrap();
+            writer.write(&batch, Some(&metadata)).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let mut reader = StreamReader::new(encoded.as_slice()).unwrap();
+        let (decoded, decoded_metadata) = reader.read_next().unwrap().expect("batch");
+        let decoded = decoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(
+            decoded.value(0),
+            b"payload retained in the original Arrow allocation"
+        );
+        assert_eq!(
+            md_get(&decoded_metadata, "vgi_rpc.method"),
+            Some("echo_large_binary")
+        );
+        assert!(reader.read_next().unwrap().is_none());
     }
 
     #[test]

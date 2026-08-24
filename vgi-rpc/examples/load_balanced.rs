@@ -50,11 +50,7 @@ impl Counter {
 }
 
 fn build_state(server: Arc<RpcServer>, key: &[u8; 32]) -> Arc<HttpState> {
-    HttpState::builder()
-        .server(server)
-        .token_key(key)
-        .producer_batch_limit(1) // emit at most 1 batch per round-trip
-        .build()
+    HttpState::builder().server(server).token_key(key).build()
 }
 
 #[tokio::main(flavor = "multi_thread")]

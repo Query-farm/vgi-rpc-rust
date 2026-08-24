@@ -22,6 +22,7 @@ pub(crate) enum Emitted {
 pub struct OutputCollector {
     schema: SchemaRef,
     pub(crate) items: Vec<Emitted>,
+    data_emitted: bool,
     finished: bool,
     is_producer: bool,
 }
@@ -31,6 +32,7 @@ impl OutputCollector {
         Self {
             schema,
             items: Vec::new(),
+            data_emitted: false,
             finished: false,
             is_producer,
         }
@@ -43,6 +45,7 @@ impl OutputCollector {
 
     /// Emit a data batch. Schema must match `self.schema()` exactly.
     pub fn emit(&mut self, batch: RecordBatch) -> Result<()> {
+        self.ensure_data_slot()?;
         if batch.schema() != self.schema {
             return Err(RpcError::runtime_error(format!(
                 "emit(): schema mismatch — expected {:?}, got {:?}",
@@ -54,12 +57,14 @@ impl OutputCollector {
             batch,
             metadata: None,
         });
+        self.data_emitted = true;
         Ok(())
     }
 
     /// Emit a data batch with per-batch custom metadata (e.g. VGI's
     /// `vgi_batch_index` / `vgi_partition_values#b64` ordering tags).
     pub fn emit_with_metadata(&mut self, batch: RecordBatch, metadata: Metadata) -> Result<()> {
+        self.ensure_data_slot()?;
         if batch.schema() != self.schema {
             return Err(RpcError::runtime_error(format!(
                 "emit_with_metadata(): schema mismatch — expected {:?}, got {:?}",
@@ -71,6 +76,16 @@ impl OutputCollector {
             batch,
             metadata: Some(metadata),
         });
+        self.data_emitted = true;
+        Ok(())
+    }
+
+    fn ensure_data_slot(&self) -> Result<()> {
+        if self.data_emitted {
+            return Err(RpcError::protocol_error(
+                "only one data batch may be emitted per stream turn",
+            ));
+        }
         Ok(())
     }
 
@@ -99,20 +114,12 @@ impl OutputCollector {
     }
 }
 
-/// Server-driven producer state — called once per tick to emit zero or more batches.
+/// Server-driven producer state — called once per tick to emit at most one data batch.
 pub trait ProducerState: Send {
     fn produce(&mut self, out: &mut OutputCollector, ctx: &CallContext) -> Result<()>;
 
     /// Optional cancel hook — invoked when the client signals cancellation.
     fn on_cancel(&mut self, _ctx: &CallContext) {}
-
-    /// Per-producer override of the HTTP `producer_batch_limit` (`None` = use
-    /// the server default). `Some(n)` makes the producer yield a continuation
-    /// after `n` emitting `produce()` calls. Only the HTTP transport consults
-    /// this; pipe/unix always drain fully.
-    fn batch_limit(&self) -> Option<usize> {
-        None
-    }
 
     /// Serialize this state for stateless HTTP continuation. The default
     /// returns an error; override via [`crate::stream_codec::StreamStateCodec`]
@@ -231,3 +238,47 @@ pub(crate) fn empty_schema() -> SchemaRef {
 
 // Re-export for trait bounds below.
 pub use crate::server::CallContext;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field};
+
+    fn batch(schema: SchemaRef, value: i64) -> RecordBatch {
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap()
+    }
+
+    #[test]
+    fn collector_rejects_a_second_data_batch_as_protocol_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let mut out = OutputCollector::new(schema.clone(), true);
+
+        out.emit(batch(schema.clone(), 1)).unwrap();
+        let err = out
+            .emit_with_metadata(batch(schema, 2), Metadata::default())
+            .unwrap_err();
+
+        assert_eq!(err.error_type, "ProtocolError");
+        assert_eq!(out.items.len(), 1);
+    }
+
+    #[test]
+    fn collector_allows_logs_after_data() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let mut out = OutputCollector::new(schema.clone(), true);
+
+        out.emit(batch(schema, 1)).unwrap();
+        out.client_log(LogLevel::Info, "still allowed");
+
+        assert_eq!(out.items.len(), 2);
+    }
+}

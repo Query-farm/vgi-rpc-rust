@@ -1,5 +1,5 @@
 //! Integration tests: CORS, health endpoint, landing/describe pages,
-//! URL prefix mounting, and zstd response compression.
+//! URL prefix mounting, and zstd/gzip response compression.
 
 use std::sync::Arc;
 
@@ -434,16 +434,31 @@ async fn custom_header_beats_gzip_first_standard_header() {
     assert!(h.get("x-vgi-content-encoding").is_none());
 }
 
-/// A client offering only codings this server cannot produce (gzip is
-/// decode-only on the response path) gets an uncompressed body — and no
-/// encoding header at all. Same for a client that explicitly asks for
-/// `identity`: an identity body is just a body.
+#[tokio::test]
+async fn gzip_only_offers_compress_and_stamp_the_matching_header() {
+    for (request_header, response_header) in [
+        (
+            header::ACCEPT_ENCODING.as_str(),
+            header::CONTENT_ENCODING.as_str(),
+        ),
+        ("x-vgi-accept-encoding", "x-vgi-content-encoding"),
+    ] {
+        let h = big_response_headers(&[(request_header, "gzip")]).await;
+        assert_eq!(
+            h.get(response_header).and_then(|v| v.to_str().ok()),
+            Some("gzip")
+        );
+    }
+}
+
+/// An absent/unknown offer gets an uncompressed body. Same for a client that
+/// explicitly asks for `identity`: an identity body is just a body.
 #[tokio::test]
 async fn unproducible_absent_or_identity_offers_yield_no_encoding_header() {
     for req_headers in [
         &[][..],
-        &[("x-vgi-accept-encoding", "gzip")][..],
-        &[(header::ACCEPT_ENCODING.as_str(), "gzip, br, deflate")][..],
+        &[("x-vgi-accept-encoding", "br")][..],
+        &[(header::ACCEPT_ENCODING.as_str(), "br, deflate")][..],
         // Explicit opt-out, even though zstd is offered right behind it.
         &[("x-vgi-accept-encoding", "identity, zstd")][..],
         &[(header::ACCEPT_ENCODING.as_str(), "identity, zstd")][..],
@@ -489,9 +504,7 @@ async fn supported_encodings_advertised_on_options_health() {
             .get("vgi-supported-encodings")
             .map(|v| v.to_str().unwrap().to_string())
     }
-    // zstd is decodable and producible; gzip is decode-only, so it is not in
-    // the intersection and is not advertised.
-    assert_eq!(probe(Some(3)).await.as_deref(), Some("zstd"));
+    assert_eq!(probe(Some(3)).await.as_deref(), Some("zstd, gzip"));
     // Response compression is off by default: the header must still be
     // present, with an empty value. Absent would mean "legacy server, assume
     // zstd" — the opposite of the truth.
@@ -538,16 +551,16 @@ async fn compression_disabled_server_advertises_and_behaves_consistently() {
 /// A server built with **no** compression configuration compresses, and says
 /// so. Response compression used to default to off, which meant a stock Rust
 /// server advertised an empty `VGI-Supported-Encodings` and shipped every
-/// Arrow body raw. It now defaults to zstd at
-/// `DEFAULT_RESPONSE_COMPRESSION_LEVEL`.
+/// Arrow body raw. It now defaults to response compression at
+/// `DEFAULT_RESPONSE_COMPRESSION_LEVEL` and advertises both mandatory codecs.
 #[tokio::test]
-async fn default_server_compresses_and_advertises_zstd() {
+async fn default_server_compresses_and_advertises_mandatory_codecs() {
     let h = big_response_headers_on(stock_builder().build(), &[("accept-encoding", "zstd")]).await;
     assert_eq!(
         h.get("vgi-supported-encodings")
             .and_then(|v| v.to_str().ok()),
-        Some("zstd"),
-        "a stock server must advertise the codec it can produce"
+        Some("zstd, gzip"),
+        "a stock server must advertise both mandatory codecs"
     );
     assert_eq!(
         h.get(header::CONTENT_ENCODING)

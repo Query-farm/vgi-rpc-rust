@@ -84,6 +84,10 @@ name = "http_auth"
 required-features = ["http"]
 
 [[test]]
+name = "http_exchange_metadata"
+required-features = ["http", "stream-codec"]
+
+[[test]]
 name = "http_init_metadata"
 required-features = ["http"]
 

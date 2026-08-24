@@ -2889,6 +2889,7 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
+ "flate2",
  "reqwest",
  "serde_json",
  "sha2",

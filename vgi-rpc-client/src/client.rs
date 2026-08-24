@@ -465,6 +465,14 @@ impl StreamSession<'_> {
     /// Producer step: send a tick, return the next emitted batch, or `None`
     /// at end-of-stream.
     pub fn tick(&mut self) -> Result<Option<(RecordBatch, Metadata)>> {
+        self.tick_with_metadata(None)
+    }
+
+    /// Producer step with application custom metadata attached to the tick.
+    pub fn tick_with_metadata(
+        &mut self,
+        metadata: Option<&Metadata>,
+    ) -> Result<Option<(RecordBatch, Metadata)>> {
         if self.cancelled || self.closed {
             return Err(RpcError::protocol_error("tick after close/cancel"));
         }
@@ -476,7 +484,7 @@ impl StreamSession<'_> {
         let batch = empty_batch(&tick_schema)?;
         {
             let w = self.in_writer.as_mut().unwrap();
-            w.write(&batch, None)?;
+            w.write(&batch, metadata)?;
             w.flush()?;
         }
         self.ensure_output_reader()?;

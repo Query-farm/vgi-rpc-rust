@@ -14,9 +14,9 @@ categories = ["network-programming", "web-programming::http-client", "data-struc
 
 [features]
 default = ["http"]
-# HTTP transport (reqwest blocking + zstd codec negotiation + external-location
+# HTTP transport (reqwest blocking + zstd/gzip codec negotiation + external-location
 # resolve/upload via vgi-rpc's external module).
-http = ["dep:reqwest", "dep:zstd", "dep:base64", "dep:sha2", "vgi-rpc/external"]
+http = ["dep:reqwest", "dep:zstd", "dep:flate2", "dep:base64", "dep:sha2", "vgi-rpc/external"]
 # AF_UNIX socket transport. Compiles to a no-op on non-unix targets.
 unix = []
 # POSIX shared-memory side-channel. Reuses vgi-rpc's shm module.
@@ -33,6 +33,7 @@ tracing.workspace = true
 
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
 zstd = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 

@@ -4,6 +4,30 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## Unreleased
 
+## [0.23.0] — 2026-08-23
+
+### Added
+
+- HTTP workers now encode gzip responses as well as zstd and advertise the
+  mandatory `zstd, gzip` pair. The Rust HTTP client advertises both codecs and
+  decodes gzip responses with the same encoded and decoded size bounds used
+  for zstd.
+- Producer ticks can carry application metadata through raw and HTTP clients,
+  including continuation turns handled by the native conformance bridge.
+- TCP, shared-memory, raw-adversarial, and same-connection stream-init recovery
+  now participate in the normal shared conformance matrix.
+- Recursive container serialization covers enums and Arrow dataclasses inside
+  lists, maps, sets, and tagged unions, with protocol-version enforcement at
+  dispatch.
+
+### Changed
+
+- HTTP producer requests are strictly lock-step: one request invokes the
+  producer state exactly once and may return at most one data batch. Response
+  byte caps size that turn but never authorize coalescing later turns.
+- The conformance client preserves native continuation tokens and correctly
+  distinguishes metadata-only token sentinels from zero-column data batches.
+
 ### Performance
 
 - **A Unix socket got 8 KiB of kernel buffer, and so ran at half the pipe's
@@ -27,6 +51,11 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
   Adds `socket2` as a `cfg(unix)` dependency of `vgi-rpc` and `vgi-rpc-client`.
 
 ### Fixed
+
+- Stream initialization failures remain typed and leave persistent raw
+  connections reusable.
+- HTTP response parsing rejects genuinely coalesced data batches without
+  rejecting a valid zero-column batch followed by a continuation sentinel.
 
 - The conformance harness imported `httpx`, which the Python reference no
   longer installs — it moved to the `httpx2` fork. `test_rust_conformance.py`

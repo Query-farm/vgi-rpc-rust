@@ -97,13 +97,12 @@ fn build_server() -> RpcServer {
     srv
 }
 
-/// Start the server on a background runtime with per-batch continuation
-/// tokens (producer_batch_limit(1)); return the bound port.
+/// Start the server on a background runtime with per-turn continuation
+/// tokens; return the bound port.
 fn start_server() -> u16 {
     let state = HttpState::builder()
         .server(Arc::new(build_server()))
         .token_key(&[0x42u8; 32])
-        .producer_batch_limit(1)
         .build();
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
@@ -139,7 +138,7 @@ fn value_of(batch: &RecordBatch) -> i64 {
 fn resume_stream_continues_from_a_per_batch_token() {
     let port = start_server();
 
-    // First turn: a real init. producer_batch_limit(1) → one batch + token.
+    // First turn: a real init emits one batch + token.
     let mut c = client(port);
     let mut session = c
         .open_producer("count_to", &params(3), None, false)

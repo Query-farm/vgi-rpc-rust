@@ -46,6 +46,13 @@ fn counter_schema() -> SchemaRef {
     ]))
 }
 
+fn tick_metadata_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("index", DataType::Int64, false),
+        Field::new("seen", DataType::Utf8, false),
+    ]))
+}
+
 fn scale_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
         "value",
@@ -87,6 +94,37 @@ fn counter_batch_range(start: i64, count: i64) -> Result<RecordBatch> {
 struct Counter {
     total: i64,
     cur: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TickMetadata {
+    total: i64,
+    cur: i64,
+}
+impl_bincode_codec!(TickMetadata);
+impl ProducerState for TickMetadata {
+    fn produce(&mut self, out: &mut OutputCollector, ctx: &CallContext) -> Result<()> {
+        if self.cur >= self.total {
+            out.finish();
+            return Ok(());
+        }
+        let seen = ctx
+            .tick_metadata("vgi.conformance.tick")
+            .unwrap_or_default();
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![self.cur])),
+            Arc::new(StringArray::from(vec![seen])),
+        ];
+        out.emit(RecordBatch::try_new(tick_metadata_schema(), arrays)?)?;
+        self.cur += 1;
+        if self.cur >= self.total {
+            out.finish();
+        }
+        Ok(())
+    }
+    fn encode_state(&self) -> Result<Vec<u8>> {
+        StreamStateCodec::encode(self)
+    }
 }
 impl_bincode_codec!(Counter);
 impl ProducerState for Counter {
@@ -571,6 +609,10 @@ fn counter_schema_fn() -> SchemaRef {
     counter_schema()
 }
 
+fn tick_metadata_schema_fn() -> SchemaRef {
+    tick_metadata_schema()
+}
+
 fn scale_schema_fn() -> SchemaRef {
     scale_schema()
 }
@@ -616,6 +658,15 @@ impl StreamSvc {
     #[producer(state = Counter, output_schema = counter_schema_fn)]
     fn produce_n(&self, count: i64) -> Result<Counter> {
         Ok(Counter {
+            total: count,
+            cur: 0,
+        })
+    }
+
+    /// Report the application metadata attached to each producer tick.
+    #[producer(state = TickMetadata, output_schema = tick_metadata_schema_fn)]
+    fn produce_tick_metadata(&self, count: i64) -> Result<TickMetadata> {
+        Ok(TickMetadata {
             total: count,
             cur: 0,
         })

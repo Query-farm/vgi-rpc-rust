@@ -286,12 +286,16 @@ class RustStreamSession:
         batch, cm = reader.read_next_batch_with_custom_metadata()
         return AnnotatedBatch(batch=batch, custom_metadata=cm)
 
-    def tick(self) -> AnnotatedBatch:
+    def tick(self, custom_metadata: Any = None) -> AnnotatedBatch:
         if self._cancelled:
             raise RpcError("ProtocolError", "stream cancelled", "")
         if self._finished or not self._active:
             raise StopIteration
-        self._proxy._send({"op": "tick"})
+        request: dict[str, Any] = {"op": "tick"}
+        if custom_metadata is not None:
+            empty = pa.RecordBatch.from_arrays([], schema=pa.schema([]))
+            request["input_b64"] = _b64e(_serialize_batch(empty, custom_metadata))
+        self._proxy._send(request)
         resp = self._proxy._recv()
         if not resp.get("ok"):
             self._active = False
@@ -312,6 +316,28 @@ class RustStreamSession:
 
     def __next__(self) -> AnnotatedBatch:
         return self.tick()
+
+    def next_with_token(self) -> tuple[AnnotatedBatch, str | None]:
+        """Return the next native-client batch and its opaque resume token."""
+        if self._cancelled:
+            raise RpcError("ProtocolError", "stream cancelled", "")
+        if self._finished or not self._active:
+            raise StopIteration
+        self._proxy._send({"op": "next_with_token"})
+        resp = self._proxy._recv()
+        if not resp.get("ok"):
+            self._active = False
+            raise RpcError("TransportError", str(resp.get("error")), "")
+        self._proxy._replay_logs(resp.get("logs"))
+        if resp.get("error"):
+            self._active = False
+            self._finished = True
+            self._proxy._raise_if_error(resp)
+        if resp.get("done") or resp.get("batch_b64") is None:
+            self._active = False
+            self._finished = True
+            raise StopIteration
+        return self._decode_batch(resp), resp.get("token")
 
     def exchange(self, input: AnnotatedBatch) -> AnnotatedBatch:
         if self._cancelled or self._closed:

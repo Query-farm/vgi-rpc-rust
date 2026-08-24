@@ -18,7 +18,14 @@ import pytest
 from vgi_rpc.conformance import ConformanceService
 from vgi_rpc.http import http_connect
 from vgi_rpc.log import Message
-from vgi_rpc.rpc import SubprocessTransport, UnixTransport, _RpcProxy, tcp_connect, unix_connect
+from vgi_rpc.rpc import (
+    SubprocessTransport,
+    TcpTransport,
+    UnixTransport,
+    _RpcProxy,
+    tcp_connect,
+    unix_connect,
+)
 
 RUST_WORKER = os.environ.get(
     "RUST_CONFORMANCE_WORKER",
@@ -39,7 +46,7 @@ SERVER = os.environ.get("VGI_CONFORMANCE_SERVER", "rust")
 def _worker_cmd(mode: str, path: str | None = None) -> list[str]:
     """Build the argv to spawn the conformance server in `mode`.
 
-    mode ∈ {"stdio", "http", "unix"}. The Rust and Go workers default
+    mode ∈ {"stdio", "http", "unix", "tcp"}. The Rust and Go workers default
     describe-on; the Python CLI needs an explicit ``--describe`` and an
     explicit ``--pipe`` for stdio.
     """
@@ -52,6 +59,8 @@ def _worker_cmd(mode: str, path: str | None = None) -> list[str]:
             return base + ["--http", *extra]
         if mode == "unix":
             return base + ["--unix", path, *extra]
+        if mode == "tcp":
+            return base + ["--tcp", path, *extra]
     else:  # rust / go share the same flag surface
         if mode == "stdio":
             return base
@@ -59,6 +68,8 @@ def _worker_cmd(mode: str, path: str | None = None) -> list[str]:
             return base + ["--http"]
         if mode == "unix":
             return base + ["--unix", path]
+        if mode == "tcp":
+            return base + ["--tcp", path]
     raise AssertionError(f"unknown worker mode {mode!r}")
 
 
@@ -225,6 +236,19 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
             return _spawn_read_port(args, expect_port=port)
         if variant == "strict":
             return _spawn_read_port([_VENV_PY, _PY_SERVE_STRICT])
+        if variant == "small_request_cap":
+            port = _free_port()
+            return _spawn_read_port(
+                [
+                    _VENV_PY,
+                    _PY_SERVE_HTTP,
+                    "--port",
+                    str(port),
+                    "--max-request-bytes",
+                    str(4 * 1024),
+                ],
+                expect_port=port,
+            )
         if variant == "externalized_cap":
             return _spawn_read_port(
                 [
@@ -545,9 +569,7 @@ def conformance_http_strict_cap_port() -> Iterator[int]:
 
 @pytest.fixture(scope="session")
 def conformance_http_small_request_cap_port() -> Iterator[int]:
-    """Rust HTTP worker advertising a 4 KiB encoded and decoded request cap."""
-    if SERVER != "rust":
-        pytest.skip(f"small request-cap worker not wired for SERVER={SERVER}")
+    """HTTP worker advertising a 4 KiB encoded and decoded request cap."""
     yield from _http_variant_fixture("small_request_cap")
 
 
@@ -760,6 +782,27 @@ def rust_unix_path() -> Iterator[str]:
         proc.wait(timeout=5)
 
 
+@pytest.fixture(scope="session")
+def rust_tcp_addr() -> Iterator[tuple[str, int]]:
+    """Start the selected conformance server on a raw TCP socket."""
+    proc = subprocess.Popen(
+        _worker_cmd("tcp", "127.0.0.1:0"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("TCP:"), f"Expected TCP:<host>:<port>, got: {line!r}"
+        host, _, raw_port = line[len("TCP:") :].rpartition(":")
+        port = int(raw_port)
+        _wait_for_tcp(host, port)
+        yield host, port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
 class _KindProbe(Protocol):
     def report_transport_kind(self) -> str: ...
 
@@ -851,7 +894,7 @@ ConnFactory = Callable[..., contextlib.AbstractContextManager[Any]]
 
 
 _TRANSPORTS = os.environ.get(
-    "VGI_TRANSPORTS", "pipe,subprocess,http,unix,http_externalize_always,shm_pipe"
+    "VGI_TRANSPORTS", "pipe,subprocess,http,unix,tcp,http_externalize_always,shm_pipe"
 ).split(",")
 
 
@@ -892,6 +935,7 @@ def _client_factory(
     on_log: Callable[[Message], None] | None,
     http_port: int | None,
     unix_path: str | None,
+    tcp_addr: tuple[str, int] | None,
     ext_port: int | None,
 ) -> contextlib.AbstractContextManager[Any]:
     """Yield a Rust-client-backed proxy (VGI_CONFORMANCE_ROLE=client)."""
@@ -913,6 +957,8 @@ def _client_factory(
         external_config = ExternalLocationConfig(url_validator=None)
     elif param == "unix":
         transport, target = "unix", unix_path
+    elif param == "tcp":
+        transport, target = "tcp", f"{tcp_addr[0]}:{tcp_addr[1]}"
     else:
         raise AssertionError(f"unknown transport {param!r}")
 
@@ -934,6 +980,7 @@ def conformance_conn(
 ) -> ConnFactory:
     rust_http_port = request.getfixturevalue("rust_http_port") if request.param == "http" else None
     rust_unix_path = request.getfixturevalue("rust_unix_path") if request.param == "unix" else None
+    rust_tcp_addr = request.getfixturevalue("rust_tcp_addr") if request.param == "tcp" else None
     ext_always_port = (
         request.getfixturevalue("conformance_http_externalize_always_port")
         if request.param == "http_externalize_always"
@@ -943,7 +990,14 @@ def conformance_conn(
         on_log: Callable[[Message], None] | None = None,
     ) -> contextlib.AbstractContextManager[Any]:
         if ROLE == "client":
-            return _client_factory(request.param, on_log, rust_http_port, rust_unix_path, ext_always_port)
+            return _client_factory(
+                request.param,
+                on_log,
+                rust_http_port,
+                rust_unix_path,
+                rust_tcp_addr,
+                ext_always_port,
+            )
         if request.param == "pipe":
 
             @contextlib.contextmanager
@@ -979,6 +1033,14 @@ def conformance_conn(
                 rust_unix_path,
                 on_log=on_log,
             )
+        elif request.param == "tcp":
+            assert rust_tcp_addr is not None
+            return tcp_connect(
+                ConformanceService,
+                rust_tcp_addr[0],
+                rust_tcp_addr[1],
+                on_log=on_log,
+            )
         elif request.param == "shm_pipe":
             from vgi_rpc.shm import ShmSegment
 
@@ -1007,23 +1069,85 @@ def conformance_conn(
     return factory
 
 
+_RAW_TRANSPORTS = [
+    transport
+    for transport in _TRANSPORTS
+    if transport in {"pipe", "subprocess", "shm_pipe", "unix", "tcp"}
+]
+
+
+@pytest.fixture(params=_RAW_TRANSPORTS)
+def conformance_raw_conn(
+    request: pytest.FixtureRequest,
+    rust_transport: SubprocessTransport,
+) -> ConnFactory:
+    """Raw byte-stream connections for adversarial framing tests.
+
+    These are server-contract probes even in a client-role matrix, so they use
+    the Python raw proxy rather than the typed Rust-client bridge.
+    """
+    unix_path = request.getfixturevalue("rust_unix_path") if request.param == "unix" else None
+    tcp_addr = request.getfixturevalue("rust_tcp_addr") if request.param == "tcp" else None
+
+    def factory(
+        on_log: Callable[[Message], None] | None = None,
+    ) -> contextlib.AbstractContextManager[Any]:
+        if request.param == "pipe":
+
+            @contextlib.contextmanager
+            def _pipe_conn() -> Iterator[_RpcProxy]:
+                transport = SubprocessTransport([RUST_WORKER])
+                try:
+                    yield _RpcProxy(ConformanceService, transport, on_log)
+                finally:
+                    transport.close()
+
+            return _pipe_conn()
+        if request.param == "subprocess":
+
+            @contextlib.contextmanager
+            def _shared_conn() -> Iterator[_RpcProxy]:
+                yield _RpcProxy(ConformanceService, rust_transport, on_log)
+
+            return _shared_conn()
+        if request.param == "shm_pipe":
+            from vgi_rpc.shm import ShmSegment
+
+            @contextlib.contextmanager
+            def _shm_conn() -> Iterator[_RpcProxy]:
+                shm = ShmSegment.create(4 * 1024 * 1024)
+                inner = SubprocessTransport([RUST_WORKER])
+                try:
+                    yield _RpcProxy(
+                        ConformanceService,
+                        _ShmSubprocessTransport(inner, shm),
+                        on_log,
+                    )
+                finally:
+                    inner.close()
+                    with contextlib.suppress(BufferError):
+                        shm.close()
+                    shm.unlink()
+
+            return _shm_conn()
+        if request.param == "unix":
+            assert unix_path is not None
+            return unix_connect(ConformanceService, unix_path, on_log=on_log)
+        if request.param == "tcp":
+            assert tcp_addr is not None
+            return tcp_connect(
+                ConformanceService,
+                tcp_addr[0],
+                tcp_addr[1],
+                on_log=on_log,
+            )
+        raise AssertionError(f"unknown raw transport {request.param!r}")
+
+    return factory
+
+
 # Import all tests from the conformance test module (PyPI package)
 from vgi_rpc.conformance._pytest_suite import *  # noqa: F401,F403,E402
-
-
-from vgi_rpc.rpc import AnnotatedBatch, RpcError  # noqa: E402
-
-
-# The Go conformance server's __describe__ advertises 76 methods (its port
-# implements a subset / names some differently), not the canonical 81 — a
-# Go-*server* describe discrepancy that the Rust client relays faithfully (all
-# method calls still round-trip). Skip the describe-metadata conformance checks
-# for the Go server; they're validated against the rust + python servers.
-class TestDescribeConformance(TestDescribeConformance):  # type: ignore[no-redef]  # noqa: F811
-    pytestmark = pytest.mark.skipif(
-        SERVER == "go",
-        reason="Go server __describe__ reports 76 methods, not the canonical 81",
-    )
 
 
 # Override: allow TestLargeData on all transports (the upstream suite skips
@@ -1034,25 +1158,8 @@ class TestLargeData(TestLargeData):  # type: ignore[no-redef]  # noqa: F811
         pass
 
 
-# Override: the Rust server drains client input after stream init errors, so
-# these tests work on all transports (the upstream suite skips them).
-class TestProducerStream(TestProducerStream):  # type: ignore[no-redef]  # noqa: F811
-    def test_produce_error_on_init(self, conformance_conn: ConnFactory) -> None:
-        with conformance_conn() as proxy, pytest.raises(RpcError, match="intentional init error"):
-            list(proxy.produce_error_on_init())
-
-
-class TestExchangeStream(TestExchangeStream):  # type: ignore[no-redef]  # noqa: F811
-    def test_error_on_init(self, conformance_conn: ConnFactory) -> None:
-        with conformance_conn() as proxy:
-            with pytest.raises(RpcError, match="intentional exchange init error"):
-                session = proxy.exchange_error_on_init()
-                # HTTP raises during init; pipe/subprocess raises on first exchange.
-                session.exchange(AnnotatedBatch.from_pydict({"value": [1.0]}))
-
-
 # -----------------------------------------------------------------------------
-# Live describe conformance against the actual Rust worker (pipe + http).
+# Live describe conformance against the actual worker transport matrix.
 # The upstream TestDescribeConformance runs in-process against a Python
 # RpcServer — which covers the protocol format but not our implementation.
 # -----------------------------------------------------------------------------
@@ -1062,7 +1169,9 @@ from vgi_rpc.introspect import introspect, DESCRIBE_METHOD_NAME, DESCRIBE_VERSIO
 from vgi_rpc.http import http_introspect  # noqa: E402
 
 
-@pytest.fixture(params=[t for t in _TRANSPORTS if t in ("pipe", "subprocess", "http", "unix")])
+@pytest.fixture(
+    params=[t for t in _TRANSPORTS if t in ("pipe", "subprocess", "http", "unix", "tcp")]
+)
 def conformance_describe(request: pytest.FixtureRequest):  # type: ignore[no-untyped-def]
     """Return a ``ServiceDescription`` from a real ``__describe__`` call to the
     Rust worker under test — the fixture the upstream ``TestDescribeConformance``
@@ -1082,6 +1191,9 @@ def conformance_describe(request: pytest.FixtureRequest):  # type: ignore[no-unt
             tr, tgt = "http", f"http://127.0.0.1:{request.getfixturevalue('rust_http_port')}"
         elif param == "unix":
             tr, tgt = "unix", request.getfixturevalue("rust_unix_path")
+        elif param == "tcp":
+            host, port = request.getfixturevalue("rust_tcp_addr")
+            tr, tgt = "tcp", f"{host}:{port}"
         else:
             raise AssertionError(f"unknown describe transport: {param!r}")
         proxy = RustClientProxy(tr, tgt)
@@ -1111,7 +1223,29 @@ def conformance_describe(request: pytest.FixtureRequest):  # type: ignore[no-unt
             return introspect(transport)
         finally:
             transport.close()
+    if param == "tcp":
+        host, port = request.getfixturevalue("rust_tcp_addr")
+        sock = socket.create_connection((host, port))
+        transport = TcpTransport(sock)
+        try:
+            return introspect(transport)
+        finally:
+            transport.close()
     raise AssertionError(f"unknown describe transport: {param!r}")
+
+
+class TestMandatoryHttpCodecs:
+    """Compression-enabled conformance workers must provide both codecs."""
+
+    def test_server_advertises_zstd_and_gzip(self, rust_http_port: int) -> None:
+        response = httpx.options(f"http://127.0.0.1:{rust_http_port}/health")
+        response.raise_for_status()
+        advertised = {
+            item.strip().lower()
+            for item in response.headers.get("vgi-supported-encodings", "").split(",")
+            if item.strip()
+        }
+        assert advertised == {"zstd", "gzip"}
 
 
 @pytest.mark.skipif(
@@ -1138,7 +1272,7 @@ class TestRustDescribeConformance:
 def _assert_describe(desc) -> None:  # type: ignore[no-untyped-def]
     assert desc.protocol_name == "ConformanceService"
     assert desc.describe_version == DESCRIBE_VERSION
-    assert len(desc.methods) == 81, sorted(desc.methods.keys())
+    assert len(desc.methods) == 87, sorted(desc.methods.keys())
     suite = run_describe_conformance(desc)
     if not suite.success:
         failures = [r for r in suite.results if not r.passed]

@@ -529,7 +529,7 @@ impl HttpClient {
             // Advertise the codecs we can decode on responses.
             h.insert(
                 reqwest::header::ACCEPT_ENCODING,
-                HeaderValue::from_static("zstd, identity"),
+                HeaderValue::from_static("zstd, gzip, identity"),
             );
         }
         if let Some(s) = self.session.as_ref() {
@@ -622,8 +622,8 @@ impl HttpClient {
     }
 
     /// One send attempt (with connection retry for `retryable` ops),
-    /// returning `(response headers, decoded body, status)`. Decodes a
-    /// `Content-Encoding: zstd` response transparently.
+    /// returning `(response headers, decoded body, status)`. Decodes bounded
+    /// zstd and gzip responses transparently.
     fn send(
         &self,
         path: &str,
@@ -670,46 +670,53 @@ impl HttpClient {
                 Ok(resp) => {
                     let status = resp.status();
                     let resp_headers = resp.headers().clone();
-                    let zstd_resp = resp_headers
+                    let response_encoding = resp_headers
                         .get(reqwest::header::CONTENT_ENCODING)
                         .and_then(|v| v.to_str().ok())
-                        .map(|v| v.eq_ignore_ascii_case("zstd"))
-                        .unwrap_or(false);
+                        .map(str::to_ascii_lowercase);
                     let raw = read_bounded_response(resp, self.max_encoded_response_bytes)?;
-                    let decoded = if zstd_resp {
-                        let mut decoder =
-                            zstd::Decoder::new(Cursor::new(raw.as_slice())).map_err(|e| {
-                                RpcError::new(
-                                    "TransportError",
-                                    format!("zstd decode response: {e}"),
-                                )
-                            })?;
-                        decoder
-                            .window_log_max(zstd_window_log_for_limit(
+                    let decoded = match response_encoding.as_deref() {
+                        Some("zstd") => {
+                            let mut decoder = zstd::Decoder::new(Cursor::new(raw.as_slice()))
+                                .map_err(|e| {
+                                    RpcError::new(
+                                        "TransportError",
+                                        format!("zstd decode response: {e}"),
+                                    )
+                                })?;
+                            decoder
+                                .window_log_max(zstd_window_log_for_limit(
+                                    self.max_decoded_response_bytes,
+                                ))
+                                .map_err(|e| {
+                                    RpcError::new(
+                                        "TransportError",
+                                        format!("zstd response window limit: {e}"),
+                                    )
+                                })?;
+                            read_bounded(
+                                decoder,
                                 self.max_decoded_response_bytes,
-                            ))
-                            .map_err(|e| {
-                                RpcError::new(
-                                    "TransportError",
-                                    format!("zstd response window limit: {e}"),
-                                )
-                            })?;
-                        read_bounded(
-                            decoder,
+                                "decoded HTTP response (max_decoded_response_bytes)",
+                            )?
+                        }
+                        Some("gzip") => read_bounded(
+                            flate2::read::GzDecoder::new(raw.as_slice()),
                             self.max_decoded_response_bytes,
                             "decoded HTTP response (max_decoded_response_bytes)",
-                        )?
-                    } else {
-                        if raw.len() > self.max_decoded_response_bytes {
-                            return Err(RpcError::new(
-                                "TransportError",
-                                format!(
-                                    "decoded HTTP response exceeds max_decoded_response_bytes={}",
-                                    self.max_decoded_response_bytes
-                                ),
-                            ));
+                        )?,
+                        _ => {
+                            if raw.len() > self.max_decoded_response_bytes {
+                                return Err(RpcError::new(
+                                    "TransportError",
+                                    format!(
+                                        "decoded HTTP response exceeds max_decoded_response_bytes={}",
+                                        self.max_decoded_response_bytes
+                                    ),
+                                ));
+                            }
+                            raw
                         }
-                        raw
                     };
                     return Ok((resp_headers, decoded, status));
                 }
@@ -1171,6 +1178,14 @@ impl HttpStreamSession<'_> {
 
     /// Producer step: return the next emitted batch, or `None` at end-of-stream.
     pub fn tick(&mut self) -> Result<Option<(RecordBatch, Metadata)>> {
+        self.tick_with_metadata(None)
+    }
+
+    /// Producer step with application custom metadata attached to the tick.
+    pub fn tick_with_metadata(
+        &mut self,
+        metadata: Option<&Metadata>,
+    ) -> Result<Option<(RecordBatch, Metadata)>> {
         if self.cancelled {
             return Err(RpcError::protocol_error("tick after cancel"));
         }
@@ -1183,7 +1198,7 @@ impl HttpStreamSession<'_> {
                 return Ok(None);
             }
             let token = self.token.clone().unwrap();
-            let body = self.continuation_body(&token, false)?;
+            let body = self.continuation_body(&token, false, metadata)?;
             // Producer continuation is idempotent (token-addressed) → retryable.
             let resp = self
                 .client
@@ -1224,8 +1239,7 @@ impl HttpStreamSession<'_> {
     /// interleave with `tick`/`exchange` on the same session.
     #[allow(clippy::type_complexity)]
     pub fn next_with_token(&mut self) -> Result<Option<((RecordBatch, Metadata), Option<String>)>> {
-        const MULTI: &str = "next_with_token requires one data batch per response; the upstream \
-                             worker buffered multiple (configured max_response_bytes?)";
+        const MULTI: &str = "HTTP stream response contained more than one data batch";
         if self.cancelled {
             return Err(RpcError::protocol_error("next_with_token after cancel"));
         }
@@ -1233,7 +1247,7 @@ impl HttpStreamSession<'_> {
         // token already held by the session.
         if !self.pending.is_empty() {
             if self.pending.len() > 1 {
-                return Err(RpcError::runtime_error(MULTI));
+                return Err(RpcError::protocol_error(MULTI));
             }
             let item = self.pending.pop_front().unwrap();
             return Ok(Some((item, self.resume_token())));
@@ -1245,7 +1259,7 @@ impl HttpStreamSession<'_> {
         }
 
         let token = self.token.clone().unwrap();
-        let body = self.continuation_body(&token, false)?;
+        let body = self.continuation_body(&token, false, None)?;
         // Producer continuation is idempotent (token-addressed) → retryable.
         let resp = self
             .client
@@ -1261,7 +1275,7 @@ impl HttpStreamSession<'_> {
             external.as_ref(),
         )?;
         if parsed.batches.len() > 1 {
-            return Err(RpcError::runtime_error(MULTI));
+            return Err(RpcError::protocol_error(MULTI));
         }
         self.token = parsed.token;
         match parsed.batches.into_iter().next() {
@@ -1333,7 +1347,7 @@ impl HttpStreamSession<'_> {
             return Ok(());
         }
         if let Some(token) = self.token.clone() {
-            let body = self.continuation_body(&token, true)?;
+            let body = self.continuation_body(&token, true, None)?;
             let _ = self
                 .client
                 .post(&format!("{}/exchange", self.method), body, false);
@@ -1370,9 +1384,14 @@ impl HttpStreamSession<'_> {
     /// re-issue it; a request that omitted it would still succeed while the
     /// server's call-state cache is warm and fail once it is not — exactly
     /// the kind of load-dependent bug worth designing out.
-    fn continuation_body(&self, token: &str, cancel: bool) -> Result<Vec<u8>> {
+    fn continuation_body(
+        &self,
+        token: &str,
+        cancel: bool,
+        application_metadata: Option<&Metadata>,
+    ) -> Result<Vec<u8>> {
         let batch = empty_batch(&Schema::empty())?;
-        let mut md = Metadata::new();
+        let mut md = application_metadata.cloned().unwrap_or_default();
         md.insert(STATE_KEY.to_string(), token.to_string());
         if let Some(call) = self.call_token.as_ref() {
             md.insert(CALL_STATE_KEY.to_string(), call.clone());
@@ -1447,6 +1466,11 @@ fn parse_response(
             return Err(e);
         }
     }
+    if out.batches.len() > 1 {
+        return Err(RpcError::protocol_error(
+            "HTTP response contained more than one data batch",
+        ));
+    }
     out.finished = out.token.is_none();
     Ok(out)
 }
@@ -1519,7 +1543,15 @@ fn process_frame(
             }
             if let Some(tok) = md.remove(STATE_KEY) {
                 out.token = Some(tok);
-                if treat_state_frame_as_data {
+                // Exchange servers normally merge the refreshed token onto
+                // their one output batch. Older/raw-compatible peers may
+                // instead write the DATA batch followed by a zero-row token
+                // sentinel (notably when both schemas have zero columns).
+                // Once this turn already yielded DATA, that trailing sentinel
+                // is control, not a second DATA batch. A non-empty token frame
+                // is always data and therefore remains subject to the
+                // one-batch rejection below.
+                if treat_state_frame_as_data && (batch.num_rows() != 0 || out.batches.is_empty()) {
                     out.batches.push((batch, md));
                 }
             } else {
@@ -1648,6 +1680,8 @@ fn parse_caps(h: &HeaderMap) -> HttpServerCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field, Schema};
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -1658,6 +1692,58 @@ mod tests {
             );
         }
         h
+    }
+
+    #[test]
+    fn response_parser_rejects_multiple_data_batches() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let mut bytes = Vec::new();
+        {
+            let mut writer = vgi_rpc::wire::StreamWriter::new(&mut bytes, schema.as_ref()).unwrap();
+            for value in [1, 2] {
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int64Array::from(vec![value]))],
+                )
+                .unwrap();
+                writer.write(&batch, None).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        let err = parse_response(&mut Cursor::new(bytes), &mut None, false, false, None)
+            .err()
+            .expect("multiple DATA batches must fail");
+        assert_eq!(err.error_type, "ProtocolError");
+    }
+
+    #[test]
+    fn response_parser_accepts_data_then_zero_row_token_sentinel() {
+        let schema = Arc::new(Schema::empty());
+        let mut bytes = Vec::new();
+        {
+            let mut writer = vgi_rpc::wire::StreamWriter::new(&mut bytes, schema.as_ref()).unwrap();
+            let empty = RecordBatch::new_empty(schema.clone());
+            writer.write(&empty, None).unwrap();
+            writer
+                .write(
+                    &empty,
+                    Some(&Metadata::from([(
+                        STATE_KEY.to_string(),
+                        "cursor".to_string(),
+                    )])),
+                )
+                .unwrap();
+            writer.finish().unwrap();
+        }
+
+        let parsed = parse_response(&mut Cursor::new(bytes), &mut None, false, true, None).unwrap();
+        assert_eq!(parsed.batches.len(), 1);
+        assert_eq!(parsed.token.as_deref(), Some("cursor"));
     }
 
     /// The three answers `VGI-Supported-Encodings` can give must stay

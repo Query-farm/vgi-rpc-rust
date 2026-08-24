@@ -67,6 +67,18 @@ pub struct EmbeddedArrow {
     pub schema: Bytes,
 }
 
+#[derive(Clone, Debug, PartialEq, vgi_rpc::VgiArrow)]
+#[vgi_arrow(name = "NestedContainers")]
+pub struct NestedContainers {
+    pub statuses: Vec<DictString>,
+    pub points: Vec<super::types::Point>,
+    pub status_by_name: Vec<(String, DictString)>,
+    pub frozen_statuses: Vec<DictString>,
+    pub tagged_status: Option<DictString>,
+    pub tagged_point: Option<super::types::Point>,
+    pub tagged_batch: Option<Bytes>,
+}
+
 /// Serialize a `VgiArrow` dataclass as a single-row Arrow IPC stream
 /// whose top-level columns are the struct's fields. Matches the
 /// Python `ArrowSerializableDataclass` wire shape.

@@ -27,7 +27,8 @@ fn as_array<'a, A: Array + 'static>(a: &'a dyn Array, field: &str) -> Result<&'a
 // Point
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, vgi_rpc::VgiArrow)]
+#[vgi_arrow(name = "Point")]
 pub struct Point {
     pub x: f64,
     pub y: f64,

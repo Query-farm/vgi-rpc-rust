@@ -9,6 +9,9 @@
 
 use std::sync::Arc;
 
+use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use vgi_rpc::wire::StreamWriter;
 use vgi_rpc::{
     service, Bytes, CallContext, Decimal20_4, DictString, FixedBinary, LargeBytes, LargeString,
     LogLevel, LogMessage, Result, RpcError, RpcServer, UtcTimestamp,
@@ -17,7 +20,7 @@ use vgi_rpc::{
 use super::types;
 use super::wide_types::{
     dataclass_deserialize_ipc, dataclass_serialize_ipc, ContainerWideTypes, DeepNested,
-    EmbeddedArrow, WideTypes,
+    EmbeddedArrow, NestedContainers, WideTypes,
 };
 
 /// Stateless service handle.
@@ -229,6 +232,28 @@ impl UnarySvc {
         Ok(value)
     }
 
+    /// Echo an optional structured value.
+    #[unary]
+    #[param(name = "point", arrow_type = "Point | None")]
+    fn echo_optional_point(&self, point: Option<Bytes>) -> Result<Option<Bytes>> {
+        if let Some(ref bytes) = point {
+            let _ = types::Point::deserialize_ipc(&bytes.0)?;
+        }
+        Ok(point)
+    }
+
+    /// Echo an optional explicitly-int32 value.
+    #[unary]
+    fn echo_annotated_optional_int(&self, value: Option<i32>) -> Result<Option<i32>> {
+        Ok(value)
+    }
+
+    /// Explicit non-null wins over an outer optional source annotation.
+    #[unary]
+    fn echo_outer_optional_non_null(&self, value: i32) -> Result<i32> {
+        Ok(value)
+    }
+
     // --- Dataclass round-trip (carried as Arrow Binary IPC bytes) ---
 
     /// Echo a Point dataclass.
@@ -285,6 +310,33 @@ impl UnarySvc {
     fn echo_embedded_arrow(&self, data: Bytes) -> Result<Bytes> {
         let e: EmbeddedArrow = dataclass_deserialize_ipc(&data.0)?;
         Ok(Bytes(dataclass_serialize_ipc(e)?))
+    }
+
+    /// Build a dataclass containing enums and points nested in collections.
+    #[unary]
+    fn pack_nested_containers(
+        &self,
+        statuses: Vec<DictString>,
+        points: Vec<types::Point>,
+        status_by_name: Vec<(String, DictString)>,
+    ) -> Result<Bytes> {
+        let tagged_batch = Bytes(tagged_batch_ipc()?);
+        let value = NestedContainers {
+            tagged_status: statuses.first().cloned(),
+            tagged_point: points.first().cloned(),
+            frozen_statuses: statuses.clone(),
+            statuses,
+            points,
+            status_by_name,
+            tagged_batch: Some(tagged_batch),
+        };
+        Ok(Bytes(dataclass_serialize_ipc(value)?))
+    }
+
+    /// Echo enum members nested in a top-level list.
+    #[unary]
+    fn echo_status_list(&self, statuses: Vec<DictString>) -> Result<Vec<DictString>> {
+        Ok(statuses)
     }
 
     /// Accept a Point param (`pa.binary()` on wire), return formatted string.
@@ -474,4 +526,21 @@ fn format_float(f: f64) -> String {
     } else {
         s
     }
+}
+
+fn tagged_batch_ipc() -> Result<Vec<u8>> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        true,
+    )]));
+    let arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1, 2]))];
+    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::new(&mut buf, &schema)?;
+        writer.write(&batch, None)?;
+        writer.finish()?;
+    }
+    Ok(buf)
 }

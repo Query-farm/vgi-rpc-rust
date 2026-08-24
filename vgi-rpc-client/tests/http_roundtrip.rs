@@ -1,10 +1,6 @@
 //! In-process HTTP round-trip tests: a real axum `vgi_rpc::http` server on a
 //! background tokio runtime, driven by the blocking `HttpClient`. Covers
-//! unary, describe, capabilities, and a finite producer (drained in the init
-//! response via `producer_batch_limit(0)` — no continuation token, so no
-//! state decoder is required). Producer-continuation and exchange-over-HTTP
-//! need state codecs and are covered by the Phase 2 conformance harness
-//! against the real worker.
+//! unary, describe, capabilities, and a finite lock-step producer.
 
 #![cfg(feature = "http")]
 
@@ -19,6 +15,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi_rpc::http::{build_router, HttpState};
 use vgi_rpc::server::{MethodInfo, MethodType, RpcServer};
 use vgi_rpc::stream::{OutputCollector, ProducerState, StreamResult};
+use vgi_rpc::stream_codec::StreamStateCodec;
 use vgi_rpc::{CallContext, Result};
 use vgi_rpc_client::HttpClient;
 
@@ -32,7 +29,23 @@ fn i64_schema(name: &str) -> SchemaRef {
 struct CountTo {
     n: i64,
     cur: i64,
-    schema: SchemaRef,
+}
+impl StreamStateCodec for CountTo {
+    fn encode(&self) -> Result<Vec<u8>> {
+        let mut bytes = self.n.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&self.cur.to_le_bytes());
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 16 {
+            return Err(vgi_rpc::RpcError::protocol_error("invalid CountTo state"));
+        }
+        Ok(Self {
+            n: i64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            cur: i64::from_le_bytes(bytes[8..].try_into().unwrap()),
+        })
+    }
 }
 impl ProducerState for CountTo {
     fn produce(&mut self, out: &mut OutputCollector, _ctx: &CallContext) -> Result<()> {
@@ -41,11 +54,15 @@ impl ProducerState for CountTo {
             return Ok(());
         }
         let b = RecordBatch::try_new(
-            self.schema.clone(),
+            i64_schema("value"),
             vec![Arc::new(Int64Array::from(vec![self.cur]))],
         )?;
         self.cur += 1;
         out.emit(b)
+    }
+
+    fn encode_state(&self) -> Result<Vec<u8>> {
+        StreamStateCodec::encode(self)
     }
 }
 
@@ -71,26 +88,29 @@ fn build_server() -> RpcServer {
         },
     ));
     let os = i64_schema("value");
-    srv.register(MethodInfo::stream(
-        "count_to",
-        MethodType::Producer,
-        i64_schema("n"),
-        move |req, _ctx| {
-            let n = req
-                .column("n")
-                .unwrap()
-                .as_primitive::<Int64Type>()
-                .value(0);
-            Ok(StreamResult::producer(
-                os.clone(),
-                Box::new(CountTo {
-                    n,
-                    cur: 0,
-                    schema: os.clone(),
-                }),
-            ))
-        },
-    ));
+    srv.register(
+        MethodInfo::stream(
+            "count_to",
+            MethodType::Producer,
+            i64_schema("n"),
+            move |req, _ctx| {
+                let n = req
+                    .column("n")
+                    .unwrap()
+                    .as_primitive::<Int64Type>()
+                    .value(0);
+                Ok(StreamResult::producer(
+                    os.clone(),
+                    Box::new(CountTo { n, cur: 0 }),
+                ))
+            },
+        )
+        .with_state_decoder(Arc::new(|bytes| {
+            Ok(vgi_rpc::stream::StreamStateKind::Producer(Box::new(
+                CountTo::decode(bytes)?,
+            )))
+        })),
+    );
     srv
 }
 
@@ -98,7 +118,6 @@ fn build_server() -> RpcServer {
 fn start_server() -> u16 {
     let state = HttpState::builder()
         .server(Arc::new(build_server()))
-        .producer_batch_limit(0) // drain finite producers in the init response
         .build();
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {

@@ -127,10 +127,9 @@ const RPC_ERROR_HEADER: &str = "x-vgi-rpc-error";
 /// A response content coding vgi-rpc knows how to negotiate.
 ///
 /// Knowing a codec is not the same as being able to *produce* it — see
-/// [`ResponseEncoding::producible`]. `gzip` is decode-only on this server
-/// today (requests may arrive gzip-encoded; responses are never gzipped).
-/// `identity` is a first-class token: a client can ask for it explicitly to
-/// switch response compression off for that request.
+/// [`ResponseEncoding::producible`]. `identity` is a first-class token: a
+/// client can ask for it explicitly to switch response compression off for
+/// that request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponseEncoding {
     /// No coding at all. Always producible; carries no response header.
@@ -177,15 +176,11 @@ impl ResponseEncoding {
         match self {
             // Shipping bytes unchanged needs no encoder and no configuration.
             ResponseEncoding::Identity => true,
-            // The `zstd` crate is a hard dependency, so the encoder always
-            // exists; `response_compression_level` is the configuration gate,
+            // Both encoders are hard dependencies of the HTTP feature;
+            // `response_compression_level` is their shared configuration gate,
             // on by default at [`DEFAULT_RESPONSE_COMPRESSION_LEVEL`] and
             // cleared by `HttpStateBuilder::disable_response_compression`.
-            ResponseEncoding::Zstd => compression_level.is_some(),
-            // No gzip encoder is registered on the response path, so the
-            // negotiation walk skips gzip and falls through to the next
-            // codec the client offered.
-            ResponseEncoding::Gzip => false,
+            ResponseEncoding::Zstd | ResponseEncoding::Gzip => compression_level.is_some(),
         }
     }
 
@@ -203,12 +198,8 @@ impl ResponseEncoding {
 /// server can handle in **both** directions — decode on requests *and* produce
 /// on responses — in server-preference order, excluding `identity`.
 ///
-/// The intersection is deliberate. This server decodes zstd and gzip requests
-/// but only encodes zstd responses, so gzip drops out and the advertised value
-/// is `zstd` (or empty). Losing the "I can still decode gzip requests"
-/// information is accepted; a client that wants a mutually-supported codec
-/// needs the both-directions set, and one header stating it beats two headers
-/// that can disagree.
+/// The intersection is deliberate. The HTTP server implements zstd and gzip
+/// in both directions, so an enabled server advertises `zstd, gzip`.
 ///
 /// Empty when the intersection is empty — response compression disabled by
 /// config (the default) or no encoder available. The header is still emitted
@@ -311,14 +302,19 @@ fn pick_response_encoding(
 
 /// Compress `body` with `encoding` at `level`. `None` means "no compressed
 /// form to ship", so the caller sends the body as-is and stamps no encoding
-/// header. That covers three cases: the client explicitly chose `identity`;
-/// no response encoder is registered for the coding (gzip — though
-/// [`ResponseEncoding::producible`] already keeps it out of the negotiation);
-/// or the encoder failed.
+/// header. That covers the client explicitly choosing `identity` or an encoder
+/// failure.
 fn encode_response_body(encoding: ResponseEncoding, body: &[u8], level: i32) -> Option<Vec<u8>> {
     match encoding {
-        ResponseEncoding::Identity | ResponseEncoding::Gzip => None,
+        ResponseEncoding::Identity => None,
         ResponseEncoding::Zstd => zstd::encode_all(std::io::Cursor::new(body), level).ok(),
+        ResponseEncoding::Gzip => {
+            let level = u32::try_from(level.clamp(0, 9)).ok()?;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level));
+            std::io::Write::write_all(&mut encoder, body).ok()?;
+            encoder.finish().ok()
+        }
     }
 }
 
@@ -348,7 +344,6 @@ pub struct HttpState {
     /// accelerator: a miss reopens the call token the client echoed, so
     /// correctness never depends on a hit. See [`HttpState::resolve_call`].
     call_states: std::sync::Mutex<HashMap<String, (u64, Arc<ResolvedCall>)>>,
-    producer_batch_limit: usize,
     token_ttl: std::time::Duration,
     max_body_size: usize,
     /// Wall-clock ceiling for a single HTTP request, enforced by a
@@ -417,7 +412,6 @@ pub struct HttpState {
 pub struct HttpStateBuilder {
     server: Option<Arc<RpcServer>>,
     token_key: Option<[u8; 32]>,
-    producer_batch_limit: Option<usize>,
     token_ttl: Option<std::time::Duration>,
     max_body_size: Option<usize>,
     request_timeout: Option<std::time::Duration>,
@@ -508,10 +502,15 @@ impl HttpStateBuilder {
         self.token_key(&bytes)
     }
 
-    /// Maximum data batches per producer HTTP response (0 = unbounded).
-    /// Default `1` to mirror the Python/Go servers.
-    pub fn producer_batch_limit(mut self, n: usize) -> Self {
-        self.producer_batch_limit = Some(n);
+    /// Assert the protocol's fixed producer limit of one data batch per HTTP
+    /// response. Retained for source compatibility with callers that
+    /// explicitly configured the former default; values other than `1` are
+    /// rejected because HTTP requests are lock-step producer turns.
+    pub fn producer_batch_limit(self, n: usize) -> Self {
+        assert_eq!(
+            n, 1,
+            "producer_batch_limit is fixed at 1 by the lock-step protocol"
+        );
         self
     }
 
@@ -886,7 +885,6 @@ impl HttpStateBuilder {
             call_states: std::sync::Mutex::new(HashMap::new()),
             server,
             token_key,
-            producer_batch_limit: self.producer_batch_limit.unwrap_or(1),
             token_ttl: self
                 .token_ttl
                 .unwrap_or_else(|| std::time::Duration::from_secs(300)),
@@ -2688,7 +2686,7 @@ fn enforce_response_body_cap(
 /// The one message shape for a `max_externalized_response_bytes` overshoot.
 ///
 /// Every enforcement site funnels through here so the wording cannot drift
-/// between the unary pre-flight, the producer loop, the exchange turn and
+/// between the unary pre-flight, the producer turn, the exchange turn and
 /// the post-flush backstops. The literal `max_externalized_response_bytes`
 /// token is load-bearing: the cross-language conformance suite matches the
 /// client-visible `RpcError` against exactly that string, and the reference
@@ -3656,7 +3654,6 @@ async fn handle_stream_init(
                 &state,
                 &method,
                 &req,
-                state.producer_batch_limit,
                 sticky_sink.as_ref(),
                 Some(req.metadata.as_ref()),
             );
@@ -3865,17 +3862,15 @@ fn strip_framework_tick_metadata(md: &Metadata) -> Metadata {
         .collect()
 }
 
-/// `first_tick_md` is surfaced as [`CallContext::tick_metadata`] on the FIRST
-/// `produce` call of this HTTP turn only. On the pipe transports every
+/// `tick_md` is surfaced as [`CallContext::tick_metadata`] on the single
+/// `produce` call of this HTTP turn. On the pipe transports every
 /// producer turn is a distinct tick batch whose custom metadata reaches the
 /// worker; over HTTP the first turn folds into the /init request and later
 /// turns are continuation POSTs, so callers pass the corresponding request's
 /// metadata (framework transport keys stripped by
 /// [`strip_framework_tick_metadata`]). That carries both the /init-time
 /// revalidators (`vgi.cache.if_none_match`) and DuckDB's between-tick
-/// dynamic-filter updates (`vgi_pushdown_filters`). If a byte/batch cap makes
-/// one turn emit several batches, the later ticks in that turn legitimately
-/// see empty metadata — the client has no opportunity to update mid-turn.
+/// dynamic-filter updates (`vgi_pushdown_filters`).
 #[allow(clippy::too_many_arguments)]
 fn run_producer<W: std::io::Write>(
     sw: &mut StreamWriter<W>,
@@ -3884,9 +3879,8 @@ fn run_producer<W: std::io::Write>(
     state: &Arc<HttpState>,
     method: &str,
     req: &Request,
-    limit: usize,
     sticky: Option<&Arc<crate::sticky::StickySinkImpl>>,
-    first_tick_md: Option<&Metadata>,
+    tick_md: Option<&Metadata>,
 ) -> ProducerTurn {
     let server = &state.server;
     // Continuation producers run without auth context (session-bound).
@@ -3894,114 +3888,75 @@ fn run_producer<W: std::io::Write>(
     if let Some(s) = sticky {
         ctx.set_sticky(s.clone());
     }
-    if let Some(md) = first_tick_md {
+    if let Some(md) = tick_md {
         ctx.set_tick_metadata(md.clone());
     }
-    let mut first_tick = true;
     let producer = match ss {
         StreamStateKind::Producer(p) => p,
         StreamStateKind::Exchange(_) => unreachable!(),
     };
-    // A resumable producer may cap its own per-response batch count (so it
-    // yields a continuation instead of draining the whole shared work queue).
-    let limit = match crate::server::call_guard(|| producer.batch_limit()) {
-        Ok(producer_limit) => producer_limit.unwrap_or(limit),
-        Err(err) => {
-            let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-            let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
-            return ProducerTurn {
-                finished: true,
-                errored: true,
-            };
-        }
-    };
-    let mut batches_written = 0usize;
     // Bytes this turn has pushed to external storage. Resets per HTTP turn,
     // matching the reference: each turn is one response and the cap is a
     // per-response ceiling.
     let mut cumulative_external = 0usize;
-    while limit == 0 || batches_written < limit {
-        let mut out = OutputCollector::new(output_schema.clone(), true);
-        let result = crate::server::call_guard(|| producer.produce(&mut out, &ctx))
-            .and_then(|result| result);
-        // First-tick metadata is delivered to the first produce call only —
-        // later turns within this response are not the producer's first tick.
-        if first_tick {
-            ctx.set_tick_metadata(Metadata::default());
-            first_tick = false;
-        }
-        for log in ctx.drain_logs() {
-            let md = build_log_metadata(&log, &server.server_id, &req.request_id);
-            let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
-        }
-        if let Err(err) = result {
-            let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-            let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
-            return ProducerTurn {
-                finished: true,
-                errored: true,
-            };
-        }
-        let finished = out.finished();
-        let mut emitted_data = false;
-        for item in out.items.drain(..) {
-            match item {
-                Emitted::Log(log) => {
-                    let md = build_log_metadata(&log, &server.server_id, &req.request_id);
-                    let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
-                }
-                Emitted::Batch { batch, metadata } => {
-                    match externalize_stream_batch(
-                        state,
-                        &batch,
-                        output_schema,
-                        metadata.as_ref(),
-                        method,
-                        &mut cumulative_external,
-                    ) {
-                        StreamEmit::Pointer(ptr, md) => {
-                            let _ = sw.write(&ptr, Some(&md));
-                        }
-                        StreamEmit::Inline => {
-                            let _ = sw.write(&batch, metadata.as_ref());
-                        }
-                        StreamEmit::Failed(err) => {
-                            // Hard stop: no continuation token is minted, so
-                            // the client sees an `RpcError` on iteration
-                            // rather than a stream that quietly resumes past
-                            // a cap it just blew.
-                            let md = build_error_metadata(&err, &server.server_id, &req.request_id);
-                            let _ =
-                                sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
-                            return ProducerTurn {
-                                finished: true,
-                                errored: true,
-                            };
-                        }
-                    }
-                    emitted_data = true;
-                }
+    let mut out = OutputCollector::new(output_schema.clone(), true);
+    let result =
+        crate::server::call_guard(|| producer.produce(&mut out, &ctx)).and_then(|result| result);
+    for log in ctx.drain_logs() {
+        let md = build_log_metadata(&log, &server.server_id, &req.request_id);
+        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+    }
+    if let Err(err) = result {
+        let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+        return ProducerTurn {
+            finished: true,
+            errored: true,
+        };
+    }
+    let finished = out.finished();
+    let mut emitted_data = false;
+    for item in out.items.drain(..) {
+        match item {
+            Emitted::Log(log) => {
+                let md = build_log_metadata(&log, &server.server_id, &req.request_id);
+                let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
             }
-        }
-        if emitted_data {
-            batches_written += 1;
-        }
-        if finished {
-            return ProducerTurn {
-                finished: true,
-                errored: false,
-            };
-        }
-        if !emitted_data {
-            // Guard against degenerate producers that neither emit nor finish.
-            return ProducerTurn {
-                finished: true,
-                errored: false,
-            };
+            Emitted::Batch { batch, metadata } => {
+                match externalize_stream_batch(
+                    state,
+                    &batch,
+                    output_schema,
+                    metadata.as_ref(),
+                    method,
+                    &mut cumulative_external,
+                ) {
+                    StreamEmit::Pointer(ptr, md) => {
+                        let _ = sw.write(&ptr, Some(&md));
+                    }
+                    StreamEmit::Inline => {
+                        let _ = sw.write(&batch, metadata.as_ref());
+                    }
+                    StreamEmit::Failed(err) => {
+                        // Hard stop: no continuation token is minted, so
+                        // the client sees an `RpcError` on iteration
+                        // rather than a stream that quietly resumes past
+                        // a cap it just blew.
+                        let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+                        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                        return ProducerTurn {
+                            finished: true,
+                            errored: true,
+                        };
+                    }
+                }
+                emitted_data = true;
+            }
         }
     }
     ProducerTurn {
-        finished: false,
+        // Guard against degenerate producers that neither emit nor finish.
+        finished: finished || !emitted_data,
         errored: false,
     }
 }
@@ -4181,7 +4136,6 @@ async fn handle_stream_exchange(
                 &state,
                 &method,
                 &req,
-                state.producer_batch_limit,
                 sticky_sink.as_ref(),
                 Some(&continuation_md),
             );
@@ -4722,10 +4676,8 @@ mod tests {
     // ---- response-codec negotiation ------------------------------------
     //
     // `pick_response_encoding` walks the *client's* stated order over the
-    // merged `X-VGI-Accept-Encoding ++ Accept-Encoding` list. zstd is the
-    // only coding this server can produce, so gzip is never chosen; the
-    // tests below pin the ordering, the parsing, and which response header
-    // carries the answer.
+    // merged `X-VGI-Accept-Encoding ++ Accept-Encoding` list. The tests below
+    // pin the ordering, parsing, and which response header carries the answer.
 
     /// Build a `HeaderMap` from `(name, value)` pairs.
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -4812,13 +4764,10 @@ mod tests {
     }
 
     #[test]
-    fn a_codec_we_cannot_produce_means_uncompressed() {
-        // gzip is decode-only on the response path: the walk skips it and,
-        // with nothing else offered, the body ships uncompressed.
+    fn an_unknown_codec_means_uncompressed() {
         for pairs in [
-            &[("accept-encoding", "gzip")][..],
-            &[("x-vgi-accept-encoding", "gzip")][..],
             &[("accept-encoding", "br, deflate")][..],
+            &[("x-vgi-accept-encoding", "br")][..],
         ] {
             let h = headers(pairs);
             assert!(
@@ -4848,6 +4797,25 @@ mod tests {
         let (enc, used_custom) = super::pick_response_encoding(&h, Some(3)).unwrap();
         assert_eq!(enc, super::ResponseEncoding::Zstd);
         assert!(!used_custom);
+    }
+
+    #[test]
+    fn gzip_only_offer_negotiates_and_round_trips() {
+        use std::io::Read;
+
+        let h = headers(&[("accept-encoding", "gzip")]);
+        let (enc, used_custom) = super::pick_response_encoding(&h, Some(3)).unwrap();
+        assert_eq!(enc, super::ResponseEncoding::Gzip);
+        assert!(!used_custom);
+
+        let body = b"gzip-response".repeat(1024);
+        let encoded = super::encode_response_body(enc, &body, 3).unwrap();
+        assert!(encoded.len() < body.len());
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(encoded.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, body);
     }
 
     #[test]
@@ -4894,17 +4862,18 @@ mod tests {
         let (enc, used_custom) = super::pick_response_encoding(&h, Some(3)).unwrap();
         assert_eq!(enc, super::ResponseEncoding::Zstd);
         assert!(used_custom);
-        // But an unproducible codec ahead of identity is skipped, not honoured.
+        // A producible gzip offer ahead of identity wins.
         let h = headers(&[("x-vgi-accept-encoding", "gzip, identity, zstd")]);
         let (enc, _) = super::pick_response_encoding(&h, Some(3)).unwrap();
-        assert_eq!(enc, super::ResponseEncoding::Identity);
+        assert_eq!(enc, super::ResponseEncoding::Gzip);
     }
 
     #[test]
     fn supported_encodings_is_the_both_directions_intersection() {
-        // zstd is decodable and (with a level configured) producible; gzip is
-        // decodable but never producible, so it drops out of the intersection.
-        assert_eq!(super::supported_encodings_header_value(Some(3)), "zstd");
+        assert_eq!(
+            super::supported_encodings_header_value(Some(3)),
+            "zstd, gzip"
+        );
         // Compression off — the default — advertises an empty list, not an
         // absent header. Present-but-empty means "I speak no compression".
         assert_eq!(super::supported_encodings_header_value(None), "");

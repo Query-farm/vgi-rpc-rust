@@ -190,7 +190,7 @@ jobs:
         env:
           VGI_CONFORMANCE_ROLE: ${{ matrix.role }}
           VGI_CONFORMANCE_SERVER: ${{ matrix.server }}
-          VGI_TRANSPORTS: pipe,subprocess,http,unix,http_externalize_always,shm_pipe
+          VGI_TRANSPORTS: pipe,subprocess,http,unix,tcp,http_externalize_always,shm_pipe
           VGI_CLIENT_DRIVER: ${{ github.workspace }}/target/debug/vgi-rpc-conformance-client-driver
         run: |
           if [ "${{ matrix.server }}" = "python" ]; then

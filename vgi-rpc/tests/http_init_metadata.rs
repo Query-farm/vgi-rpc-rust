@@ -102,7 +102,7 @@ fn producer_decoder() -> StateDecoder {
     })
 }
 
-fn build_state(producer_batch_limit: usize) -> Arc<HttpState> {
+fn build_state() -> Arc<HttpState> {
     let mut srv = RpcServer::builder().server_id("meta").build();
     srv.register(
         MethodInfo::stream(
@@ -118,10 +118,7 @@ fn build_state(producer_batch_limit: usize) -> Arc<HttpState> {
         )
         .with_state_decoder(producer_decoder()),
     );
-    HttpState::builder()
-        .server(Arc::new(srv))
-        .producer_batch_limit(producer_batch_limit)
-        .build()
+    HttpState::builder().server(Arc::new(srv)).build()
 }
 
 /// Frame the /init request, attaching the revalidator to its metadata the
@@ -204,24 +201,27 @@ async fn post_arrow(app: axum::Router, path: &str, body: Vec<u8>) -> Bytes {
     to_bytes(resp.into_body(), usize::MAX).await.unwrap()
 }
 
-/// Within one /init response, the init request's metadata is visible to the
-/// first produce call only.
+/// The /init request is exactly one producer turn, and its metadata reaches
+/// that single produce call.
 #[tokio::test]
-async fn init_metadata_reaches_first_tick_only() {
-    let state = build_state(0); // drain the whole producer in /init
+async fn init_is_one_metadata_bearing_producer_turn() {
+    let state = build_state();
     let app = vgi_rpc::http::build_router(state);
     let body = post_arrow(app, "/meta_echo/init", init_body("etag-1")).await;
     let (values, leaked, token) = parse_response(&body);
     assert_eq!(
         values,
-        vec!["etag-1".to_string(), String::new(), String::new()],
-        "first tick sees the /init metadata; later ticks do not"
+        vec!["etag-1".to_string()],
+        "/init must invoke the producer exactly once"
     );
     assert!(
         leaked.iter().all(String::is_empty),
         "framework transport keys leaked into user-visible tick metadata: {leaked:?}"
     );
-    assert!(token.is_none(), "drained producer emits no token");
+    assert!(
+        token.is_some(),
+        "unfinished producer emits a continuation token"
+    );
 }
 
 /// A continuation turn's own request metadata must reach the first produce
@@ -231,7 +231,7 @@ async fn init_metadata_reaches_first_tick_only() {
 /// transport keys must not come along for the ride.
 #[tokio::test]
 async fn continuation_turn_carries_its_own_request_metadata() {
-    let state = build_state(1); // one batch per response + continuation token
+    let state = build_state();
     let app = vgi_rpc::http::build_router(state.clone());
     let body = post_arrow(app, "/meta_echo/init", init_body("etag-2")).await;
     let (values, leaked, token) = parse_response(&body);

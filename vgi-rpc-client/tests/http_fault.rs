@@ -335,6 +335,47 @@ fn zstd_chunked_decoded_response_is_bounded_and_recovers() {
 }
 
 #[test]
+fn gzip_decoded_response_is_bounded_and_recovers() {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&vec![b'x'; 16 * 1024]).unwrap();
+    let encoded = encoder.finish().unwrap();
+    assert!(encoded.len() < 1024);
+    assert_response_cap_then_recovery(
+        encoded,
+        Some("gzip"),
+        false,
+        1024,
+        1024,
+        "max_decoded_response_bytes",
+    );
+}
+
+#[test]
+fn gzip_response_decodes_to_a_valid_arrow_result() {
+    let response = ok_response();
+    let body_offset = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&response[body_offset..]).unwrap();
+    let encoded = encoder.finish().unwrap();
+    let url = mock_server(move |_attempt, mut stream| {
+        drain_request(&stream);
+        stream
+            .write_all(&capped_response(&encoded, Some("gzip"), false))
+            .unwrap();
+        stream.flush().unwrap();
+    });
+    let mut client = HttpClient::connect(url).build().unwrap();
+    let (batch, _) = client
+        .call_unary("echo_int", &echo_params(), None)
+        .expect("gzip response must decode before Arrow parsing");
+    assert_eq!(batch.column(0).as_primitive::<Int64Type>().value(0), 42);
+}
+
+#[test]
 fn zstd_large_window_is_rejected_even_for_tiny_output_and_recovers() {
     let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
     encoder.window_log(20).unwrap();

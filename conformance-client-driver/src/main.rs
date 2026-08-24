@@ -42,19 +42,29 @@ enum Conn {
 
 /// Uniform stream interface over the byte-stream and HTTP session types.
 trait DriverSession {
-    fn tick(&mut self) -> vgi_rpc::errors::Result<Option<(RecordBatch, Metadata)>>;
+    fn tick(
+        &mut self,
+        md: Option<&Metadata>,
+    ) -> vgi_rpc::errors::Result<Option<(RecordBatch, Metadata)>>;
     fn exchange(
         &mut self,
         input: &RecordBatch,
         md: Option<&Metadata>,
     ) -> vgi_rpc::errors::Result<Option<(RecordBatch, Metadata)>>;
+    #[allow(clippy::type_complexity)]
+    fn next_with_token(
+        &mut self,
+    ) -> vgi_rpc::errors::Result<Option<((RecordBatch, Metadata), Option<String>)>>;
     fn cancel(&mut self) -> vgi_rpc::errors::Result<()>;
     fn header(&self) -> Option<&(RecordBatch, Metadata)>;
 }
 
 impl DriverSession for vgi_rpc_client::StreamSession<'_> {
-    fn tick(&mut self) -> vgi_rpc::errors::Result<Option<(RecordBatch, Metadata)>> {
-        vgi_rpc_client::StreamSession::tick(self)
+    fn tick(
+        &mut self,
+        md: Option<&Metadata>,
+    ) -> vgi_rpc::errors::Result<Option<(RecordBatch, Metadata)>> {
+        vgi_rpc_client::StreamSession::tick_with_metadata(self, md)
     }
     fn exchange(
         &mut self,
@@ -62,6 +72,12 @@ impl DriverSession for vgi_rpc_client::StreamSession<'_> {
         md: Option<&Metadata>,
     ) -> vgi_rpc::errors::Result<Option<(RecordBatch, Metadata)>> {
         vgi_rpc_client::StreamSession::exchange(self, input, md)
+    }
+    fn next_with_token(
+        &mut self,
+    ) -> vgi_rpc::errors::Result<Option<((RecordBatch, Metadata), Option<String>)>> {
+        vgi_rpc_client::StreamSession::tick_with_metadata(self, None)
+            .map(|item| item.map(|batch| (batch, None)))
     }
     fn cancel(&mut self) -> vgi_rpc::errors::Result<()> {
         vgi_rpc_client::StreamSession::cancel(self)
@@ -72,8 +88,11 @@ impl DriverSession for vgi_rpc_client::StreamSession<'_> {
 }
 
 impl DriverSession for vgi_rpc_client::HttpStreamSession<'_> {
-    fn tick(&mut self) -> vgi_rpc::errors::Result<Option<(RecordBatch, Metadata)>> {
-        vgi_rpc_client::HttpStreamSession::tick(self)
+    fn tick(
+        &mut self,
+        md: Option<&Metadata>,
+    ) -> vgi_rpc::errors::Result<Option<(RecordBatch, Metadata)>> {
+        vgi_rpc_client::HttpStreamSession::tick_with_metadata(self, md)
     }
     fn exchange(
         &mut self,
@@ -81,6 +100,11 @@ impl DriverSession for vgi_rpc_client::HttpStreamSession<'_> {
         md: Option<&Metadata>,
     ) -> vgi_rpc::errors::Result<Option<(RecordBatch, Metadata)>> {
         vgi_rpc_client::HttpStreamSession::exchange(self, input, md)
+    }
+    fn next_with_token(
+        &mut self,
+    ) -> vgi_rpc::errors::Result<Option<((RecordBatch, Metadata), Option<String>)>> {
+        vgi_rpc_client::HttpStreamSession::next_with_token(self)
     }
     fn cancel(&mut self) -> vgi_rpc::errors::Result<()> {
         vgi_rpc_client::HttpStreamSession::cancel(self)
@@ -553,12 +577,56 @@ fn stream_sub_loop(
         let op = req.get("op").and_then(Value::as_str).unwrap_or("");
         match op {
             "tick" => {
-                let r = session.tick();
+                let tick_md = req
+                    .get("input_b64")
+                    .and_then(Value::as_str)
+                    .and_then(|b64| b64_decode(b64).ok())
+                    .and_then(|bytes| read_one(&bytes).ok())
+                    .map(|(_, md)| md);
+                let r = session.tick(tick_md.as_ref());
                 let terminal = !matches!(r, Ok(Some(_)));
                 let logs = drain_logs(log_buf);
                 write_response(out, &stream_item_response(r, logs));
                 if terminal {
                     return; // stream ended (EOS or error); release the client
+                }
+            }
+            "next_with_token" => {
+                let r = session.next_with_token();
+                let terminal = !matches!(r, Ok(Some(_)));
+                let logs = drain_logs(log_buf);
+                let response = match r {
+                    Ok(Some(((batch, metadata), token))) => match batch_b64(&batch, &metadata) {
+                        Ok(b64) => json!({
+                            "ok": true,
+                            "done": false,
+                            "batch_b64": b64,
+                            "token": token,
+                            "logs": logs,
+                            "error": Value::Null,
+                        }),
+                        Err(e) => json!({"ok": false, "error": e}),
+                    },
+                    Ok(None) => json!({
+                        "ok": true,
+                        "done": true,
+                        "batch_b64": Value::Null,
+                        "token": Value::Null,
+                        "logs": logs,
+                        "error": Value::Null,
+                    }),
+                    Err(e) => json!({
+                        "ok": true,
+                        "done": true,
+                        "batch_b64": Value::Null,
+                        "token": Value::Null,
+                        "logs": logs,
+                        "error": error_to_json(&e),
+                    }),
+                };
+                write_response(out, &response);
+                if terminal {
+                    return;
                 }
             }
             "exchange" => {

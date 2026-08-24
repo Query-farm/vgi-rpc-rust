@@ -4,6 +4,20 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## Unreleased
 
+## [0.23.2] — 2026-08-24
+
+### Performance
+
+- Non-dictionary shared-memory batches now decode directly from mmap-backed
+  Arrow buffers while retaining stock crates.io `arrow-rs`. Allocator slots
+  remain owned until the final array view is dropped, avoiding both the inbound
+  payload copy and premature slot reuse.
+- Shared-memory serialization now uses the direct single-row `LargeBinary`
+  writer introduced in 0.23.1, and allocator entries preserve Arrow IPC
+  alignment between consecutive batches. On the canonical Linux benchmark,
+  16 MiB echo latency fell from 11.91 ms to 9.56 ms (3.27 GiB/s), making shared
+  memory 14% faster than the 11.12 ms Unix-socket result.
+
 ## [0.23.1] — 2026-08-24
 
 ### Added

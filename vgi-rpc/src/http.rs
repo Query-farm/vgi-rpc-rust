@@ -1765,6 +1765,15 @@ pub async fn shutdown_signal() {
 /// Serve `state` on `listener`, terminating cleanly on SIGTERM/SIGINT.
 /// Convenience wrapper around [`build_router`] +
 /// [`axum::serve`](fn@axum::serve) + [`shutdown_signal`].
+///
+/// # Runtime requirement
+///
+/// Run this on a multi-thread Tokio runtime when requests must make concurrent
+/// progress. RPC handlers are synchronous so they can serve every transport;
+/// the HTTP adapter uses `block_in_place` on a multi-thread runtime to keep a
+/// slow handler from occupying an async worker. A current-thread runtime is
+/// supported for single-request/embedded use, but one synchronous callback
+/// necessarily delays unrelated requests on that sole thread.
 pub async fn serve_with_shutdown(
     state: Arc<HttpState>,
     listener: tokio::net::TcpListener,
@@ -1802,6 +1811,11 @@ fn response_buffer_ceiling(state: &HttpState) -> usize {
     }
 }
 
+/// Build the Axum router for an HTTP RPC server.
+///
+/// Run the router on a multi-thread Tokio runtime when requests must make
+/// concurrent progress. Synchronous RPC callbacks use `block_in_place` there;
+/// on a current-thread runtime one callback necessarily delays other requests.
 pub fn build_router(state: Arc<HttpState>) -> Router {
     let body_limit = state.max_body_size;
     let request_timeout = state.request_timeout;
@@ -3183,6 +3197,30 @@ async fn handle_upload_url(
 // Unary
 // ---------------------------------------------------------------------------
 
+/// Run one synchronous RPC callback without occupying an async HTTP worker.
+///
+/// `RpcServer` handlers are deliberately synchronous so the same implementation
+/// can serve pipe, Unix, TCP, and HTTP transports. Calling one directly from an
+/// Axum handler, however, lets a slow database/file/network operation pin a
+/// Tokio worker and starve unrelated HTTP requests. `block_in_place` tells a
+/// multi-thread runtime to hand that worker's async tasks to a replacement.
+///
+/// Router users and unit tests may choose Tokio's current-thread runtime,
+/// where `block_in_place` is unavailable. Keep direct execution there: one
+/// current-thread runtime cannot concurrently serve another request while a
+/// synchronous callback is running. Deployments that require concurrent HTTP
+/// request progress must run the router on a multi-thread Tokio runtime (as
+/// VGI's built-in HTTP worker does).
+fn dispatch_sync<T>(callback: impl FnOnce() -> T) -> T {
+    let multi_thread = tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if multi_thread {
+        tokio::task::block_in_place(callback)
+    } else {
+        callback()
+    }
+}
+
 async fn handle_unary(
     State(state): State<Arc<HttpState>>,
     Path(method): Path<String>,
@@ -3343,8 +3381,9 @@ async fn handle_unary(
     // structured Arrow error envelope below, matching the stdio/unix serve loop.
     // Without this a panic would bottom out at the `CatchPanicLayer` as a bare
     // 500 the DuckDB client can't parse as a VGI error.
-    let result =
-        crate::server::call_guard(|| (info.unary.as_ref().unwrap())(&req, &ctx)).and_then(|r| r);
+    let result = dispatch_sync(|| {
+        crate::server::call_guard(|| (info.unary.as_ref().unwrap())(&req, &ctx)).and_then(|r| r)
+    });
     let logs = ctx.drain_logs();
     let mut app_err: Option<RpcError> = None;
     // Bytes this response pushed to external storage, in the units
@@ -3589,8 +3628,9 @@ async fn handle_stream_init(
     }
     // Isolate handler panics into the structured stream error envelope below
     // (see the unary path for rationale).
-    let init_result =
-        crate::server::call_guard(|| (info.stream.as_ref().unwrap())(&req, &ctx)).and_then(|r| r);
+    let init_result = dispatch_sync(|| {
+        crate::server::call_guard(|| (info.stream.as_ref().unwrap())(&req, &ctx)).and_then(|r| r)
+    });
     let init_logs = ctx.drain_logs();
 
     let sr = match init_result {
@@ -3746,11 +3786,13 @@ fn build_cursor_token(
     ss: &StreamStateKind,
     call_id: &[u8; CALL_ID_LEN],
 ) -> Result<String> {
-    let state_bytes = crate::server::call_guard(|| match ss {
-        StreamStateKind::Producer(p) => p.encode_state(),
-        StreamStateKind::Exchange(e) => e.encode_state(),
-    })
-    .and_then(|result| result)?;
+    let state_bytes = dispatch_sync(|| {
+        crate::server::call_guard(|| match ss {
+            StreamStateKind::Producer(p) => p.encode_state(),
+            StreamStateKind::Exchange(e) => e.encode_state(),
+        })
+        .and_then(|result| result)
+    })?;
     Ok(state.pack_cursor_token(auth, &state_bytes, call_id))
 }
 
@@ -3900,8 +3942,9 @@ fn run_producer<W: std::io::Write>(
     // per-response ceiling.
     let mut cumulative_external = 0usize;
     let mut out = OutputCollector::new(output_schema.clone(), true);
-    let result =
-        crate::server::call_guard(|| producer.produce(&mut out, &ctx)).and_then(|result| result);
+    let result = dispatch_sync(|| {
+        crate::server::call_guard(|| producer.produce(&mut out, &ctx)).and_then(|result| result)
+    });
     for log in ctx.drain_logs() {
         let md = build_log_metadata(&log, &server.server_id, &req.request_id);
         let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
@@ -4066,9 +4109,9 @@ async fn handle_stream_exchange(
         ));
         return arrow_error(&state, StatusCode::INTERNAL_SERVER_ERROR, &err, "");
     };
-    let mut ss = match crate::server::call_guard(|| decoder(&unpacked.state_bytes))
-        .and_then(|result| result)
-    {
+    let mut ss = match dispatch_sync(|| {
+        crate::server::call_guard(|| decoder(&unpacked.state_bytes)).and_then(|result| result)
+    }) {
         Ok(s) => s,
         Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
     };
@@ -4087,9 +4130,11 @@ async fn handle_stream_exchange(
     let mut body_buf = Vec::new();
 
     if cancelled {
-        let cancel_result = crate::server::call_guard(|| match &mut ss {
-            StreamStateKind::Producer(p) => p.on_cancel(&ctx),
-            StreamStateKind::Exchange(e) => e.on_cancel(&ctx),
+        let cancel_result = dispatch_sync(|| {
+            crate::server::call_guard(|| match &mut ss {
+                StreamStateKind::Producer(p) => p.on_cancel(&ctx),
+                StreamStateKind::Exchange(e) => e.on_cancel(&ctx),
+            })
         });
         {
             let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
@@ -4198,11 +4243,13 @@ async fn handle_stream_exchange(
     ctx.set_tick_metadata(strip_framework_tick_metadata(&metadata));
 
     let mut out = OutputCollector::new(output_schema.clone(), false);
-    let res = crate::server::call_guard(|| match &mut ss {
-        StreamStateKind::Exchange(e) => e.exchange(&casted, &mut out, &ctx),
-        _ => unreachable!(),
-    })
-    .and_then(|result| result);
+    let res = dispatch_sync(|| {
+        crate::server::call_guard(|| match &mut ss {
+            StreamStateKind::Exchange(e) => e.exchange(&casted, &mut out, &ctx),
+            _ => unreachable!(),
+        })
+        .and_then(|result| result)
+    });
 
     let mut wrote_error = false;
     {

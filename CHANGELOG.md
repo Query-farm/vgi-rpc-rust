@@ -4,6 +4,14 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## Unreleased
 
+### Fixed
+
+- Synchronous unary, stream-init, producer, exchange, cancellation, state
+  decode, and state-encode callbacks no longer occupy Tokio HTTP workers on a
+  multi-thread runtime. Slow worker code now yields async request capacity via
+  `block_in_place`, so unrelated requests and post-timeout recovery continue
+  immediately even on a one-worker runtime.
+
 ## [0.23.2] — 2026-08-24
 
 ### Performance

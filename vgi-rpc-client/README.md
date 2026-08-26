@@ -18,10 +18,13 @@ canonical Python client: you build the request parameters as a one-row Arrow
 ## Transports
 
 - **subprocess / stdio** — spawn a worker and talk over its stdin/stdout. An
-  optional monotonic response deadline kills, reaps, and poisons a timed-out
-  child, preventing late bytes from desynchronizing the next call. Anonymous
-  pipe writes are not interruptible by `std`, so subprocess request sizes and
-  workers remain a trusted-peer boundary.
+  optional monotonic response deadline terminates, reaps, and poisons a timed-out
+  child, preventing late bytes from desynchronizing the next call. Unix workers
+  run in a private process group which is killed in full. On other platforms,
+  `std::process` can kill only the direct child; reader shutdown is bounded and
+  detaches if a descendant retained stdout. Anonymous pipe writes are not
+  interruptible by `std`, so subprocess request sizes and workers remain a
+  trusted-peer boundary.
 - **AF_UNIX** — connect to a worker on a unix socket (with an optional read
   timeout for untrusted peers). *(feature `unix`)*
 - **HTTP** — `reqwest`-blocking, with the full production surface:

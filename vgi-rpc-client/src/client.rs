@@ -145,8 +145,11 @@ impl RpcClient {
     /// Spawn a subprocess with a monotonic response/read timeout per RPC.
     ///
     /// A timeout kills, reaps, and poisons the subprocess connection so late
-    /// response bytes can never desynchronize a later call. Anonymous-pipe
-    /// writes themselves are not interruptible by `std`; see
+    /// response bytes can never desynchronize a later call. Unix terminates
+    /// the worker's private process group; other platforms terminate the
+    /// direct child and bound the reader join, detaching it if a descendant
+    /// retained stdout. Anonymous-pipe writes themselves are not interruptible
+    /// by `std`; see
     /// [`crate::transport::SubprocessTransport::spawn_with_stderr_and_timeout`].
     pub fn connect_with_timeout(
         cmd: &[impl AsRef<std::ffi::OsStr>],

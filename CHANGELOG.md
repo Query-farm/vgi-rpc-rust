@@ -7,9 +7,11 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 ### Fixed
 
 - Subprocess clients can enforce a monotonic response deadline per RPC. An
-  expired call kills and reaps the worker process group, joins its bounded
-  reader, and poisons the connection so late pipe bytes cannot desynchronize a
-  later call or return the client to a pool.
+  expired call poisons the connection so late pipe bytes cannot desynchronize a
+  later call or return the client to a pool. Unix kills and reaps the worker's
+  private process group before joining its reader. Other platforms kill and
+  reap the direct child, then bound the reader join and detach it if a
+  descendant retained stdout.
 - Synchronous unary, stream-init, producer, exchange, cancellation, state
   decode, and state-encode callbacks no longer occupy Tokio HTTP workers on a
   multi-thread runtime. Slow worker code now yields async request capacity via

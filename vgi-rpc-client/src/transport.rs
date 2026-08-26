@@ -144,8 +144,40 @@ impl SubprocessIo {
 
     fn join_reader(&self) {
         if let Some(thread) = self.reader_thread.lock().unwrap().take() {
-            let _ = thread.join();
+            #[cfg(unix)]
+            {
+                // The child owns a private process group, so terminating that
+                // group closes every inherited stdout handle. A full join is
+                // therefore safe and proves the reader has released the pipe.
+                let _ = thread.join();
+            }
+            #[cfg(not(unix))]
+            {
+                // `std::process` can terminate only the wrapper on these
+                // platforms. A descendant may retain the inherited stdout
+                // handle, so never let its missing EOF strand close/timeout.
+                // Dropping an unfinished JoinHandle detaches only this reader;
+                // it owns no client state and exits when the handle closes.
+                let _ = join_reader_bounded(thread, READER_JOIN_GRACE);
+            }
         }
+    }
+}
+
+#[cfg(any(not(unix), test))]
+fn join_reader_bounded(thread: JoinHandle<()>, grace: Duration) -> bool {
+    let deadline = Instant::now().checked_add(grace);
+    while !thread.is_finished() && deadline.is_some_and(|deadline| Instant::now() < deadline) {
+        std::thread::sleep(CLOSE_POLL);
+    }
+    if thread.is_finished() {
+        let _ = thread.join();
+        true
+    } else {
+        // Dropping a JoinHandle detaches the thread. This is the only bounded
+        // option when the platform cannot close stdout handles inherited by a
+        // process outside the wrapper's lifetime.
+        false
     }
 }
 
@@ -229,10 +261,14 @@ impl SubprocessTransport {
 
     /// Spawn with explicit stderr handling and a monotonic per-RPC timeout.
     ///
-    /// The deadline bounds response reads and kills the child on expiry. Rust
-    /// anonymous pipes cannot interrupt a thread blocked writing a very large
-    /// request to a worker that never reads stdin; callers should keep pipe
-    /// request batches bounded or use a socket/HTTP transport for hostile
+    /// The deadline bounds response reads and kills the child on expiry. On
+    /// Unix, the child runs in a private process group which is terminated in
+    /// full before its reader is joined. Other platforms can terminate only
+    /// the direct child through `std::process`; reader shutdown waits for a
+    /// short bounded grace and then detaches if a descendant retained stdout.
+    /// Rust anonymous pipes cannot interrupt a thread blocked writing a very
+    /// large request to a worker that never reads stdin; callers should keep
+    /// pipe request batches bounded or use a socket/HTTP transport for hostile
     /// peers.
     pub fn spawn_with_stderr_and_timeout(
         cmd: &[impl AsRef<std::ffi::OsStr>],
@@ -309,13 +345,13 @@ impl SubprocessTransport {
     }
 }
 
-fn kill_subprocess_tree(child: &mut Child, process_group: u32) {
+fn kill_subprocess_tree(child: &mut Child, _process_group: u32) {
     #[cfg(unix)]
     {
         // The child was placed in its own process group before exec. Kill the
         // group so wrappers cannot leave a descendant holding stdout open and
         // strand the reader thread during timeout recovery.
-        let pgid = i32::try_from(process_group).unwrap_or(i32::MAX);
+        let pgid = i32::try_from(_process_group).unwrap_or(i32::MAX);
         // SAFETY: `kill` accepts any process-group id. A negative id targets
         // only the group created for this still-owned child.
         unsafe {
@@ -384,6 +420,13 @@ const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Poll interval while waiting out [`CLOSE_GRACE`].
 const CLOSE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
+/// Maximum non-Unix wait for a subprocess reader after the direct child exits.
+///
+/// Unix closes inherited pipe handles by terminating the private process group
+/// and therefore joins without this fallback.
+#[cfg(any(not(unix), test))]
+const READER_JOIN_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
 impl Transport for SubprocessTransport {
     fn split(&mut self) -> (&mut dyn Read, &mut dyn Write) {
         // `stdin` is always `Some` between `spawn` and `close`.
@@ -425,6 +468,39 @@ impl Transport for SubprocessTransport {
 impl Drop for SubprocessTransport {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+#[cfg(test)]
+mod reader_join_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_reader_join_detaches_instead_of_waiting_for_eof() {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            release_receiver.recv().unwrap();
+            finished_sender.send(()).unwrap();
+        });
+
+        let started = Instant::now();
+        assert!(!join_reader_bounded(reader, Duration::from_millis(25)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "bounded reader join blocked instead of detaching"
+        );
+
+        release_sender.send(()).unwrap();
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached reader can finish after its handle is released");
+    }
+
+    #[test]
+    fn bounded_reader_join_reaps_a_finished_reader() {
+        let reader = std::thread::spawn(|| {});
+        assert!(join_reader_bounded(reader, READER_JOIN_GRACE));
     }
 }
 

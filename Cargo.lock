@@ -2890,6 +2890,7 @@ dependencies = [
  "base64",
  "bytes",
  "flate2",
+ "libc",
  "reqwest",
  "serde_json",
  "sha2",

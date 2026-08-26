@@ -16,7 +16,26 @@ use vgi_rpc::wire::{empty_batch, md_get, Metadata, StreamReader, StreamWriter};
 use crate::envelope::{classify, BatchKind};
 use crate::introspect::{empty_schema, parse_describe_batch, ServiceDescription};
 use crate::request::{build_request_metadata, generate_request_id};
-use crate::transport::Transport;
+use crate::transport::{RpcDeadline, Transport};
+
+struct DeadlineTurn(Option<RpcDeadline>);
+
+impl DeadlineTurn {
+    fn start(deadline: Option<RpcDeadline>) -> Result<Self> {
+        if let Some(deadline) = &deadline {
+            deadline.start()?;
+        }
+        Ok(Self(deadline))
+    }
+}
+
+impl Drop for DeadlineTurn {
+    fn drop(&mut self) {
+        if let Some(deadline) = &self.0 {
+            deadline.finish();
+        }
+    }
+}
 
 /// Callback invoked for each out-of-band log message received during a call.
 pub type OnLog = Box<dyn FnMut(LogMessage) + Send>;
@@ -123,6 +142,24 @@ impl RpcClient {
         Ok(Self::from_transport(Box::new(t)))
     }
 
+    /// Spawn a subprocess with a monotonic response/read timeout per RPC.
+    ///
+    /// A timeout kills, reaps, and poisons the subprocess connection so late
+    /// response bytes can never desynchronize a later call. Anonymous-pipe
+    /// writes themselves are not interruptible by `std`; see
+    /// [`crate::transport::SubprocessTransport::spawn_with_stderr_and_timeout`].
+    pub fn connect_with_timeout(
+        cmd: &[impl AsRef<std::ffi::OsStr>],
+        rpc_timeout: Option<std::time::Duration>,
+    ) -> Result<Self> {
+        let t = crate::transport::SubprocessTransport::spawn_with_stderr_and_timeout(
+            cmd,
+            crate::transport::StderrMode::default(),
+            rpc_timeout,
+        )?;
+        Ok(Self::from_transport(Box::new(t)))
+    }
+
     /// Connect to a worker listening on an AF_UNIX socket.
     #[cfg(unix)]
     pub fn unix_connect(path: impl AsRef<std::path::Path>) -> Result<Self> {
@@ -156,10 +193,9 @@ impl RpcClient {
     /// untrusted peers — a stalled peer then ends the call with a
     /// `TransportError` instead of hanging the thread).
     ///
-    /// Note: stdio/subprocess pipes cannot carry a read timeout in `std`
-    /// (anonymous pipes have no `set_read_timeout`); for `connect`, the worker
-    /// is a child this process spawned (trusted) and a hang is bounded by
-    /// dropping the client. Use unix sockets with a timeout for untrusted peers.
+    /// Subprocess response reads use a deadline-aware pipe adapter configured
+    /// by [`Self::connect_with_timeout`]. Anonymous-pipe writes remain a
+    /// trusted-peer boundary because `std` cannot interrupt a blocked write.
     #[cfg(unix)]
     pub fn unix_connect_with_timeout(
         path: impl AsRef<std::path::Path>,
@@ -206,6 +242,11 @@ impl RpcClient {
         self.transport.close()
     }
 
+    /// Whether the byte stream remains synchronized for another RPC.
+    pub fn is_reusable(&self) -> bool {
+        self.transport.is_reusable()
+    }
+
     /// Make a unary call: send `params` (one row), return the result batch.
     pub fn call_unary(
         &mut self,
@@ -213,6 +254,7 @@ impl RpcClient {
         params: &RecordBatch,
         metadata: Option<&Metadata>,
     ) -> Result<(RecordBatch, Metadata)> {
+        let _deadline = DeadlineTurn::start(self.transport.rpc_deadline())?;
         let req_id = generate_request_id();
         // Advertise the shm segment (when present) so the server may return
         // large result batches through shared memory. Inputs are sent inline:
@@ -292,6 +334,8 @@ impl RpcClient {
         has_header: bool,
         kind: StreamKind,
     ) -> Result<StreamSession<'_>> {
+        let deadline = self.transport.rpc_deadline();
+        let _deadline_turn = DeadlineTurn::start(deadline.clone())?;
         let req_id = generate_request_id();
         let shm_md = shm_request_md(&self.shm, metadata);
         let req_md = build_request_metadata(
@@ -342,6 +386,7 @@ impl RpcClient {
             cancelled: false,
             finished: false,
             closed: false,
+            deadline,
         })
     }
 
@@ -416,6 +461,7 @@ pub struct StreamSession<'c> {
     cancelled: bool,
     finished: bool,
     closed: bool,
+    deadline: Option<RpcDeadline>,
 }
 
 impl StreamSession<'_> {
@@ -480,6 +526,7 @@ impl StreamSession<'_> {
         if self.finished {
             return Ok(None);
         }
+        let _deadline = DeadlineTurn::start(self.deadline.clone())?;
         let tick_schema = Schema::empty();
         self.ensure_input_writer(&tick_schema)?;
         let batch = empty_batch(&tick_schema)?;
@@ -504,6 +551,7 @@ impl StreamSession<'_> {
         if self.finished {
             return Ok(None);
         }
+        let _deadline = DeadlineTurn::start(self.deadline.clone())?;
         // Inputs are sent inline; the server resolves shm only for output.
         self.ensure_input_writer(input.schema().as_ref())?;
         {
@@ -546,6 +594,7 @@ impl StreamSession<'_> {
             self.cancelled = true;
             return Ok(());
         }
+        let _deadline = DeadlineTurn::start(self.deadline.clone())?;
         let schema = self
             .in_writer
             .as_ref()
@@ -578,6 +627,7 @@ impl StreamSession<'_> {
         if self.cancelled {
             return Ok(());
         }
+        let _deadline = DeadlineTurn::start(self.deadline.clone())?;
         // Finish the input writer (or open+finish an empty one) so the server
         // sees EOS and stops, then drain any trailing output.
         if let Some(mut w) = self.in_writer.take() {

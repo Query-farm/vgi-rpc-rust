@@ -11,6 +11,10 @@
 
 use std::io::{BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use vgi_rpc::errors::{Result, RpcError};
 
@@ -19,6 +23,17 @@ use vgi_rpc::errors::{Result, RpcError};
 pub trait Transport: Send {
     /// Borrow the read half and write half as disjoint mutable references.
     fn split(&mut self) -> (&mut dyn Read, &mut dyn Write);
+
+    /// Return this transport's per-RPC deadline controller, when supported.
+    #[doc(hidden)]
+    fn rpc_deadline(&self) -> Option<RpcDeadline> {
+        None
+    }
+
+    /// Whether framing is safe for another RPC.
+    fn is_reusable(&self) -> bool {
+        true
+    }
 
     /// Shut the transport down (flush + signal EOF + reap any child).
     fn close(&mut self) -> Result<()>;
@@ -45,15 +60,163 @@ impl StderrMode {
 
 /// A worker spawned as a child process; the RPC wire is its stdin/stdout.
 pub struct SubprocessTransport {
-    child: Child,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    stdout: SubprocessReader,
+    io: Arc<SubprocessIo>,
+    deadline: Option<RpcDeadline>,
+}
+
+/// Shared monotonic deadline for one subprocess RPC at a time.
+#[derive(Clone)]
+pub struct RpcDeadline {
+    timeout: Duration,
+    deadline: Arc<Mutex<Option<Instant>>>,
+    io: Arc<SubprocessIo>,
+}
+
+impl RpcDeadline {
+    pub(crate) fn start(&self) -> Result<()> {
+        if self.io.poisoned.load(Ordering::Acquire) {
+            return Err(RpcError::new(
+                "TransportError",
+                "subprocess transport is poisoned after an RPC timeout",
+            ));
+        }
+        let expires = Instant::now().checked_add(self.timeout).ok_or_else(|| {
+            RpcError::new("TransportError", "subprocess RPC timeout exceeds Instant")
+        })?;
+        *self.deadline.lock().unwrap() = Some(expires);
+        Ok(())
+    }
+
+    pub(crate) fn finish(&self) {
+        *self.deadline.lock().unwrap() = None;
+    }
+}
+
+struct SubprocessIo {
+    child: Mutex<Child>,
+    process_group: u32,
+    reader_thread: Mutex<Option<JoinHandle<()>>>,
+    poisoned: AtomicBool,
+    stopping: Arc<AtomicBool>,
+    closed: AtomicBool,
+}
+
+impl SubprocessIo {
+    fn terminate_timeout(&self) {
+        self.poisoned.store(true, Ordering::Release);
+        self.stopping.store(true, Ordering::Release);
+        if self.closed.swap(true, Ordering::AcqRel) {
+            self.join_reader();
+            return;
+        }
+        let mut child = self.child.lock().unwrap();
+        kill_subprocess_tree(&mut child, self.process_group);
+        let _ = child.wait();
+        drop(child);
+        self.join_reader();
+    }
+
+    fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            self.join_reader();
+            return;
+        }
+        let deadline = Instant::now() + CLOSE_GRACE;
+        let mut child = self.child.lock().unwrap();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(CLOSE_POLL),
+                _ => break,
+            }
+        }
+        // Even when the group leader exited cooperatively, a wrapper may have
+        // left descendants holding stdout open. End the still-owned process
+        // group before joining the reader or that join can wait forever.
+        kill_subprocess_tree(&mut child, self.process_group);
+        let _ = child.wait();
+        drop(child);
+        self.stopping.store(true, Ordering::Release);
+        self.join_reader();
+    }
+
+    fn join_reader(&self) {
+        if let Some(thread) = self.reader_thread.lock().unwrap().take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+enum ReaderMessage {
+    Data(Vec<u8>),
+    Eof,
+    Error(std::io::Error),
+}
+
+struct SubprocessReader {
+    receiver: mpsc::Receiver<ReaderMessage>,
+    buffered: Vec<u8>,
+    offset: usize,
+    deadline: Arc<Mutex<Option<Instant>>>,
+    io: Arc<SubprocessIo>,
+}
+
+impl Read for SubprocessReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.offset < self.buffered.len() {
+            let count = output.len().min(self.buffered.len() - self.offset);
+            output[..count].copy_from_slice(&self.buffered[self.offset..self.offset + count]);
+            self.offset += count;
+            return Ok(count);
+        }
+        self.buffered.clear();
+        self.offset = 0;
+
+        let deadline = *self.deadline.lock().unwrap();
+        let message = match deadline {
+            Some(deadline) => {
+                if Instant::now() >= deadline {
+                    self.io.terminate_timeout();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "subprocess RPC deadline elapsed; worker terminated",
+                    ));
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match self.receiver.recv_timeout(remaining) {
+                    Ok(message) => message,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        self.io.terminate_timeout();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "subprocess RPC deadline elapsed; worker terminated",
+                        ));
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => ReaderMessage::Eof,
+                }
+            }
+            None => self.receiver.recv().unwrap_or(ReaderMessage::Eof),
+        };
+        match message {
+            ReaderMessage::Data(bytes) => {
+                self.buffered = bytes;
+                self.read(output)
+            }
+            ReaderMessage::Eof => Ok(0),
+            ReaderMessage::Error(error) => Err(error),
+        }
+    }
 }
 
 impl SubprocessTransport {
     /// Spawn `cmd[0]` with `cmd[1..]` as arguments, piping stdin/stdout.
     pub fn spawn(cmd: &[impl AsRef<std::ffi::OsStr>]) -> Result<Self> {
-        Self::spawn_with_stderr(cmd, StderrMode::default())
+        Self::spawn_with_stderr_and_timeout(cmd, StderrMode::default(), None)
     }
 
     /// Spawn with an explicit stderr disposition.
@@ -61,14 +224,36 @@ impl SubprocessTransport {
         cmd: &[impl AsRef<std::ffi::OsStr>],
         stderr: StderrMode,
     ) -> Result<Self> {
+        Self::spawn_with_stderr_and_timeout(cmd, stderr, None)
+    }
+
+    /// Spawn with explicit stderr handling and a monotonic per-RPC timeout.
+    ///
+    /// The deadline bounds response reads and kills the child on expiry. Rust
+    /// anonymous pipes cannot interrupt a thread blocked writing a very large
+    /// request to a worker that never reads stdin; callers should keep pipe
+    /// request batches bounded or use a socket/HTTP transport for hostile
+    /// peers.
+    pub fn spawn_with_stderr_and_timeout(
+        cmd: &[impl AsRef<std::ffi::OsStr>],
+        stderr: StderrMode,
+        rpc_timeout: Option<Duration>,
+    ) -> Result<Self> {
         let (program, args) = cmd
             .split_first()
             .ok_or_else(|| RpcError::value_error("empty command for SubprocessTransport"))?;
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args.iter().map(|a| a.as_ref()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(stderr.to_stdio())
+            .stderr(stderr.to_stdio());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command
             .spawn()
             .map_err(|e| RpcError::new("TransportError", format!("spawn worker: {e}")))?;
         let stdin = child
@@ -79,11 +264,113 @@ impl SubprocessTransport {
             .stdout
             .take()
             .ok_or_else(|| RpcError::new("TransportError", "child stdout not piped"))?;
+        let deadline = Arc::new(Mutex::new(None));
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let reader_stopping = Arc::clone(&stopping);
+        let reader_thread = std::thread::Builder::new()
+            .name("vgi-subprocess-reader".into())
+            .spawn(move || read_subprocess_stdout(stdout, sender, reader_stopping))
+            .map_err(|error| {
+                let process_group = child.id();
+                kill_subprocess_tree(&mut child, process_group);
+                let _ = child.wait();
+                RpcError::new(
+                    "TransportError",
+                    format!("spawn subprocess reader: {error}"),
+                )
+            })?;
+        let process_group = child.id();
+        let io = Arc::new(SubprocessIo {
+            child: Mutex::new(child),
+            process_group,
+            reader_thread: Mutex::new(Some(reader_thread)),
+            poisoned: AtomicBool::new(false),
+            stopping,
+            closed: AtomicBool::new(false),
+        });
+        let deadline_control = rpc_timeout.map(|timeout| RpcDeadline {
+            timeout,
+            deadline: Arc::clone(&deadline),
+            io: Arc::clone(&io),
+        });
         Ok(Self {
-            child,
             stdin: Some(stdin),
-            stdout: BufReader::new(stdout),
+            stdout: SubprocessReader {
+                receiver,
+                buffered: Vec::new(),
+                offset: 0,
+                deadline,
+                io: Arc::clone(&io),
+            },
+            io,
+            deadline: deadline_control,
         })
+    }
+}
+
+fn kill_subprocess_tree(child: &mut Child, process_group: u32) {
+    #[cfg(unix)]
+    {
+        // The child was placed in its own process group before exec. Kill the
+        // group so wrappers cannot leave a descendant holding stdout open and
+        // strand the reader thread during timeout recovery.
+        let pgid = i32::try_from(process_group).unwrap_or(i32::MAX);
+        // SAFETY: `kill` accepts any process-group id. A negative id targets
+        // only the group created for this still-owned child.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
+fn read_subprocess_stdout(
+    mut stdout: ChildStdout,
+    sender: mpsc::SyncSender<ReaderMessage>,
+    stopping: Arc<AtomicBool>,
+) {
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        match stdout.read(&mut buffer) {
+            Ok(0) => {
+                let _ = send_reader_message(&sender, ReaderMessage::Eof, &stopping);
+                return;
+            }
+            Ok(count) => {
+                if !send_reader_message(
+                    &sender,
+                    ReaderMessage::Data(buffer[..count].to_vec()),
+                    &stopping,
+                ) {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = send_reader_message(&sender, ReaderMessage::Error(error), &stopping);
+                return;
+            }
+        }
+    }
+}
+
+fn send_reader_message(
+    sender: &mpsc::SyncSender<ReaderMessage>,
+    mut message: ReaderMessage,
+    stopping: &AtomicBool,
+) -> bool {
+    loop {
+        match sender.try_send(message) {
+            Ok(()) => return true,
+            Err(mpsc::TrySendError::Disconnected(_)) => return false,
+            Err(mpsc::TrySendError::Full(returned)) => {
+                if stopping.load(Ordering::Acquire) {
+                    return false;
+                }
+                message = returned;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 }
 
@@ -104,6 +391,14 @@ impl Transport for SubprocessTransport {
         (&mut self.stdout, writer)
     }
 
+    fn rpc_deadline(&self) -> Option<RpcDeadline> {
+        self.deadline.clone()
+    }
+
+    fn is_reusable(&self) -> bool {
+        !self.io.poisoned.load(Ordering::Acquire)
+    }
+
     fn close(&mut self) -> Result<()> {
         // Drop stdin to send EOF, then reap the child — but never wait for it
         // unboundedly.
@@ -122,22 +417,7 @@ impl Transport for SubprocessTransport {
         // `CLOSE_GRACE` and dies.
         drop(self.stdin.take());
 
-        let deadline = std::time::Instant::now() + CLOSE_GRACE;
-        loop {
-            match self.child.try_wait() {
-                // Exited on its own.
-                Ok(Some(_)) => return Ok(()),
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(CLOSE_POLL);
-                }
-                // Out of grace, or the child is unwaitable (already reaped by a
-                // SIGCHLD handler, say). Either way stop waiting.
-                _ => break,
-            }
-        }
-
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.io.close();
         Ok(())
     }
 }
@@ -145,6 +425,50 @@ impl Transport for SubprocessTransport {
 impl Drop for SubprocessTransport {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod subprocess_tests {
+    use super::*;
+
+    #[test]
+    fn deadline_transport_preserves_multiple_pipe_turns() {
+        let mut transport = SubprocessTransport::spawn_with_stderr_and_timeout(
+            &["sh", "-c", "exec cat"],
+            StderrMode::Null,
+            Some(Duration::from_secs(2)),
+        )
+        .unwrap();
+        let deadline = transport.rpc_deadline().unwrap();
+        for message in [b"first".as_slice(), b"second".as_slice()] {
+            deadline.start().unwrap();
+            let (reader, writer) = transport.split();
+            writer.write_all(message).unwrap();
+            writer.flush().unwrap();
+            let mut echoed = vec![0; message.len()];
+            reader.read_exact(&mut echoed).unwrap();
+            deadline.finish();
+            assert_eq!(echoed, message);
+        }
+    }
+
+    #[test]
+    fn timeout_joins_a_reader_even_when_its_channel_is_full() {
+        let mut transport = SubprocessTransport::spawn_with_stderr_and_timeout(
+            &["sh", "-c", "exec yes flood"],
+            StderrMode::Null,
+            Some(Duration::from_millis(25)),
+        )
+        .unwrap();
+        let deadline = transport.rpc_deadline().unwrap();
+        deadline.start().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let (reader, _) = transport.split();
+        let error = reader.read(&mut [0_u8; 1]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(!transport.is_reusable());
+        transport.close().unwrap();
     }
 }
 

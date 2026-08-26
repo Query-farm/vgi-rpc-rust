@@ -17,7 +17,11 @@ canonical Python client: you build the request parameters as a one-row Arrow
 
 ## Transports
 
-- **subprocess / stdio** — spawn a worker and talk over its stdin/stdout.
+- **subprocess / stdio** — spawn a worker and talk over its stdin/stdout. An
+  optional monotonic response deadline kills, reaps, and poisons a timed-out
+  child, preventing late bytes from desynchronizing the next call. Anonymous
+  pipe writes are not interruptible by `std`, so subprocess request sizes and
+  workers remain a trusted-peer boundary.
 - **AF_UNIX** — connect to a worker on a unix socket (with an optional read
   timeout for untrusted peers). *(feature `unix`)*
 - **HTTP** — `reqwest`-blocking, with the full production surface:

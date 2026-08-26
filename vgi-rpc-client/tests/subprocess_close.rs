@@ -89,3 +89,22 @@ fn a_cooperative_child_is_reaped_promptly_and_not_killed() {
          cost only a poll or two"
     );
 }
+
+#[test]
+fn an_exited_wrapper_cannot_leave_a_stdout_holding_descendant() {
+    let mut t = SubprocessTransport::spawn(&[
+        "sh",
+        "-c",
+        // The shell exits immediately, but its child inherits stdout. Joining
+        // the reader after reaping only the shell would wait for this sleep.
+        "sleep 60 & exit 0",
+    ])
+    .expect("spawn wrapper");
+
+    let start = Instant::now();
+    t.close().expect("close kills the owned process group");
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "close joined a pipe still held by a wrapper descendant"
+    );
+}

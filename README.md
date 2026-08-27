@@ -1,8 +1,21 @@
-<div align="center">
-  <img src="https://raw.githubusercontent.com/Query-farm/vgi-rpc-rust/main/assets/vgi-logo.png" alt="Vector Gateway Interface" width="320">
-</div>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Query-farm/vgi-rpc-rust/main/assets/vgi-logo.png" alt="Vector Gateway Interface logo" width="320">
+</p>
 
-# vgi-rpc (Rust)
+<h1 align="center">vgi-rpc (Rust)</h1>
+
+<p align="center">
+  Transport-agnostic RPC framework built on <a href="https://arrow.apache.org/">Apache Arrow</a> IPC serialization — the Rust port of <a href="https://github.com/Query-farm/vgi-rpc-python">vgi-rpc</a>.<br>
+  Built by <a href="https://query.farm">🚜 Query.Farm</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Query-farm/vgi-rpc-rust/actions/workflows/ci.yml"><img src="https://github.com/Query-farm/vgi-rpc-rust/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://crates.io/crates/vgi-rpc"><img src="https://img.shields.io/crates/v/vgi-rpc" alt="crates.io"></a>
+  <a href="https://crates.io/crates/vgi-rpc"><img src="https://img.shields.io/crates/d/vgi-rpc" alt="crates.io downloads"></a>
+  <a href="https://docs.rs/vgi-rpc"><img src="https://img.shields.io/docsrs/vgi-rpc" alt="docs.rs"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
+</p>
 
 Transport-agnostic RPC framework built on Apache Arrow IPC. The Rust
 implementation tracks the Python canonical

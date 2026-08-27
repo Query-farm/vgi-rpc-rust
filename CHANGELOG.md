@@ -4,6 +4,8 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## Unreleased
 
+## [0.23.3] — 2026-08-27
+
 ### Fixed
 
 - Subprocess clients can enforce a monotonic response deadline per RPC. An

@@ -2823,7 +2823,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi-rpc"
-version = "0.23.2"
+version = "0.23.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -2870,7 +2870,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-benchmark-rust"
-version = "0.23.2"
+version = "0.23.3"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2880,7 +2880,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-client"
-version = "0.23.2"
+version = "0.23.3"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -2903,7 +2903,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-conformance-client-driver"
-version = "0.23.2"
+version = "0.23.3"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -2917,7 +2917,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-conformance-rust"
-version = "0.23.2"
+version = "0.23.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -2942,7 +2942,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-gcs"
-version = "0.23.2"
+version = "0.23.3"
 dependencies = [
  "reqwest",
  "uuid",
@@ -2952,7 +2952,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-macros"
-version = "0.23.2"
+version = "0.23.3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2961,7 +2961,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-s3"
-version = "0.23.2"
+version = "0.23.3"
 dependencies = [
  "reqwest",
  "tokio",

@@ -4873,6 +4873,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vgi-rpc-tailnet-rust"
+version = "0.23.3"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "axum",
+ "ctrlc",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "vgi-rpc",
+ "vgi-rpc-client",
+]
+
+[[package]]
 name = "wait-timeout"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -46,20 +46,44 @@ const SESSION_ID_LEN: usize = 12;
 /// token classes can never be cross-replayed. Mirrors Python
 /// `_sticky`/`_state_token` AAD conventions for the session namespace.
 fn compute_session_aad(auth: &AuthContext) -> Vec<u8> {
-    let prefix = b"vgi_rpc.session.v1\x00";
+    let binding = auth
+        .claims
+        .get("peer_evidence_binding")
+        .filter(|value| !value.is_empty());
+    let prefix = if binding.is_some() {
+        b"vgi_rpc.session.v2\x00".as_slice()
+    } else {
+        b"vgi_rpc.session.v1\x00".as_slice()
+    };
     if !auth.authenticated {
-        let mut out = Vec::with_capacity(prefix.len() + b"\x00anonymous".len());
+        let mut out = Vec::with_capacity(
+            prefix.len() + b"\x00anonymous".len() + binding.map_or(0, |value| value.len() + 1),
+        );
         out.extend_from_slice(prefix);
         out.extend_from_slice(b"\x00anonymous");
+        if let Some(binding) = binding {
+            out.push(0);
+            out.extend_from_slice(binding.as_bytes());
+        }
         return out;
     }
-    let mut out =
-        Vec::with_capacity(prefix.len() + 1 + auth.domain.len() + 1 + auth.principal.len());
+    let mut out = Vec::with_capacity(
+        prefix.len()
+            + 1
+            + auth.domain.len()
+            + 1
+            + auth.principal.len()
+            + binding.map_or(0, |value| value.len() + 1),
+    );
     out.extend_from_slice(prefix);
     out.push(0x01);
     out.extend_from_slice(auth.domain.as_bytes());
     out.push(0);
     out.extend_from_slice(auth.principal.as_bytes());
+    if let Some(binding) = binding {
+        out.push(0);
+        out.extend_from_slice(binding.as_bytes());
+    }
     out
 }
 
@@ -67,10 +91,25 @@ fn compute_session_aad(auth: &AuthContext) -> Vec<u8> {
 /// Python `_StickyMiddleware._principal_key`: `"\x00anonymous"` when
 /// unauthenticated, `"{domain}\x00{principal}"` otherwise.
 pub(crate) fn principal_key(auth: &AuthContext) -> String {
+    let binding = auth
+        .claims
+        .get("peer_evidence_binding")
+        .filter(|value| !value.is_empty())
+        .map(String::as_str)
+        .unwrap_or("");
     if !auth.authenticated {
-        return "\u{0}anonymous".to_string();
+        return if binding.is_empty() {
+            "\u{0}anonymous".to_string()
+        } else {
+            format!("\u{0}anonymous\u{0}{binding}")
+        };
     }
-    format!("{}\u{0}{}", auth.domain, auth.principal)
+    let key = format!("{}\u{0}{}", auth.domain, auth.principal);
+    if binding.is_empty() {
+        key
+    } else {
+        format!("{key}\u{0}{binding}")
+    }
 }
 
 fn now_unix_secs() -> u64 {
@@ -604,6 +643,24 @@ mod tests {
         let sid = [1u8; SESSION_ID_LEN];
         let tok = seal_session_token("srv", &sid, 1, &key(), &aad_a);
         assert!(open_session_token(&tok, &key(), &aad_b).is_err());
+    }
+
+    #[test]
+    fn cross_peer_evidence_rejected_for_anonymous_application_auth() {
+        let mut first = auth_anon();
+        first
+            .claims
+            .insert("peer_evidence_binding".into(), "first".into());
+        let mut second = auth_anon();
+        second
+            .claims
+            .insert("peer_evidence_binding".into(), "second".into());
+        let aad_first = compute_session_aad(&first);
+        let aad_second = compute_session_aad(&second);
+        let sid = [1u8; SESSION_ID_LEN];
+        let token = seal_session_token("srv", &sid, 1, &key(), &aad_first);
+        assert!(open_session_token(&token, &key(), &aad_second).is_err());
+        assert_ne!(principal_key(&first), principal_key(&second));
     }
 
     #[test]

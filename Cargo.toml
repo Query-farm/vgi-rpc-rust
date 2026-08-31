@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["vgi-rpc", "vgi-rpc-macros", "vgi-rpc-client", "conformance-client-driver", "conformance-worker", "benchmark-worker", "vgi-rpc-s3", "vgi-rpc-gcs"]
+members = ["vgi-rpc", "vgi-rpc-macros", "vgi-rpc-client", "vgi-rpc-iroh", "conformance-client-driver", "conformance-worker", "benchmark-worker", "vgi-rpc-s3", "vgi-rpc-gcs"]
 
 [workspace.package]
 version = "0.23.3"

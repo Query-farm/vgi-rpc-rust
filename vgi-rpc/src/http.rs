@@ -17,7 +17,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -88,6 +88,7 @@ const STICKY_DEFAULT_TTL_HEADER: &str = "vgi-sticky-default-ttl";
 const STICKY_ECHO_HEADERS_HEADER: &str = "vgi-sticky-echo-headers";
 /// Framework-managed sticky session teardown endpoint path segment.
 const SESSION_ENDPOINT: &str = "__session__";
+const DEFAULT_PEER_IDENTITY_PROVIDER_CONCURRENCY: usize = 32;
 
 /// Response bodies smaller than this are never zstd-compressed: below it the
 /// frame overhead dominates and often enlarges the payload, so the CPU and
@@ -351,6 +352,12 @@ pub struct HttpState {
     /// slow-loris client cannot pin a runtime worker indefinitely.
     request_timeout: std::time::Duration,
     authenticate: Option<crate::auth::Authenticate>,
+    peer_identity_providers: Arc<[crate::auth::identity::PeerIdentityProvider]>,
+    /// Permits remain owned by blocking tasks after an HTTP timeout, bounding
+    /// both active and detached provider work during an upstream stall.
+    peer_identity_provider_permits: Arc<tokio::sync::Semaphore>,
+    peer_authentication_policy: Option<crate::auth::identity::PeerAuthenticationPolicy>,
+    peer_service_name: Option<String>,
     #[allow(dead_code)]
     oauth_metadata: Option<Arc<crate::auth::oauth::OAuthResourceMetadata>>,
     oauth_metadata_json: Option<Vec<u8>>,
@@ -416,6 +423,10 @@ pub struct HttpStateBuilder {
     max_body_size: Option<usize>,
     request_timeout: Option<std::time::Duration>,
     authenticate: Option<crate::auth::Authenticate>,
+    peer_identity_providers: Vec<crate::auth::identity::PeerIdentityProvider>,
+    peer_identity_provider_concurrency: Option<usize>,
+    peer_authentication_policy: Option<crate::auth::identity::PeerAuthenticationPolicy>,
+    peer_service_name: Option<String>,
     oauth_metadata: Option<Arc<crate::auth::oauth::OAuthResourceMetadata>>,
     cors_origins: Option<String>,
     cors_max_age: Option<u32>,
@@ -553,6 +564,46 @@ impl HttpStateBuilder {
     /// anonymous for all callers (mirrors the Python `make_wsgi_app` default).
     pub fn authenticate(mut self, cb: crate::auth::Authenticate) -> Self {
         self.authenticate = Some(cb);
+        self
+    }
+
+    /// Resolve transport peer evidence before dispatch. Providers receive a
+    /// transport-neutral snapshot rather than Axum request types.
+    pub fn peer_identity_providers<I>(mut self, providers: I) -> Self
+    where
+        I: IntoIterator<Item = crate::auth::identity::PeerIdentityProvider>,
+    {
+        self.peer_identity_providers = providers.into_iter().collect();
+        self
+    }
+
+    /// Maximum number of provider calls executing globally. Default 32.
+    /// Admission fails as authentication-unavailable when all permits are
+    /// occupied, so stalled blocking work cannot form an unbounded queue after
+    /// request timeouts. Each provider call keeps its permit until it actually
+    /// exits, even after its request stopped waiting.
+    pub fn peer_identity_provider_concurrency(mut self, max: usize) -> Self {
+        assert!(
+            max > 0,
+            "peer identity provider concurrency must be positive"
+        );
+        self.peer_identity_provider_concurrency = Some(max);
+        self
+    }
+
+    /// Compose resolved peer evidence with application authentication.
+    /// Without a policy, evidence is observation-only.
+    pub fn peer_authentication_policy(
+        mut self,
+        policy: crate::auth::identity::PeerAuthenticationPolicy,
+    ) -> Self {
+        self.peer_authentication_policy = Some(policy);
+        self
+    }
+
+    /// Destination service name supplied to destination-scoped providers.
+    pub fn peer_service_name(mut self, service_name: impl Into<String>) -> Self {
+        self.peer_service_name = Some(service_name.into());
         self
     }
 
@@ -893,6 +944,13 @@ impl HttpStateBuilder {
                 .request_timeout
                 .unwrap_or_else(|| std::time::Duration::from_secs(30)),
             authenticate: self.authenticate,
+            peer_identity_providers: Arc::from(self.peer_identity_providers),
+            peer_identity_provider_permits: Arc::new(tokio::sync::Semaphore::new(
+                self.peer_identity_provider_concurrency
+                    .unwrap_or(DEFAULT_PEER_IDENTITY_PROVIDER_CONCURRENCY),
+            )),
+            peer_authentication_policy: self.peer_authentication_policy,
+            peer_service_name: self.peer_service_name,
             oauth_metadata: self.oauth_metadata,
             oauth_metadata_json,
             www_authenticate,
@@ -1261,11 +1319,16 @@ impl HttpState {
 
     /// Render the caller-identity half of a cache key.
     fn cache_identity(auth: &crate::auth::AuthContext) -> String {
-        if !auth.authenticated {
+        let mut identity = if !auth.authenticated {
             "\u{0}anonymous".to_string()
         } else {
             format!("{}\u{0}{}", auth.domain, auth.principal)
+        };
+        if let Some(binding) = peer_evidence_binding(auth) {
+            identity.push('\0');
+            identity.push_str(binding);
         }
+        identity
     }
 
     fn cache_key(auth: &crate::auth::AuthContext, call_id: &[u8; CALL_ID_LEN]) -> String {
@@ -1353,7 +1416,12 @@ impl HttpState {
 /// callers produce distinct AAD strings so a token minted in one
 /// context cannot be opened in another. Mirrors Python's `_compute_aad`.
 fn compute_aad(auth: &crate::auth::AuthContext) -> Vec<u8> {
-    compute_aad_with(b"vgi_rpc.state.v4\x00", auth)
+    let prefix = if peer_evidence_binding(auth).is_some() {
+        b"vgi_rpc.state.v5\x00".as_slice()
+    } else {
+        b"vgi_rpc.state.v4\x00".as_slice()
+    };
+    compute_aad_with(prefix, auth)
 }
 
 /// [`compute_aad`]'s counterpart for call tokens. The prefix differs
@@ -1362,24 +1430,53 @@ fn compute_aad(auth: &crate::auth::AuthContext) -> Vec<u8> {
 /// fails the AEAD tag check rather than decoding into a payload the reader
 /// would misinterpret.
 fn compute_call_aad(auth: &crate::auth::AuthContext) -> Vec<u8> {
-    compute_aad_with(b"vgi_rpc.call.v1\x00", auth)
+    let prefix = if peer_evidence_binding(auth).is_some() {
+        b"vgi_rpc.call.v2\x00".as_slice()
+    } else {
+        b"vgi_rpc.call.v1\x00".as_slice()
+    };
+    compute_aad_with(prefix, auth)
 }
 
 fn compute_aad_with(prefix: &[u8], auth: &crate::auth::AuthContext) -> Vec<u8> {
+    let binding = peer_evidence_binding(auth);
     if !auth.authenticated {
-        let mut out = Vec::with_capacity(prefix.len() + b"\x00anonymous".len());
+        let mut out = Vec::with_capacity(
+            prefix.len() + b"\x00anonymous".len() + binding.map_or(0, |value| value.len() + 1),
+        );
         out.extend_from_slice(prefix);
         out.extend_from_slice(b"\x00anonymous");
+        if let Some(binding) = binding {
+            out.push(0);
+            out.extend_from_slice(binding.as_bytes());
+        }
         return out;
     }
-    let mut out =
-        Vec::with_capacity(prefix.len() + 1 + auth.domain.len() + 1 + auth.principal.len());
+    let mut out = Vec::with_capacity(
+        prefix.len()
+            + 1
+            + auth.domain.len()
+            + 1
+            + auth.principal.len()
+            + binding.map_or(0, |value| value.len() + 1),
+    );
     out.extend_from_slice(prefix);
     out.push(0x01);
     out.extend_from_slice(auth.domain.as_bytes());
     out.push(0);
     out.extend_from_slice(auth.principal.as_bytes());
+    if let Some(binding) = binding {
+        out.push(0);
+        out.extend_from_slice(binding.as_bytes());
+    }
     out
+}
+
+fn peer_evidence_binding(auth: &crate::auth::AuthContext) -> Option<&str> {
+    auth.claims
+        .get("peer_evidence_binding")
+        .filter(|value| !value.is_empty())
+        .map(String::as_str)
 }
 
 /// On-wire version bytes. The cursor and call tokens carry independent
@@ -1779,9 +1876,12 @@ pub async fn serve_with_shutdown(
     listener: tokio::net::TcpListener,
 ) -> std::io::Result<()> {
     let app = build_router(state);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
 }
 
 /// Absolute ceiling on a buffered HTTP response body in the
@@ -2181,12 +2281,21 @@ fn build_router_inner(state: Arc<HttpState>) -> Router {
 /// a live session ⇒ close it, emit `VGI-Session-Close: true`, 204.
 async fn handle_delete_session(
     State(state): State<Arc<HttpState>>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
-    let auth = match authenticate_request(&state, SESSION_ENDPOINT, &headers) {
-        Ok(a) => a,
+    let identity = match authenticate_request_from_peer(
+        &state,
+        SESSION_ENDPOINT,
+        &headers,
+        connect_info.map(|info| info.0),
+    )
+    .await
+    {
+        Ok(identity) => identity,
         Err(resp) => return resp,
     };
+    let auth = identity.auth;
     let Some(ctx) = state.sticky.as_ref() else {
         return StatusCode::OK.into_response();
     };
@@ -2210,6 +2319,7 @@ async fn handle_delete_session(
 /// as `503` so it is retried instead.
 async fn handle_introspect_token(
     State(state): State<Arc<HttpState>>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Response {
@@ -2221,14 +2331,18 @@ async fn handle_introspect_token(
         // preflight rather than after arranging credentials.
         return introspect_refusal(StatusCode::NOT_FOUND, "not_enabled", None);
     };
-    let auth = match authenticate_request(
+    let identity = match authenticate_request_from_peer(
         &state,
         crate::auth::introspect::INTROSPECT_ENDPOINT,
         &headers,
-    ) {
-        Ok(a) => a,
+        connect_info.map(|info| info.0),
+    )
+    .await
+    {
+        Ok(identity) => identity,
         Err(resp) => return resp,
     };
+    let auth = identity.auth;
     // Bounded here rather than by the global body limit: the only legitimate
     // content is one credential, and an over-length body collapses onto the
     // same answer an unknown one gets.
@@ -2556,32 +2670,226 @@ fn headers_to_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
 
 /// Run the authenticate callback (if any); on error, build a 401 response
 /// with WWW-Authenticate attached.
+struct RequestIdentity {
+    auth: crate::auth::AuthContext,
+    evidence: Arc<crate::auth::identity::PeerEvidenceSet>,
+}
+
+fn redact_peer_policy_error(error: RpcError) -> RpcError {
+    if error.is_auth_unavailable() {
+        let retry_after = error.retry_after_seconds;
+        let mut redacted = RpcError::auth_unavailable("peer identity authentication unavailable");
+        if let Some(seconds) = retry_after {
+            redacted = redacted.with_retry_after(seconds);
+        }
+        redacted
+    } else {
+        RpcError::auth_failure(
+            error.auth_reason.unwrap_or(AuthReason::InvalidCredential),
+            "peer identity authentication rejected",
+        )
+    }
+}
+
+fn authentication_log_class(error: &RpcError) -> &'static str {
+    if error.is_auth_unavailable() {
+        "unavailable"
+    } else if matches!(error.error_type.as_str(), "PermissionError" | "ValueError") {
+        "rejected"
+    } else {
+        "failed"
+    }
+}
+
 // Err is an axum `Response` (large), shared throughout the HTTP layer; boxing
 // it would churn every call site for no real benefit.
 #[allow(clippy::result_large_err)]
-fn authenticate_request(
+async fn authenticate_request_from_peer(
     state: &Arc<HttpState>,
     method: &str,
     headers: &HeaderMap,
-) -> std::result::Result<crate::auth::AuthContext, Response> {
-    let Some(cb) = state.authenticate.as_ref() else {
-        return Ok(crate::auth::AuthContext::anonymous());
-    };
+    peer_addr: Option<std::net::SocketAddr>,
+) -> std::result::Result<RequestIdentity, Response> {
+    // One monotonic budget covers application authentication, request
+    // snapshotting, provider scheduling, and provider execution. The outer
+    // Tower timeout remains a final whole-handler ceiling, but providers must
+    // not receive a freshly reset deadline after earlier auth work consumed
+    // part of the request budget.
+    let identity_started_at = std::time::Instant::now();
+    let identity_deadline = identity_started_at + state.request_timeout;
     let pairs = headers_to_pairs(headers);
+    let peer_addr_string = peer_addr.map(|address| address.to_string());
     let req = crate::auth::AuthRequest {
         method,
         headers: &pairs,
-        peer_addr: None,
+        peer_addr: peer_addr_string.as_deref(),
     };
-    match (cb)(&req) {
-        Ok(ctx) => Ok(ctx),
+    let resolved = async {
+        let (existing_auth, deferred_missing_credential) = match state.authenticate.as_ref() {
+            Some(callback) => match callback(&req) {
+                Ok(auth) => (auth, None),
+                Err(error)
+                    if state.peer_authentication_policy.is_some()
+                        && error.auth_reason == Some(AuthReason::MissingCredential) =>
+                {
+                    (crate::auth::AuthContext::anonymous(), Some(error))
+                }
+                Err(error) => return Err(error),
+            },
+            None => (crate::auth::AuthContext::anonymous(), None),
+        };
+        let application_credential_present = headers.contains_key(header::AUTHORIZATION)
+            || state
+                .extra_proxy_auth_headers
+                .iter()
+                .any(|name| headers.contains_key(name));
+        if state.authenticate.is_some()
+            && application_credential_present
+            && (!existing_auth.authenticated || deferred_missing_credential.is_some())
+        {
+            return Err(RpcError::auth_failure(
+                AuthReason::InvalidCredential,
+                "presented application credential was not accepted",
+            ));
+        }
+        let provider_headers = headers
+            .keys()
+            .map(|name| {
+                let values = headers
+                    .get_all(name)
+                    .iter()
+                    .map(|value| {
+                        value.to_str().map(str::to_owned).map_err(|_| {
+                            RpcError::permission_error("non-text peer identity header")
+                        })
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?;
+                Ok((name.as_str().to_owned(), values))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let immediate_peer = peer_addr.map(|address| address.ip().to_string());
+        let destination = headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let context = crate::auth::identity::PeerResolutionContext::new("http")?
+            .with_peers(immediate_peer, None::<String>)
+            .with_source_endpoint(peer_addr_string.clone())
+            .with_destination(None::<String>, state.peer_service_name.clone())
+            .with_authority(destination)
+            .with_headers(provider_headers)?
+            .with_deadline(identity_deadline);
+        let providers = Arc::clone(&state.peer_identity_providers);
+        let results = if providers.is_empty() {
+            Vec::new()
+        } else {
+            // Start every configured factor concurrently. Each blocking task
+            // owns its global permit until it actually exits; dropping its
+            // JoinHandle on timeout does not release capacity around a provider
+            // that ignored the monotonic deadline.
+            // Capacity and timeout are per-provider evidence outcomes. That
+            // distinction lets observation and an already-valid application
+            // factor continue, while required/primary policies still fail
+            // closed on the named provider's Unavailable status.
+            let mut results = Vec::with_capacity(providers.len());
+            let mut pending = std::collections::BTreeSet::new();
+            let mut provider_tasks = tokio::task::JoinSet::new();
+            for provider in providers.iter() {
+                let name = provider.provider().to_owned();
+                match Arc::clone(&state.peer_identity_provider_permits).try_acquire_owned() {
+                    Ok(permit) => {
+                        pending.insert(name.clone());
+                        let provider = provider.clone();
+                        let context = context.clone();
+                        provider_tasks.spawn_blocking(move || {
+                            let _permit = permit;
+                            let result = provider.resolve(&context);
+                            (name, result)
+                        });
+                    }
+                    Err(_) => {
+                        results.push(crate::auth::identity::PeerIdentityResult::without_identity(
+                            name,
+                            crate::auth::identity::PeerIdentityStatus::Unavailable,
+                        )?)
+                    }
+                }
+            }
+            while !pending.is_empty() {
+                let remaining =
+                    identity_deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, provider_tasks.join_next()).await {
+                    Ok(Some(Ok((provider, result)))) => record_http_peer_provider_result(
+                        &mut results,
+                        &mut pending,
+                        provider,
+                        result,
+                    )?,
+                    Ok(Some(Err(_))) => {
+                        // A panic/cancellation is a programming/runtime error,
+                        // not an authority outage and must not be swallowed as
+                        // usable observation evidence.
+                        return Err(RpcError::runtime_error(
+                            "peer identity provider task failed",
+                        ));
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+            // Prefer completed security evidence at the deadline boundary.
+            // Calls still running after this non-blocking drain are snapshotted
+            // as unavailable and keep their permit until they really exit.
+            while let Some(joined) = provider_tasks.try_join_next() {
+                match joined {
+                    Ok((provider, result)) => record_http_peer_provider_result(
+                        &mut results,
+                        &mut pending,
+                        provider,
+                        result,
+                    )?,
+                    Err(_) => {
+                        return Err(RpcError::runtime_error(
+                            "peer identity provider task failed",
+                        ));
+                    }
+                }
+            }
+            for provider in pending {
+                results.push(crate::auth::identity::PeerIdentityResult::without_identity(
+                    provider,
+                    crate::auth::identity::PeerIdentityStatus::Unavailable,
+                )?);
+            }
+            results
+        };
+        let evidence = Arc::new(crate::auth::identity::PeerEvidenceSet::from_results(
+            results,
+        )?);
+        let auth = match state.peer_authentication_policy.as_ref() {
+            Some(policy) => policy(&evidence, &existing_auth).map_err(redact_peer_policy_error)?,
+            None => existing_auth,
+        };
+        if !auth.authenticated {
+            if let Some(error) = deferred_missing_credential {
+                return Err(error);
+            }
+        }
+        Ok::<RequestIdentity, RpcError>(RequestIdentity { auth, evidence })
+    }
+    .await;
+    match resolved {
+        Ok(identity) => Ok(identity),
         Err(err) if err.is_auth_unavailable() => {
             // Not a rejection: the authority could not be reached. A 401 here
             // tells every caller to re-authenticate against a service that is
             // simply down, and invites them to negative-cache an outage.
             tracing::warn!(
                 target: "vgi_rpc.http",
-                error = %err.message,
+                failure_class = authentication_log_class(&err),
                 "authentication unavailable"
             );
             let mut h = HeaderMap::new();
@@ -2604,12 +2912,9 @@ fn authenticate_request(
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             let mut h = HeaderMap::new();
-            // The response body must not echo internal detail. A 401 is
-            // part of the auth contract, but the verifier's message can
-            // carry an attacker-supplied `kid` or a raw library error —
-            // keep that in the logs, return a generic body. A 500 from
-            // the auth callback (e.g. a JWKS fetch failure) is purely
-            // internal and gets the same treatment.
+            // Neither response nor normal logs may echo arbitrary verifier
+            // detail: it can carry an attacker-supplied `kid`, token material,
+            // or raw library errors.
             if status == StatusCode::UNAUTHORIZED {
                 if let Some(wa) = state.www_authenticate.as_deref() {
                     if let Ok(hv) = HeaderValue::from_str(wa) {
@@ -2618,7 +2923,7 @@ fn authenticate_request(
                 }
                 tracing::info!(
                     target: "vgi_rpc.http",
-                    error = %err.message,
+                    failure_class = authentication_log_class(&err),
                     "request authentication rejected"
                 );
                 // A classified failure names its own reason; otherwise guess
@@ -2633,11 +2938,9 @@ fn authenticate_request(
                     } else {
                         AuthReason::Unauthorized
                     });
-                // Echo the detail only when the authenticator classified the
-                // failure, i.e. chose that text deliberately. An unclassified
-                // message is an arbitrary verifier/library string that may
-                // carry attacker-supplied input (a `kid`, say), and spec §2
-                // keeps that out of the body — it stays in the log above.
+                // A classified failure's detail is an application-selected
+                // public wire message for compatibility. Unclassified verifier
+                // and library messages remain private and are never logged.
                 let detail = if err.auth_reason.is_some() {
                     err.message.as_str()
                 } else {
@@ -2648,13 +2951,60 @@ fn authenticate_request(
             let body = {
                 tracing::error!(
                     target: "vgi_rpc.http",
-                    error = %err.message,
+                    failure_class = authentication_log_class(&err),
                     "authentication callback errored"
                 );
                 "internal error during authentication"
             };
             Err((status, h, body).into_response())
         }
+    }
+}
+
+fn record_http_peer_provider_result(
+    results: &mut Vec<crate::auth::identity::PeerIdentityResult>,
+    pending: &mut std::collections::BTreeSet<String>,
+    provider: String,
+    result: crate::Result<crate::auth::identity::PeerIdentityResult>,
+) -> crate::Result<()> {
+    use crate::auth::identity::{PeerIdentityResult, PeerIdentityStatus};
+
+    if !pending.remove(&provider) {
+        return Err(RpcError::runtime_error(
+            "peer identity provider task attribution mismatch",
+        ));
+    }
+    match result {
+        Ok(result) if result.provider() == provider => {
+            results.push(result);
+            Ok(())
+        }
+        Ok(_) => Err(RpcError::runtime_error(
+            "peer identity provider result attribution mismatch",
+        )),
+        Err(error) if error.is_auth_unavailable() => {
+            results.push(PeerIdentityResult::without_identity(
+                provider,
+                PeerIdentityStatus::Unavailable,
+            )?);
+            Ok(())
+        }
+        Err(error)
+            if error.auth_reason.is_some()
+                || matches!(error.error_type.as_str(), "PermissionError" | "ValueError") =>
+        {
+            // Extension/provider messages can contain daemon tokens,
+            // capabilities, certificate material, or attacker-controlled
+            // header text. Preserve only the rejection class and safe provider
+            // identifier; never pass provider-controlled detail to normal logs.
+            Err(RpcError::auth_failure(
+                AuthReason::InvalidCredential,
+                format!("peer identity provider {provider} rejected evidence"),
+            ))
+        }
+        Err(_) => Err(RpcError::runtime_error(format!(
+            "peer identity provider {provider} failed"
+        ))),
     }
 }
 
@@ -3068,14 +3418,22 @@ use crate::external::{
 
 async fn handle_upload_url(
     State(state): State<Arc<HttpState>>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let auth = match authenticate_request(&state, UPLOAD_URL_METHOD, &headers) {
-        Ok(a) => a,
+    let identity = match authenticate_request_from_peer(
+        &state,
+        UPLOAD_URL_METHOD,
+        &headers,
+        connect_info.map(|info| info.0),
+    )
+    .await
+    {
+        Ok(identity) => identity,
         Err(resp) => return resp,
     };
-    let _ = auth;
+    let _ = identity;
     if !has_arrow_ct(&headers) {
         return plain_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -3223,6 +3581,7 @@ fn dispatch_sync<T>(callback: impl FnOnce() -> T) -> T {
 
 async fn handle_unary(
     State(state): State<Arc<HttpState>>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     Path(method): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -3230,10 +3589,18 @@ async fn handle_unary(
     // Authenticate before any other rejection: an unauthenticated
     // caller should always see 401, regardless of whether they sent
     // the right content type or anything else.
-    let auth = match authenticate_request(&state, &method, &headers) {
-        Ok(a) => a,
+    let identity = match authenticate_request_from_peer(
+        &state,
+        &method,
+        &headers,
+        connect_info.map(|info| info.0),
+    )
+    .await
+    {
+        Ok(identity) => identity,
         Err(resp) => return resp,
     };
+    let RequestIdentity { auth, evidence } = identity;
     if !has_arrow_ct(&headers) {
         return plain_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -3333,7 +3700,7 @@ async fn handle_unary(
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
 
-    let mut ctx = CallContext::with_auth_cookies(&server, &req, auth.clone(), cookies);
+    let mut ctx = CallContext::with_auth_cookies(&server, &req, auth.clone(), evidence, cookies);
     if let Some(s) = sticky_sink.clone() {
         ctx.set_sticky(s);
     }
@@ -3549,14 +3916,23 @@ fn attach_access_sink(resp: &mut Response, sink: Option<crate::hooks::AccessSink
 
 async fn handle_stream_init(
     State(state): State<Arc<HttpState>>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     Path(method): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let auth = match authenticate_request(&state, &method, &headers) {
-        Ok(a) => a,
+    let identity = match authenticate_request_from_peer(
+        &state,
+        &method,
+        &headers,
+        connect_info.map(|info| info.0),
+    )
+    .await
+    {
+        Ok(identity) => identity,
         Err(resp) => return resp,
     };
+    let RequestIdentity { auth, evidence } = identity;
     if !has_arrow_ct(&headers) {
         return plain_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -3622,7 +3998,7 @@ async fn handle_stream_init(
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
 
-    let mut ctx = CallContext::with_auth_cookies(&server, &req, auth, cookies);
+    let mut ctx = CallContext::with_auth_cookies(&server, &req, auth, evidence.clone(), cookies);
     if let Some(s) = sticky_sink.clone() {
         ctx.set_sticky(s);
     }
@@ -3694,6 +4070,8 @@ async fn handle_stream_init(
                 &state,
                 &method,
                 &req,
+                &auth_for_token,
+                &evidence,
                 sticky_sink.as_ref(),
                 Some(req.metadata.as_ref()),
             );
@@ -3921,12 +4299,19 @@ fn run_producer<W: std::io::Write>(
     state: &Arc<HttpState>,
     method: &str,
     req: &Request,
+    auth: &crate::auth::AuthContext,
+    evidence: &Arc<crate::auth::identity::PeerEvidenceSet>,
     sticky: Option<&Arc<crate::sticky::StickySinkImpl>>,
     tick_md: Option<&Metadata>,
 ) -> ProducerTurn {
     let server = &state.server;
-    // Continuation producers run without auth context (session-bound).
-    let mut ctx = CallContext::for_request(server, req);
+    let mut ctx = CallContext::with_auth_cookies(
+        server,
+        req,
+        auth.clone(),
+        evidence.clone(),
+        std::collections::BTreeMap::new(),
+    );
     if let Some(s) = sticky {
         ctx.set_sticky(s.clone());
     }
@@ -4010,14 +4395,23 @@ fn run_producer<W: std::io::Write>(
 
 async fn handle_stream_exchange(
     State(state): State<Arc<HttpState>>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     Path(method): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let auth = match authenticate_request(&state, &method, &headers) {
-        Ok(a) => a,
+    let identity = match authenticate_request_from_peer(
+        &state,
+        &method,
+        &headers,
+        connect_info.map(|info| info.0),
+    )
+    .await
+    {
+        Ok(identity) => identity,
         Err(resp) => return resp,
     };
+    let RequestIdentity { auth, evidence } = identity;
     if !has_arrow_ct(&headers) {
         return plain_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -4122,7 +4516,17 @@ async fn handle_stream_exchange(
         batch: empty_batch(&Schema::empty()).unwrap(),
         metadata: Arc::new(metadata.clone()),
     };
-    let mut ctx = CallContext::for_request(&server, &req);
+    let mut ctx = CallContext::with_auth_cookies(
+        &server,
+        &req,
+        auth.clone(),
+        evidence.clone(),
+        parse_cookies(
+            headers
+                .get(header::COOKIE)
+                .and_then(|value| value.to_str().ok()),
+        ),
+    );
     if let Some(s) = sticky_sink.clone() {
         ctx.set_sticky(s);
     }
@@ -4181,6 +4585,8 @@ async fn handle_stream_exchange(
                 &state,
                 &method,
                 &req,
+                &auth,
+                &evidence,
                 sticky_sink.as_ref(),
                 Some(&continuation_md),
             );
@@ -4363,7 +4769,30 @@ fn read_input_batch(body: &[u8]) -> Result<(RecordBatch, Metadata)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    #[derive(Clone)]
+    struct IdentityLogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for IdentityLogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for IdentityLogCapture {
+        type Writer = IdentityLogCapture;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     fn state_with_key() -> Arc<HttpState> {
         use crate::server::RpcServer;
@@ -4492,6 +4921,511 @@ mod tests {
         assert_eq!(call.output_schema_bytes, out_sch);
         assert_eq!(call.input_schema_bytes, in_sch);
         assert_eq!(call.stream_id, "sid-123");
+    }
+
+    #[test]
+    fn peer_evidence_binds_cursor_and_call_tokens_for_anonymous_auth() {
+        let state = state_with_key();
+        let mut first = crate::auth::AuthContext::anonymous();
+        first
+            .claims
+            .insert("peer_evidence_binding".into(), "first".into());
+        let mut second = crate::auth::AuthContext::anonymous();
+        second
+            .claims
+            .insert("peer_evidence_binding".into(), "second".into());
+
+        let cursor = state.pack_cursor_token(&first, b"state", &TEST_CALL_ID);
+        assert!(state.unpack_cursor_token(&second, &cursor).is_err());
+
+        let schema = sample_schema_bytes();
+        let call = state.pack_call_token(&first, &TEST_CALL_ID, &schema, &schema, "stream");
+        assert!(unpack_call_token(
+            &state.token_key,
+            &compute_call_aad(&second),
+            &call,
+            Some(state.token_ttl),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn http_request_resolves_peer_evidence_before_policy() {
+        use crate::auth::identity::{
+            peer_identity_primary, IdentityAssurance, PeerIdentity, PeerIdentityProvider,
+            PeerIdentityResult, SubjectKind, SubjectStability,
+        };
+
+        let provider = PeerIdentityProvider::new("spiffe", |context| {
+            assert_eq!(context.transport(), "http");
+            assert_eq!(context.immediate_peer(), Some("192.0.2.10"));
+            assert_eq!(context.destination_address(), None);
+            assert_eq!(context.authority(), Some("worker.example.test"));
+            assert_eq!(context.service_name(), Some("svc:vgi"));
+            assert_eq!(context.header("x-peer")?, Some("present"));
+            Ok(PeerIdentityResult::available(
+                PeerIdentity::new(
+                    "spiffe",
+                    "test",
+                    IdentityAssurance::ConfiguredProxy,
+                    "spiffe://example.org",
+                    "http",
+                )?
+                .with_subject(
+                    SubjectKind::Workload,
+                    "spiffe://example.org/worker",
+                    SubjectStability::Stable,
+                    true,
+                )?,
+            ))
+        })
+        .unwrap();
+        let server = Arc::new(RpcServer::builder().server_id("peer-test").build());
+        let state = HttpState::builder()
+            .server(server)
+            .token_key(&[7u8; 32])
+            .peer_identity_providers([provider])
+            .peer_authentication_policy(peer_identity_primary("spiffe"))
+            .peer_service_name("svc:vgi")
+            .build();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-peer", HeaderValue::from_static("present"));
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("worker.example.test"),
+        );
+        let identity = authenticate_request_from_peer(
+            &state,
+            "whoami",
+            &headers,
+            Some("192.0.2.10:1234".parse().unwrap()),
+        )
+        .await
+        .unwrap_or_else(|response| panic!("peer identity rejected: {}", response.status()));
+        assert!(identity.auth.authenticated);
+        assert!(identity.auth.principal.starts_with("peer/spiffe/"));
+        assert_eq!(identity.evidence.identities().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn typed_missing_application_credential_can_defer_to_peer_primary() {
+        use crate::auth::identity::{
+            peer_identity_primary, IdentityAssurance, PeerIdentity, PeerIdentityProvider,
+            PeerIdentityResult, SubjectKind, SubjectStability,
+        };
+
+        let authenticate: crate::auth::Authenticate = Arc::new(|_| {
+            Err(RpcError::auth_failure(
+                AuthReason::MissingCredential,
+                "application credential missing",
+            ))
+        });
+        let provider = PeerIdentityProvider::new("spiffe", |_| {
+            Ok(PeerIdentityResult::available(
+                PeerIdentity::new(
+                    "spiffe",
+                    "test",
+                    IdentityAssurance::ConfiguredProxy,
+                    "spiffe://example.org",
+                    "http",
+                )?
+                .with_subject(
+                    SubjectKind::Workload,
+                    "spiffe://example.org/worker",
+                    SubjectStability::Stable,
+                    true,
+                )?,
+            ))
+        })
+        .unwrap();
+        let state = HttpState::builder()
+            .server(Arc::new(
+                RpcServer::builder().server_id("peer-fallback").build(),
+            ))
+            .token_key(&[7u8; 32])
+            .authenticate(authenticate)
+            .peer_identity_providers([provider])
+            .peer_authentication_policy(peer_identity_primary("spiffe"))
+            .build();
+
+        let identity = authenticate_request_from_peer(&state, "whoami", &HeaderMap::new(), None)
+            .await
+            .unwrap_or_else(|response| panic!("peer fallback rejected: {}", response.status()));
+        assert!(identity.auth.authenticated);
+        assert_eq!(identity.auth.domain, "spiffe");
+    }
+
+    #[tokio::test]
+    async fn missing_is_rethrown_when_peer_policy_leaves_auth_anonymous() {
+        let authenticate: crate::auth::Authenticate = Arc::new(|_| {
+            Err(RpcError::auth_failure(
+                AuthReason::MissingCredential,
+                "application credential missing",
+            ))
+        });
+        let state = HttpState::builder()
+            .server(Arc::new(
+                RpcServer::builder().server_id("peer-observe-only").build(),
+            ))
+            .token_key(&[7u8; 32])
+            .authenticate(authenticate)
+            .peer_authentication_policy(crate::observe_peer_identity())
+            .build();
+
+        let response =
+            match authenticate_request_from_peer(&state, "whoami", &HeaderMap::new(), None).await {
+                Ok(_) => panic!("anonymous peer policy unexpectedly satisfied missing credentials"),
+                Err(response) => response,
+            };
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(AUTH_REASON_HEADER).unwrap(),
+            "missing_credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_or_present_custom_credentials_never_downgrade_to_peer_fallback() {
+        use crate::auth::identity::{PeerIdentityResult, PeerIdentityStatus};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for (reason, custom_credential, expected) in [
+            (AuthReason::ExpiredCredential, false, "expired_credential"),
+            (AuthReason::MissingCredential, true, "invalid_credential"),
+        ] {
+            let authenticate: crate::auth::Authenticate = Arc::new(move |_| {
+                Err(RpcError::auth_failure(
+                    reason,
+                    "application credential rejected",
+                ))
+            });
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider_calls = Arc::clone(&calls);
+            let provider = crate::auth::identity::PeerIdentityProvider::new("unused", move |_| {
+                provider_calls.fetch_add(1, Ordering::Relaxed);
+                PeerIdentityResult::without_identity("unused", PeerIdentityStatus::NoMatch)
+            })
+            .unwrap();
+            let state = HttpState::builder()
+                .server(Arc::new(
+                    RpcServer::builder().server_id("no-auth-downgrade").build(),
+                ))
+                .token_key(&[7u8; 32])
+                .authenticate(authenticate)
+                .proxy_auth_headers(["x-api-key"])
+                .peer_identity_providers([provider])
+                .peer_authentication_policy(crate::any_of_peer_identities(["unused"]).unwrap())
+                .build();
+            let mut headers = HeaderMap::new();
+            if custom_credential {
+                headers.insert("x-api-key", HeaderValue::from_static("bad"));
+            }
+            let response =
+                match authenticate_request_from_peer(&state, "whoami", &headers, None).await {
+                    Ok(_) => panic!("rejected application credential unexpectedly downgraded"),
+                    Err(response) => response,
+                };
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers().get(AUTH_REASON_HEADER).unwrap(),
+                expected
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn tailscale_serve_duplicate_raw_header_fails_closed() {
+        let provider = crate::tailscale_serve_header_provider(
+            crate::TailscaleServeConfig::new("tailnet:test", ["127.0.0.1"]).unwrap(),
+        )
+        .unwrap();
+        let state = HttpState::builder()
+            .server(Arc::new(
+                RpcServer::builder()
+                    .server_id("tailscale-raw-header")
+                    .build(),
+            ))
+            .token_key(&[7u8; 32])
+            .peer_identity_providers([provider])
+            .peer_authentication_policy(crate::require_peer_identity("tailscale"))
+            .build();
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "tailscale-user-login",
+            HeaderValue::from_static("alice@example.com"),
+        );
+        headers.append(
+            "Tailscale-User-Login",
+            HeaderValue::from_static("mallory@example.com"),
+        );
+        let result = authenticate_request_from_peer(
+            &state,
+            "whoami",
+            &headers,
+            Some("127.0.0.1:1234".parse().unwrap()),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn timed_out_peer_provider_keeps_its_concurrency_permit() {
+        use crate::auth::identity::{PeerIdentityProvider, PeerIdentityResult, PeerIdentityStatus};
+
+        let provider = PeerIdentityProvider::new("slow", |_| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            PeerIdentityResult::without_identity("slow", PeerIdentityStatus::NoMatch)
+        })
+        .unwrap();
+        let server = Arc::new(RpcServer::builder().server_id("peer-limit-test").build());
+        let state = HttpState::builder()
+            .server(server)
+            .token_key(&[7u8; 32])
+            .request_timeout(std::time::Duration::from_millis(10))
+            .authenticate(Arc::new(|_| {
+                Ok(crate::auth::AuthContext::for_principal("bearer", "alice"))
+            }))
+            .peer_identity_providers([provider])
+            .peer_identity_provider_concurrency(1)
+            .peer_authentication_policy(crate::any_of_peer_identities(["slow"]).unwrap())
+            .build();
+
+        let first = authenticate_request_from_peer(&state, "whoami", &HeaderMap::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.evidence.status("slow"),
+            PeerIdentityStatus::Unavailable
+        );
+        assert_eq!(state.peer_identity_provider_permits.available_permits(), 0);
+
+        let second = authenticate_request_from_peer(&state, "whoami", &HeaderMap::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.evidence.status("slow"),
+            PeerIdentityStatus::Unavailable
+        );
+        assert_eq!(state.peer_identity_provider_permits.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_deadline_includes_application_authentication_time() {
+        use crate::auth::identity::{PeerIdentityProvider, PeerIdentityResult, PeerIdentityStatus};
+
+        let authenticate: crate::auth::Authenticate = Arc::new(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            Ok(crate::auth::AuthContext::anonymous())
+        });
+        let provider = PeerIdentityProvider::new("slow", |context| {
+            assert!(context.remaining_time().is_some());
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            PeerIdentityResult::without_identity("slow", PeerIdentityStatus::NoMatch)
+        })
+        .unwrap();
+        let server = Arc::new(
+            RpcServer::builder()
+                .server_id("peer-total-deadline")
+                .build(),
+        );
+        let state = HttpState::builder()
+            .server(server)
+            .token_key(&[7u8; 32])
+            .request_timeout(std::time::Duration::from_millis(40))
+            .authenticate(authenticate)
+            .peer_identity_providers([provider])
+            .peer_authentication_policy(crate::observe_peer_identity())
+            .build();
+
+        let result = authenticate_request_from_peer(&state, "whoami", &HeaderMap::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.evidence.status("slow"),
+            PeerIdentityStatus::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_provider_fails_require_and_primary_with_503() {
+        use crate::auth::identity::{PeerIdentityProvider, PeerIdentityResult, PeerIdentityStatus};
+
+        for policy in [
+            crate::require_peer_identity("slow"),
+            crate::peer_identity_primary("slow"),
+        ] {
+            let provider = PeerIdentityProvider::new("slow", |_| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                PeerIdentityResult::without_identity("slow", PeerIdentityStatus::NoMatch)
+            })
+            .unwrap();
+            let state = HttpState::builder()
+                .server(Arc::new(
+                    RpcServer::builder()
+                        .server_id("peer-required-outage")
+                        .build(),
+                ))
+                .token_key(&[7u8; 32])
+                .request_timeout(std::time::Duration::from_millis(10))
+                .peer_identity_providers([provider])
+                .peer_authentication_policy(policy)
+                .build();
+
+            let response =
+                match authenticate_request_from_peer(&state, "whoami", &HeaderMap::new(), None)
+                    .await
+                {
+                    Ok(_) => panic!("unavailable required provider was accepted"),
+                    Err(response) => response,
+                };
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    #[test]
+    fn provider_error_detail_is_redacted_before_auth_logging() {
+        const SECRET: &str = "secret-localapi-token-and-capability";
+        let mut results = Vec::new();
+        let mut pending = std::collections::BTreeSet::from(["tailscale".to_owned()]);
+        let error = record_http_peer_provider_result(
+            &mut results,
+            &mut pending,
+            "tailscale".to_owned(),
+            Err(RpcError::runtime_error(SECRET)),
+        )
+        .unwrap_err();
+        assert_eq!(error.error_type, "RuntimeError");
+        assert!(!error.message.contains(SECRET));
+        assert_eq!(error.message, "peer identity provider tailscale failed");
+    }
+
+    #[test]
+    fn custom_peer_policy_detail_is_redacted_before_http_response_and_logging() {
+        const SECRET: &str = "raw-capability-policy-secret";
+        let rejected =
+            redact_peer_policy_error(RpcError::auth_failure(AuthReason::ProxyRequired, SECRET));
+        assert_eq!(rejected.auth_reason, Some(AuthReason::ProxyRequired));
+        assert_eq!(rejected.message, "peer identity authentication rejected");
+        assert!(!rejected.message.contains(SECRET));
+
+        let unavailable =
+            redact_peer_policy_error(RpcError::auth_unavailable(SECRET).with_retry_after(17));
+        assert!(unavailable.is_auth_unavailable());
+        assert_eq!(unavailable.retry_after_seconds, Some(17));
+        assert_eq!(
+            unavailable.message,
+            "peer identity authentication unavailable"
+        );
+        assert!(!unavailable.message.contains(SECRET));
+    }
+
+    #[test]
+    fn application_authentication_log_class_never_contains_callback_detail() {
+        const SECRET: &str = "jwt-kid-and-callback-secret";
+        for (error, expected) in [
+            (RpcError::auth_unavailable(SECRET), "unavailable"),
+            (
+                RpcError::auth_failure(AuthReason::InvalidCredential, SECRET),
+                "rejected",
+            ),
+            (RpcError::runtime_error(SECRET), "failed"),
+        ] {
+            let class = authentication_log_class(&error);
+            assert_eq!(class, expected);
+            assert!(!class.contains(SECRET));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_panic_payload_is_redacted_from_auth_logs() {
+        const SECRET: &str = "secret-provider-panic-token-and-certificate";
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(IdentityLogCapture(Arc::clone(&buffer)))
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let provider = crate::PeerIdentityProvider::new("panic-provider", |_| {
+            panic!("{}", SECRET);
+        })
+        .unwrap();
+        let state = HttpState::builder()
+            .server(Arc::new(
+                RpcServer::builder()
+                    .server_id("peer-panic-redaction")
+                    .build(),
+            ))
+            .token_key(&[7u8; 32])
+            .peer_identity_providers([provider])
+            .build();
+
+        let response =
+            match authenticate_request_from_peer(&state, "whoami", &HeaderMap::new(), None).await {
+                Ok(_) => panic!("panicked provider was accepted"),
+                Err(response) => response,
+            };
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        drop(_guard);
+        let log = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(
+            !log.contains(SECRET),
+            "panic payload reached auth log: {log}"
+        );
+        assert!(log.contains("authentication callback errored"));
+        assert!(log.contains("failed"));
+    }
+
+    #[tokio::test]
+    async fn independent_peer_providers_execute_in_parallel() {
+        use crate::auth::identity::{PeerIdentityProvider, PeerIdentityResult, PeerIdentityStatus};
+
+        let provider = |name: &'static str| -> PeerIdentityProvider {
+            PeerIdentityProvider::new(name, move |_| {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                PeerIdentityResult::without_identity(name, PeerIdentityStatus::NoMatch)
+            })
+            .unwrap()
+        };
+        let server = Arc::new(RpcServer::builder().server_id("peer-parallel").build());
+        let state = HttpState::builder()
+            .server(server)
+            .token_key(&[7u8; 32])
+            .request_timeout(std::time::Duration::from_millis(70))
+            .peer_identity_providers([provider("first"), provider("second")])
+            .build();
+
+        assert!(
+            authenticate_request_from_peer(&state, "whoami", &HeaderMap::new(), None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn call_cache_and_token_aad_bind_complete_identity() {
+        let mut first = crate::auth::AuthContext::for_principal("oauth", "");
+        first
+            .claims
+            .insert("peer_evidence_binding".into(), "first".into());
+        let mut second = first.clone();
+        second
+            .claims
+            .insert("peer_evidence_binding".into(), "second".into());
+        let anonymous = crate::auth::AuthContext::anonymous();
+
+        assert_ne!(
+            HttpState::cache_key(&first, &TEST_CALL_ID),
+            HttpState::cache_key(&second, &TEST_CALL_ID)
+        );
+        assert_ne!(
+            HttpState::cache_key(&first, &TEST_CALL_ID),
+            HttpState::cache_key(&anonymous, &TEST_CALL_ID)
+        );
+        assert_ne!(compute_aad(&first), compute_aad(&second));
+        assert_ne!(compute_call_aad(&first), compute_call_aad(&second));
+        assert_ne!(compute_aad(&first), compute_aad(&anonymous));
+        assert_ne!(compute_call_aad(&first), compute_call_aad(&anonymous));
     }
 
     #[tokio::test]

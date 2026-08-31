@@ -25,6 +25,7 @@ pub mod intermediary;
 pub mod introspect;
 pub mod log;
 pub mod metadata;
+pub mod proxy_protocol;
 #[cfg(feature = "sentry-sdk")]
 pub mod sentry_sdk;
 #[cfg(feature = "sentry-tracing")]
@@ -58,7 +59,26 @@ pub use arrow_type::{
     UtcTimestamp, VgiArrow,
 };
 
+pub use auth::identity::{
+    all_of_peer_identities, any_of_peer_identities, observe_peer_identity, peer_identity_primary,
+    require_peer_identity, IdentityAssurance, PeerAuthenticationPolicy, PeerEvidenceSet,
+    PeerIdentity, PeerIdentityLinker, PeerIdentityProvider, PeerIdentityResult, PeerIdentityStatus,
+    PeerResolutionContext, SubjectKind, SubjectStability,
+};
 pub use auth::oauth::OAuthResourceMetadata;
+#[cfg(feature = "mtls-pem")]
+pub use auth::spiffe_proxy::{
+    aws_alb_spiffe_provider, azure_application_gateway_spiffe_provider, nginx_spiffe_provider,
+    spiffe_certificate_header_provider, SpiffeCertificateHeaderConfig,
+};
+pub use auth::spiffe_proxy::{
+    envoy_xfcc_spiffe_provider, gcp_load_balancer_spiffe_provider, validate_spiffe_id,
+    EnvoyXfccSpiffeConfig, GcpSpiffeConfig, SpiffeProxyConfig,
+};
+pub use auth::tailscale::{
+    tailscale_localapi_provider, tailscale_serve_header_provider, TailscaleLocalApiConfig,
+    TailscaleLocalApiEndpoint, TailscaleServeConfig,
+};
 pub use auth::{chain_all, chain_authenticate, AuthContext, AuthRequest, AuthResult, Authenticate};
 pub use errors::{Result, RpcError};
 #[cfg(feature = "external")]
@@ -75,9 +95,14 @@ pub use intermediary::{
 };
 pub use introspect::{DESCRIBE_METHOD_NAME, DESCRIBE_VERSION};
 pub use log::{LogLevel, LogMessage};
+pub use proxy_protocol::{
+    parse_proxy_protocol_v2, read_proxy_protocol_v2, ProxyProtocolV2Address,
+    DEFAULT_MAX_PROXY_V2_BYTES,
+};
 pub use retry::RetryConfig;
 pub use server::{
-    CallContext, MethodInfo, MethodType, Request, RpcServer, RpcServerBuilder, StickySink,
+    CallContext, ConnectionContext, MethodInfo, MethodType, Request, RpcServer, RpcServerBuilder,
+    StickySink,
 };
 #[cfg(feature = "http")]
 pub use sticky::{DrainHandle, SessionRegistry};

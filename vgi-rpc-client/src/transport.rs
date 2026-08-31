@@ -71,12 +71,33 @@ pub struct SubprocessTransport {
 pub struct RpcDeadline {
     timeout: Duration,
     deadline: Arc<Mutex<Option<Instant>>>,
-    io: Arc<SubprocessIo>,
+    io: Option<Arc<SubprocessIo>>,
 }
 
 impl RpcDeadline {
+    /// Create a monotonic per-RPC deadline controller for an external
+    /// transport. [`RpcClient`](crate::RpcClient) starts and clears it around
+    /// every complete unary or streaming turn.
+    pub fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            deadline: Arc::new(Mutex::new(None)),
+            io: None,
+        }
+    }
+
+    /// Remaining time in the active RPC budget, or `None` between calls.
+    pub fn remaining(&self) -> Option<Duration> {
+        (*self.deadline.lock().unwrap())
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
     pub(crate) fn start(&self) -> Result<()> {
-        if self.io.poisoned.load(Ordering::Acquire) {
+        if self
+            .io
+            .as_ref()
+            .is_some_and(|io| io.poisoned.load(Ordering::Acquire))
+        {
             return Err(RpcError::new(
                 "TransportError",
                 "subprocess transport is poisoned after an RPC timeout",
@@ -328,7 +349,7 @@ impl SubprocessTransport {
         let deadline_control = rpc_timeout.map(|timeout| RpcDeadline {
             timeout,
             deadline: Arc::clone(&deadline),
-            io: Arc::clone(&io),
+            io: Some(Arc::clone(&io)),
         });
         Ok(Self {
             stdin: Some(stdin),
@@ -588,6 +609,54 @@ pub struct TcpTransport {
     writer: std::net::TcpStream,
 }
 
+/// A strict SOCKS5h proxy endpoint used to reach a TCP worker.
+///
+/// The proxy itself must be an IP literal, which keeps proxy connection setup
+/// inside the single monotonic deadline without invoking an unbounded local
+/// DNS resolver. Worker domain names are IDNA-normalized and always sent to
+/// the proxy as SOCKS domain names; they are never resolved locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Socks5hProxy {
+    address: std::net::SocketAddr,
+}
+
+impl Socks5hProxy {
+    /// Parse `socks5h://IP:port`. Credentials, paths, query strings, and
+    /// fragments are deliberately unsupported.
+    pub fn parse(value: &str) -> Result<Self> {
+        let parsed = url::Url::parse(value)
+            .map_err(|_| RpcError::value_error("invalid SOCKS5h proxy URI"))?;
+        if parsed.scheme() != "socks5h"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || !matches!(parsed.path(), "" | "/")
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(RpcError::value_error(
+                "SOCKS5h proxy must be socks5h://IP:port without credentials or options",
+            ));
+        }
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| RpcError::value_error("SOCKS5h proxy host is required"))?;
+        let ip = host
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| RpcError::value_error("SOCKS5h proxy host must be an IP literal"))?;
+        let port = parsed
+            .port()
+            .ok_or_else(|| RpcError::value_error("SOCKS5h proxy port is required"))?;
+        Ok(Self {
+            address: std::net::SocketAddr::new(ip, port),
+        })
+    }
+
+    /// Return the proxy socket address.
+    pub fn address(self) -> std::net::SocketAddr {
+        self.address
+    }
+}
+
 impl TcpTransport {
     /// Connect to a worker listening on a TCP socket at `host:port`.
     pub fn connect(host: &str, port: u16) -> Result<Self> {
@@ -619,6 +688,302 @@ impl TcpTransport {
             reader: BufReader::new(stream),
             writer,
         })
+    }
+
+    /// Connect through a SOCKS5h proxy with one deadline covering the proxy
+    /// TCP connection, method negotiation, and the proxy's target connection.
+    ///
+    /// Only SOCKS `NO AUTH` is offered. Failure never falls back to a direct
+    /// connection. `host` is encoded as a domain name for proxy-side DNS, or
+    /// as an address literal when it is already IPv4/IPv6.
+    pub fn connect_socks5h(
+        proxy: Socks5hProxy,
+        host: &str,
+        port: u16,
+        connect_timeout: Duration,
+        read_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        if connect_timeout.is_zero() {
+            return Err(RpcError::value_error(
+                "SOCKS5h connect timeout must be positive",
+            ));
+        }
+        let deadline = Instant::now()
+            .checked_add(connect_timeout)
+            .ok_or_else(|| RpcError::value_error("SOCKS5h connect timeout exceeds Instant"))?;
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&proxy.address(), socks_remaining(deadline)?)
+                .map_err(|error| {
+                    RpcError::new("TransportError", format!("connect SOCKS5h proxy: {error}"))
+                })?;
+        stream.set_nodelay(true).map_err(|error| {
+            RpcError::new(
+                "TransportError",
+                format!("configure SOCKS5h socket: {error}"),
+            )
+        })?;
+
+        socks_write_all(&mut stream, &[5, 1, 0], deadline)?;
+        let mut method = [0_u8; 2];
+        socks_read_exact(&mut stream, &mut method, deadline)?;
+        if method != [5, 0] {
+            return Err(RpcError::new(
+                "TransportError",
+                "SOCKS5h proxy rejected the NO AUTH method",
+            ));
+        }
+
+        let mut request = vec![5, 1, 0];
+        match url::Host::parse(host)
+            .map_err(|_| RpcError::value_error("invalid SOCKS5h target host"))?
+        {
+            url::Host::Ipv4(address) => {
+                request.push(1);
+                request.extend_from_slice(&address.octets());
+            }
+            url::Host::Ipv6(address) => {
+                request.push(4);
+                request.extend_from_slice(&address.octets());
+            }
+            url::Host::Domain(domain) => {
+                let bytes = domain.as_bytes();
+                if bytes.is_empty() || bytes.len() > u8::MAX as usize {
+                    return Err(RpcError::value_error(
+                        "SOCKS5h target domain must contain 1..255 IDNA bytes",
+                    ));
+                }
+                request.push(3);
+                request.push(bytes.len() as u8);
+                request.extend_from_slice(bytes);
+            }
+        }
+        request.extend_from_slice(&port.to_be_bytes());
+        socks_write_all(&mut stream, &request, deadline)?;
+
+        let mut response = [0_u8; 4];
+        socks_read_exact(&mut stream, &mut response, deadline)?;
+        if response[0] != 5 || response[2] != 0 {
+            return Err(RpcError::new(
+                "TransportError",
+                "malformed SOCKS5h connect response",
+            ));
+        }
+        if response[1] != 0 {
+            return Err(RpcError::new(
+                "TransportError",
+                format!(
+                    "SOCKS5h proxy rejected target connection (reply {})",
+                    response[1]
+                ),
+            ));
+        }
+        let address_bytes = match response[3] {
+            1 => 4,
+            4 => 16,
+            3 => {
+                let mut length = [0_u8; 1];
+                socks_read_exact(&mut stream, &mut length, deadline)?;
+                usize::from(length[0])
+            }
+            _ => {
+                return Err(RpcError::new(
+                    "TransportError",
+                    "SOCKS5h response used an invalid address type",
+                ))
+            }
+        };
+        let mut bound = vec![0_u8; address_bytes + 2];
+        socks_read_exact(&mut stream, &mut bound, deadline)?;
+
+        stream.set_write_timeout(None).map_err(|error| {
+            RpcError::new(
+                "TransportError",
+                format!("clear SOCKS5h write deadline: {error}"),
+            )
+        })?;
+        stream.set_read_timeout(read_timeout).map_err(|error| {
+            RpcError::new("TransportError", format!("set tcp read timeout: {error}"))
+        })?;
+        let writer = stream.try_clone().map_err(|error| {
+            RpcError::new("TransportError", format!("clone tcp socket: {error}"))
+        })?;
+        Ok(Self {
+            reader: BufReader::new(stream),
+            writer,
+        })
+    }
+}
+
+fn socks_remaining(deadline: Instant) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| RpcError::new("TransportError", "SOCKS5h connection deadline elapsed"))
+}
+
+fn socks_write_all(
+    stream: &mut std::net::TcpStream,
+    value: &[u8],
+    deadline: Instant,
+) -> Result<()> {
+    stream
+        .set_write_timeout(Some(socks_remaining(deadline)?))
+        .and_then(|_| stream.write_all(value))
+        .map_err(|error| {
+            RpcError::new(
+                "TransportError",
+                format!("write SOCKS5h handshake: {error}"),
+            )
+        })
+}
+
+fn socks_read_exact(
+    stream: &mut std::net::TcpStream,
+    value: &mut [u8],
+    deadline: Instant,
+) -> Result<()> {
+    stream
+        .set_read_timeout(Some(socks_remaining(deadline)?))
+        .and_then(|_| stream.read_exact(value))
+        .map_err(|error| {
+            RpcError::new("TransportError", format!("read SOCKS5h handshake: {error}"))
+        })
+}
+
+#[cfg(test)]
+mod socks5h_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn proxy_uri_rejects_credentials_options_and_local_dns() {
+        for value in [
+            "socks5://127.0.0.1:1080",
+            "socks5h://user@127.0.0.1:1080",
+            "socks5h://127.0.0.1:1080/path",
+            "socks5h://127.0.0.1:1080/?x=1",
+            "socks5h://localhost:1080",
+            "socks5h://127.0.0.1",
+        ] {
+            assert!(Socks5hProxy::parse(value).is_err(), "accepted {value}");
+        }
+        assert_eq!(
+            Socks5hProxy::parse("socks5h://127.0.0.1:1080")
+                .unwrap()
+                .address(),
+            "127.0.0.1:1080".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn domain_is_idna_encoded_and_resolved_only_by_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = Socks5hProxy {
+            address: listener.local_addr().unwrap(),
+        };
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut greeting = [0_u8; 3];
+            connection.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            for byte in [5_u8, 0] {
+                connection.write_all(&[byte]).unwrap();
+            }
+
+            let mut prefix = [0_u8; 5];
+            connection.read_exact(&mut prefix).unwrap();
+            assert_eq!(&prefix[..4], &[5, 1, 0, 3]);
+            let mut target = vec![0_u8; usize::from(prefix[4]) + 2];
+            connection.read_exact(&mut target).unwrap();
+            assert_eq!(&target[..target.len() - 2], b"xn--bcher-kva.example");
+            assert_eq!(&target[target.len() - 2..], &9400_u16.to_be_bytes());
+
+            for chunk in [&[5_u8, 0][..], &[0, 1, 127][..], &[0, 0, 1, 0, 0][..]] {
+                connection.write_all(chunk).unwrap();
+            }
+        });
+
+        let mut transport = TcpTransport::connect_socks5h(
+            proxy,
+            "bücher.example",
+            9400,
+            Duration::from_secs(1),
+            None,
+        )
+        .unwrap();
+        transport.close().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn negotiation_uses_one_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = Socks5hProxy {
+            address: listener.local_addr().unwrap(),
+        };
+        let server = std::thread::spawn(move || {
+            let (_connection, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        let started = Instant::now();
+        let error = match TcpTransport::connect_socks5h(
+            proxy,
+            "worker.example",
+            9400,
+            Duration::from_millis(30),
+            None,
+        ) {
+            Ok(_) => panic!("stalled SOCKS5h negotiation unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.error_type, "TransportError");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn proxy_rejection_never_connects_directly() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = Socks5hProxy {
+            address: proxy_listener.local_addr().unwrap(),
+        };
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = proxy_listener.accept().unwrap();
+            let mut greeting = [0_u8; 3];
+            connection.read_exact(&mut greeting).unwrap();
+            connection.write_all(&[5, 0]).unwrap();
+            let mut prefix = [0_u8; 4];
+            connection.read_exact(&mut prefix).unwrap();
+            let address_bytes = match prefix[3] {
+                1 => 4,
+                4 => 16,
+                3 => {
+                    let mut length = [0_u8; 1];
+                    connection.read_exact(&mut length).unwrap();
+                    usize::from(length[0])
+                }
+                value => panic!("unexpected SOCKS address type {value}"),
+            };
+            let mut rest = vec![0_u8; address_bytes + 2];
+            connection.read_exact(&mut rest).unwrap();
+            connection
+                .write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0])
+                .unwrap();
+        });
+        assert!(TcpTransport::connect_socks5h(
+            proxy,
+            "127.0.0.1",
+            target_port,
+            Duration::from_secs(1),
+            None,
+        )
+        .is_err());
+        assert!(
+            matches!(target.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        server.join().unwrap();
     }
 }
 

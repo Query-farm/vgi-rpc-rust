@@ -176,6 +176,8 @@ pub struct CallContext {
     /// Authentication state, or [`crate::AuthContext::anonymous`] when
     /// no authenticator is configured (e.g. pipe/unix transports).
     pub auth: crate::auth::AuthContext,
+    /// Transport peer evidence, independent from application authentication.
+    pub peer_evidence: Arc<crate::auth::identity::PeerEvidenceSet>,
     /// HTTP request cookies (empty for pipe/unix). Name → value.
     pub cookies: std::collections::BTreeMap<String, String>,
     /// Coarse identifier of the bound transport. `None` until the
@@ -191,6 +193,31 @@ pub struct CallContext {
     /// HTTP servers without sticky support — [`CallContext::open_session`]
     /// then raises a clear "not available on this transport" error.
     pub(crate) sticky: Option<Arc<dyn StickySink>>,
+}
+
+/// Authentication and peer evidence fixed for the lifetime of a stateful
+/// byte-stream connection.
+///
+/// Transports such as authenticated QUIC resolve their peer once, after the
+/// cryptographic handshake, then use this immutable snapshot for every VGI
+/// request carried by the connection.  Pipe/TCP/Unix callers can continue to
+/// use [`RpcServer::serve`], which supplies the anonymous default.
+#[derive(Clone, Debug, Default)]
+pub struct ConnectionContext {
+    pub auth: crate::auth::AuthContext,
+    pub peer_evidence: Arc<crate::auth::identity::PeerEvidenceSet>,
+}
+
+impl ConnectionContext {
+    pub fn new(
+        auth: crate::auth::AuthContext,
+        peer_evidence: Arc<crate::auth::identity::PeerEvidenceSet>,
+    ) -> Self {
+        Self {
+            auth,
+            peer_evidence,
+        }
+    }
 }
 
 /// Bridge between [`CallContext`]'s sticky-session API and the HTTP
@@ -246,13 +273,18 @@ impl CallContext {
     /// anonymous auth with no cookies — callers on authenticated
     /// transports (HTTP) override the two after construction or use
     /// [`CallContext::with_auth_cookies`].
-    pub(crate) fn for_request(server: &RpcServer, req: &Request) -> Self {
+    fn for_request_on_connection(
+        server: &RpcServer,
+        req: &Request,
+        connection: &ConnectionContext,
+    ) -> Self {
         Self {
             server_id: server.server_id.clone(),
             method: req.method.clone(),
             request_id: req.request_id.clone(),
             transport_metadata: req.metadata.clone(),
-            auth: crate::auth::AuthContext::anonymous(),
+            auth: connection.auth.clone(),
+            peer_evidence: Arc::clone(&connection.peer_evidence),
             cookies: std::collections::BTreeMap::new(),
             kind: server.transport_kind(),
             log_sink: Arc::new(Mutex::new(Vec::new())),
@@ -270,6 +302,7 @@ impl CallContext {
         server: &RpcServer,
         req: &Request,
         auth: crate::auth::AuthContext,
+        peer_evidence: Arc<crate::auth::identity::PeerEvidenceSet>,
         cookies: std::collections::BTreeMap<String, String>,
     ) -> Self {
         Self {
@@ -278,6 +311,7 @@ impl CallContext {
             request_id: req.request_id.clone(),
             transport_metadata: req.metadata.clone(),
             auth,
+            peer_evidence,
             cookies,
             kind: server.transport_kind(),
             log_sink: Arc::new(Mutex::new(Vec::new())),
@@ -900,12 +934,28 @@ impl RpcServer {
     /// here; a `TimedOut`/`WouldBlock` error then cleanly ends the
     /// connection via the error path below.
     pub fn serve<R: Read, W: Write>(&self, mut r: R, mut w: W) {
+        self.serve_with_context(&mut r, &mut w, ConnectionContext::default());
+    }
+
+    /// Run the stateful byte-stream serve loop with connection-scoped
+    /// authentication and peer evidence.
+    ///
+    /// The supplied context is cloned into every [`CallContext`] while the
+    /// connection's framing and streaming state remain resident in this one
+    /// loop. Authenticated transports should resolve and authorize their peer
+    /// before calling this method and must not mutate that snapshot later.
+    pub fn serve_with_context<R: Read, W: Write>(
+        &self,
+        mut r: R,
+        mut w: W,
+        connection: ConnectionContext,
+    ) {
         // Cache the client's dynamically-advertised SHM segment for the
         // life of the connection so later offset-only request/data batches
         // resolve against it (see [`ConnectionShm`]).
         let mut conn_shm = ConnectionShm::default();
         loop {
-            match self.serve_one_conn(&mut r, &mut w, Some(&mut conn_shm)) {
+            match self.serve_one_conn(&mut r, &mut w, Some(&mut conn_shm), &connection) {
                 Ok(keep_going) => {
                     if !keep_going {
                         return;
@@ -939,12 +989,33 @@ impl RpcServer {
         W: Write,
         F: Fn() -> bool,
     {
+        self.serve_with_context_and_shutdown(
+            &mut r,
+            &mut w,
+            ConnectionContext::default(),
+            shutdown,
+        );
+    }
+
+    /// [`Self::serve_with_shutdown`] with a connection-scoped identity
+    /// snapshot.
+    pub fn serve_with_context_and_shutdown<R, W, F>(
+        &self,
+        mut r: R,
+        mut w: W,
+        connection: ConnectionContext,
+        shutdown: F,
+    ) where
+        R: Read,
+        W: Write,
+        F: Fn() -> bool,
+    {
         let mut conn_shm = ConnectionShm::default();
         loop {
             if shutdown() {
                 return;
             }
-            match self.serve_one_conn(&mut r, &mut w, Some(&mut conn_shm)) {
+            match self.serve_one_conn(&mut r, &mut w, Some(&mut conn_shm), &connection) {
                 Ok(true) => {}
                 _ => return,
             }
@@ -958,7 +1029,17 @@ impl RpcServer {
     /// of being cached across requests (the [`serve`](Self::serve) loop
     /// supplies the cache).
     pub fn serve_one<R: Read, W: Write>(&self, r: &mut R, w: &mut W) -> Result<bool> {
-        self.serve_one_conn(r, w, None)
+        self.serve_one_conn(r, w, None, &ConnectionContext::default())
+    }
+
+    /// Handle one request with a connection-scoped identity snapshot.
+    pub fn serve_one_with_context<R: Read, W: Write>(
+        &self,
+        r: &mut R,
+        w: &mut W,
+        connection: &ConnectionContext,
+    ) -> Result<bool> {
+        self.serve_one_conn(r, w, None, connection)
     }
 
     fn serve_one_conn<R: Read, W: Write>(
@@ -966,8 +1047,9 @@ impl RpcServer {
         r: &mut R,
         w: &mut W,
         shm_cache: Option<&mut ConnectionShm>,
+        connection: &ConnectionContext,
     ) -> Result<bool> {
-        let result = self._serve_one(r, w, shm_cache);
+        let result = self._serve_one(r, w, shm_cache, connection);
         let _ = w.flush();
         result
     }
@@ -977,6 +1059,7 @@ impl RpcServer {
         r: &mut R,
         w: &mut W,
         mut shm_cache: Option<&mut ConnectionShm>,
+        connection: &ConnectionContext,
     ) -> Result<bool> {
         let (batch, metadata, request_used_shm) =
             match self.read_request(r, shm_cache.as_deref_mut())? {
@@ -1022,7 +1105,7 @@ impl RpcServer {
             return Ok(true);
         }
 
-        let ctx = CallContext::for_request(self, &req);
+        let ctx = CallContext::for_request_on_connection(self, &req, connection);
 
         let stats = Arc::new(Mutex::new(crate::hooks::CallStatistics::default()));
         // Record the unary request batch as input stats (one row).

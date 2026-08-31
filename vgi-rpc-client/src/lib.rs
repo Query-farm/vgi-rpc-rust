@@ -35,7 +35,9 @@ pub use http::{
 pub use client::{ClientTransportOptions, OnLog, RpcClient, StreamKind, StreamSession};
 pub use envelope::{classify, BatchKind};
 pub use introspect::{MethodDescription, ServiceDescription};
-pub use transport::{PipeTransport, StderrMode, SubprocessTransport, TcpTransport, Transport};
+pub use transport::{
+    PipeTransport, Socks5hProxy, StderrMode, SubprocessTransport, TcpTransport, Transport,
+};
 
 #[cfg(unix)]
 pub use transport::UnixTransport;

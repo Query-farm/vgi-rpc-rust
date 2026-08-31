@@ -192,6 +192,26 @@ impl RpcClient {
         Ok(Self::from_transport(Box::new(t)))
     }
 
+    /// Connect to a TCP worker through a strict SOCKS5h proxy. The worker
+    /// hostname is resolved by the proxy and proxy failure never falls back
+    /// to a direct TCP connection.
+    pub fn tcp_connect_socks5h(
+        proxy: crate::transport::Socks5hProxy,
+        host: &str,
+        port: u16,
+        connect_timeout: std::time::Duration,
+        read_timeout: Option<std::time::Duration>,
+    ) -> Result<Self> {
+        let transport = crate::transport::TcpTransport::connect_socks5h(
+            proxy,
+            host,
+            port,
+            connect_timeout,
+            read_timeout,
+        )?;
+        Ok(Self::from_transport(Box::new(transport)))
+    }
+
     /// Connect to a unix socket with a per-read timeout (recommended for
     /// untrusted peers — a stalled peer then ends the call with a
     /// `TransportError` instead of hanging the thread).

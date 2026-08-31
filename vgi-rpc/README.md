@@ -29,7 +29,8 @@ Stock `arrow-rs` 59.x dependency tree, MSRV 1.97, no
   compression, configurable URL prefix, landing / describe / health
   pages, RFC 9728 Protected Resource Metadata, configurable response
   / externalised-response caps.
-- **Auth** — bearer (constant-time compare), mTLS via RFC 8705
+- **Auth** — provider-neutral peer evidence, strict Tailscale Serve/LocalAPI
+  adapters and PROXY v2 TCP identity snapshots; bearer (constant-time compare), mTLS via RFC 8705
   `x-forwarded-client-cert`, OAuth 2 Protected Resource Metadata;
   JWKS-backed JWT (single-flight refresh) and OAuth 2 PKCE
   primitives behind Cargo features.
@@ -52,6 +53,13 @@ Stock `arrow-rs` 59.x dependency tree, MSRV 1.97, no
 - **Graceful shutdown** on SIGTERM / SIGINT for both HTTP and Unix
   listeners.
 
+See [Tailscale identity evidence](docs/tailscale-identity.md) for Serve,
+LocalAPI WhoIs, and raw TCP PROXY v2 deployment profiles.
+See [cloud and trusted-proxy SPIFFE identity](docs/cloud-and-proxy-identity.md)
+for strict Envoy, nginx, AWS, GCP, and Azure ingress profiles.
+See [direct TCP mutual-TLS SPIFFE identity](docs/direct-tcp-mtls.md) for
+rustls client-chain verification, PROXY v2 ordering, and policy composition.
+
 ## Cargo features
 
 | feature | default | enables |
@@ -63,6 +71,7 @@ Stock `arrow-rs` 59.x dependency tree, MSRV 1.97, no
 | `oauth-pkce` |  | `auth::pkce` cookie + verifier crypto primitives. |
 | `oauth-pkce-server` |  | OAuth 2 PKCE server-side redirect / token-exchange (`reqwest`). |
 | `mtls-pem` |  | PEM-cert parsing helpers (`x509-parser`). XFCC parsing is always on. |
+| `tcp-mtls` |  | Mandatory rustls client certificates and direct X.509-SVID evidence for raw TCP. |
 | — |  | `auth::proof` (proxy proof) ships with `http`; no extra dependency. See `docs/proxy-proof-spec.md` in vgi-rpc. |
 | `otel` |  | `OtelHook` — real `tracing::Span` per RPC for `tracing-opentelemetry`. |
 | `sentry-tracing` |  | `TracingSentryHook` — lightweight, no extra deps. |
@@ -139,6 +148,8 @@ use vgi_rpc::{
 use vgi_rpc::auth::bearer::bearer_authenticate_static;      // always on
 use vgi_rpc::auth::mtls::mtls_authenticate_fingerprint;     // always on
 use vgi_rpc::auth::proof::proof_authenticate;               // feature `http`
+use vgi_rpc::{tailscale_serve_header_provider, tailscale_localapi_provider};
+use vgi_rpc::tcp::{serve_tcp_with_identity, TcpIdentityOptions};
 use vgi_rpc::http::{HttpState, HttpStateBuilder};            // "http"
 use vgi_rpc::external::{ExternalLocationConfig, Compression}; // "http"
 // use vgi_rpc::auth::jwt::jwt_authenticate;                 // "jwt"

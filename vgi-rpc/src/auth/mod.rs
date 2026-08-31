@@ -20,9 +20,15 @@
 //! from authenticating a request and is off unless explicitly enabled.
 
 pub mod bearer;
+pub mod identity;
 pub mod introspect;
 pub mod mtls;
 pub mod oauth;
+pub mod spiffe_proxy;
+pub mod tailscale;
+
+#[cfg(feature = "mtls-pem")]
+pub(crate) mod spiffe_x509;
 
 #[cfg(feature = "http")]
 pub mod proof;

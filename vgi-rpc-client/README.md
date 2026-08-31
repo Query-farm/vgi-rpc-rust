@@ -27,6 +27,11 @@ canonical Python client: you build the request parameters as a one-row Arrow
   trusted-peer boundary.
 - **AF_UNIX** — connect to a worker on a unix socket (with an optional read
   timeout for untrusted peers). *(feature `unix`)*
+- **TCP / SOCKS5h** — persistent raw Arrow framing over TCP. `Socks5hProxy`
+  supports credential-free userspace Tailscale sidecars with proxy-side IDNA
+  hostname resolution, one setup deadline, and no direct fallback. The proxy
+  URI intentionally requires an IP literal so local proxy DNS cannot escape
+  that deadline. Raw TCP provides neither encryption nor authentication.
 - **HTTP** — `reqwest`-blocking, with the full production surface:
   external-location resolution, sticky sessions, 413 request-externalization,
   415/zstd codec negotiation, a request timeout, and opt-in connection-level

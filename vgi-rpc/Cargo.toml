@@ -39,6 +39,10 @@ jwt-jsonwebtoken = ["jwt", "dep:jsonwebtoken", "dep:reqwest"]
 oauth-pkce = ["dep:base64", "dep:hmac", "dep:rand"]
 oauth-pkce-server = ["oauth-pkce", "http", "dep:reqwest", "dep:urlencoding"]
 mtls-pem = ["dep:x509-parser", "dep:percent-encoding"]
+# Blocking rustls server support for direct X.509-SVID identity on raw TCP.
+# Reuses the strict X.509 profile from `mtls-pem` after rustls verifies the
+# client chain and proves possession of the private key.
+tcp-mtls = ["mtls-pem", "dep:rustls"]
 otel = []
 # Lightweight, tracing-only Sentry hook. No extra deps; consumers wire
 # `sentry-tracing` themselves on the subscriber side if they want real
@@ -55,6 +59,7 @@ shm = ["dep:libc", "dep:windows-sys"]
 test-utils = []
 
 [dev-dependencies]
+base64.workspace = true
 tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber.workspace = true
@@ -185,6 +190,7 @@ urlencoding = { version = "2", optional = true }
 vgi-rpc-macros = { path = "../vgi-rpc-macros", version = "0.23.2", optional = true }
 x509-parser = { version = "0.16", optional = true }
 percent-encoding = { version = "2", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring"] }
 libc = { version = "0.2", optional = true }
 # Windows shared-memory backend (page-file-backed named CreateFileMapping) is
 # declared target-gated below (Windows only). Keeping it out of the cross-platform

@@ -53,6 +53,17 @@ jobs:
           grep -q 'fetchHttpi' target/browser-bindings/vgi_rpc_iroh_browser.d.ts
           grep -q 'openVgiStream' target/browser-bindings/vgi_rpc_iroh_browser.d.ts
 
+      - name: Smoke concurrent generated wasm-bindgen API in Chrome
+        env:
+          CC_wasm32_unknown_unknown: clang
+          AR_wasm32_unknown_unknown: llvm-ar
+        run: |
+          cargo build -p vgi-rpc-iroh-browser --target wasm32-unknown-unknown \
+            --features browser-smoke --locked
+          wasm-bindgen --target web --out-dir target/browser-smoke \
+            target/wasm32-unknown-unknown/debug/vgi_rpc_iroh_browser.wasm
+          vgi-rpc-iroh-browser/js/run-generated-bindings-smoke.sh
+
       - name: Upload browser WebAssembly package
         uses: actions/upload-artifact@v6
         with:

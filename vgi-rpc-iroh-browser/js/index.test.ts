@@ -25,7 +25,7 @@ test("raw VGI wasm stream is exposed as one WHATWG duplex stream", async () => {
         async read() {
           return reads.shift();
         },
-        closeWrite() {
+        async closeWrite() {
           writeClosed = true;
         },
         abort() {},
@@ -108,7 +108,7 @@ test("application resolver is the optional authorization boundary", async () => 
         async read() {
           return undefined;
         },
-        closeWrite() {},
+        async closeWrite() {},
         abort() {},
       };
     },
@@ -226,7 +226,7 @@ test("abort promptly rejects pending raw opens and disposes a late stream", asyn
     async read() {
       return undefined;
     },
-    closeWrite() {},
+    async closeWrite() {},
     abort() {
       lateAborted = true;
     },

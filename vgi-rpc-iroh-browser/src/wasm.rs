@@ -16,7 +16,9 @@ use http_body_util::BodyExt;
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 use js_sys::{Array, Reflect, Uint8Array};
+use tokio::sync::{watch, Mutex};
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::spawn_local;
 
 use crate::{IrohHttpEndpoint, IrohHttpError, RequestBody, IROH_HTTP_ALPN};
 
@@ -143,8 +145,12 @@ impl BrowserIrohNode {
             .await
             .map_err(|error| js_error("opening VGI stream failed", error))?;
         Ok(BrowserVgiStream {
-            send: Some(send),
-            recv: Some(recv),
+            send: Rc::new(Mutex::new(Some(send))),
+            recv: Rc::new(Mutex::new(Some(recv))),
+            send_cancel: watch::channel(false).0,
+            recv_cancel: watch::channel(false).0,
+            #[cfg(feature = "browser-smoke")]
+            smoke: false,
         })
     }
 
@@ -239,7 +245,10 @@ impl BrowserIrohNode {
         Ok(BrowserHttpResponse {
             status,
             headers: response_headers,
-            body: Some(response.into_body()),
+            body: Rc::new(Mutex::new(Some(response.into_body()))),
+            cancel: watch::channel(false).0,
+            #[cfg(feature = "browser-smoke")]
+            smoke: false,
         })
     }
 
@@ -300,44 +309,98 @@ pub async fn create_iroh_node(options: Option<JsValue>) -> Result<BrowserIrohNod
 /// these methods as WHATWG `ReadableStream` and `WritableStream` objects.
 #[wasm_bindgen]
 pub struct BrowserVgiStream {
-    send: Option<SendStream>,
-    recv: Option<RecvStream>,
+    send: Rc<Mutex<Option<SendStream>>>,
+    recv: Rc<Mutex<Option<RecvStream>>>,
+    send_cancel: watch::Sender<bool>,
+    recv_cancel: watch::Sender<bool>,
+    #[cfg(feature = "browser-smoke")]
+    smoke: bool,
+}
+
+async fn cancelled(mut receiver: watch::Receiver<bool>) {
+    if *receiver.borrow() {
+        return;
+    }
+    while receiver.changed().await.is_ok() {
+        if *receiver.borrow() {
+            return;
+        }
+    }
+}
+
+fn reset_send(send: Rc<Mutex<Option<SendStream>>>) {
+    spawn_local(async move {
+        if let Some(mut send) = send.lock().await.take() {
+            let _ = send.reset(CLOSE_CODE.into());
+        }
+    });
+}
+
+fn stop_recv(recv: Rc<Mutex<Option<RecvStream>>>) {
+    spawn_local(async move {
+        if let Some(mut recv) = recv.lock().await.take() {
+            let _ = recv.stop(CLOSE_CODE.into());
+        }
+    });
 }
 
 #[wasm_bindgen]
 impl BrowserVgiStream {
     /// Write the complete chunk, respecting QUIC backpressure.
-    pub async fn write(&mut self, chunk: Uint8Array) -> Result<(), JsValue> {
-        let send = self
-            .send
+    pub async fn write(&self, chunk: Uint8Array) -> Result<(), JsValue> {
+        #[cfg(feature = "browser-smoke")]
+        if self.smoke {
+            if *self.send_cancel.borrow() {
+                return Err(js_sys::Error::new("VGI stream write aborted").into());
+            }
+            let _ = chunk;
+            return Ok(());
+        }
+        let chunk = chunk.to_vec();
+        let mut send = self.send.lock().await;
+        let send = send
             .as_mut()
             .ok_or_else(|| js_sys::Error::new("VGI stream write side is closed"))?;
-        send.write_all(&chunk.to_vec())
-            .await
-            .map_err(|error| js_error("VGI stream write failed", error))
+        tokio::select! {
+            result = send.write_all(&chunk) => {
+                result.map_err(|error| js_error("VGI stream write failed", error))
+            }
+            () = cancelled(self.send_cancel.subscribe()) => {
+                Err(js_sys::Error::new("VGI stream write aborted").into())
+            }
+        }
     }
 
     /// Read up to `max_bytes`; returns `undefined` after a clean peer FIN.
-    pub async fn read(&mut self, max_bytes: usize) -> Result<Option<Uint8Array>, JsValue> {
+    pub async fn read(&self, max_bytes: usize) -> Result<Option<Uint8Array>, JsValue> {
         if max_bytes == 0 {
             return Err(js_sys::RangeError::new("maxBytes must be positive").into());
         }
-        let recv = self
-            .recv
+        #[cfg(feature = "browser-smoke")]
+        if self.smoke {
+            cancelled(self.recv_cancel.subscribe()).await;
+            return Err(js_sys::Error::new("VGI stream read aborted").into());
+        }
+        let mut recv = self.recv.lock().await;
+        let stream = recv
             .as_mut()
             .ok_or_else(|| js_sys::Error::new("VGI stream read side is closed"))?;
         let mut buffer = vec![0; max_bytes.min(1024 * 1024)];
-        let read = recv
-            .read(&mut buffer)
-            .await
-            .map_err(|error| js_error("VGI stream read failed", error))?;
+        let read = tokio::select! {
+            result = stream.read(&mut buffer) => {
+                result.map_err(|error| js_error("VGI stream read failed", error))?
+            }
+            () = cancelled(self.recv_cancel.subscribe()) => {
+                return Err(js_sys::Error::new("VGI stream read aborted").into());
+            }
+        };
         match read {
             Some(read) => {
                 buffer.truncate(read);
                 Ok(Some(Uint8Array::from(buffer.as_slice())))
             }
             None => {
-                self.recv = None;
+                *recv = None;
                 Ok(None)
             }
         }
@@ -345,8 +408,13 @@ impl BrowserVgiStream {
 
     /// Finish the request direction while retaining the response direction.
     #[wasm_bindgen(js_name = closeWrite)]
-    pub fn close_write(&mut self) -> Result<(), JsValue> {
-        let Some(mut send) = self.send.take() else {
+    pub async fn close_write(&self) -> Result<(), JsValue> {
+        #[cfg(feature = "browser-smoke")]
+        if self.smoke {
+            return Ok(());
+        }
+        let mut guard = self.send.lock().await;
+        let Some(mut send) = guard.take() else {
             return Ok(());
         };
         send.finish()
@@ -354,13 +422,11 @@ impl BrowserVgiStream {
     }
 
     /// Reset both stream directions.  This never closes sibling mux streams.
-    pub fn abort(&mut self) {
-        if let Some(mut send) = self.send.take() {
-            let _ = send.reset(CLOSE_CODE.into());
-        }
-        if let Some(mut recv) = self.recv.take() {
-            let _ = recv.stop(CLOSE_CODE.into());
-        }
+    pub fn abort(&self) {
+        self.send_cancel.send_replace(true);
+        self.recv_cancel.send_replace(true);
+        reset_send(Rc::clone(&self.send));
+        stop_recv(Rc::clone(&self.recv));
     }
 }
 
@@ -369,7 +435,10 @@ impl BrowserVgiStream {
 pub struct BrowserHttpResponse {
     status: u16,
     headers: Vec<(String, String)>,
-    body: Option<hyper::body::Incoming>,
+    body: Rc<Mutex<Option<hyper::body::Incoming>>>,
+    cancel: watch::Sender<bool>,
+    #[cfg(feature = "browser-smoke")]
+    smoke: bool,
 }
 
 #[wasm_bindgen]
@@ -393,22 +462,69 @@ impl BrowserHttpResponse {
 
     /// Read the next raw HTTP body data frame; trailers are currently skipped.
     /// No browser content decoding is performed.
-    pub async fn read(&mut self) -> Result<Option<Uint8Array>, JsValue> {
-        let Some(body) = self.body.as_mut() else {
+    pub async fn read(&self) -> Result<Option<Uint8Array>, JsValue> {
+        #[cfg(feature = "browser-smoke")]
+        if self.smoke {
+            cancelled(self.cancel.subscribe()).await;
+            return Err(js_sys::Error::new("HTTP response body cancelled").into());
+        }
+        let mut guard = self.body.lock().await;
+        let Some(body) = guard.as_mut() else {
             return Ok(None);
         };
-        while let Some(frame) = body.frame().await {
+        loop {
+            let frame = tokio::select! {
+                frame = body.frame() => frame,
+                () = cancelled(self.cancel.subscribe()) => {
+                    return Err(js_sys::Error::new("HTTP response body cancelled").into());
+                }
+            };
+            let Some(frame) = frame else {
+                *guard = None;
+                return Ok(None);
+            };
             let frame =
                 frame.map_err(|error| js_error("reading HTTP response body failed", error))?;
             if let Ok(data) = frame.into_data() {
                 return Ok(Some(Uint8Array::from(data.as_ref())));
             }
         }
-        self.body = None;
-        Ok(None)
     }
 
-    pub fn cancel(&mut self) {
-        self.body = None;
+    pub fn cancel(&self) {
+        self.cancel.send_replace(true);
+        let body = Rc::clone(&self.body);
+        spawn_local(async move {
+            body.lock().await.take();
+        });
+    }
+}
+
+/// Test-only factory used by the generated-bindings browser smoke.  It returns
+/// the real exported class with deterministic pending I/O, so the test detects
+/// wasm-bindgen's dynamic borrow behavior rather than exercising a mock.
+#[cfg(feature = "browser-smoke")]
+#[wasm_bindgen(js_name = __vgiBorrowSmoke)]
+pub fn vgi_borrow_smoke() -> BrowserVgiStream {
+    BrowserVgiStream {
+        send: Rc::new(Mutex::new(None)),
+        recv: Rc::new(Mutex::new(None)),
+        send_cancel: watch::channel(false).0,
+        recv_cancel: watch::channel(false).0,
+        smoke: true,
+    }
+}
+
+/// Test-only pending HTTP body for verifying cancel-during-read through the
+/// actual wasm-bindgen JavaScript glue.
+#[cfg(feature = "browser-smoke")]
+#[wasm_bindgen(js_name = __httpBorrowSmoke)]
+pub fn http_borrow_smoke() -> BrowserHttpResponse {
+    BrowserHttpResponse {
+        status: 200,
+        headers: Vec::new(),
+        body: Rc::new(Mutex::new(None)),
+        cancel: watch::channel(false).0,
+        smoke: true,
     }
 }

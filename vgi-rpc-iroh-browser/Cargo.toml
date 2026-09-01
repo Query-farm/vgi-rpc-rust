@@ -15,6 +15,9 @@ categories = ["network-programming", "wasm", "web-programming::http-client"]
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+browser-smoke = []
+
 [dependencies]
 bytes.workspace = true
 http = "1"

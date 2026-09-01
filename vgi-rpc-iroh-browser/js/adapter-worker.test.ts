@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { installIrohVgiAdapter } from "./adapter-worker.ts";
-import { HttpiTransportError } from "./index.ts";
+import { HttpiTransportError, IrohNode } from "./index.ts";
 import type {
   HeaderPair,
   HttpiResponse,
-  IrohNode,
   VgiDuplexStream,
+  WasmHttpResponse,
+  WasmIrohNode,
 } from "./index.ts";
 
 const MAGIC = 0x42534756;
@@ -509,6 +510,116 @@ test("httpi aggregate admission prevents concurrent buffered claims from multipl
     /aggregate request-body budget exhausted/,
   );
   stop();
+});
+
+test("httpi body budget remains charged until an aborted wasm request actually settles", async (t) => {
+  const listeners = installTestScope();
+  let resolveFirst!: (response: WasmHttpResponse) => void;
+  let fetchCalls = 0;
+  let lateCancelled = false;
+  const wasm = {
+    endpointId: "01".repeat(32),
+    async openVgiStream() {
+      throw new Error("unused");
+    },
+    fetchHttpi() {
+      fetchCalls++;
+      if (fetchCalls === 1) {
+        return new Promise<WasmHttpResponse>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return Promise.resolve({
+        status: 200,
+        headers: [],
+        async read() {
+          return undefined;
+        },
+        cancel() {},
+      });
+    },
+    async close() {},
+  } as WasmIrohNode;
+  const node = new IrohNode(wasm);
+  const cap = 1024;
+  const { buffer, words } = makeRegion(2, cap);
+  const stride = SLOT_CONTROL_BYTES + cap * 2;
+  const firstControl = HEADER_BYTES >> 2;
+  const secondControl = (HEADER_BYTES + stride) >> 2;
+  const stop = installIrohVgiAdapter(Promise.resolve(node), {
+    maxHttpiRequestBytes: 8,
+    maxHttpiAggregateRequestBytes: 8,
+  });
+  t.after(stop);
+  for (const listener of listeners)
+    listener({
+      data: {
+        type: "vgi-init",
+        target: `httpi://${"02".repeat(32)}`,
+        buffer,
+        offset: 0,
+      },
+    });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  writeClaim(
+    buffer,
+    words,
+    0,
+    cap,
+    141,
+    encodeHttpiRequest("POST", "/vgi", [], new Uint8Array(6)),
+  );
+  await until(() => fetchCalls === 1 && typeof resolveFirst === "function");
+
+  // Releasing the SAB claim aborts the caller-visible wrapper, but the wasm
+  // future still owns the Uint8Array. Its six-byte lease must remain charged.
+  Atomics.store(words, firstControl, 0);
+  writeClaim(
+    buffer,
+    words,
+    1,
+    cap,
+    142,
+    encodeHttpiRequest("POST", "/vgi", [], new Uint8Array(6)),
+  );
+  await until(() => Atomics.load(words, secondControl + 6) === 142);
+  const rejected = new Uint8Array(
+    buffer,
+    (secondControl << 2) + SLOT_CONTROL_BYTES + cap,
+    Atomics.load(words, secondControl + 4),
+  );
+  assert.match(
+    new TextDecoder().decode(rejected),
+    /aggregate request-body budget exhausted/,
+  );
+  assert.equal(fetchCalls, 1);
+
+  resolveFirst({
+    status: 200,
+    headers: [],
+    async read() {
+      return undefined;
+    },
+    cancel() {
+      lateCancelled = true;
+    },
+  });
+  await until(() => lateCancelled);
+
+  // Once the real wasm promise settles, the lease is released and another
+  // six-byte request is admitted.
+  for (let index = 0; index < SLOT_CONTROL_BYTES / 4; index++)
+    Atomics.store(words, secondControl + index, 0);
+  writeClaim(
+    buffer,
+    words,
+    1,
+    cap,
+    143,
+    encodeHttpiRequest("POST", "/vgi", [], new Uint8Array(6)),
+  );
+  await until(() => fetchCalls === 2);
 });
 
 function encodeHttpiRequest(

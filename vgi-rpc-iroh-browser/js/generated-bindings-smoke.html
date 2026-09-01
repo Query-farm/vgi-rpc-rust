@@ -1,0 +1,51 @@
+<!doctype html>
+<meta charset="utf-8">
+<body>RUNNING</body>
+<script type="module">
+  const bounded = (promise, label) => Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} did not settle`)), 2000),
+    ),
+  ]);
+  const rejects = async (promise, label) => {
+    try {
+      await bounded(promise, label);
+      throw new Error(`${label} unexpectedly resolved`);
+    } catch (error) {
+      if (String(error).includes("unexpectedly resolved")) throw error;
+    }
+  };
+
+  try {
+    const wasm = await import("/target/browser-smoke/vgi_rpc_iroh_browser.js");
+    await wasm.default();
+
+    // These calls use the real generated BrowserVgiStream bindings. A mutable
+    // async wasm-bindgen receiver fails synchronously when write/abort overlaps
+    // the pending read; shared receivers permit the intended duplex use.
+    const stream = wasm.__vgiBorrowSmoke();
+    const pendingRead = stream.read(1024);
+    await bounded(stream.write(new Uint8Array([1, 2, 3])), "overlapping write");
+    stream.abort();
+    await rejects(pendingRead, "aborted raw read");
+    await bounded(stream.closeWrite(), "ordered half-close");
+    const preAborted = wasm.__vgiBorrowSmoke();
+    preAborted.abort();
+    await rejects(preAborted.read(1024), "read after raw abort");
+
+    // Likewise, cancel must remain callable while an exported async read owns
+    // the response-body future, and that read must be woken promptly.
+    const response = wasm.__httpBorrowSmoke();
+    const pendingBodyRead = response.read();
+    response.cancel();
+    await rejects(pendingBodyRead, "cancelled HTTP read");
+    const preCancelled = wasm.__httpBorrowSmoke();
+    preCancelled.cancel();
+    await rejects(preCancelled.read(), "read after HTTP cancel");
+
+    document.body.textContent = "PASS";
+  } catch (error) {
+    document.body.textContent = `FAIL: ${error?.stack ?? error}`;
+  }
+</script>

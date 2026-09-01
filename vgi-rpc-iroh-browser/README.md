@@ -23,12 +23,22 @@ certainty. Ambiguous POST failures are never replayed, and releasing a claim
 cancels pending resolution, connect/request wrappers, and response streams.
 Because the current wasm API materializes request bodies, the adapter defaults
 to 64 MiB per claim and 128 MiB across all active claims; applications may lower
-these values through `installIrohVgiAdapter` options. Raw duplex pump failures
-abort the sibling direction immediately rather than waiting on a blocked ring.
+these values through `installIrohVgiAdapter` options. If a claim is aborted
+while its wasm request is still pending, its body lease remains charged until
+that request settles and releases the retained `Uint8Array`. Raw duplex pump
+failures abort the sibling direction immediately rather than waiting on a
+blocked ring.
 The public wrapper also admits at most 16 underlying wasm connect/request
 futures by default. An aborted caller returns promptly, but its admission slot
 is deliberately retained until the actual Rust future settles; this prevents
 repeated network outages from accumulating unbounded background connects.
+
+The generated wasm API permits one read and one write to remain pending on the
+same raw stream. Writes are serialized for ordering and QUIC backpressure.
+`abort()` and HTTP `cancel()` use independent cancellation state, so they remain
+callable during pending async I/O and wake it before resetting or dropping the
+underlying resource. CI exercises these overlaps through the real generated
+wasm-bindgen JavaScript glue in headless Chrome.
 
 One node should be shared by the whole DuckDB engine so raw and HTTP requests
 present the same cryptographic endpoint identity. HTTP response bodies are raw

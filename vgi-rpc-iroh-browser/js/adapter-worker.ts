@@ -732,6 +732,7 @@ async function serveHttpiClaim(
   }
 
   let response: HttpiResponse;
+  let underlyingSettled: Promise<void> | undefined;
   try {
     response = await node.fetchHttpi(
       region.endpointId,
@@ -740,6 +741,9 @@ async function serveHttpiClaim(
       request.headers,
       request.body,
       signal,
+      (settled) => {
+        underlyingSettled = settled;
+      },
     );
   } catch (error) {
     if (signal.aborted) return;
@@ -787,7 +791,9 @@ async function serveHttpiClaim(
     );
     return;
   } finally {
-    budget.release(request.reservedBytes);
+    const release = () => budget.release(request.reservedBytes);
+    if (underlyingSettled) void underlyingSettled.then(release, release);
+    else release();
     request.body = new Uint8Array();
   }
 

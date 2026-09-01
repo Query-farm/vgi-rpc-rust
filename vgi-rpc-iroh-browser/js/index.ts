@@ -6,7 +6,7 @@ export type IrohProtocol = "vgi-rpc/arrow-mux/1" | "iroh-http/2";
 export interface WasmVgiStream {
   write(chunk: Uint8Array): Promise<void>;
   read(maxBytes: number): Promise<Uint8Array | undefined>;
-  closeWrite(): void;
+  closeWrite(): Promise<void>;
   abort(): void;
 }
 
@@ -156,6 +156,7 @@ export class IrohNode {
     start: () => Promise<T>,
     signal?: AbortSignal,
     disposeLate?: (value: T) => void,
+    onUnderlyingSettled?: (settled: Promise<void>) => void,
   ): Promise<T> {
     if (this.pendingOperations >= this.maxPendingOperations) {
       return Promise.reject(
@@ -177,7 +178,7 @@ export class IrohNode {
     }
     // Admission remains charged after the caller aborts. Only the actual wasm
     // future settling releases it, which hard-bounds abandoned connects.
-    underlying.then(
+    const settled = underlying.then(
       () => {
         this.pendingOperations--;
       },
@@ -185,6 +186,7 @@ export class IrohNode {
         this.pendingOperations--;
       },
     );
+    onUnderlyingSettled?.(settled);
     return abortable(underlying, signal, disposeLate);
   }
 
@@ -256,8 +258,8 @@ export class IrohNode {
         throwIfAborted(options.signal);
         await stream.write(chunk);
       },
-      close() {
-        stream.closeWrite();
+      async close() {
+        await stream.closeWrite();
       },
       abort() {
         abortStream();
@@ -273,6 +275,8 @@ export class IrohNode {
     headers: HeaderPair[],
     body: Uint8Array,
     signal?: AbortSignal,
+    /** Internal adapter hook: settles with the actual wasm request, not caller abort. */
+    onUnderlyingSettled?: (settled: Promise<void>) => void,
   ): Promise<HttpiResponse> {
     try {
       throwIfAborted(signal);
@@ -305,6 +309,7 @@ export class IrohNode {
         () => this.wasm.fetchHttpi(endpointId, method, path, headers, body),
         signal,
         (lateResponse) => lateResponse.cancel(),
+        onUnderlyingSettled,
       );
     } catch (error) {
       if (signal?.aborted) {

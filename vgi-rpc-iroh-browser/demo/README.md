@@ -12,7 +12,7 @@ It uses the generated wasm-bindgen package, the production
 `installIrohVgiAdapter` pump, and Haybarn's production
 `installVgiWebWorkerBridge`. The page accepts one bridge EndpointId, authorizes
 only that exact peer, loads the VGI extension, executes
-`ATTACH 'httpi://<EndpointId>' AS remote (TYPE vgi)`, and runs a SELECT against
+`ATTACH 'example' AS remote (TYPE vgi, LOCATION 'httpi://<EndpointId>')`, and runs a SELECT against
 the attached catalog.
 
 ## Prerequisites

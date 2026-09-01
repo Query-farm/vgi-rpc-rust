@@ -14,7 +14,7 @@ test("parseEndpointId accepts only the canonical bridge identity", () => {
   assert.throws(() => parseEndpointId("0a"), /lowercase hex/);
 });
 
-test("requireSelect keeps the demo read-only", () => {
+test("requireSelect rejects obviously non-query input", () => {
   assert.equal(requireSelect("  SELECT 42; "), "SELECT 42;");
   assert.equal(
     requireSelect("with x as (select 1) select * from x"),

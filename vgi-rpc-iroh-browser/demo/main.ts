@@ -20,6 +20,20 @@ const resultRoot = required<HTMLElement>("result");
 
 let database: { terminate(): Promise<void> } | undefined;
 let adapterWorker: Worker | undefined;
+let browserEndpointId: string | undefined;
+
+declare global {
+  interface Window {
+    __vgiIrohDemo?: {
+      done: boolean;
+      browserEndpointId?: string;
+      rows?: unknown[][];
+      error?: string;
+    };
+  }
+}
+
+window.__vgiIrohDemo = { done: false };
 
 const endpointFromUrl = new URL(location.href).searchParams.get("endpoint");
 if (endpointFromUrl) endpointInput.value = endpointFromUrl;
@@ -31,6 +45,7 @@ window.addEventListener("beforeunload", () => {
 });
 
 async function runDemo(): Promise<void> {
+  window.__vgiIrohDemo = { done: false };
   runButton.disabled = true;
   resultRoot.replaceChildren();
   logOutput.textContent = "";
@@ -59,6 +74,7 @@ async function runDemo(): Promise<void> {
       const message = event.data as
         { type?: string; endpointId?: string; error?: string } | undefined;
       if (message?.type === "demo-iroh-identity") {
+        browserEndpointId = message.endpointId;
         appendLog(`Local browser EndpointId: ${message.endpointId}`);
       } else if (message?.type === "demo-iroh-error") {
         appendLog(`Iroh adapter error: ${message.error}`);
@@ -99,7 +115,9 @@ async function runDemo(): Promise<void> {
       appendLog("Loaded the VGI extension.");
 
       setStatus(`Attaching ${target}…`);
-      await connection.query(`ATTACH '${target}' AS remote (TYPE vgi)`);
+      await connection.query(
+        `ATTACH 'example' AS remote (TYPE vgi, LOCATION '${target}')`,
+      );
       appendLog("ATTACH completed; remote catalog discovery succeeded.");
 
       const functions = (await connection.query(
@@ -114,6 +132,12 @@ async function runDemo(): Promise<void> {
       appendLog(`SQL> ${query}`);
       const result = (await connection.query(query)) as ArrowLikeResult;
       renderResult(result);
+      const rows = resultRows(result);
+      window.__vgiIrohDemo = {
+        done: true,
+        browserEndpointId,
+        rows,
+      };
       setStatus(`Done — ${result.numRows} row(s).`, "ok");
     } finally {
       await connection.close();
@@ -122,10 +146,21 @@ async function runDemo(): Promise<void> {
     const detail =
       error instanceof Error ? (error.stack ?? error.message) : String(error);
     appendLog(detail);
+    window.__vgiIrohDemo = {
+      done: true,
+      browserEndpointId,
+      error: detail,
+    };
     setStatus("Failed — see the log below.", "error");
   } finally {
     runButton.disabled = false;
   }
+}
+
+function resultRows(result: ArrowLikeResult): unknown[][] {
+  return Array.from({ length: result.numRows }, (_, row) =>
+    result.schema.fields.map((_, column) => result.getChildAt(column)?.get(row)),
+  );
 }
 
 function renderResult(result: ArrowLikeResult): void {

@@ -10,31 +10,37 @@ const repository = join(here, "..", "..");
 const haybarn =
   process.env.HAYBARN_WASM ??
   join(homedir(), "Development", "haybarn", "haybarn-wasm");
+const engineRoot = process.env.VGI_ENGINE_ROOT ?? haybarn;
 const generatedBindings =
   process.env.IROH_BINDINGS ?? join(repository, "target", "browser-bindings");
 const engineVersion = process.env.VGI_ENGINE_VERSION_DIR ?? "v1.5.5";
 const extension =
   process.env.VGI_EXT_WASM ??
   join(
-    haybarn,
+    engineRoot,
     "extensions",
     engineVersion,
     "wasm_threads",
     "vgi.duckdb_extension.wasm",
   );
 const output = process.env.DEMO_DIST ?? join(here, "dist");
-const haybarnDist = join(haybarn, "packages", "duckdb-wasm", "dist");
 const engineWasmCandidates = [
   join(
-    haybarn,
+    engineRoot,
     "packages",
     "duckdb-wasm",
     "src",
     "bindings",
     "duckdb-coi.wasm",
   ),
-  join(haybarnDist, "duckdb-coi.wasm"),
+  join(engineRoot, "packages", "duckdb-wasm", "dist", "duckdb-coi.wasm"),
 ];
+const haybarnDist = join(
+  engineRoot,
+  "packages",
+  "duckdb-wasm",
+  "dist",
+);
 const engineWasm = engineWasmCandidates.find(existsSync);
 const generatedJavaScript = join(generatedBindings, "vgi_rpc_iroh_browser.js");
 const generatedWasm = join(generatedBindings, "vgi_rpc_iroh_browser_bg.wasm");

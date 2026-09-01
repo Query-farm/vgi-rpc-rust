@@ -210,7 +210,7 @@
           <label>
             SELECT to run after attaching the catalog as <code>remote</code>
             <textarea id="query" spellcheck="false">
-SELECT * FROM remote.main.count_to(5);</textarea>
+SELECT remote.main.whoami(1) AS identity;</textarea>
           </label>
           <div class="actions">
             <button id="run" type="button">Attach and run</button>

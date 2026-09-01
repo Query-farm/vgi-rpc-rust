@@ -92,11 +92,33 @@ async fn main() -> Result<()> {
 
     println!("{endpoint_id}");
     tracing::info!(%endpoint_id, "VGI Iroh bridge ready");
-    tokio::signal::ctrl_c()
-        .await
-        .context("wait for shutdown signal")?;
+    shutdown_signal().await?;
     router.shutdown().await.context("shut down Iroh router")?;
     Ok(())
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut terminate = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.context("wait for SIGINT")?;
+            }
+            _ = terminate.recv() => {}
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("wait for shutdown signal")?;
+        Ok(())
+    }
 }
 
 fn load_secret_key(args: &Args) -> Result<SecretKey> {

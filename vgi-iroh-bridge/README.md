@@ -55,8 +55,9 @@ The first stdout line is the bridge EndpointId. A persistent key is required
 from `--secret-key-file` or `VGI_IROH_SECRET_KEY`; `--ephemeral` is an explicit
 development-only alternative. The key itself is never accepted as a command
 line argument. Repeated `--relay-url` values replace the default relay set,
-and `--no-relay` selects direct paths only. `SIGINT` stops the Router, which in
-turn drains both protocol handlers within their configured bounds.
+and `--no-relay` selects direct paths only. `SIGINT` and, on Unix, `SIGTERM`
+stop the Router, which in turn drains both protocol handlers within their
+configured bounds.
 
 Raw `tcp://` destinations accept IP literals or DNS names, so the one fixed
 destination may be an internal Envoy/nginx stream listener or cloud network

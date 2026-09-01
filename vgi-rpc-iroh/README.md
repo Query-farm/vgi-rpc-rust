@@ -4,13 +4,16 @@
 over an authenticated Iroh QUIC connection. Iroh remains an optional workspace
 crate: neither `vgi-rpc` nor `vgi-rpc-client` depends on it.
 
-Each client connection opens one long-lived bidirectional QUIC stream. All
-unary calls and producer/exchange turns use that stream, so worker stream state
-stays in memory exactly as it does over pipe, Unix sockets, or raw TCP. It does
-not convert Arrow batches to HTTP bodies or serialize continuation state.
+The `vgi-rpc/arrow-mux/1` protocol carries many independent logical VGI
+transports on one Iroh QUIC connection. Each logical transport is one
+long-lived bidirectional QUIC stream. Unary calls and producer/exchange turns
+on that transport stay on the same stream, so worker state stays in memory
+exactly as it does over pipe, Unix sockets, or raw TCP. It does not convert
+Arrow batches to HTTP bodies or serialize continuation state.
 
-The server snapshots `Connection::remote_id()` after Iroh's cryptographic
-handshake and records it as stable `iroh` peer evidence. Possession of an
+The server snapshots `Connection::remote_id()` once after Iroh's cryptographic
+handshake and shares that immutable evidence with every accepted logical
+stream. Possession of an
 Internet-reachable endpoint key proves the peer key; it does **not** prove
 deployment membership or authorization. The default therefore observes this
 evidence without authenticating it. An operator must configure an explicit
@@ -61,21 +64,25 @@ application authentication, or deliberately select primary identity in a
 network where membership is enforced independently. `issuer` must uniquely
 name the deployment so endpoint IDs from separate trust domains cannot collide.
 
-The server bounds pending handshakes and established connections before
-allocating blocking framing work. Stream-open and per-read/write idle budgets
-close peers that occupy admission slots without making progress. An absolute
-`first_request_timeout` also bounds the first VGI frame even when a peer keeps
-drip-feeding bytes inside the idle timeout. The budget stops applying when the
-server begins the first response, after the first request framing has been
-consumed.
+The server bounds pending handshakes, established connections, global logical
+streams, and streams per connection before allocating blocking framing work.
+The first-stream-open budget prevents a peer from occupying an unused
+connection slot. Per-read/write idle budgets apply independently to each
+logical stream, so a timed-out or malformed stream is reset without poisoning
+healthy sibling streams. An absolute `first_request_timeout` also bounds each
+stream's first VGI frame even when a peer keeps drip-feeding bytes inside the
+idle timeout. The budget stops applying when the server begins that stream's
+first response, after its first request framing has been consumed.
 
-Configure `max_pending_handshakes`, `max_active_connections`, and
+Configure `max_pending_handshakes`, `max_active_connections`,
+`max_active_streams`, `max_active_streams_per_connection`, and
 `connection_io_timeout` for the deployment's capacity. Internet-facing workers
 can additionally set `max_active_connections_per_endpoint` (or use
 `with_max_active_connections_per_endpoint`) so one authenticated endpoint key
-cannot occupy every global connection slot. Endpoint permits are held for the
-whole connection and released automatically on rejection, timeout, shutdown,
-or normal completion.
+cannot occupy every global connection slot. Connection and stream permits are
+released automatically on rejection, timeout, shutdown, or normal completion.
+Shutdown stops accepting new streams, lets active streams finish until
+`shutdown_timeout`, and then cancels only the remaining work.
 
 ## Client
 
@@ -83,20 +90,26 @@ or normal completion.
 use std::time::Duration;
 use iroh::{Endpoint, EndpointId, endpoint::presets};
 use vgi_rpc_client::RpcClient;
-use vgi_rpc_iroh::{IrohClientOptions, IrohTransport};
+use vgi_rpc_iroh::{IrohClientOptions, IrohConnection};
 
 # async fn connect(remote: EndpointId) -> Result<(), Box<dyn std::error::Error>> {
 let endpoint = Endpoint::bind(presets::N0).await?;
-let transport = IrohTransport::connect_id(
+let connection = IrohConnection::connect_id(
     endpoint,
     remote,
     IrohClientOptions::default().with_rpc_timeout(Duration::from_secs(30)),
 ).await?;
+let transport = connection.open_transport().await?;
 
 // RpcClient is blocking. Run calls on a blocking thread, outside Tokio's
 // async worker threads.
 let mut client = RpcClient::from_transport(Box::new(transport));
 # drop(client);
+
+// Open another independent logical VGI transport without another Iroh
+// handshake. It can be used concurrently on another blocking thread.
+let second_client = connection.open_client().await?;
+# drop(second_client);
 # Ok(()) }
 ```
 
@@ -104,9 +117,14 @@ Connecting with only an endpoint ID requires the supplied Iroh endpoint to
 have a suitable address-lookup service. `connect_addr` also accepts an
 `EndpointAddr` containing direct or relay addresses.
 
-Cancellation closes the QUIC connection and interrupts blocked framing I/O.
-Connect, stream-open, handshake, and shutdown budgets use Tokio's monotonic
-timeouts. The optional client RPC timeout is a single monotonic budget across
-all reads and writes in a VGI call or stream turn.
+Dropping or closing an `IrohTransport` finishes/resets only its QUIC stream.
+Dropping the last `IrohConnection`/transport handle or explicitly calling
+`IrohConnection::close` closes the pooled connection. Cancelling the
+connection token interrupts all blocked stream work; call `close` as well when
+the peer must observe immediate connection closure. Connect, stream-open,
+handshake, and shutdown budgets use Tokio's monotonic timeouts. The optional
+client RPC timeout is a single monotonic budget across all reads and writes in
+a VGI call or stream turn. `IrohTransport::connect_id` and `connect_addr`
+remain as one-connection/one-stream convenience constructors.
 
 Iroh 1.1.0 has MSRV 1.91; this workspace tests the adapter with Rust 1.97.

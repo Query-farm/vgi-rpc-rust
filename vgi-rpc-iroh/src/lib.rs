@@ -26,8 +26,8 @@ use vgi_rpc::{
 use vgi_rpc_client::transport::RpcDeadline;
 use vgi_rpc_client::{RpcClient, Transport};
 
-/// ALPN used by the stateful VGI-over-Iroh protocol.
-pub const VGI_IROH_ALPN: &[u8] = b"vgi-rpc/arrow-stream/1";
+/// ALPN used by the multiplexed, stateful VGI-over-Iroh protocol.
+pub const VGI_IROH_ALPN: &[u8] = b"vgi-rpc/arrow-mux/1";
 
 const CLOSE_CODE: u32 = 0;
 const CLOSE_REASON: &[u8] = b"vgi-rpc transport closed";
@@ -75,6 +75,16 @@ fn redacted_policy_error(error: RpcError) -> RpcError {
             "peer identity authentication rejected",
         )
     }
+}
+
+fn endpoint_subject(endpoint: EndpointId) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut subject = String::with_capacity(64);
+    for byte in endpoint.as_bytes() {
+        subject.push(HEX[usize::from(byte >> 4)] as char);
+        subject.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    subject
 }
 
 fn adapter_error_class(error: &IrohAdapterError) -> &'static str {
@@ -131,7 +141,13 @@ pub struct IrohServerOptions {
     /// Optional concurrent connection limit for each authenticated endpoint
     /// ID. This is enforced in addition to `max_active_connections`.
     pub max_active_connections_per_endpoint: Option<usize>,
-    /// Maximum graceful drain after shutdown closes active connections.
+    /// Maximum number of logical VGI streams dispatched across all Iroh
+    /// connections. Admission is acquired before blocking worker dispatch.
+    pub max_active_streams: usize,
+    /// Maximum number of concurrent logical VGI streams on one Iroh
+    /// connection. Excess streams are rejected without closing the connection.
+    pub max_active_streams_per_connection: usize,
+    /// Maximum graceful drain for active logical streams after shutdown.
     pub shutdown_timeout: Duration,
 }
 
@@ -148,6 +164,8 @@ impl Default for IrohServerOptions {
             max_pending_handshakes: 64,
             max_active_connections: 256,
             max_active_connections_per_endpoint: None,
+            max_active_streams: 1024,
+            max_active_streams_per_connection: 32,
             shutdown_timeout: Duration::from_secs(10),
         }
     }
@@ -179,6 +197,16 @@ impl IrohServerOptions {
         self
     }
 
+    pub fn with_max_active_streams(mut self, limit: usize) -> Self {
+        self.max_active_streams = limit;
+        self
+    }
+
+    pub fn with_max_active_streams_per_connection(mut self, limit: usize) -> Self {
+        self.max_active_streams_per_connection = limit;
+        self
+    }
+
     fn validate(&self) -> Result<()> {
         if self.issuer.is_empty()
             || self.handshake_timeout.is_zero()
@@ -189,6 +217,8 @@ impl IrohServerOptions {
             || self.max_pending_handshakes == 0
             || self.max_active_connections == 0
             || self.max_active_connections_per_endpoint == Some(0)
+            || self.max_active_streams == 0
+            || self.max_active_streams_per_connection == 0
         {
             return Err(IrohAdapterError::Authentication(RpcError::value_error(
                 "Iroh issuer, timeouts, and admission limits must be positive",
@@ -201,6 +231,7 @@ impl IrohServerOptions {
 struct IrohAdmission {
     pending: Arc<Semaphore>,
     active: Arc<Semaphore>,
+    streams: Arc<Semaphore>,
     endpoint_active: Arc<Mutex<HashMap<String, usize>>>,
     max_active_per_endpoint: Option<usize>,
 }
@@ -210,6 +241,7 @@ impl IrohAdmission {
         Self {
             pending: Arc::new(Semaphore::new(options.max_pending_handshakes)),
             active: Arc::new(Semaphore::new(options.max_active_connections)),
+            streams: Arc::new(Semaphore::new(options.max_active_streams)),
             endpoint_active: Arc::new(Mutex::new(HashMap::new())),
             max_active_per_endpoint: options.max_active_connections_per_endpoint,
         }
@@ -228,6 +260,14 @@ impl IrohAdmission {
             .try_acquire_owned()
             .map_err(|_| IrohAdapterError::Saturated {
                 operation: "Iroh connection admission",
+            })
+    }
+
+    fn try_stream(&self) -> Result<OwnedSemaphorePermit> {
+        Arc::clone(&self.streams)
+            .try_acquire_owned()
+            .map_err(|_| IrohAdapterError::Saturated {
+                operation: "Iroh stream admission",
             })
     }
 
@@ -257,6 +297,11 @@ impl IrohAdmission {
 struct EndpointPermit {
     endpoint: String,
     active: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+struct StreamPermits {
+    _global: OwnedSemaphorePermit,
+    _local: OwnedSemaphorePermit,
 }
 
 impl Drop for EndpointPermit {
@@ -361,24 +406,17 @@ impl IrohServer {
         }
 
         connections_shutdown.cancel();
-        let drain = async {
-            while let Some(completed) = connections.join_next().await {
-                report_connection_result(Some(completed));
-            }
-        };
-        if timeout(self.options.shutdown_timeout, drain).await.is_err() {
-            connections.abort_all();
-            while connections.join_next().await.is_some() {}
+        while let Some(completed) = connections.join_next().await {
+            report_connection_result(Some(completed));
         }
         Ok(())
     }
 
     /// Serve one already-authenticated Iroh connection.
     ///
-    /// One long-lived bidirectional QUIC stream is accepted and handed to the
-    /// ordinary blocking VGI connection loop. That loop retains VGI stream and
-    /// connection state across all calls; no HTTP continuation encoding is
-    /// involved.
+    /// Each accepted bidirectional QUIC stream is one stateful logical VGI
+    /// transport. Streams are dispatched independently, while the
+    /// cryptographic peer identity is snapshotted once for this connection.
     pub async fn serve_connection(
         &self,
         connection: Connection,
@@ -400,53 +438,159 @@ impl IrohServer {
     ) -> Result<()> {
         let remote_id = connection.remote_id();
         let context = self.connection_context(remote_id)?;
-        let (send, recv) = cancellable_timeout(
+        let per_connection = Arc::new(Semaphore::new(
+            self.options.max_active_streams_per_connection,
+        ));
+        let hard_cancel = CancellationToken::new();
+        let mut streams = JoinSet::new();
+
+        // A peer cannot occupy a connection slot forever without opening its
+        // first logical transport. Once multiplexing is active, an idle gap
+        // between later streams is harmless and is governed by QUIC itself.
+        let first = cancellable_timeout(
             &shutdown,
             self.options.stream_open_timeout,
-            "Iroh VGI stream open",
+            "first Iroh VGI stream open",
             connection.accept_bi(),
         )
         .await?
-        .map_err(|error| iroh_error("accept Iroh bidirectional stream", error))?;
+        .map_err(|error| iroh_error("accept first Iroh bidirectional stream", error))?;
+        self.admit_stream(
+            first,
+            &mut streams,
+            Arc::clone(&per_connection),
+            context.clone(),
+            shutdown.clone(),
+            hard_cancel.child_token(),
+        );
 
-        let handle = Handle::current();
-        let first_request = Arc::new(FirstRequestBudget::new(self.options.first_request_timeout));
-        let reader = BlockingRecv {
-            stream: recv,
-            handle: handle.clone(),
-            cancellation: shutdown.clone(),
-            deadline: None,
-            io_timeout: Some(self.options.connection_io_timeout),
-            first_request: Some(Arc::clone(&first_request)),
-        };
-        let writer = BlockingSend {
-            stream: send,
-            handle,
-            cancellation: shutdown.clone(),
-            deadline: None,
-            io_timeout: Some(self.options.connection_io_timeout),
-            first_request: Some(first_request),
-        };
-        let rpc = Arc::clone(&self.rpc);
-        let task = tokio::task::spawn_blocking(move || {
-            rpc.serve_with_context(reader, writer, context);
-        });
-        tokio::pin!(task);
-
-        tokio::select! {
-            result = &mut task => result.map_err(IrohAdapterError::Join)?,
-            _ = shutdown.cancelled() => {
-                connection.close(CLOSE_CODE.into(), CLOSE_REASON);
-                task.await.map_err(IrohAdapterError::Join)?;
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                accepted = connection.accept_bi() => {
+                    let accepted = match accepted {
+                        Ok(stream) => stream,
+                        Err(_) => {
+                            hard_cancel.cancel();
+                            break;
+                        }
+                    };
+                    self.admit_stream(
+                        accepted,
+                        &mut streams,
+                        Arc::clone(&per_connection),
+                        context.clone(),
+                        shutdown.clone(),
+                        hard_cancel.child_token(),
+                    );
+                }
+                completed = streams.join_next(), if !streams.is_empty() => {
+                    report_stream_result(completed);
+                }
             }
+        }
+
+        let drain = async {
+            while let Some(completed) = streams.join_next().await {
+                report_stream_result(Some(completed));
+            }
+        };
+        if timeout(self.options.shutdown_timeout, drain).await.is_err() {
+            hard_cancel.cancel();
+            connection.close(CLOSE_CODE.into(), CLOSE_REASON);
+            streams.abort_all();
+            while streams.join_next().await.is_some() {}
         }
         connection.close(CLOSE_CODE.into(), CLOSE_REASON);
         Ok(())
     }
 
+    fn admit_stream(
+        &self,
+        (mut send, mut recv): (SendStream, RecvStream),
+        streams: &mut JoinSet<Result<()>>,
+        per_connection: Arc<Semaphore>,
+        context: ConnectionContext,
+        shutdown: CancellationToken,
+        cancellation: CancellationToken,
+    ) {
+        let global = self.admission.try_stream();
+        let local = per_connection
+            .try_acquire_owned()
+            .map_err(|_| IrohAdapterError::Saturated {
+                operation: "Iroh per-connection stream admission",
+            });
+        let (global, local) = match (global, local) {
+            (Ok(global), Ok(local)) => (global, local),
+            (global, local) => {
+                let error = global.err().or_else(|| local.err()).expect("one error");
+                tracing::warn!(
+                    target: "vgi_rpc_iroh.server",
+                    error_class = adapter_error_class(&error),
+                    "Iroh VGI stream rejected at admission boundary"
+                );
+                let _ = send.reset(CLOSE_CODE.into());
+                let _ = recv.stop(CLOSE_CODE.into());
+                return;
+            }
+        };
+
+        let server = self.clone();
+        let permits = StreamPermits {
+            _global: global,
+            _local: local,
+        };
+        streams.spawn(async move {
+            server
+                .serve_stream(send, recv, context, shutdown, cancellation, permits)
+                .await
+        });
+    }
+
+    async fn serve_stream(
+        &self,
+        send: SendStream,
+        recv: RecvStream,
+        context: ConnectionContext,
+        shutdown: CancellationToken,
+        cancellation: CancellationToken,
+        _permits: StreamPermits,
+    ) -> Result<()> {
+        let handle = Handle::current();
+        let first_request = Arc::new(FirstRequestBudget::new(self.options.first_request_timeout));
+        let mut reader = BlockingRecv {
+            stream: recv,
+            handle: handle.clone(),
+            cancellation: cancellation.clone(),
+            deadline: None,
+            io_timeout: Some(self.options.connection_io_timeout),
+            first_request: Some(Arc::clone(&first_request)),
+        };
+        let mut writer = BlockingSend {
+            stream: send,
+            handle,
+            cancellation,
+            deadline: None,
+            io_timeout: Some(self.options.connection_io_timeout),
+            first_request: Some(first_request),
+        };
+        let rpc = Arc::clone(&self.rpc);
+        tokio::task::spawn_blocking(move || {
+            rpc.serve_with_context_and_shutdown(&mut reader, &mut writer, context, || {
+                shutdown.is_cancelled()
+            });
+            let _ = writer.stream.finish();
+            let _ = reader.stream.stop(CLOSE_CODE.into());
+        })
+        .await
+        .map_err(IrohAdapterError::Join)
+    }
+
     fn connection_context(&self, remote_id: EndpointId) -> Result<ConnectionContext> {
         self.options.validate()?;
-        let subject = remote_id.to_string();
+        // The portable identity contract uses the complete raw endpoint key,
+        // not Iroh's human-oriented z-base-32 Display representation.
+        let subject = endpoint_subject(remote_id);
         let identity = PeerIdentity::new(
             "iroh",
             "iroh_quic_handshake",
@@ -522,6 +666,22 @@ fn report_connection_result(completed: Option<std::result::Result<Result<()>, Jo
     }
 }
 
+fn report_stream_result(completed: Option<std::result::Result<Result<()>, JoinError>>) {
+    match completed {
+        Some(Ok(Ok(()))) | None => {}
+        Some(Ok(Err(error))) => tracing::warn!(
+            target: "vgi_rpc_iroh.server",
+            error_class = adapter_error_class(&error),
+            "Iroh VGI logical stream ended with an error"
+        ),
+        Some(Err(_error)) => tracing::warn!(
+            target: "vgi_rpc_iroh.server",
+            error_class = "join",
+            "Iroh VGI logical stream task failed"
+        ),
+    }
+}
+
 /// Client connection, cancellation, and per-RPC deadline settings.
 #[derive(Clone)]
 pub struct IrohClientOptions {
@@ -554,20 +714,29 @@ impl IrohClientOptions {
     }
 }
 
-/// Blocking VGI client transport backed by one persistent Iroh QUIC stream.
-///
-/// Construct it asynchronously, then use the resulting `RpcClient` only from
-/// a blocking thread (for example `tokio::task::spawn_blocking`).
-pub struct IrohTransport {
-    reader: BlockingRecv,
-    writer: BlockingSend,
+/// A reusable Iroh connection that opens one independent VGI transport per
+/// bidirectional QUIC stream.
+#[derive(Clone)]
+pub struct IrohConnection {
+    inner: Arc<IrohConnectionInner>,
+}
+
+struct IrohConnectionInner {
     connection: Connection,
     remote_id: EndpointId,
-    deadline: Option<RpcDeadline>,
+    stream_open_timeout: Duration,
+    rpc_timeout: Option<Duration>,
     cancellation: CancellationToken,
 }
 
-impl IrohTransport {
+impl Drop for IrohConnectionInner {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.connection.close(CLOSE_CODE.into(), CLOSE_REASON);
+    }
+}
+
+impl IrohConnection {
     /// Connect using endpoint-ID address lookup configured on `endpoint`.
     pub async fn connect_id(
         endpoint: Endpoint,
@@ -593,17 +762,31 @@ impl IrohTransport {
         .await?
         .map_err(|error| iroh_error("connect Iroh endpoint", error))?;
         let remote_id = connection.remote_id();
+        Ok(Self {
+            inner: Arc::new(IrohConnectionInner {
+                connection,
+                remote_id,
+                stream_open_timeout: options.stream_open_timeout,
+                rpc_timeout: options.rpc_timeout,
+                cancellation,
+            }),
+        })
+    }
+
+    /// Open a new logical VGI byte transport on this pooled connection.
+    pub async fn open_transport(&self) -> Result<IrohTransport> {
+        let cancellation = self.inner.cancellation.child_token();
         let (send, recv) = cancellable_timeout(
             &cancellation,
-            options.stream_open_timeout,
+            self.inner.stream_open_timeout,
             "Iroh VGI stream open",
-            connection.open_bi(),
+            self.inner.connection.open_bi(),
         )
         .await?
         .map_err(|error| iroh_error("open Iroh bidirectional stream", error))?;
-        let deadline = options.rpc_timeout.map(RpcDeadline::new);
+        let deadline = self.inner.rpc_timeout.map(RpcDeadline::new);
         let handle = Handle::current();
-        Ok(Self {
+        Ok(IrohTransport {
             reader: BlockingRecv {
                 stream: recv,
                 handle: handle.clone(),
@@ -620,15 +803,74 @@ impl IrohTransport {
                 io_timeout: None,
                 first_request: None,
             },
-            connection,
-            remote_id,
+            connection: Arc::clone(&self.inner),
             deadline,
             cancellation,
+            closed: false,
         })
     }
 
     pub fn remote_id(&self) -> EndpointId {
-        self.remote_id
+        self.inner.remote_id
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.inner.cancellation.clone()
+    }
+
+    /// Close the shared QUIC connection and cancel all of its logical streams.
+    pub fn close(&self) {
+        self.inner.cancellation.cancel();
+        self.inner.connection.close(CLOSE_CODE.into(), CLOSE_REASON);
+    }
+
+    /// Open a logical transport and wrap it in a blocking [`RpcClient`].
+    pub async fn open_client(&self) -> Result<RpcClient> {
+        Ok(self.open_transport().await?.into_client())
+    }
+}
+
+/// Blocking VGI client transport backed by one bidirectional QUIC stream.
+///
+/// Construct it asynchronously, then use the resulting `RpcClient` only from
+/// a blocking thread (for example `tokio::task::spawn_blocking`). Dropping one
+/// transport does not close the pooled [`IrohConnection`] or sibling streams.
+pub struct IrohTransport {
+    reader: BlockingRecv,
+    writer: BlockingSend,
+    connection: Arc<IrohConnectionInner>,
+    deadline: Option<RpcDeadline>,
+    cancellation: CancellationToken,
+    closed: bool,
+}
+
+impl IrohTransport {
+    /// Convenience constructor that opens a new connection and one stream.
+    pub async fn connect_id(
+        endpoint: Endpoint,
+        remote_id: EndpointId,
+        options: IrohClientOptions,
+    ) -> Result<Self> {
+        IrohConnection::connect_id(endpoint, remote_id, options)
+            .await?
+            .open_transport()
+            .await
+    }
+
+    /// Convenience constructor that opens a new connection and one stream.
+    pub async fn connect_addr(
+        endpoint: Endpoint,
+        remote: EndpointAddr,
+        options: IrohClientOptions,
+    ) -> Result<Self> {
+        IrohConnection::connect_addr(endpoint, remote, options)
+            .await?
+            .open_transport()
+            .await
+    }
+
+    pub fn remote_id(&self) -> EndpointId {
+        self.connection.remote_id
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {
@@ -650,7 +892,7 @@ impl Transport for IrohTransport {
     }
 
     fn is_reusable(&self) -> bool {
-        !self.cancellation.is_cancelled() && self.connection.close_reason().is_none()
+        !self.cancellation.is_cancelled() && self.connection.connection.close_reason().is_none()
     }
 
     fn close(&mut self) -> vgi_rpc_client::Result<()> {
@@ -660,7 +902,8 @@ impl Transport for IrohTransport {
                 format!("finish Iroh send stream: {error}"),
             )
         });
-        self.connection.close(CLOSE_CODE.into(), CLOSE_REASON);
+        let _ = self.reader.stream.stop(CLOSE_CODE.into());
+        self.closed = true;
         self.cancellation.cancel();
         finish
     }
@@ -668,7 +911,10 @@ impl Transport for IrohTransport {
 
 impl Drop for IrohTransport {
     fn drop(&mut self) {
-        self.connection.close(CLOSE_CODE.into(), CLOSE_REASON);
+        if !self.closed {
+            let _ = self.writer.stream.reset(CLOSE_CODE.into());
+            let _ = self.reader.stream.stop(CLOSE_CODE.into());
+        }
         self.cancellation.cancel();
     }
 }
@@ -885,6 +1131,7 @@ mod tests {
     #[test]
     fn defaults_do_not_authenticate_arbitrary_endpoint_keys() {
         assert!(IrohServerOptions::default().policy.is_none());
+        assert_eq!(VGI_IROH_ALPN, b"vgi-rpc/arrow-mux/1");
     }
 
     #[test]
@@ -927,6 +1174,7 @@ mod tests {
             max_pending_handshakes: 1,
             max_active_connections: 1,
             max_active_connections_per_endpoint: Some(1),
+            max_active_streams: 1,
             ..IrohServerOptions::default()
         };
         let admission = IrohAdmission::new(&options);
@@ -945,6 +1193,14 @@ mod tests {
         ));
         drop(active);
         assert!(admission.try_active().is_ok());
+
+        let stream = admission.try_stream().unwrap();
+        assert!(matches!(
+            admission.try_stream(),
+            Err(IrohAdapterError::Saturated { .. })
+        ));
+        drop(stream);
+        assert!(admission.try_stream().is_ok());
 
         let endpoint_a = admission.try_endpoint(&"endpoint-a").unwrap().unwrap();
         assert!(matches!(

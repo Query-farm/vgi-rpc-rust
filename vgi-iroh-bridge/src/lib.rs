@@ -1264,11 +1264,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn loopback_forwards_identity_before_bytes_and_echoes() {
+    async fn active_raw_stream_survives_connection_idle_timeout_and_echoes() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind upstream");
         let upstream_address = listener.local_addr().expect("upstream address");
+        let (stream_active_tx, stream_active_rx) = tokio::sync::oneshot::channel();
+        let (release_upstream_tx, release_upstream_rx) = tokio::sync::oneshot::channel();
         let upstream = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept upstream");
             let mut preamble = [0_u8; 52];
@@ -1281,6 +1283,8 @@ mod tests {
                 .read_exact(&mut payload)
                 .await
                 .expect("read bridged payload");
+            stream_active_tx.send(()).expect("signal active stream");
+            release_upstream_rx.await.expect("release active stream");
             socket.write_all(&payload).await.expect("echo payload");
             (preamble, payload)
         });
@@ -1321,6 +1325,13 @@ mod tests {
             .expect("connect bridge");
         let (mut send, mut recv) = connection.open_bi().await.expect("open stream");
         send.write_all(b"ping").await.expect("write payload");
+        stream_active_rx.await.expect("upstream observed payload");
+
+        // The connection has no newly accepted streams for more than three
+        // idle-timeout periods, but this stream is active and must survive.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(connection.close_reason(), None);
+        release_upstream_tx.send(()).expect("release upstream echo");
         send.finish().expect("finish payload");
         let mut echoed = [0_u8; 4];
         recv.read_exact(&mut echoed).await.expect("read echo");

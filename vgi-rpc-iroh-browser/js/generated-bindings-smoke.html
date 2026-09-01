@@ -8,16 +8,32 @@
       setTimeout(() => reject(new Error(`${label} did not settle`)), 2000),
     ),
   ]);
-  const rejects = async (promise, label) => {
-    try {
-      await bounded(promise, label);
-      throw new Error(`${label} unexpectedly resolved`);
-    } catch (error) {
-      if (String(error).includes("unexpectedly resolved")) throw error;
-    }
+  const expectRejected = async (promise, label, timeoutMs = 2000) => {
+    const outcome = await Promise.race([
+      promise.then(
+        () => ({ kind: "resolved" }),
+        (error) => ({ kind: "rejected", error }),
+      ),
+      new Promise((resolve) =>
+        setTimeout(() => resolve({ kind: "timeout" }), timeoutMs),
+      ),
+    ]);
+    if (outcome.kind === "rejected") return outcome.error;
+    if (outcome.kind === "timeout")
+      throw new Error(`${label} did not settle`);
+    throw new Error(`${label} unexpectedly resolved`);
   };
 
   try {
+    let timeoutWasRejected = false;
+    try {
+      await expectRejected(new Promise(() => {}), "timeout self-test", 10);
+    } catch (error) {
+      timeoutWasRejected = String(error).includes("did not settle");
+    }
+    if (!timeoutWasRejected)
+      throw new Error("expectRejected accepted a timed-out promise");
+
     const wasm = await import("/target/browser-smoke/vgi_rpc_iroh_browser.js");
     await wasm.default();
 
@@ -28,21 +44,21 @@
     const pendingRead = stream.read(1024);
     await bounded(stream.write(new Uint8Array([1, 2, 3])), "overlapping write");
     stream.abort();
-    await rejects(pendingRead, "aborted raw read");
+    await expectRejected(pendingRead, "aborted raw read");
     await bounded(stream.closeWrite(), "ordered half-close");
     const preAborted = wasm.__vgiBorrowSmoke();
     preAborted.abort();
-    await rejects(preAborted.read(1024), "read after raw abort");
+    await expectRejected(preAborted.read(1024), "read after raw abort");
 
     // Likewise, cancel must remain callable while an exported async read owns
     // the response-body future, and that read must be woken promptly.
     const response = wasm.__httpBorrowSmoke();
     const pendingBodyRead = response.read();
     response.cancel();
-    await rejects(pendingBodyRead, "cancelled HTTP read");
+    await expectRejected(pendingBodyRead, "cancelled HTTP read");
     const preCancelled = wasm.__httpBorrowSmoke();
     preCancelled.cancel();
-    await rejects(preCancelled.read(), "read after HTTP cancel");
+    await expectRejected(preCancelled.read(), "read after HTTP cancel");
 
     document.body.textContent = "PASS";
   } catch (error) {

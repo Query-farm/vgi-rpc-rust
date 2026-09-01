@@ -35,7 +35,7 @@ use iroh_http_core::{
     Body as IrohHttpBody, ConnectionServeOptions, ConnectionServeRuntime, RemoteEndpointId,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -529,6 +529,7 @@ pub struct RawBridgeProtocol {
     peer_connections: Arc<PeerConnectionAdmission>,
     streams: Arc<Semaphore>,
     shutdown: CancellationToken,
+    handlers: Arc<HandlerDrain>,
 }
 
 impl std::fmt::Debug for RawBridgeProtocol {
@@ -553,6 +554,7 @@ impl RawBridgeProtocol {
             streams: Arc::new(Semaphore::new(options.max_streams)),
             options,
             shutdown: CancellationToken::new(),
+            handlers: Arc::new(HandlerDrain::new()),
         })
     }
 
@@ -576,14 +578,22 @@ impl RawBridgeProtocol {
         let local_streams = Arc::new(Semaphore::new(self.options.max_streams_per_connection));
         let mut tasks = JoinSet::new();
 
-        let first = match timeout(self.options.first_stream_timeout, connection.accept_bi()).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(error)) => return Err(iroh_error("accept first Iroh stream", error)),
-            Err(_) => {
-                connection.close(CLOSE_CODE.into(), b"first raw stream timeout");
-                return Err(BridgeError::Timeout {
-                    operation: "first Iroh stream",
-                });
+        let first = tokio::select! {
+            _ = self.shutdown.cancelled() => {
+                connection.close(CLOSE_CODE.into(), b"bridge shutting down");
+                return Ok(());
+            }
+            first = timeout(self.options.first_stream_timeout, connection.accept_bi()) => {
+                match first {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => return Err(iroh_error("accept first Iroh stream", error)),
+                    Err(_) => {
+                        connection.close(CLOSE_CODE.into(), b"first raw stream timeout");
+                        return Err(BridgeError::Timeout {
+                            operation: "first Iroh stream",
+                        });
+                    }
+                }
             }
         };
         self.admit_stream(first, remote, Arc::clone(&local_streams), &mut tasks);
@@ -702,13 +712,94 @@ impl Drop for PeerConnectionPermit {
 
 impl ProtocolHandler for RawBridgeProtocol {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        let Some(_handler) = self.handlers.try_enter() else {
+            connection.close(CLOSE_CODE.into(), b"bridge shutting down");
+            return Err(AcceptError::from_err(io::Error::other(
+                "raw bridge is shutting down",
+            )));
+        };
         self.serve_connection(connection)
             .await
             .map_err(|error| AcceptError::from_err(io::Error::other(error.to_string())))
     }
 
     async fn shutdown(&self) {
+        self.handlers.close();
         self.shutdown.cancel();
+        if timeout(self.options.drain_timeout, self.handlers.wait())
+            .await
+            .is_err()
+        {
+            tracing::warn!("raw bridge connection drain timed out");
+        }
+    }
+}
+
+#[derive(Default)]
+struct HandlerDrainState {
+    closed: bool,
+    active: usize,
+}
+
+struct HandlerDrain {
+    state: Mutex<HandlerDrainState>,
+    active: watch::Sender<usize>,
+}
+
+impl HandlerDrain {
+    fn new() -> Self {
+        let (active, _) = watch::channel(0);
+        Self {
+            state: Mutex::new(HandlerDrainState::default()),
+            active,
+        }
+    }
+
+    fn try_enter(self: &Arc<Self>) -> Option<HandlerPermit> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return None;
+        }
+        state.active += 1;
+        self.active.send_replace(state.active);
+        Some(HandlerPermit {
+            drain: Arc::clone(self),
+        })
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
+    }
+
+    async fn wait(&self) {
+        let mut active = self.active.subscribe();
+        while *active.borrow_and_update() != 0 {
+            if active.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+struct HandlerPermit {
+    drain: Arc<HandlerDrain>,
+}
+
+impl Drop for HandlerPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .drain
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = state.active.saturating_sub(1);
+        self.drain.active.send_replace(state.active);
     }
 }
 
@@ -936,6 +1027,36 @@ mod tests {
                 "101112131415161718191a1b1c1d1e1f"
             )
         );
+    }
+
+    #[tokio::test]
+    async fn handler_drain_rejects_after_close_and_waits_for_active_permit() {
+        let drain = Arc::new(HandlerDrain::new());
+        let permit = drain.try_enter().expect("first handler is admitted");
+        drain.close();
+        assert!(drain.try_enter().is_none(), "closed drain rejects entrants");
+
+        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn({
+            let drain = Arc::clone(&drain);
+            async move {
+                drain.wait().await;
+                let _ = finished_tx.send(());
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut finished_rx)
+                .await
+                .is_err(),
+            "drain wait must remain pending while a handler permit is active"
+        );
+
+        drop(permit);
+        tokio::time::timeout(Duration::from_secs(1), finished_rx)
+            .await
+            .expect("drain wait deadline")
+            .expect("drain waiter completion");
+        waiter.await.expect("drain waiter task");
     }
 
     #[test]

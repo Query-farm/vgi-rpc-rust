@@ -15,7 +15,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::Handle;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{timeout, Instant};
 pub use tokio_util::sync::CancellationToken;
@@ -352,6 +352,7 @@ impl IrohServer {
         IrohProtocol {
             server: self.clone(),
             shutdown: CancellationToken::new(),
+            handlers: Arc::new(HandlerDrain::new()),
         }
     }
 
@@ -622,6 +623,75 @@ impl IrohServer {
 pub struct IrohProtocol {
     server: IrohServer,
     shutdown: CancellationToken,
+    handlers: Arc<HandlerDrain>,
+}
+
+#[derive(Default)]
+struct HandlerDrainState {
+    closed: bool,
+    active: usize,
+}
+
+struct HandlerDrain {
+    state: Mutex<HandlerDrainState>,
+    active: watch::Sender<usize>,
+}
+
+impl HandlerDrain {
+    fn new() -> Self {
+        let (active, _) = watch::channel(0);
+        Self {
+            state: Mutex::new(HandlerDrainState::default()),
+            active,
+        }
+    }
+
+    fn try_enter(self: &Arc<Self>) -> Option<HandlerPermit> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return None;
+        }
+        state.active += 1;
+        self.active.send_replace(state.active);
+        Some(HandlerPermit {
+            drain: Arc::clone(self),
+        })
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
+    }
+
+    async fn wait(&self) {
+        let mut active = self.active.subscribe();
+        while *active.borrow_and_update() != 0 {
+            if active.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+struct HandlerPermit {
+    drain: Arc<HandlerDrain>,
+}
+
+impl Drop for HandlerPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .drain
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = state.active.saturating_sub(1);
+        self.drain.active.send_replace(state.active);
+    }
 }
 
 impl std::fmt::Debug for IrohProtocol {
@@ -634,6 +704,12 @@ impl std::fmt::Debug for IrohProtocol {
 
 impl ProtocolHandler for IrohProtocol {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        let Some(_handler) = self.handlers.try_enter() else {
+            connection.close(CLOSE_CODE.into(), CLOSE_REASON);
+            return Err(AcceptError::from_err(io::Error::other(
+                "Iroh VGI protocol is shutting down",
+            )));
+        };
         self.server
             .serve_connection(connection, self.shutdown.child_token())
             .await
@@ -646,7 +722,14 @@ impl ProtocolHandler for IrohProtocol {
     }
 
     async fn shutdown(&self) {
+        self.handlers.close();
         self.shutdown.cancel();
+        if timeout(self.server.options.shutdown_timeout, self.handlers.wait())
+            .await
+            .is_err()
+        {
+            tracing::warn!("Iroh VGI connection drain timed out");
+        }
     }
 }
 
@@ -1114,6 +1197,25 @@ async fn timeout_at<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn handler_shutdown_closes_admission_and_waits_for_active_accepts() {
+        let handlers = Arc::new(HandlerDrain::new());
+        let permit = handlers.try_enter().expect("first handler admitted");
+        handlers.close();
+        assert!(handlers.try_enter().is_none(), "shutdown closes admission");
+        assert!(
+            timeout(Duration::from_millis(20), handlers.wait())
+                .await
+                .is_err(),
+            "shutdown must wait for the active handler"
+        );
+
+        drop(permit);
+        timeout(Duration::from_secs(1), handlers.wait())
+            .await
+            .expect("released handler drains");
+    }
 
     #[tokio::test]
     async fn an_io_deadline_poison_cancels_the_connection_token() {

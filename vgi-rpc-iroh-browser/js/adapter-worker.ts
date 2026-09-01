@@ -247,7 +247,10 @@ async function writeWorkerChunk(
 }
 
 class RingReader {
-  private pending = new Uint8Array(0);
+  // Chunks may be backed by either an ordinary ArrayBuffer (Iroh/Web streams)
+  // or the SharedArrayBuffer ring. Keep the backing type honest at this
+  // boundary; TypeScript 6 no longer silently treats the two as identical.
+  private pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
   private readonly region: Region;
   private readonly slot: number;
   private readonly claim: number;
@@ -343,7 +346,7 @@ function responseHead(status: number, headers: HeaderPair[]): Uint8Array {
 
 function frame(
   kind: number,
-  payload = new Uint8Array(0),
+  payload: Uint8Array<ArrayBufferLike> = new Uint8Array(0),
   stage = 0,
   category = 0,
   certainty = 0,

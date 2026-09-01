@@ -53,6 +53,13 @@ jobs:
           grep -q 'fetchHttpi' target/browser-bindings/vgi_rpc_iroh_browser.d.ts
           grep -q 'openVgiStream' target/browser-bindings/vgi_rpc_iroh_browser.d.ts
 
+      - name: Upload browser WebAssembly package
+        uses: actions/upload-artifact@v6
+        with:
+          name: vgi-rpc-iroh-browser-${{ github.sha }}
+          path: target/browser-bindings/
+          if-no-files-found: error
+
       - name: Typecheck WHATWG stream wrapper
         run: >-
           npx --yes --package typescript tsc --noEmit --strict

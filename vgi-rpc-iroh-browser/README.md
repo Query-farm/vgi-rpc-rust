@@ -60,4 +60,6 @@ wasm-bindgen --target web --out-dir dist \
 
 CI generates the bindings and verifies the `createIrohNode`, `fetchHttpi`, and
 `openVgiStream` exports so a check-only build cannot hide a missing browser
-artifact.
+artifact. Each CI run uploads the complete generated directory as the
+`vgi-rpc-iroh-browser-<commit>` artifact; applications can publish or bundle
+that immutable output without requiring a Rust toolchain.

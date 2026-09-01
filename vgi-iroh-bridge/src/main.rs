@@ -1,6 +1,8 @@
 use std::ffi::OsString;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -36,6 +38,62 @@ struct Args {
     /// Fixed HTTP(S) worker, proxy, or load-balancer origin and base path.
     #[arg(long, value_name = "URL")]
     http_upstream: Option<String>,
+
+    /// Raw upstream connect deadline in seconds.
+    #[arg(long, value_name = "SECONDS", requires = "raw_upstream")]
+    raw_connect_timeout: Option<NonZeroU64>,
+
+    /// Deadline for the first raw mux stream on a connection, in seconds.
+    #[arg(long, value_name = "SECONDS", requires = "raw_upstream")]
+    raw_first_stream_timeout: Option<NonZeroU64>,
+
+    /// Maximum simultaneous raw Iroh connections.
+    #[arg(long, value_name = "COUNT", requires = "raw_upstream")]
+    raw_max_connections: Option<NonZeroUsize>,
+
+    /// Maximum simultaneous raw mux streams across all connections.
+    #[arg(long, value_name = "COUNT", requires = "raw_upstream")]
+    raw_max_streams: Option<NonZeroUsize>,
+
+    /// Maximum simultaneous raw mux streams on one Iroh connection.
+    #[arg(long, value_name = "COUNT", requires = "raw_upstream")]
+    raw_max_streams_per_connection: Option<NonZeroUsize>,
+
+    /// Raw graceful-drain deadline in seconds.
+    #[arg(long, value_name = "SECONDS", requires = "raw_upstream")]
+    raw_drain_timeout: Option<NonZeroU64>,
+
+    /// Maximum simultaneous HTTP connections from one EndpointId.
+    #[arg(long, value_name = "COUNT", requires = "http_upstream")]
+    http_max_connections_per_peer: Option<NonZeroUsize>,
+
+    /// Maximum simultaneous HTTP connections across the bridge.
+    #[arg(long, value_name = "COUNT", requires = "http_upstream")]
+    http_max_total_connections: Option<NonZeroUsize>,
+
+    /// HTTP connection idle deadline in seconds.
+    #[arg(long, value_name = "SECONDS", requires = "http_upstream")]
+    http_connection_idle_timeout: Option<NonZeroU64>,
+
+    /// Maximum simultaneous HTTP requests across all connections.
+    #[arg(long, value_name = "COUNT", requires = "http_upstream")]
+    http_max_concurrency: Option<NonZeroUsize>,
+
+    /// HTTP request and request-head deadline in seconds.
+    #[arg(long, value_name = "SECONDS", requires = "http_upstream")]
+    http_request_timeout: Option<NonZeroU64>,
+
+    /// Maximum encoded HTTP request body bytes.
+    #[arg(long, value_name = "BYTES", requires = "http_upstream")]
+    http_max_request_body_bytes: Option<NonZeroUsize>,
+
+    /// Maximum HTTP request-head bytes.
+    #[arg(long, value_name = "BYTES", requires = "http_upstream")]
+    http_max_header_bytes: Option<NonZeroUsize>,
+
+    /// HTTP graceful-drain deadline in seconds.
+    #[arg(long, value_name = "SECONDS", requires = "http_upstream")]
+    http_drain_timeout: Option<NonZeroU64>,
 
     /// Disable Iroh relays and use direct paths only.
     #[arg(long, conflicts_with = "relay_url")]
@@ -79,12 +137,12 @@ async fn main() -> Result<()> {
     let mut router = Router::builder(endpoint);
     if let Some(value) = args.raw_upstream.as_deref() {
         let upstream = parse_raw_upstream(value)?;
-        let protocol = RawBridgeProtocol::new(upstream, RawBridgeOptions::default())
+        let protocol = RawBridgeProtocol::new(upstream, raw_bridge_options(&args))
             .context("configure raw VGI bridge")?;
         router = router.accept(VGI_IROH_ALPN, protocol);
     }
     if let Some(value) = args.http_upstream.as_deref() {
-        let protocol = HttpBridgeProtocol::new(value, HttpBridgeOptions::default())
+        let protocol = HttpBridgeProtocol::new(value, http_bridge_options(&args))
             .context("configure HTTP VGI bridge")?;
         router = router.accept(IROH_HTTP_ALPN, protocol);
     }
@@ -95,6 +153,59 @@ async fn main() -> Result<()> {
     shutdown_signal().await?;
     router.shutdown().await.context("shut down Iroh router")?;
     Ok(())
+}
+
+fn raw_bridge_options(args: &Args) -> RawBridgeOptions {
+    let mut options = RawBridgeOptions::default();
+    if let Some(value) = args.raw_connect_timeout {
+        options.connect_timeout = Duration::from_secs(value.get());
+    }
+    if let Some(value) = args.raw_first_stream_timeout {
+        options.first_stream_timeout = Duration::from_secs(value.get());
+    }
+    if let Some(value) = args.raw_max_connections {
+        options.max_connections = value.get();
+    }
+    if let Some(value) = args.raw_max_streams {
+        options.max_streams = value.get();
+    }
+    if let Some(value) = args.raw_max_streams_per_connection {
+        options.max_streams_per_connection = value.get();
+    }
+    if let Some(value) = args.raw_drain_timeout {
+        options.drain_timeout = Duration::from_secs(value.get());
+    }
+    options
+}
+
+fn http_bridge_options(args: &Args) -> HttpBridgeOptions {
+    let mut options = HttpBridgeOptions::default();
+    if let Some(value) = args.http_max_connections_per_peer {
+        options.connection.max_connections_per_peer = value.get();
+    }
+    if let Some(value) = args.http_max_total_connections {
+        options.connection.max_total_connections = value.get();
+    }
+    if let Some(value) = args.http_connection_idle_timeout {
+        options.connection.connection_idle_timeout = Duration::from_secs(value.get());
+    }
+    if let Some(value) = args.http_max_concurrency {
+        options.connection.max_concurrency = value.get();
+    }
+    if let Some(value) = args.http_request_timeout {
+        options.connection.request_timeout = Some(Duration::from_secs(value.get()));
+    }
+    if let Some(value) = args.http_max_request_body_bytes {
+        options.connection.max_request_body_wire_bytes = Some(value.get());
+        options.connection.max_request_body_decoded_bytes = Some(value.get());
+    }
+    if let Some(value) = args.http_max_header_bytes {
+        options.connection.max_header_size = value.get();
+    }
+    if let Some(value) = args.http_drain_timeout {
+        options.connection.drain_timeout = Duration::from_secs(value.get());
+    }
+    options
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -109,7 +220,7 @@ async fn shutdown_signal() -> Result<()> {
             }
             _ = terminate.recv() => {}
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]
@@ -208,5 +319,59 @@ mod tests {
         ] {
             assert!(parse_raw_upstream(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn cli_overrides_are_scoped_positive_and_preserve_transparency() {
+        let args = Args::try_parse_from([
+            "vgi-iroh-bridge",
+            "--ephemeral",
+            "--raw-upstream",
+            "tcp://worker:9400",
+            "--raw-max-connections",
+            "7",
+            "--raw-connect-timeout",
+            "3",
+            "--http-upstream",
+            "https://worker.example/vgi",
+            "--http-max-connections-per-peer",
+            "5",
+            "--http-max-total-connections",
+            "17",
+            "--http-connection-idle-timeout",
+            "11",
+            "--http-max-request-body-bytes",
+            "4096",
+        ])
+        .unwrap();
+
+        let raw = raw_bridge_options(&args);
+        assert_eq!(raw.max_connections, 7);
+        assert_eq!(raw.connect_timeout, Duration::from_secs(3));
+
+        let http = http_bridge_options(&args).connection;
+        assert_eq!(http.max_connections_per_peer, 5);
+        assert_eq!(http.max_total_connections, 17);
+        assert_eq!(http.connection_idle_timeout, Duration::from_secs(11));
+        assert_eq!(http.max_request_body_wire_bytes, Some(4096));
+        assert_eq!(http.max_request_body_decoded_bytes, Some(4096));
+        assert!(!http.decompression);
+
+        assert!(Args::try_parse_from([
+            "vgi-iroh-bridge",
+            "--ephemeral",
+            "--raw-upstream",
+            "tcp://worker:9400",
+            "--raw-max-connections",
+            "0",
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "vgi-iroh-bridge",
+            "--ephemeral",
+            "--http-max-total-connections",
+            "2",
+        ])
+        .is_err());
     }
 }

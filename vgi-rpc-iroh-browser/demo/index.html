@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VGI over Iroh HTTP</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family:
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        background: #09111f;
+        color: #e7edf8;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        min-height: 100vh;
+        margin: 0;
+        background:
+          radial-gradient(circle at 15% 0%, #173461 0, transparent 32rem),
+          linear-gradient(145deg, #09111f 0%, #0d1728 55%, #08101c 100%);
+      }
+      main {
+        width: min(1080px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 64px 0 80px;
+      }
+      .eyebrow {
+        color: #79c5ff;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+      }
+      h1 {
+        max-width: 780px;
+        margin: 12px 0 14px;
+        font-size: clamp(36px, 7vw, 70px);
+        line-height: 0.98;
+        letter-spacing: -0.045em;
+      }
+      .lede {
+        max-width: 720px;
+        margin: 0 0 34px;
+        color: #aab8ce;
+        font-size: 18px;
+        line-height: 1.6;
+      }
+      .panel {
+        border: 1px solid #263a57;
+        border-radius: 18px;
+        background: rgb(10 20 35 / 82%);
+        box-shadow: 0 24px 80px rgb(0 0 0 / 32%);
+        overflow: hidden;
+      }
+      .form {
+        display: grid;
+        gap: 20px;
+        padding: 28px;
+      }
+      label {
+        display: grid;
+        gap: 8px;
+        color: #d4deed;
+        font-size: 14px;
+        font-weight: 650;
+      }
+      input,
+      textarea {
+        width: 100%;
+        border: 1px solid #324865;
+        border-radius: 10px;
+        background: #07101d;
+        color: #f4f7fb;
+        padding: 13px 14px;
+        font:
+          14px/1.5 ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          Consolas,
+          monospace;
+        outline: none;
+      }
+      input:focus,
+      textarea:focus {
+        border-color: #56b7ff;
+        box-shadow: 0 0 0 3px rgb(71 169 241 / 14%);
+      }
+      textarea {
+        min-height: 96px;
+        resize: vertical;
+      }
+      .actions {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        flex-wrap: wrap;
+      }
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 12px 22px;
+        color: #06101d;
+        background: #77c8ff;
+        font-weight: 800;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #a2dcff;
+      }
+      button:disabled {
+        cursor: wait;
+        opacity: 0.55;
+      }
+      #status {
+        color: #aab8ce;
+        font-size: 14px;
+      }
+      #status[data-state="ok"] {
+        color: #7ee7ae;
+      }
+      #status[data-state="error"] {
+        color: #ff9d9d;
+      }
+      .output {
+        border-top: 1px solid #263a57;
+        padding: 24px 28px 30px;
+      }
+      .output h2 {
+        margin: 0 0 14px;
+        font-size: 17px;
+      }
+      #result {
+        overflow: auto;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font:
+          13px/1.45 ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          Consolas,
+          monospace;
+      }
+      th,
+      td {
+        max-width: 520px;
+        padding: 10px 12px;
+        border-bottom: 1px solid #1d3049;
+        text-align: left;
+        overflow-wrap: anywhere;
+      }
+      th {
+        position: sticky;
+        top: 0;
+        background: #101e32;
+        color: #8ed0ff;
+      }
+      pre {
+        min-height: 92px;
+        margin: 24px 0 0;
+        padding: 16px;
+        overflow: auto;
+        border-radius: 10px;
+        background: #050b14;
+        color: #9fb0c8;
+        font-size: 12px;
+        line-height: 1.55;
+        white-space: pre-wrap;
+      }
+      code {
+        color: #b8ddf7;
+      }
+      .note {
+        margin-top: 18px;
+        color: #7f91ab;
+        font-size: 13px;
+        line-height: 1.6;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="eyebrow">Haybarn · VGI · Iroh HTTP</div>
+      <h1>Query a VGI worker through an Iroh EndpointId.</h1>
+      <p class="lede">
+        This page creates one browser Iroh identity, hands its adapter Worker to
+        <code>installVgiWebWorkerBridge</code>, then runs a real
+        <code>ATTACH 'httpi://…'</code> and SELECT inside Haybarn.
+      </p>
+      <section class="panel">
+        <div class="form">
+          <label>
+            Bridge EndpointId
+            <input
+              id="endpoint-id"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="64 lowercase hexadecimal characters"
+            />
+          </label>
+          <label>
+            SELECT to run after attaching the catalog as <code>remote</code>
+            <textarea id="query" spellcheck="false">
+SELECT * FROM remote.main.count_to(5);</textarea>
+          </label>
+          <div class="actions">
+            <button id="run" type="button">Attach and run</button>
+            <span id="status" data-state="idle">Ready.</span>
+          </div>
+          <div class="note">
+            The page authorizes only the EndpointId entered above. The bridge
+            must be running
+            <code>vgi-iroh-bridge --http …</code> in front of a VGI HTTP worker
+            whose catalog contains the selected function.
+          </div>
+        </div>
+        <div class="output">
+          <h2>Query result</h2>
+          <div id="result"></div>
+          <pre id="log" aria-live="polite"></pre>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

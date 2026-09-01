@@ -81,3 +81,7 @@ CI generates the bindings and verifies the `createIrohNode`, `fetchHttpi`, and
 artifact. Each CI run uploads the complete generated directory as the
 `vgi-rpc-iroh-browser-<commit>` artifact; applications can publish or bundle
 that immutable output without requiring a Rust toolchain.
+
+For a runnable Haybarn integration that wires this generated package and the
+adapter Worker into `installVgiWebWorkerBridge`, then performs a real
+`ATTACH 'httpi://…'` and SELECT, see [`demo/`](demo/README.md).

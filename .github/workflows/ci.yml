@@ -85,7 +85,10 @@ jobs:
           vgi-rpc-iroh-browser/js/adapter-worker.ts
 
       - name: Test WHATWG stream wrapper
-        run: npx --yes tsx --test vgi-rpc-iroh-browser/js/*.test.ts
+        run: >-
+          npx --yes tsx --test
+          vgi-rpc-iroh-browser/js/*.test.ts
+          vgi-rpc-iroh-browser/demo/*.test.ts
 
   fmt-clippy-test:
     runs-on: ubuntu-latest

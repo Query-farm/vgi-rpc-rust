@@ -47,9 +47,17 @@ struct Args {
     #[arg(long, value_name = "SECONDS", requires = "raw_upstream")]
     raw_first_stream_timeout: Option<NonZeroU64>,
 
+    /// Deadline while waiting for another raw mux stream, in seconds.
+    #[arg(long, value_name = "SECONDS", requires = "raw_upstream")]
+    raw_connection_idle_timeout: Option<NonZeroU64>,
+
     /// Maximum simultaneous raw Iroh connections.
     #[arg(long, value_name = "COUNT", requires = "raw_upstream")]
     raw_max_connections: Option<NonZeroUsize>,
+
+    /// Maximum simultaneous raw connections from one EndpointId.
+    #[arg(long, value_name = "COUNT", requires = "raw_upstream")]
+    raw_max_connections_per_peer: Option<NonZeroUsize>,
 
     /// Maximum simultaneous raw mux streams across all connections.
     #[arg(long, value_name = "COUNT", requires = "raw_upstream")]
@@ -163,8 +171,14 @@ fn raw_bridge_options(args: &Args) -> RawBridgeOptions {
     if let Some(value) = args.raw_first_stream_timeout {
         options.first_stream_timeout = Duration::from_secs(value.get());
     }
+    if let Some(value) = args.raw_connection_idle_timeout {
+        options.connection_idle_timeout = Duration::from_secs(value.get());
+    }
     if let Some(value) = args.raw_max_connections {
         options.max_connections = value.get();
+    }
+    if let Some(value) = args.raw_max_connections_per_peer {
+        options.max_connections_per_peer = value.get();
     }
     if let Some(value) = args.raw_max_streams {
         options.max_streams = value.get();
@@ -332,6 +346,10 @@ mod tests {
             "7",
             "--raw-connect-timeout",
             "3",
+            "--raw-connection-idle-timeout",
+            "13",
+            "--raw-max-connections-per-peer",
+            "4",
             "--http-upstream",
             "https://worker.example/vgi",
             "--http-max-connections-per-peer",
@@ -347,7 +365,9 @@ mod tests {
 
         let raw = raw_bridge_options(&args);
         assert_eq!(raw.max_connections, 7);
+        assert_eq!(raw.max_connections_per_peer, 4);
         assert_eq!(raw.connect_timeout, Duration::from_secs(3));
+        assert_eq!(raw.connection_idle_timeout, Duration::from_secs(13));
 
         let http = http_bridge_options(&args).connection;
         assert_eq!(http.max_connections_per_peer, 5);

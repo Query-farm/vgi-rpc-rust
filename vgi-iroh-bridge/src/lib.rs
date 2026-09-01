@@ -14,9 +14,10 @@
 //! EndpointId and applies reverse-proxy header boundary rules in both
 //! directions. Neither protocol chooses among upstream workers.
 
+use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -420,7 +421,10 @@ pub enum RawUpstream {
 pub struct RawBridgeOptions {
     pub connect_timeout: Duration,
     pub first_stream_timeout: Duration,
+    /// Maximum wait for another mux stream after the first stream is accepted.
+    pub connection_idle_timeout: Duration,
     pub max_connections: usize,
+    pub max_connections_per_peer: usize,
     pub max_streams: usize,
     pub max_streams_per_connection: usize,
     pub drain_timeout: Duration,
@@ -431,7 +435,9 @@ impl Default for RawBridgeOptions {
         Self {
             connect_timeout: Duration::from_secs(10),
             first_stream_timeout: Duration::from_secs(15),
+            connection_idle_timeout: Duration::from_secs(60),
             max_connections: 256,
+            max_connections_per_peer: 8,
             max_streams: 1024,
             max_streams_per_connection: 32,
             drain_timeout: Duration::from_secs(10),
@@ -443,10 +449,18 @@ impl RawBridgeOptions {
     fn validate(&self) -> Result<()> {
         if self.connect_timeout.is_zero()
             || self.first_stream_timeout.is_zero()
+            || self.connection_idle_timeout.is_zero()
             || self.drain_timeout.is_zero()
             || self.max_connections == 0
+            || self.max_connections_per_peer == 0
             || self.max_streams == 0
             || self.max_streams_per_connection == 0
+            || self.max_connections > Semaphore::MAX_PERMITS
+            || self.max_connections_per_peer > Semaphore::MAX_PERMITS
+            || self.max_streams > Semaphore::MAX_PERMITS
+            || self.max_streams_per_connection > Semaphore::MAX_PERMITS
+            || self.max_connections_per_peer > self.max_connections
+            || self.max_streams_per_connection > self.max_streams
         {
             return Err(BridgeError::InvalidConfiguration);
         }
@@ -456,7 +470,7 @@ impl RawBridgeOptions {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
-    #[error("bridge timeouts and admission limits must be positive")]
+    #[error("bridge timeouts and admission limits are invalid or out of range")]
     InvalidConfiguration,
     #[error("invalid HTTP upstream: {reason}")]
     InvalidHttpUpstream { reason: &'static str },
@@ -512,6 +526,7 @@ pub struct RawBridgeProtocol {
     upstream: RawUpstream,
     options: RawBridgeOptions,
     connections: Arc<Semaphore>,
+    peer_connections: Arc<PeerConnectionAdmission>,
     streams: Arc<Semaphore>,
     shutdown: CancellationToken,
 }
@@ -532,6 +547,9 @@ impl RawBridgeProtocol {
         Ok(Self {
             upstream,
             connections: Arc::new(Semaphore::new(options.max_connections)),
+            peer_connections: Arc::new(PeerConnectionAdmission::new(
+                options.max_connections_per_peer,
+            )),
             streams: Arc::new(Semaphore::new(options.max_streams)),
             options,
             shutdown: CancellationToken::new(),
@@ -543,27 +561,43 @@ impl RawBridgeProtocol {
             connection.close(CLOSE_CODE.into(), b"unexpected ALPN");
             return Err(iroh_error("validate ALPN", "unexpected protocol"));
         }
-        let _connection_permit = Arc::clone(&self.connections)
-            .try_acquire_owned()
-            .map_err(|_| iroh_error("connection admission", "bridge at capacity"))?;
         let remote = connection.remote_id();
+        let _peer_permit = self.peer_connections.acquire(remote).ok_or_else(|| {
+            connection.close(CLOSE_CODE.into(), b"peer connection limit reached");
+            iroh_error("connection admission", "peer at capacity")
+        })?;
+        let _connection_permit =
+            Arc::clone(&self.connections)
+                .try_acquire_owned()
+                .map_err(|_| {
+                    connection.close(CLOSE_CODE.into(), b"bridge connection limit reached");
+                    iroh_error("connection admission", "bridge at capacity")
+                })?;
         let local_streams = Arc::new(Semaphore::new(self.options.max_streams_per_connection));
         let mut tasks = JoinSet::new();
 
-        let first = timeout(self.options.first_stream_timeout, connection.accept_bi())
-            .await
-            .map_err(|_| BridgeError::Timeout {
-                operation: "first Iroh stream",
-            })?
-            .map_err(|error| iroh_error("accept first Iroh stream", error))?;
+        let first = match timeout(self.options.first_stream_timeout, connection.accept_bi()).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => return Err(iroh_error("accept first Iroh stream", error)),
+            Err(_) => {
+                connection.close(CLOSE_CODE.into(), b"first raw stream timeout");
+                return Err(BridgeError::Timeout {
+                    operation: "first Iroh stream",
+                });
+            }
+        };
         self.admit_stream(first, remote, Arc::clone(&local_streams), &mut tasks);
 
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => break,
-                accepted = connection.accept_bi() => match accepted {
-                    Ok(stream) => self.admit_stream(stream, remote, Arc::clone(&local_streams), &mut tasks),
-                    Err(_) => break,
+                accepted = timeout(self.options.connection_idle_timeout, connection.accept_bi()) => match accepted {
+                    Ok(Ok(stream)) => self.admit_stream(stream, remote, Arc::clone(&local_streams), &mut tasks),
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        connection.close(CLOSE_CODE.into(), b"raw connection idle timeout");
+                        break;
+                    }
                 },
                 completed = tasks.join_next(), if !tasks.is_empty() => {
                     report_stream(completed);
@@ -609,6 +643,58 @@ impl RawBridgeProtocol {
         tasks.spawn(async move {
             bridge_stream(upstream, connect_timeout, remote, send, recv, permits).await
         });
+    }
+}
+
+struct PeerConnectionAdmission {
+    max_per_peer: usize,
+    counts: Mutex<HashMap<EndpointId, usize>>,
+}
+
+impl PeerConnectionAdmission {
+    fn new(max_per_peer: usize) -> Self {
+        Self {
+            max_per_peer,
+            counts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>, peer: EndpointId) -> Option<PeerConnectionPermit> {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let count = counts.entry(peer).or_insert(0);
+        if *count >= self.max_per_peer {
+            return None;
+        }
+        *count += 1;
+        Some(PeerConnectionPermit {
+            admission: Arc::clone(self),
+            peer,
+        })
+    }
+}
+
+struct PeerConnectionPermit {
+    admission: Arc<PeerConnectionAdmission>,
+    peer: EndpointId,
+}
+
+impl Drop for PeerConnectionPermit {
+    fn drop(&mut self) {
+        let mut counts = self
+            .admission
+            .counts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(count) = counts.get_mut(&self.peer) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(&self.peer);
+        }
     }
 }
 
@@ -863,6 +949,30 @@ mod tests {
             ),
             Err(BridgeError::InvalidConfiguration)
         ));
+
+        let options = RawBridgeOptions {
+            max_connections: Semaphore::MAX_PERMITS + 1,
+            ..RawBridgeOptions::default()
+        };
+        assert!(matches!(
+            RawBridgeProtocol::new(
+                RawUpstream::Tcp("127.0.0.1:9400".parse().expect("address")),
+                options
+            ),
+            Err(BridgeError::InvalidConfiguration)
+        ));
+    }
+
+    #[test]
+    fn raw_peer_connection_admission_is_shared_and_released() {
+        let peer =
+            EndpointId::from_bytes(&(0_u8..32).collect::<Vec<_>>().try_into().expect("32 bytes"))
+                .expect("endpoint ID");
+        let admission = Arc::new(PeerConnectionAdmission::new(1));
+        let permit = admission.acquire(peer).expect("first connection");
+        assert!(admission.acquire(peer).is_none());
+        drop(permit);
+        assert!(admission.acquire(peer).is_some());
     }
 
     #[test]
@@ -1188,7 +1298,10 @@ mod tests {
         let client_id = client_endpoint.id();
         let protocol = RawBridgeProtocol::new(
             RawUpstream::Tcp(upstream_address),
-            RawBridgeOptions::default(),
+            RawBridgeOptions {
+                connection_idle_timeout: Duration::from_millis(100),
+                ..RawBridgeOptions::default()
+            },
         )
         .expect("bridge config");
         let bridge = tokio::spawn({
@@ -1210,12 +1323,15 @@ mod tests {
         let mut echoed = [0_u8; 4];
         recv.read_exact(&mut echoed).await.expect("read echo");
         assert_eq!(&echoed, b"ping");
-        connection.close(CLOSE_CODE.into(), b"test complete");
-
         let (preamble, payload) = upstream.await.expect("upstream task");
         assert_eq!(preamble, encode_iroh_proxy_v2(client_id));
         assert_eq!(&payload, b"ping");
-        bridge.await.expect("bridge task").expect("bridge result");
+        tokio::time::timeout(Duration::from_secs(2), bridge)
+            .await
+            .expect("post-stream connection idle timeout")
+            .expect("bridge task")
+            .expect("bridge result");
+        connection.close(CLOSE_CODE.into(), b"test complete");
         client_endpoint.close().await;
     }
 }

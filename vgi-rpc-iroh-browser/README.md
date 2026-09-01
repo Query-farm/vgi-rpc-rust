@@ -48,3 +48,16 @@ CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang \
 AR_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/llvm-ar \
 cargo check -p vgi-rpc-iroh-browser --target wasm32-unknown-unknown
 ```
+
+The library emits both `rlib` and `cdylib`; the latter is the input to
+`wasm-bindgen`. Use a CLI version matching `Cargo.lock`:
+
+```sh
+cargo build -p vgi-rpc-iroh-browser --target wasm32-unknown-unknown
+wasm-bindgen --target web --out-dir dist \
+  target/wasm32-unknown-unknown/debug/vgi_rpc_iroh_browser.wasm
+```
+
+CI generates the bindings and verifies the `createIrohNode`, `fetchHttpi`, and
+`openVgiStream` exports so a check-only build cannot hide a missing browser
+artifact.

@@ -36,6 +36,23 @@ jobs:
           cargo clippy -p vgi-rpc-iroh-browser
           --target wasm32-unknown-unknown --locked -- -D warnings
 
+      - name: Build browser WebAssembly artifact
+        env:
+          CC_wasm32_unknown_unknown: clang
+          AR_wasm32_unknown_unknown: llvm-ar
+        run: >-
+          cargo build -p vgi-rpc-iroh-browser
+          --target wasm32-unknown-unknown --locked
+
+      - name: Generate and verify wasm-bindgen API
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.121 --locked
+          wasm-bindgen --target web --out-dir target/browser-bindings \
+            target/wasm32-unknown-unknown/debug/vgi_rpc_iroh_browser.wasm
+          grep -q 'createIrohNode' target/browser-bindings/vgi_rpc_iroh_browser.d.ts
+          grep -q 'fetchHttpi' target/browser-bindings/vgi_rpc_iroh_browser.d.ts
+          grep -q 'openVgiStream' target/browser-bindings/vgi_rpc_iroh_browser.d.ts
+
       - name: Typecheck WHATWG stream wrapper
         run: >-
           npx --yes --package typescript tsc --noEmit --strict

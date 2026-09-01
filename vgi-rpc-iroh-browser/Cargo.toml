@@ -12,6 +12,9 @@ readme = "README.md"
 keywords = ["rpc", "iroh", "http", "wasm", "browser"]
 categories = ["network-programming", "wasm", "web-programming::http-client"]
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 bytes.workspace = true
 http = "1"

@@ -59,6 +59,12 @@ and `--no-relay` selects direct paths only. `SIGINT` and, on Unix, `SIGTERM`
 stop the Router, which in turn drains both protocol handlers within their
 configured bounds.
 
+Every raw and HTTP connection, stream/request, body, header, idle, and drain
+bound has a safe default. The executable exposes scoped `--raw-*` and `--http-*`
+overrides (see `--help`); an override is rejected unless its corresponding
+upstream is enabled, and zero is never accepted. HTTP remains a transparent
+hop: request decompression is disabled even when other limits are customized.
+
 Raw `tcp://` destinations accept IP literals or DNS names, so the one fixed
 destination may be an internal Envoy/nginx stream listener or cloud network
 load-balancer name. DNS resolution is part of the upstream connect deadline;
@@ -74,6 +80,12 @@ not follow redirects, and does not replay a request. Hyper connection pooling
 only reuses transport connections to that origin. The shared iroh-http runtime
 owns connection-wide admission, request/header/body limits, slowloris defense,
 delivery tracking, and graceful drain.
+
+`HttpBridgeOptions::default()` disables request decompression. Consequently
+`Content-Encoding` and the encoded body pass to the fixed upstream unchanged,
+which is the safe transparent-proxy behavior. An embedding application may
+explicitly enable decompression when the upstream expects decoded application
+bodies rather than HTTP forwarding semantics.
 
 ### Identity and header boundary
 

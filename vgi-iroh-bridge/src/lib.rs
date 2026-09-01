@@ -62,10 +62,21 @@ const CLOSE_CODE: u32 = 0;
 type PooledHttpClient = Client<HttpsConnector<HttpConnector>, IrohHttpBody>;
 
 /// HTTP serving limits and lifecycle policy for [`HttpBridgeProtocol`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct HttpBridgeOptions {
     /// Shared HTTP connection runtime settings.
     pub connection: ConnectionServeOptions,
+}
+
+impl Default for HttpBridgeOptions {
+    fn default() -> Self {
+        let mut connection = ConnectionServeOptions::default();
+        // A transparent bridge must preserve Content-Encoding and the exact
+        // wire body. Operators may opt into decoding when the upstream is an
+        // application handler rather than another HTTP hop.
+        connection.decompression = false;
+        Self { connection }
+    }
 }
 
 /// A non-balancing HTTP bridge protocol suitable for an `iroh::protocol::Router`.
@@ -883,6 +894,11 @@ mod tests {
     }
 
     #[test]
+    fn http_bridge_defaults_to_transparent_request_bodies() {
+        assert!(!HttpBridgeOptions::default().connection.decompression);
+    }
+
+    #[test]
     fn header_sanitizers_strip_spoofs_hops_and_nominated_headers() {
         let mut request = HeaderMap::new();
         request.append(
@@ -969,6 +985,7 @@ mod tests {
         identities: Vec<String>,
         duplicate_headers: Vec<String>,
         client_hop_present: bool,
+        content_encoding: Option<String>,
         body: Bytes,
     }
 
@@ -1003,6 +1020,9 @@ mod tests {
                             identities: values(&parts.headers, IROH_FORWARDED_ENDPOINT_HEADER),
                             duplicate_headers: values(&parts.headers, "x-end-to-end"),
                             client_hop_present: parts.headers.contains_key("x-client-hop"),
+                            content_encoding: parts.headers.get("content-encoding").map(|value| {
+                                value.to_str().expect("content encoding is text").to_owned()
+                            }),
                             body,
                         })
                         .expect("test observation receiver");
@@ -1058,7 +1078,8 @@ mod tests {
             .header(HOST, "attacker.invalid")
             .header(CONNECTION, "x-client-hop, vgi-forwarded-iroh-endpoint")
             .header("x-client-hop", "must-not-forward")
-            .body(IrohHttpBody::full("streamed request body"))
+            .header("content-encoding", "zstd")
+            .body(IrohHttpBody::full("opaque encoded request body"))
             .expect("client request");
         request.headers_mut().append(
             HeaderName::from_static(IROH_FORWARDED_ENDPOINT_HEADER),
@@ -1116,7 +1137,8 @@ mod tests {
         assert_eq!(observation.identities, [expected_identity]);
         assert_eq!(observation.duplicate_headers, ["one", "two"]);
         assert!(!observation.client_hop_present);
-        assert_eq!(observation.body.as_ref(), b"streamed request body");
+        assert_eq!(observation.content_encoding.as_deref(), Some("zstd"));
+        assert_eq!(observation.body.as_ref(), b"opaque encoded request body");
 
         tokio::time::timeout(Duration::from_secs(5), router.shutdown())
             .await

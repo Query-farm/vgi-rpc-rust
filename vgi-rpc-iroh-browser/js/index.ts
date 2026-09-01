@@ -50,6 +50,47 @@ export interface HttpiResponse {
   readonly bodyEncoding: "raw";
 }
 
+export type HttpiTransportStage =
+  | "parse"
+  | "resolve"
+  | "connect"
+  | "request"
+  | "response_head"
+  | "response_body";
+export type HttpiTerminalCategory =
+  | "invalid_request"
+  | "unauthorized_target"
+  | "unavailable"
+  | "timeout"
+  | "cancelled"
+  | "protocol"
+  | "transport"
+  | "internal";
+export type HttpiDispatchCertainty =
+  | "not_dispatched"
+  | "dispatched"
+  | "ambiguous";
+
+/** Stable transport evidence consumed by the SAB adapter; details stay sanitized. */
+export class HttpiTransportError extends Error {
+  readonly stage: HttpiTransportStage;
+  readonly category: HttpiTerminalCategory;
+  readonly dispatchCertainty: HttpiDispatchCertainty;
+
+  constructor(
+    stage: HttpiTransportStage,
+    category: HttpiTerminalCategory,
+    dispatchCertainty: HttpiDispatchCertainty,
+    cause: unknown,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "HttpiTransportError";
+    this.stage = stage;
+    this.category = category;
+    this.dispatchCertainty = dispatchCertainty;
+  }
+}
+
 export interface OpenOptions {
   signal?: AbortSignal;
   readChunkBytes?: number;
@@ -93,7 +134,10 @@ export class IrohNode {
     return this.wasm.endpointId;
   }
 
-  private async resolve(target: string, protocol: IrohProtocol): Promise<string> {
+  private async resolve(
+    target: string,
+    protocol: IrohProtocol,
+  ): Promise<string> {
     return this.resolveTarget ? this.resolveTarget(target, protocol) : target;
   }
 
@@ -165,15 +209,46 @@ export class IrohNode {
     body: Uint8Array,
     signal?: AbortSignal,
   ): Promise<HttpiResponse> {
-    throwIfAborted(signal);
-    const endpointId = await this.resolve(target, "iroh-http/2");
-    const response = await this.wasm.fetchHttpi(
-      endpointId,
-      method,
-      path,
-      headers,
-      body,
-    );
+    try {
+      throwIfAborted(signal);
+    } catch (error) {
+      throw new HttpiTransportError(
+        "resolve",
+        "cancelled",
+        "not_dispatched",
+        error,
+      );
+    }
+    let endpointId: string;
+    try {
+      endpointId = await this.resolve(target, "iroh-http/2");
+      throwIfAborted(signal);
+    } catch (error) {
+      throw new HttpiTransportError(
+        "resolve",
+        signal?.aborted ? "cancelled" : "unauthorized_target",
+        "not_dispatched",
+        error,
+      );
+    }
+    let response: WasmHttpResponse;
+    try {
+      response = await this.wasm.fetchHttpi(
+        endpointId,
+        method,
+        path,
+        headers,
+        body,
+      );
+    } catch (error) {
+      const evidence = readHttpiEvidence(error);
+      throw new HttpiTransportError(
+        evidence?.stage ?? "request",
+        evidence?.category ?? "transport",
+        evidence?.dispatchCertainty ?? "ambiguous",
+        error,
+      );
+    }
     const cancel = () => response.cancel();
     signal?.addEventListener("abort", cancel, { once: true });
     return {
@@ -208,6 +283,54 @@ export class IrohNode {
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
-    throw signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+    throw (
+      signal.reason ??
+      new DOMException("The operation was aborted", "AbortError")
+    );
   }
+}
+
+function readHttpiEvidence(error: unknown):
+  | {
+      stage: HttpiTransportStage;
+      category: HttpiTerminalCategory;
+      dispatchCertainty: HttpiDispatchCertainty;
+    }
+  | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const value = error as Record<string, unknown>;
+  const stages: HttpiTransportStage[] = [
+    "parse",
+    "resolve",
+    "connect",
+    "request",
+    "response_head",
+    "response_body",
+  ];
+  const categories: HttpiTerminalCategory[] = [
+    "invalid_request",
+    "unauthorized_target",
+    "unavailable",
+    "timeout",
+    "cancelled",
+    "protocol",
+    "transport",
+    "internal",
+  ];
+  const certainties: HttpiDispatchCertainty[] = [
+    "not_dispatched",
+    "dispatched",
+    "ambiguous",
+  ];
+  if (
+    !stages.includes(value.vgiStage as HttpiTransportStage) ||
+    !categories.includes(value.vgiCategory as HttpiTerminalCategory) ||
+    !certainties.includes(value.vgiDispatchCertainty as HttpiDispatchCertainty)
+  )
+    return undefined;
+  return {
+    stage: value.vgiStage as HttpiTransportStage,
+    category: value.vgiCategory as HttpiTerminalCategory,
+    dispatchCertainty: value.vgiDispatchCertainty as HttpiDispatchCertainty,
+  };
 }

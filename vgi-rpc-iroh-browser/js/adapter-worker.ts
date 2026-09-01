@@ -1,4 +1,10 @@
-import type { IrohNode, VgiDuplexStream } from "./index.ts";
+import { HttpiTransportError } from "./index.ts";
+import type {
+  HeaderPair,
+  HttpiResponse,
+  IrohNode,
+  VgiDuplexStream,
+} from "./index.ts";
 
 const MAGIC = 0x42534756;
 const VERSION = 1;
@@ -30,6 +36,36 @@ const ERROR_CLIENT_TO_IROH = 2;
 const ERROR_IROH_TO_CLIENT = 3;
 const POLL_MS = 10;
 const IO_CHUNK_BYTES = 64 * 1024;
+const HTTPI_MAGIC = new Uint8Array([0x56, 0x47, 0x49, 0x48]);
+const HTTPI_VERSION = 1;
+const HTTPI_REQUEST = 1;
+const HTTPI_RESPONSE = 2;
+const HTTPI_RAW_REPRESENTATION = 1;
+const BODY_CHUNK = 1;
+const BODY_END = 2;
+const BODY_TERMINAL = 3;
+const MAX_HEADERS = 1024;
+const MAX_HEADER_BYTES = 1024 * 1024;
+const MAX_BODY_BYTES = 1024 * 1024 * 1024;
+const MAX_DETAIL_BYTES = 512;
+
+const STAGE_PARSE = 1;
+const STAGE_RESOLVE = 2;
+const STAGE_CONNECT = 3;
+const STAGE_REQUEST = 4;
+const STAGE_RESPONSE_HEAD = 5;
+const STAGE_RESPONSE_BODY = 6;
+const CATEGORY_INVALID_REQUEST = 1;
+const CATEGORY_UNAUTHORIZED_TARGET = 2;
+const CATEGORY_UNAVAILABLE = 3;
+const CATEGORY_TIMEOUT = 4;
+const CATEGORY_CANCELLED = 5;
+const CATEGORY_PROTOCOL = 6;
+const CATEGORY_TRANSPORT = 7;
+const CATEGORY_INTERNAL = 8;
+const DISPATCH_NOT_DISPATCHED = 1;
+const DISPATCH_DISPATCHED = 2;
+const DISPATCH_AMBIGUOUS = 3;
 
 interface RegionMessage {
   type: "vgi-init" | "vgi-register-target";
@@ -50,6 +86,7 @@ type AdapterMessage = RegionMessage | UnregisterMessage;
 interface Region {
   target: string;
   endpointId: string;
+  protocol: "raw" | "httpi";
   buffer: SharedArrayBuffer;
   bytes: Uint8Array;
   words: Int32Array;
@@ -62,16 +99,27 @@ interface Region {
   stopped: boolean;
 }
 
-type WaitAsyncResult = { async: false; value: string } | { async: true; value: Promise<string> };
+type WaitAsyncResult =
+  | { async: false; value: string }
+  | { async: true; value: Promise<string> };
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function waitForChange(words: Int32Array, index: number, value: number): Promise<void> {
+async function waitForChange(
+  words: Int32Array,
+  index: number,
+  value: number,
+): Promise<void> {
   const waitAsync = (
     Atomics as typeof Atomics & {
-      waitAsync?: (array: Int32Array, index: number, value: number, timeout?: number) => WaitAsyncResult;
+      waitAsync?: (
+        array: Int32Array,
+        index: number,
+        value: number,
+        timeout?: number,
+      ) => WaitAsyncResult;
     }
   ).waitAsync;
   if (waitAsync) {
@@ -87,7 +135,10 @@ function slotWord(region: Region, slot: number): number {
 }
 
 function claimStillOwned(region: Region, slot: number, claim: number): boolean {
-  return !region.stopped && Atomics.load(region.words, slotWord(region, slot) + STATE) === claim;
+  return (
+    !region.stopped &&
+    Atomics.load(region.words, slotWord(region, slot) + STATE) === claim
+  );
 }
 
 function copyRingOut(
@@ -101,7 +152,8 @@ function copyRingOut(
   const start = position % ringCapacity;
   const first = Math.min(length, ringCapacity - start);
   output.set(bytes.subarray(dataOffset + start, dataOffset + start + first));
-  if (length > first) output.set(bytes.subarray(dataOffset, dataOffset + length - first), first);
+  if (length > first)
+    output.set(bytes.subarray(dataOffset, dataOffset + length - first), first);
   return output;
 }
 
@@ -116,13 +168,23 @@ function copyRingIn(
 ): void {
   const start = position % ringCapacity;
   const first = Math.min(length, ringCapacity - start);
-  bytes.set(source.subarray(sourceOffset, sourceOffset + first), dataOffset + start);
+  bytes.set(
+    source.subarray(sourceOffset, sourceOffset + first),
+    dataOffset + start,
+  );
   if (length > first) {
-    bytes.set(source.subarray(sourceOffset + first, sourceOffset + length), dataOffset);
+    bytes.set(
+      source.subarray(sourceOffset + first, sourceOffset + length),
+      dataOffset,
+    );
   }
 }
 
-async function readClientChunk(region: Region, slot: number, claim: number): Promise<Uint8Array | undefined> {
+async function readClientChunk(
+  region: Region,
+  slot: number,
+  claim: number,
+): Promise<Uint8Array | undefined> {
   const control = slotWord(region, slot);
   const dataOffset = (control << 2) + SLOT_CONTROL_BYTES;
   for (;;) {
@@ -132,12 +194,19 @@ async function readClientChunk(region: Region, slot: number, claim: number): Pro
     const available = write - read;
     if (available > 0) {
       const length = Math.min(available, IO_CHUNK_BYTES);
-      const chunk = copyRingOut(region.bytes, dataOffset, region.ringCap, read, length);
+      const chunk = copyRingOut(
+        region.bytes,
+        dataOffset,
+        region.ringCap,
+        read,
+        length,
+      );
       Atomics.store(region.words, control + C2W_READ, read + length);
       Atomics.notify(region.words, control + C2W_READ);
       return chunk;
     }
-    if (Atomics.load(region.words, control + C2W_CLOSED) !== 0) return undefined;
+    if (Atomics.load(region.words, control + C2W_CLOSED) !== 0)
+      return undefined;
     await waitForChange(region.words, control + C2W_WRITE, write);
   }
 }
@@ -161,12 +230,255 @@ async function writeWorkerChunk(
       continue;
     }
     const length = Math.min(free, chunk.length - offset);
-    copyRingIn(region.bytes, dataOffset, region.ringCap, write, chunk, offset, length);
+    copyRingIn(
+      region.bytes,
+      dataOffset,
+      region.ringCap,
+      write,
+      chunk,
+      offset,
+      length,
+    );
     Atomics.store(region.words, control + W2C_WRITE, write + length);
     Atomics.notify(region.words, control + W2C_WRITE);
     offset += length;
   }
   return true;
+}
+
+class RingReader {
+  private pending = new Uint8Array(0);
+  private readonly region: Region;
+  private readonly slot: number;
+  private readonly claim: number;
+
+  constructor(region: Region, slot: number, claim: number) {
+    this.region = region;
+    this.slot = slot;
+    this.claim = claim;
+  }
+
+  async exact(length: number): Promise<Uint8Array> {
+    if (!Number.isSafeInteger(length) || length < 0)
+      throw new Error("invalid envelope length");
+    const output = new Uint8Array(length);
+    let offset = 0;
+    while (offset < length) {
+      if (this.pending.length === 0) {
+        const chunk = await readClientChunk(this.region, this.slot, this.claim);
+        if (chunk === undefined)
+          throw new Error("request envelope ended early");
+        this.pending = chunk;
+      }
+      const take = Math.min(length - offset, this.pending.length);
+      output.set(this.pending.subarray(0, take), offset);
+      this.pending = this.pending.subarray(take);
+      offset += take;
+    }
+    return output;
+  }
+}
+
+function u16(bytes: Uint8Array, offset: number): number {
+  return bytes[offset] | (bytes[offset + 1] << 8);
+}
+
+function u32(bytes: Uint8Array, offset: number): number {
+  return (
+    (bytes[offset] |
+      (bytes[offset + 1] << 8) |
+      (bytes[offset + 2] << 16) |
+      (bytes[offset + 3] << 24)) >>>
+    0
+  );
+}
+
+function putU16(view: DataView, offset: number, value: number): void {
+  view.setUint16(offset, value, true);
+}
+
+function putU32(view: DataView, offset: number, value: number): void {
+  view.setUint32(offset, value, true);
+}
+
+function responseHead(status: number, headers: HeaderPair[]): Uint8Array {
+  const encoder = new TextEncoder();
+  const encoded = headers.map(
+    ([name, value]) => [encoder.encode(name), encoder.encode(value)] as const,
+  );
+  const headerBytes = encoded.reduce(
+    (sum, [name, value]) => sum + name.length + value.length,
+    0,
+  );
+  if (headers.length > MAX_HEADERS || headerBytes > MAX_HEADER_BYTES) {
+    throw new Error("response headers exceed HTTPI envelope limits");
+  }
+  const bytes = new Uint8Array(
+    16 +
+      encoded.reduce(
+        (sum, [name, value]) => sum + 8 + name.length + value.length,
+        0,
+      ),
+  );
+  bytes.set(HTTPI_MAGIC, 0);
+  bytes[4] = HTTPI_VERSION;
+  bytes[5] = HTTPI_RESPONSE;
+  const view = new DataView(bytes.buffer);
+  putU16(view, 6, HTTPI_RAW_REPRESENTATION);
+  putU16(view, 8, status);
+  putU16(view, 10, 0);
+  putU32(view, 12, headers.length);
+  let offset = 16;
+  for (const [name, value] of encoded) {
+    putU32(view, offset, name.length);
+    putU32(view, offset + 4, value.length);
+    offset += 8;
+    bytes.set(name, offset);
+    offset += name.length;
+    bytes.set(value, offset);
+    offset += value.length;
+  }
+  return bytes;
+}
+
+function frame(
+  kind: number,
+  payload = new Uint8Array(0),
+  stage = 0,
+  category = 0,
+  certainty = 0,
+): Uint8Array {
+  const bytes = new Uint8Array(8 + payload.length);
+  bytes[0] = kind;
+  bytes[1] = stage;
+  bytes[2] = category;
+  bytes[3] = certainty;
+  putU32(new DataView(bytes.buffer), 4, payload.length);
+  bytes.set(payload, 8);
+  return bytes;
+}
+
+function sanitizedDetail(error: unknown): Uint8Array {
+  const text = (error instanceof Error ? error.message : String(error)).replace(
+    /[\u0000-\u001f\u007f]/g,
+    " ",
+  );
+  const encoded = new TextEncoder().encode(text);
+  return encoded.length <= MAX_DETAIL_BYTES
+    ? encoded
+    : encoded.slice(0, MAX_DETAIL_BYTES);
+}
+
+async function terminal(
+  region: Region,
+  slot: number,
+  claim: number,
+  stage: number,
+  category: number,
+  certainty: number,
+  error: unknown,
+  includeHead: boolean,
+): Promise<void> {
+  if (
+    includeHead &&
+    !(await writeWorkerChunk(region, slot, claim, responseHead(0, [])))
+  )
+    return;
+  await writeWorkerChunk(
+    region,
+    slot,
+    claim,
+    frame(BODY_TERMINAL, sanitizedDetail(error), stage, category, certainty),
+  );
+  closeWorkerOutput(region, slot, claim);
+}
+
+interface HttpiRequest {
+  method: string;
+  path: string;
+  headers: HeaderPair[];
+  body: Uint8Array;
+}
+
+async function readHttpiRequest(reader: RingReader): Promise<HttpiRequest> {
+  const prefix = await reader.exact(20);
+  if (
+    !HTTPI_MAGIC.every((value, index) => prefix[index] === value) ||
+    prefix[4] !== HTTPI_VERSION ||
+    prefix[5] !== HTTPI_REQUEST ||
+    u16(prefix, 6) !== 0
+  ) {
+    throw new Error("invalid HTTPI request envelope");
+  }
+  const methodLength = u16(prefix, 8);
+  const pathLength = u32(prefix, 12);
+  const headerCount = u32(prefix, 16);
+  if (
+    methodLength === 0 ||
+    methodLength > 16 ||
+    pathLength === 0 ||
+    pathLength > 16 * 1024 ||
+    headerCount > MAX_HEADERS
+  ) {
+    throw new Error("HTTPI request head exceeds limits");
+  }
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const method = decoder.decode(await reader.exact(methodLength));
+  const path = decoder.decode(await reader.exact(pathLength));
+  if (
+    !/^[A-Z]+$/.test(method) ||
+    !/^\/(?:[A-Za-z0-9._~!$&'()*+,;=:@-]+(?:\/[A-Za-z0-9._~!$&'()*+,;=:@-]+)*)?$/.test(
+      path,
+    )
+  ) {
+    throw new Error("invalid HTTPI method or path");
+  }
+  const headers: HeaderPair[] = [];
+  let headerBytes = 0;
+  for (let i = 0; i < headerCount; i++) {
+    const lengths = await reader.exact(8);
+    const nameLength = u32(lengths, 0);
+    const valueLength = u32(lengths, 4);
+    headerBytes += nameLength + valueLength;
+    if (nameLength === 0 || headerBytes > MAX_HEADER_BYTES)
+      throw new Error("HTTPI request headers exceed limits");
+    const name = decoder.decode(await reader.exact(nameLength));
+    const value = decoder.decode(await reader.exact(valueLength));
+    if (
+      !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) ||
+      /[\u0000-\u0008\u000a-\u001f\u007f]/.test(value)
+    ) {
+      throw new Error("invalid HTTPI header");
+    }
+    headers.push([name, value]);
+  }
+  const chunks: Uint8Array[] = [];
+  let bodyBytes = 0;
+  for (;;) {
+    const head = await reader.exact(8);
+    const length = u32(head, 4);
+    if (head[0] === BODY_END && length === 0) break;
+    if (
+      head[0] !== BODY_CHUNK ||
+      head[1] !== 0 ||
+      head[2] !== 0 ||
+      head[3] !== 0 ||
+      length > IO_CHUNK_BYTES
+    ) {
+      throw new Error("invalid HTTPI request body frame");
+    }
+    bodyBytes += length;
+    if (bodyBytes > MAX_BODY_BYTES)
+      throw new Error("HTTPI request body exceeds buffered limit");
+    chunks.push(await reader.exact(length));
+  }
+  const body = new Uint8Array(bodyBytes);
+  let bodyOffset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, bodyOffset);
+    bodyOffset += chunk.length;
+  }
+  return { method, path, headers, body };
 }
 
 function closeWorkerOutput(region: Region, slot: number, claim: number): void {
@@ -176,10 +488,19 @@ function closeWorkerOutput(region: Region, slot: number, claim: number): void {
   Atomics.notify(region.words, control + W2C_WRITE);
 }
 
-function closeWorkerError(region: Region, slot: number, claim: number, code: number): void {
+function closeWorkerError(
+  region: Region,
+  slot: number,
+  claim: number,
+  code: number,
+): void {
   if (!claimStillOwned(region, slot, claim)) return;
   const control = slotWord(region, slot);
-  if ((Atomics.load(region.words, (region.base >> 2) + HDR_FEATURES) & FEATURE_TERMINAL_ERROR) !== 0) {
+  if (
+    (Atomics.load(region.words, (region.base >> 2) + HDR_FEATURES) &
+      FEATURE_TERMINAL_ERROR) !==
+    0
+  ) {
     Atomics.store(region.words, control + TERMINAL_CODE, code);
     Atomics.store(region.words, control + TERMINAL_DETAIL, 0);
     Atomics.store(region.words, control + TERMINAL_CLAIM, claim);
@@ -225,7 +546,12 @@ async function pumpIrohToClient(
   }
 }
 
-async function serveClaim(node: IrohNode, region: Region, slot: number, claim: number): Promise<void> {
+async function serveClaim(
+  node: IrohNode,
+  region: Region,
+  slot: number,
+  claim: number,
+): Promise<void> {
   let stream: VgiDuplexStream;
   try {
     stream = await node.openVgiStream(region.endpointId);
@@ -248,12 +574,200 @@ async function serveClaim(node: IrohNode, region: Region, slot: number, claim: n
   }
 }
 
+async function serveHttpiClaim(
+  node: IrohNode,
+  region: Region,
+  slot: number,
+  claim: number,
+): Promise<void> {
+  let request: HttpiRequest;
+  try {
+    request = await readHttpiRequest(new RingReader(region, slot, claim));
+  } catch (error) {
+    await terminal(
+      region,
+      slot,
+      claim,
+      STAGE_PARSE,
+      CATEGORY_INVALID_REQUEST,
+      DISPATCH_NOT_DISPATCHED,
+      error,
+      true,
+    );
+    return;
+  }
+
+  let response: HttpiResponse;
+  try {
+    response = await node.fetchHttpi(
+      region.endpointId,
+      request.method,
+      request.path,
+      request.headers,
+      request.body,
+    );
+  } catch (error) {
+    const structured = error instanceof HttpiTransportError ? error : undefined;
+    const stages = {
+      parse: STAGE_PARSE,
+      resolve: STAGE_RESOLVE,
+      connect: STAGE_CONNECT,
+      request: STAGE_REQUEST,
+      response_head: STAGE_RESPONSE_HEAD,
+      response_body: STAGE_RESPONSE_BODY,
+    };
+    const categories = {
+      invalid_request: CATEGORY_INVALID_REQUEST,
+      unauthorized_target: CATEGORY_UNAUTHORIZED_TARGET,
+      unavailable: CATEGORY_UNAVAILABLE,
+      timeout: CATEGORY_TIMEOUT,
+      cancelled: CATEGORY_CANCELLED,
+      protocol: CATEGORY_PROTOCOL,
+      transport: CATEGORY_TRANSPORT,
+      internal: CATEGORY_INTERNAL,
+    };
+    const certainties = {
+      not_dispatched: DISPATCH_NOT_DISPATCHED,
+      dispatched: DISPATCH_DISPATCHED,
+      ambiguous: DISPATCH_AMBIGUOUS,
+    };
+    const stage = structured ? stages[structured.stage] : STAGE_REQUEST;
+    const category = structured
+      ? categories[structured.category]
+      : CATEGORY_TRANSPORT;
+    const certainty = structured
+      ? certainties[structured.dispatchCertainty]
+      : DISPATCH_AMBIGUOUS;
+    await terminal(
+      region,
+      slot,
+      claim,
+      stage,
+      category,
+      certainty,
+      error,
+      true,
+    );
+    return;
+  }
+
+  try {
+    if (response.bodyEncoding !== "raw")
+      throw new Error("HTTPI response is not raw representation bytes");
+    if (
+      !Number.isInteger(response.status) ||
+      response.status < 100 ||
+      response.status > 999
+    ) {
+      throw new Error("invalid HTTPI response status");
+    }
+    if (
+      !(await writeWorkerChunk(
+        region,
+        slot,
+        claim,
+        responseHead(response.status, response.headers),
+      ))
+    ) {
+      await response.body.cancel(
+        "VGI HTTPI SAB slot released before response head delivery",
+      );
+      return;
+    }
+  } catch (error) {
+    await response.body.cancel("VGI HTTPI rejected response head");
+    await terminal(
+      region,
+      slot,
+      claim,
+      STAGE_RESPONSE_HEAD,
+      CATEGORY_PROTOCOL,
+      DISPATCH_DISPATCHED,
+      error,
+      true,
+    );
+    return;
+  }
+
+  const reader = response.body.getReader();
+  try {
+    for (;;) {
+      const result = await reader.read();
+      if (result.done) break;
+      if (result.value.length > IO_CHUNK_BYTES) {
+        for (
+          let offset = 0;
+          offset < result.value.length;
+          offset += IO_CHUNK_BYTES
+        ) {
+          if (
+            !(await writeWorkerChunk(
+              region,
+              slot,
+              claim,
+              frame(
+                BODY_CHUNK,
+                result.value.subarray(offset, offset + IO_CHUNK_BYTES),
+              ),
+            ))
+          ) {
+            await reader.cancel(
+              "VGI HTTPI SAB slot released during response body",
+            );
+            return;
+          }
+        }
+      } else if (
+        !(await writeWorkerChunk(
+          region,
+          slot,
+          claim,
+          frame(BODY_CHUNK, result.value),
+        ))
+      ) {
+        await reader.cancel("VGI HTTPI SAB slot released during response body");
+        return;
+      }
+    }
+    await writeWorkerChunk(region, slot, claim, frame(BODY_END));
+    closeWorkerOutput(region, slot, claim);
+  } catch (error) {
+    await terminal(
+      region,
+      slot,
+      claim,
+      STAGE_RESPONSE_BODY,
+      CATEGORY_TRANSPORT,
+      DISPATCH_DISPATCHED,
+      error,
+      false,
+    );
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 function parseRegion(message: RegionMessage): Region {
-  const match = /^iroh:\/\/([0-9a-f]{64})$/.exec(message.target);
-  if (!match) throw new Error("adapter target must be a canonical iroh:// EndpointId");
-  if (!(message.buffer instanceof SharedArrayBuffer)) throw new Error("adapter buffer must be shared");
-  if (!Number.isSafeInteger(message.offset) || message.offset < 0 || (message.offset & 3) !== 0) {
-    throw new Error("adapter region offset must be a non-negative aligned integer");
+  const rawMatch = /^iroh:\/\/([0-9a-f]{64})$/.exec(message.target);
+  const httpiMatch =
+    /^httpi:\/\/([0-9a-f]{64})(?:\/(?:[A-Za-z0-9._~!$&'()*+,;=:@-]+(?:\/[A-Za-z0-9._~!$&'()*+,;=:@-]+)*))?$/.exec(
+      message.target,
+    );
+  const match = rawMatch ?? httpiMatch;
+  if (!match)
+    throw new Error(
+      "adapter target must be a canonical iroh:// or httpi:// EndpointId target",
+    );
+  if (!(message.buffer instanceof SharedArrayBuffer))
+    throw new Error("adapter buffer must be shared");
+  if (
+    !Number.isSafeInteger(message.offset) ||
+    message.offset < 0 ||
+    (message.offset & 3) !== 0
+  ) {
+    throw new Error(
+      "adapter region offset must be a non-negative aligned integer",
+    );
   }
   const words = new Int32Array(message.buffer);
   const header = message.offset >> 2;
@@ -276,6 +790,7 @@ function parseRegion(message: RegionMessage): Region {
   return {
     target: message.target,
     endpointId: match[1],
+    protocol: rawMatch ? "raw" : "httpi",
     buffer: message.buffer,
     bytes: new Uint8Array(message.buffer),
     words,
@@ -294,7 +809,9 @@ function parseRegion(message: RegionMessage): Region {
  * Returns a local teardown hook for tests or an application-controlled Worker
  * shutdown sequence; it does not close the application-owned Iroh node.
  */
-export function installIrohVgiAdapter(nodePromise: Promise<IrohNode>): () => void {
+export function installIrohVgiAdapter(
+  nodePromise: Promise<IrohNode>,
+): () => void {
   const regions = new Map<string, Region>();
   let node: IrohNode | undefined;
   let polling = false;
@@ -309,7 +826,10 @@ export function installIrohVgiAdapter(nodePromise: Promise<IrohNode>): () => voi
         for (const region of regions.values()) {
           if (region.stopped) continue;
           for (let slot = 0; slot < region.nSlots; slot++) {
-            const claim = Atomics.load(region.words, slotWord(region, slot) + STATE);
+            const claim = Atomics.load(
+              region.words,
+              slotWord(region, slot) + STATE,
+            );
             const lastClaim = region.running.get(slot);
             if (claim === 0) {
               if (lastClaim !== undefined) region.running.delete(slot);
@@ -321,7 +841,9 @@ export function installIrohVgiAdapter(nodePromise: Promise<IrohNode>): () => voi
               // Retain the completed claim marker until STATE changes. A
               // failed open publishes one terminal error and must not redial
               // the same claim in a tight loop before the client releases it.
-              void serveClaim(node, region, slot, claim);
+              void (region.protocol === "httpi"
+                ? serveHttpiClaim(node, region, slot, claim)
+                : serveClaim(node, region, slot, claim));
             }
           }
         }
@@ -343,7 +865,8 @@ export function installIrohVgiAdapter(nodePromise: Promise<IrohNode>): () => voi
       }
       return;
     }
-    if (message.type !== "vgi-init" && message.type !== "vgi-register-target") return;
+    if (message.type !== "vgi-init" && message.type !== "vgi-register-target")
+      return;
 
     void nodePromise.then(
       (resolvedNode) => {
@@ -356,13 +879,22 @@ export function installIrohVgiAdapter(nodePromise: Promise<IrohNode>): () => voi
         if (message.type === "vgi-init") {
           self.postMessage({ type: "vgi-ready", endpointId: node.endpointId });
         } else {
-          self.postMessage({ type: "vgi-target-ready", requestId: message.requestId });
+          self.postMessage({
+            type: "vgi-target-ready",
+            requestId: message.requestId,
+          });
         }
       },
       (error) => {
         const detail = error instanceof Error ? error.message : String(error);
-        if (message.type === "vgi-init") self.postMessage({ type: "vgi-error", error: detail });
-        else self.postMessage({ type: "vgi-target-error", requestId: message.requestId, error: detail });
+        if (message.type === "vgi-init")
+          self.postMessage({ type: "vgi-error", error: detail });
+        else
+          self.postMessage({
+            type: "vgi-target-error",
+            requestId: message.requestId,
+            error: detail,
+          });
       },
     );
   };

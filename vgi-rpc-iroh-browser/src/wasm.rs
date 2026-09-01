@@ -18,13 +18,20 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 use js_sys::{Array, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 
-use crate::{IrohHttpEndpoint, RequestBody, IROH_HTTP_ALPN};
+use crate::{IrohHttpEndpoint, IrohHttpError, RequestBody, IROH_HTTP_ALPN};
 
 const VGI_MUX_ALPN: &[u8] = b"vgi-rpc/arrow-mux/1";
 const CLOSE_CODE: u32 = 0;
 
 fn js_error(context: &str, error: impl std::fmt::Display) -> JsValue {
     js_sys::Error::new(&format!("{context}: {error}")).into()
+}
+
+fn httpi_error(error: JsValue, stage: &str, category: &str, dispatch: &str) -> JsValue {
+    let _ = Reflect::set(&error, &"vgiStage".into(), &stage.into());
+    let _ = Reflect::set(&error, &"vgiCategory".into(), &category.into());
+    let _ = Reflect::set(&error, &"vgiDispatchCertainty".into(), &dispatch.into());
+    error
 }
 
 fn parse_endpoint_id(value: &str) -> Result<EndpointId, JsValue> {
@@ -155,8 +162,12 @@ impl BrowserIrohNode {
         headers: Array,
         body: Uint8Array,
     ) -> Result<BrowserHttpResponse, JsValue> {
-        let remote = parse_endpoint_id(&remote)?;
-        let connection = self.connection(remote, Protocol::Http).await?;
+        let remote = parse_endpoint_id(&remote)
+            .map_err(|error| httpi_error(error, "parse", "invalid_request", "not_dispatched"))?;
+        let connection = self
+            .connection(remote, Protocol::Http)
+            .await
+            .map_err(|error| httpi_error(error, "connect", "unavailable", "not_dispatched"))?;
         let mut builder = hyper::Request::builder()
             .method(method.as_str())
             .uri(path.as_str());
@@ -179,17 +190,50 @@ impl BrowserIrohNode {
         }
         let request = builder
             .body(RequestBody::from(bytes::Bytes::from(body.to_vec())))
-            .map_err(|error| js_error("invalid HTTP request", error))?;
+            .map_err(|error| {
+                httpi_error(
+                    js_error("invalid HTTP request", error),
+                    "request",
+                    "invalid_request",
+                    "not_dispatched",
+                )
+            })?;
         let response = IrohHttpEndpoint::new(self.endpoint.clone())
             .request_on_connection(&connection, request)
             .await
-            .map_err(|error| js_error("Iroh HTTP request failed", error))?;
+            .map_err(|error| match error {
+                setup @ (IrohHttpError::OpenStream(_) | IrohHttpError::Handshake(_)) => {
+                    httpi_error(
+                        js_error("Iroh HTTP request setup failed", setup),
+                        "connect",
+                        "unavailable",
+                        "not_dispatched",
+                    )
+                }
+                request @ IrohHttpError::Request(_) => httpi_error(
+                    js_error("Iroh HTTP request failed", request),
+                    "request",
+                    "transport",
+                    "ambiguous",
+                ),
+                connect @ IrohHttpError::Connect(_) => httpi_error(
+                    js_error("Iroh HTTP connect failed", connect),
+                    "connect",
+                    "unavailable",
+                    "not_dispatched",
+                ),
+            })?;
         let status = response.status().as_u16();
         let mut response_headers = Vec::with_capacity(response.headers().len());
         for (name, value) in response.headers() {
-            let value = value
-                .to_str()
-                .map_err(|error| js_error("HTTP response header is not text", error))?;
+            let value = value.to_str().map_err(|error| {
+                httpi_error(
+                    js_error("HTTP response header is not text", error),
+                    "response_head",
+                    "protocol",
+                    "dispatched",
+                )
+            })?;
             response_headers.push((name.as_str().to_owned(), value.to_owned()));
         }
         Ok(BrowserHttpResponse {

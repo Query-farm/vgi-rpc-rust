@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { IrohNode, type HeaderPair, type WasmIrohNode } from "./index.ts";
+import {
+  HttpiTransportError,
+  IrohNode,
+  type HeaderPair,
+  type WasmIrohNode,
+} from "./index.ts";
 
 test("raw VGI wasm stream is exposed as one WHATWG duplex stream", async () => {
   const writes: number[][] = [];
@@ -57,7 +62,9 @@ test("httpi retains duplicate headers and declares raw representation bytes", as
     async fetchHttpi(_id, method, path, headers, body) {
       assert.equal(method, "POST");
       assert.equal(path, "/vgi");
-      assert.deepEqual(headers, [["content-type", "application/vnd.apache.arrow.stream"]]);
+      assert.deepEqual(headers, [
+        ["content-type", "application/vnd.apache.arrow.stream"],
+      ]);
       assert.deepEqual([...body], [7]);
       const chunks = [new Uint8Array([8, 9]), undefined];
       return {
@@ -82,7 +89,10 @@ test("httpi retains duplicate headers and declares raw representation bytes", as
   assert.equal(response.status, 201);
   assert.equal(response.bodyEncoding, "raw");
   assert.deepEqual(response.headers, responseHeaders);
-  assert.deepEqual(await new Response(response.body).bytes(), new Uint8Array([8, 9]));
+  assert.deepEqual(
+    await new Response(response.body).bytes(),
+    new Uint8Array([8, 9]),
+  );
 });
 
 test("application resolver is the optional authorization boundary", async () => {
@@ -110,4 +120,65 @@ test("application resolver is the optional authorization boundary", async () => 
     return "03".repeat(32);
   }).openVgiStream("authorized-worker");
   assert.equal(resolved, true);
+});
+
+test("httpi preserves stable wasm transport evidence and resolver failures are not dispatched", async () => {
+  const wasm = {
+    endpointId: "01".repeat(32),
+    async openVgiStream() {
+      throw new Error("unused");
+    },
+    async fetchHttpi() {
+      const error = Object.assign(new Error("relay unavailable"), {
+        vgiStage: "connect",
+        vgiCategory: "unavailable",
+        vgiDispatchCertainty: "not_dispatched",
+      });
+      throw error;
+    },
+    async close() {},
+  } as WasmIrohNode;
+  await assert.rejects(
+    new IrohNode(wasm).fetchHttpi(
+      "02".repeat(32),
+      "POST",
+      "/vgi",
+      [],
+      new Uint8Array(),
+    ),
+    (error: unknown) =>
+      error instanceof HttpiTransportError &&
+      error.stage === "connect" &&
+      error.category === "unavailable" &&
+      error.dispatchCertainty === "not_dispatched",
+  );
+  await assert.rejects(
+    new IrohNode(wasm, () => {
+      throw new Error("denied");
+    }).fetchHttpi("02".repeat(32), "POST", "/vgi", [], new Uint8Array()),
+    (error: unknown) =>
+      error instanceof HttpiTransportError &&
+      error.stage === "resolve" &&
+      error.category === "unauthorized_target" &&
+      error.dispatchCertainty === "not_dispatched",
+  );
+  const abort = new AbortController();
+  await assert.rejects(
+    new IrohNode(wasm, async (target) => {
+      abort.abort(new Error("query cancelled"));
+      return target;
+    }).fetchHttpi(
+      "02".repeat(32),
+      "POST",
+      "/vgi",
+      [],
+      new Uint8Array(),
+      abort.signal,
+    ),
+    (error: unknown) =>
+      error instanceof HttpiTransportError &&
+      error.stage === "resolve" &&
+      error.category === "cancelled" &&
+      error.dispatchCertainty === "not_dispatched",
+  );
 });

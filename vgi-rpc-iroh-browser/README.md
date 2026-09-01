@@ -14,15 +14,20 @@ The node factory accepts an optional persisted secret key and custom relay URL
 set; default construction uses n0's browser-compatible relay/address lookup.
 
 `js/adapter-worker.ts` is the complete adapter Worker pump expected by
-Haybarn's `irohAdapterWorker` option. It registers multiple ABI-v1 SAB regions,
-discovers claimed slots, opens one mux stream per claim, and applies async ring
-backpressure without blocking the Worker event loop. Terminal transport errors
-are published with claim tokens so a late failure cannot poison a reused slot.
+Haybarn's `irohAdapterWorker` option. It registers multiple ABI-v1 SAB regions
+for both `iroh://` and `httpi://` targets. Raw claims open one mux stream;
+HTTP claims decode a bounded binary envelope and call `fetchHttpi`, preserving
+ordered duplicate headers and streaming request/response chunks through the
+rings. Terminal HTTP evidence records stage, stable category, and dispatch
+certainty. Ambiguous POST failures are never replayed, and releasing a claim
+cancels its response stream.
 
 One node should be shared by the whole DuckDB engine so raw and HTTP requests
 present the same cryptographic endpoint identity. HTTP response bodies are raw
 representation bytes; VGI retains responsibility for content decoding, OAuth,
-cookies, redirects, Arrow framing, deadlines, and retry policy.
+Secure cookies, HTTP status/redirect policy, continuation and external-location
+handling, Arrow framing, deadlines, and retry policy. External payload URLs
+remain ordinary HTTPS locations rather than nested `httpi://` requests.
 
 Experimental client-only `iroh-http/2` transport seam for browser builds.
 
@@ -31,9 +36,9 @@ identity across protocols. It opens a bidirectional stream with the
 `iroh-http/2` ALPN and delegates HTTP/1.1 framing to Hyper. Request bodies are
 currently materialized `Bytes`; response bodies remain streaming.
 
-This is transport plumbing, not yet a complete VGI client. VGI Arrow request
-serialization, response decoding, retries, cancellation, pooling, and browser
-JavaScript bindings remain separate work.
+This crate remains transport plumbing: VGI owns Arrow serialization and the HTTP
+state machine, while this package owns authenticated Iroh execution and the
+browser SAB adapter boundary.
 
 Build the browser target with an LLVM clang that includes the WebAssembly
 backend. Apple clang does not include it:

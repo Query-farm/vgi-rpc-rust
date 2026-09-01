@@ -83,5 +83,6 @@ artifact. Each CI run uploads the complete generated directory as the
 that immutable output without requiring a Rust toolchain.
 
 For a runnable Haybarn integration that wires this generated package and the
-adapter Worker into `installVgiWebWorkerBridge`, then performs a real
-`ATTACH 'httpi://…'` and SELECT, see [`demo/`](demo/README.md).
+adapter Worker into `installVgiWebWorkerBridge`, then performs a real VGI
+`ATTACH` using an `httpi://` location and runs a SELECT, see
+[`demo/`](demo/README.md).

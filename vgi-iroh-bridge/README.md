@@ -41,6 +41,28 @@ let router = iroh::protocol::Router::builder(endpoint)
     .spawn();
 ```
 
+The crate also installs a `vgi-iroh-bridge` executable for the common
+standalone deployment:
+
+```sh
+vgi-iroh-bridge \
+  --secret-key-file /run/secrets/vgi-iroh-key \
+  --raw-upstream tcp://worker.internal:9400 \
+  --http-upstream https://workers.internal.example/vgi
+```
+
+The first stdout line is the bridge EndpointId. A persistent key is required
+from `--secret-key-file` or `VGI_IROH_SECRET_KEY`; `--ephemeral` is an explicit
+development-only alternative. The key itself is never accepted as a command
+line argument. Repeated `--relay-url` values replace the default relay set,
+and `--no-relay` selects direct paths only. `SIGINT` stops the Router, which in
+turn drains both protocol handlers within their configured bounds.
+
+Raw `tcp://` destinations accept IP literals or DNS names, so the one fixed
+destination may be an internal Envoy/nginx stream listener or cloud network
+load-balancer name. DNS resolution is part of the upstream connect deadline;
+it does not make the bridge a load balancer.
+
 For an upstream base ending in `/vgi`, an incoming `/catalog?limit=1` target
 becomes `/vgi/catalog?limit=1`. The configured authority always replaces the
 incoming URI authority and `Host`. HTTPS validates the configured hostname

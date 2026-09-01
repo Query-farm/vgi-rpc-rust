@@ -11,7 +11,9 @@ description = "Narrow Iroh ingress bridge for VGI RPC workers"
 publish = false
 
 [dependencies]
+anyhow = "1"
 bytes.workspace = true
+clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 http = "1"
 http-body-util = "0.1"
@@ -26,6 +28,7 @@ tokio.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
 tower = "0.5"
 tracing.workspace = true
+tracing-subscriber.workspace = true
 vgi-rpc-iroh = { path = "../vgi-rpc-iroh" }
 
 [dev-dependencies]

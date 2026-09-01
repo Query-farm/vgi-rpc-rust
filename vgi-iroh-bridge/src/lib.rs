@@ -396,6 +396,10 @@ fn bad_gateway() -> Response<IrohHttpBody> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RawUpstream {
     Tcp(std::net::SocketAddr),
+    /// DNS name or IP authority in `host:port` form. Resolution is included in
+    /// the configured connect deadline, so this can target an internal load
+    /// balancer without introducing bridge-side balancing.
+    TcpAuthority(String),
     #[cfg(unix)]
     Unix(std::path::PathBuf),
 }
@@ -664,6 +668,13 @@ async fn connect_upstream(upstream: RawUpstream) -> Result<UpstreamIo> {
             .map(UpstreamIo::Tcp)
             .map_err(|source| BridgeError::Io {
                 operation: "connect TCP upstream",
+                source,
+            }),
+        RawUpstream::TcpAuthority(authority) => tokio::net::TcpStream::connect(authority)
+            .await
+            .map(UpstreamIo::Tcp)
+            .map_err(|source| BridgeError::Io {
+                operation: "resolve or connect TCP upstream",
                 source,
             }),
         #[cfg(unix)]

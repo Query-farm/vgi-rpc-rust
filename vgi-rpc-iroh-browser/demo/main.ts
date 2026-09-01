@@ -37,6 +37,12 @@ window.__vgiIrohDemo = { done: false };
 
 const endpointFromUrl = new URL(location.href).searchParams.get("endpoint");
 if (endpointFromUrl) endpointInput.value = endpointFromUrl;
+if (
+  endpointFromUrl &&
+  new URL(location.href).searchParams.get("autorun") === "1"
+) {
+  queueMicrotask(() => void runDemo());
+}
 
 runButton.addEventListener("click", () => void runDemo());
 window.addEventListener("beforeunload", () => {
@@ -70,14 +76,24 @@ async function runDemo(): Promise<void> {
         name: "vgi-iroh-adapter",
       },
     );
+    let resolveBrowserIdentity: (endpointId: string) => void;
+    let rejectBrowserIdentity: (error: Error) => void;
+    const browserIdentity = new Promise<string>((resolve, reject) => {
+      resolveBrowserIdentity = resolve;
+      rejectBrowserIdentity = reject;
+    });
     adapterWorker.addEventListener("message", (event: MessageEvent) => {
       const message = event.data as
         { type?: string; endpointId?: string; error?: string } | undefined;
       if (message?.type === "demo-iroh-identity") {
         browserEndpointId = message.endpointId;
         appendLog(`Local browser EndpointId: ${message.endpointId}`);
+        if (message.endpointId) resolveBrowserIdentity(message.endpointId);
       } else if (message?.type === "demo-iroh-error") {
         appendLog(`Iroh adapter error: ${message.error}`);
+        rejectBrowserIdentity(
+          new Error(message.error ?? "browser Iroh endpoint creation failed"),
+        );
       }
     });
 
@@ -119,6 +135,27 @@ async function runDemo(): Promise<void> {
         `ATTACH 'example' AS remote (TYPE vgi, LOCATION '${target}')`,
       );
       appendLog("ATTACH completed; remote catalog discovery succeeded.");
+
+      setStatus("Verifying the worker CallContext identity…");
+      const identityResult = (await connection.query(
+        "SELECT remote.main.whoami(1) AS principal",
+      )) as ArrowLikeResult;
+      if (identityResult.numRows !== 1) {
+        throw new Error(
+          `identity probe returned ${identityResult.numRows} rows instead of one`,
+        );
+      }
+      const observedPrincipal = String(identityResult.getChildAt(0)?.get(0));
+      const localIdentity = await browserIdentity;
+      if (!observedPrincipal.endsWith(`/${localIdentity}`)) {
+        throw new Error(
+          "worker CallContext identity mismatch: " +
+            `browser=${localIdentity}, worker=${observedPrincipal}`,
+        );
+      }
+      appendLog(
+        `Verified authenticated worker principal: ${observedPrincipal}`,
+      );
 
       const functions = (await connection.query(
         "SELECT schema_name, function_name " +

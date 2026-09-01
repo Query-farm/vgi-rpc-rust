@@ -12,8 +12,10 @@ It uses the generated wasm-bindgen package, the production
 `installIrohVgiAdapter` pump, and Haybarn's production
 `installVgiWebWorkerBridge`. The page accepts one bridge EndpointId, authorizes
 only that exact peer, loads the VGI extension, executes
-`ATTACH 'example' AS remote (TYPE vgi, LOCATION 'httpi://<EndpointId>')`, and runs a SELECT against
-the attached catalog.
+`ATTACH 'example' AS remote (TYPE vgi, LOCATION 'httpi://<EndpointId>')`, and
+runs a SELECT against the attached catalog. Before the user query, it calls the
+VGI example worker's `whoami` function and fails unless the authenticated
+principal ends in the browser endpoint's own EndpointId.
 
 ## Prerequisites
 
@@ -22,15 +24,26 @@ the attached catalog.
 - Homebrew LLVM on macOS (Apple clang has no WebAssembly backend), or LLVM clang
   and `llvm-ar` on Linux.
 - `wasm-bindgen-cli` 0.2.121, matching this workspace's lockfile.
-- A reachable `vgi-iroh-bridge --http-upstream ...` in front of a VGI HTTP
-  worker. The worker used by the default SELECT exposes `count_to`.
+- A `vgi-rust` checkout containing the example worker's explicit
+  `--http-iroh-demo` mode.
 
-Start the bridge, retaining the first stdout line as the EndpointId:
+The repository launcher builds and owns the VGI example worker, bridge, browser
+bindings, and asset server:
 
 ```sh
+python3 vgi-rpc-iroh-browser/demo/launch.py
+```
+
+It supplies the EndpointId in the page URL and runs the demo automatically.
+`Ctrl-C` gracefully stops both native children. For manual operation, start the
+worker and bridge separately, retaining each readiness line:
+
+```sh
+cargo run --manifest-path "$HOME/Development/vgi-rust/Cargo.toml" \
+  -p vgi-example-worker -- --http-iroh-demo
 cargo run -p vgi-iroh-bridge -- \
   --ephemeral \
-  --http-upstream http://127.0.0.1:9401
+  --http-upstream http://127.0.0.1:<worker-port>
 ```
 
 `--ephemeral` is development-only. Use `--secret-key-file` for a stable bridge
@@ -65,11 +78,14 @@ and run the query. The EndpointId can also be supplied in the URL:
 http://127.0.0.1:8787/?endpoint=<64-lowercase-hex>
 ```
 
+Add `&autorun=1` to start without pressing the button.
+
 Environment overrides understood by `build.mjs`:
 
 | Variable                 | Default                                           |
 | ------------------------ | ------------------------------------------------- |
 | `HAYBARN_WASM`           | `~/Development/haybarn/haybarn-wasm`              |
+| `VGI_ENGINE_ROOT`        | same as `HAYBARN_WASM`                             |
 | `IROH_BINDINGS`          | repository `target/browser-bindings`              |
 | `VGI_EXT_WASM`           | the extension under the Haybarn version directory |
 | `VGI_ENGINE_VERSION_DIR` | `v1.5.5`                                          |

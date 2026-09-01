@@ -3,8 +3,9 @@
 //! once the last client disconnects. The `on_bound` callback reports the actual
 //! bound port (resolved from `port = 0`).
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, Ipv4Addr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -12,8 +13,9 @@ use std::time::Duration;
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
 use vgi_rpc::metadata::{REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY};
+use vgi_rpc::tcp::TcpIdentityOptions;
 use vgi_rpc::wire::{Metadata, StreamWriter};
-use vgi_rpc::{MethodInfo, RpcServer};
+use vgi_rpc::{peer_identity_primary, IdentityAssurance, MethodInfo, RpcServer, SubjectKind};
 
 /// One zero-column, one-row request body for `method`.
 fn empty_body(method: &str) -> Vec<u8> {
@@ -34,6 +36,108 @@ fn empty_body(method: &str) -> Vec<u8> {
         w.finish().unwrap();
     }
     buf
+}
+
+fn canonical_iroh_preamble() -> Vec<u8> {
+    let mut value = vec![
+        0x0d,
+        0x0a,
+        0x0d,
+        0x0a,
+        0x00,
+        0x0d,
+        0x0a,
+        0x51,
+        0x55,
+        0x49,
+        0x54,
+        0x0a,
+        0x21,
+        0x00,
+        0x00,
+        0x24,
+        vgi_rpc::VGI_IROH_ENDPOINT_TLV,
+        0x00,
+        0x21,
+        0x01,
+    ];
+    value.extend(0_u8..32);
+    value
+}
+
+#[test]
+fn tcp_worker_authenticates_canonical_forwarded_iroh_identity() {
+    let endpoint = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let (identity_tx, identity_rx) = mpsc::channel();
+    let mut server = RpcServer::new("tcp-iroh-test");
+    let schema = Arc::new(Schema::empty());
+    server.register(MethodInfo::unary(
+        "whoami",
+        schema.clone(),
+        schema,
+        move |_request, context| {
+            let identity = context.peer_evidence.unique_verified_subject("iroh")?;
+            identity_tx
+                .send((
+                    context.auth.authenticated,
+                    context.auth.principal.clone(),
+                    identity.subject_key().map(str::to_owned),
+                    identity.issuer().to_owned(),
+                    identity.assurance(),
+                    identity.subject_kind(),
+                    identity.attributes().get("original_assurance").cloned(),
+                ))
+                .map_err(|_| vgi_rpc::RpcError::runtime_error("test receiver dropped"))?;
+            Ok(None)
+        },
+    ));
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_shutdown = Arc::clone(&shutdown);
+    let (bound_tx, bound_rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        vgi_rpc::tcp::serve_tcp_with_identity(
+            Arc::new(server),
+            "127.0.0.1",
+            0,
+            None,
+            server_shutdown,
+            TcpIdentityOptions {
+                proxy_protocol_v2_required: true,
+                trusted_proxy_addresses: BTreeSet::from([IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+                iroh_proxy_issuer: Some("production-mesh".into()),
+                policy: Some(peer_identity_primary("iroh")),
+                ..TcpIdentityOptions::default()
+            },
+            move |host, port| bound_tx.send((host.to_owned(), port)).unwrap(),
+        )
+        .unwrap();
+    });
+    let (host, port) = bound_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut stream = TcpStream::connect((host.as_str(), port)).unwrap();
+    let mut request = canonical_iroh_preamble();
+    request.extend_from_slice(&empty_body("whoami"));
+    stream.write_all(&request).unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    assert!(!response.is_empty());
+
+    let (authenticated, principal, subject, issuer, assurance, kind, original_assurance) =
+        identity_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(authenticated);
+    assert_eq!(principal, format!("peer/iroh/production-mesh/{endpoint}"));
+    assert_eq!(subject.as_deref(), Some(endpoint));
+    assert_eq!(issuer, "production-mesh");
+    assert_eq!(assurance, IdentityAssurance::ConfiguredProxy);
+    assert_eq!(kind, SubjectKind::Endpoint);
+    assert_eq!(
+        original_assurance,
+        Some(serde_json::Value::String("cryptographic_peer".into()))
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    handle.join().unwrap();
 }
 
 #[test]

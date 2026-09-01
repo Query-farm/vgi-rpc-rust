@@ -5008,6 +5008,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_worker_authenticates_canonical_forwarded_iroh_identity() {
+        let endpoint = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let provider = crate::iroh_forwarded_header_provider(
+            crate::IrohForwardedHeaderConfig::new("production-mesh", ["127.0.0.1"]).unwrap(),
+        )
+        .unwrap();
+        let state = HttpState::builder()
+            .server(Arc::new(
+                RpcServer::builder().server_id("iroh-http-test").build(),
+            ))
+            .token_key(&[7u8; 32])
+            .peer_identity_providers([provider])
+            .peer_authentication_policy(crate::peer_identity_primary("iroh"))
+            .build();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("vgi-forwarded-iroh-endpoint"),
+            HeaderValue::from_static(endpoint),
+        );
+        let resolved = authenticate_request_from_peer(
+            &state,
+            "whoami",
+            &headers,
+            Some("127.0.0.1:43123".parse().unwrap()),
+        )
+        .await
+        .unwrap_or_else(|response| {
+            panic!("forwarded Iroh identity rejected: {}", response.status())
+        });
+        assert!(resolved.auth.authenticated);
+        assert_eq!(
+            resolved.auth.principal,
+            format!("peer/iroh/production-mesh/{endpoint}")
+        );
+        let identity = resolved.evidence.unique_verified_subject("iroh").unwrap();
+        assert_eq!(identity.subject_key(), Some(endpoint));
+        assert_eq!(
+            identity.assurance(),
+            crate::IdentityAssurance::ConfiguredProxy
+        );
+    }
+
+    #[tokio::test]
     async fn typed_missing_application_credential_can_defer_to_peer_primary() {
         use crate::auth::identity::{
             peer_identity_primary, IdentityAssurance, PeerIdentity, PeerIdentityProvider,

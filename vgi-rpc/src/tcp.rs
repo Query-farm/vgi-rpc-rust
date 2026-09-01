@@ -59,6 +59,10 @@ pub struct TcpIdentityOptions {
     pub trusted_proxy_addresses: BTreeSet<IpAddr>,
     pub proxy_preamble_timeout: Duration,
     pub maximum_proxy_preamble_bytes: usize,
+    /// Enables the fixed Iroh EndpointId extension on trusted PROXY/UNSPEC
+    /// connections. The issuer is local worker configuration and is never
+    /// accepted from the preamble.
+    pub iroh_proxy_issuer: Option<String>,
     pub service_name: Option<String>,
     pub identity_resolution_timeout: Duration,
     pub identity_resolver_concurrency: usize,
@@ -74,6 +78,7 @@ impl Default for TcpIdentityOptions {
             trusted_proxy_addresses: BTreeSet::new(),
             proxy_preamble_timeout: Duration::from_secs(1),
             maximum_proxy_preamble_bytes: crate::proxy_protocol::DEFAULT_MAX_PROXY_V2_BYTES,
+            iroh_proxy_issuer: None,
             service_name: None,
             identity_resolution_timeout: Duration::from_secs(5),
             identity_resolver_concurrency: 64,
@@ -101,6 +106,15 @@ impl TcpIdentityOptions {
                 io::ErrorKind::InvalidInput,
                 "PROXY v2 requires at least one exact trusted proxy address",
             ));
+        }
+        if let Some(issuer) = self.iroh_proxy_issuer.as_deref() {
+            if !self.proxy_protocol_v2_required {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Iroh proxy identity requires required PROXY v2",
+                ));
+            }
+            crate::auth::iroh::validate_issuer(issuer).map_err(io::Error::other)?;
         }
         Ok(())
     }
@@ -565,6 +579,7 @@ struct PreparedTcpPeer {
     immediate: SocketAddr,
     asserted: Option<String>,
     destination: String,
+    iroh_endpoint_id: Option<[u8; 32]>,
 }
 
 fn prepare_tcp_peer(
@@ -577,6 +592,7 @@ fn prepare_tcp_peer(
     let immediate = SocketAddr::new(normalize_ip(immediate.ip()), immediate.port());
     let mut asserted = None;
     let mut destination = connection.local_addr()?.to_string();
+    let mut iroh_endpoint_id = None;
     if options.proxy_protocol_v2_required {
         let immediate_ip = immediate.ip();
         if !options
@@ -597,14 +613,28 @@ fn prepare_tcp_peer(
                     .unwrap_or_else(Instant::now)
             }),
             options.maximum_proxy_preamble_bytes,
+            crate::proxy_protocol::ProxyProtocolV2ParseOptions {
+                allow_iroh_identity: options.iroh_proxy_issuer.is_some(),
+            },
         )?;
-        asserted = Some(proxy.source.to_string());
-        destination = proxy.destination.to_string();
+        if let Some(endpoint) = proxy.iroh_endpoint_id {
+            iroh_endpoint_id = Some(endpoint);
+        } else {
+            let address = proxy.address.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PROXY v2 did not provide an asserted TCP address",
+                )
+            })?;
+            asserted = Some(address.source.to_string());
+            destination = address.destination.to_string();
+        }
     }
     Ok(PreparedTcpPeer {
         immediate,
         asserted,
         destination,
+        iroh_endpoint_id,
     })
 }
 
@@ -625,7 +655,29 @@ fn resolve_tcp_identity(
     resolver_slots: &Arc<ResolverSlots>,
     direct_identity: Option<PeerIdentityResult>,
 ) -> io::Result<ConnectionContext> {
-    if options.providers.is_empty() && options.policy.is_none() && direct_identity.is_none() {
+    let forwarded_iroh = peer
+        .iroh_endpoint_id
+        .map(|endpoint| {
+            let subject = crate::auth::iroh::endpoint_subject(&endpoint);
+            crate::auth::iroh::forwarded_identity(
+                &subject,
+                options
+                    .iroh_proxy_issuer
+                    .as_deref()
+                    .expect("Iroh parser requires a local issuer"),
+                "tcp",
+                "proxy_protocol_v2",
+                &peer.immediate.to_string(),
+            )
+            .map(PeerIdentityResult::available)
+            .map_err(io::Error::other)
+        })
+        .transpose()?;
+    if options.providers.is_empty()
+        && options.policy.is_none()
+        && direct_identity.is_none()
+        && forwarded_iroh.is_none()
+    {
         return Ok(ConnectionContext::new(
             options.application_auth.clone(),
             Arc::new(PeerEvidenceSet::default()),
@@ -635,7 +687,7 @@ fn resolve_tcp_identity(
         .checked_add(options.identity_resolution_timeout)
         .unwrap_or_else(Instant::now);
     let has_direct_tls = direct_identity.is_some();
-    let has_proxy_protocol = peer.asserted.is_some();
+    let has_proxy_protocol = peer.asserted.is_some() || peer.iroh_endpoint_id.is_some();
     let context = PeerResolutionContext::new("tcp")
         .map_err(io::Error::other)?
         .with_peers(Some(peer.immediate.to_string()), peer.asserted.clone())
@@ -668,8 +720,11 @@ fn resolve_tcp_identity(
     }
     let (sender, receiver) = mpsc::channel();
     let mut pending = BTreeSet::new();
-    let mut results =
-        Vec::with_capacity(options.providers.len() + usize::from(direct_identity.is_some()));
+    let mut results = Vec::with_capacity(
+        options.providers.len()
+            + usize::from(direct_identity.is_some())
+            + usize::from(forwarded_iroh.is_some()),
+    );
     for provider in options.providers.iter() {
         let name = provider.provider().to_owned();
         let Some(permit) = resolver_slots.try_acquire() else {
@@ -723,6 +778,9 @@ fn resolve_tcp_identity(
     }
     if let Some(direct_identity) = direct_identity {
         results.push(direct_identity);
+    }
+    if let Some(forwarded_iroh) = forwarded_iroh {
+        results.push(forwarded_iroh);
     }
     let evidence =
         Arc::new(PeerEvidenceSet::from_results(results).map_err(peer_provider_error_to_io)?);
@@ -945,7 +1003,8 @@ fn read_proxy_until(
     stream: &mut TcpStream,
     deadline: Instant,
     maximum_bytes: usize,
-) -> io::Result<crate::proxy_protocol::ProxyProtocolV2Address> {
+    options: crate::proxy_protocol::ProxyProtocolV2ParseOptions,
+) -> io::Result<crate::proxy_protocol::ParsedProxyProtocolV2> {
     if maximum_bytes < 16 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -965,7 +1024,7 @@ fn read_proxy_until(
     preamble[..16].copy_from_slice(&fixed);
     read_exact_until(stream, &mut preamble[16..], deadline)?;
     stream.set_read_timeout(None)?;
-    crate::proxy_protocol::parse_proxy_protocol_v2(&preamble, maximum_bytes)
+    crate::proxy_protocol::parse_proxy_protocol_v2_with_options(&preamble, maximum_bytes, options)
 }
 
 fn read_exact_until(
@@ -1036,6 +1095,33 @@ mod identity_tests {
         value.extend_from_slice(&destination);
         value.extend_from_slice(&12345u16.to_be_bytes());
         value.extend_from_slice(&9400u16.to_be_bytes());
+        value
+    }
+
+    fn proxy_iroh() -> Vec<u8> {
+        let mut value = vec![
+            0x0d,
+            0x0a,
+            0x0d,
+            0x0a,
+            0x00,
+            0x0d,
+            0x0a,
+            0x51,
+            0x55,
+            0x49,
+            0x54,
+            0x0a,
+            0x21,
+            0x00,
+            0x00,
+            0x24,
+            crate::proxy_protocol::VGI_IROH_ENDPOINT_TLV,
+            0x00,
+            0x21,
+            0x01,
+        ];
+        value.extend(0_u8..32);
         value
     }
 
@@ -1194,6 +1280,105 @@ mod identity_tests {
         let mut following = [0];
         reader.read_exact(&mut following).unwrap();
         assert_eq!(following, [0xaa]);
+    }
+
+    #[test]
+    fn forwarded_iroh_identity_is_snapshotted_before_connection_policy() {
+        let (mut client, connection, peer) = tcp_pair();
+        let mut wire = proxy_iroh();
+        wire.extend_from_slice(b"VGI");
+        client.write_all(&wire).unwrap();
+        let mut reader = connection.try_clone().unwrap();
+        let options = TcpIdentityOptions {
+            proxy_protocol_v2_required: true,
+            trusted_proxy_addresses: BTreeSet::from([IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+            iroh_proxy_issuer: Some("production-mesh".into()),
+            providers: Arc::from([PeerIdentityProvider::new("observer", |context| {
+                assert_eq!(context.asserted_peer(), None);
+                assert_eq!(
+                    context.metadata().get("proxy_protocol_v2"),
+                    Some(&serde_json::Value::Bool(true))
+                );
+                PeerIdentityResult::without_identity("observer", PeerIdentityStatus::NoMatch)
+            })
+            .unwrap()]),
+            policy: Some(peer_identity_primary("iroh")),
+            ..TcpIdentityOptions::default()
+        };
+        let slots = Arc::new(ResolverSlots {
+            active: AtomicUsize::new(0),
+            maximum: 1,
+        });
+        let snapshot =
+            prepare_tcp_identity(&mut reader, &connection, peer, &options, &slots).unwrap();
+        let endpoint = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let identity = snapshot
+            .peer_evidence
+            .unique_verified_subject("iroh")
+            .unwrap();
+        assert_eq!(identity.evidence_source(), "proxy_protocol_v2");
+        assert_eq!(identity.assurance(), IdentityAssurance::ConfiguredProxy);
+        assert_eq!(identity.issuer(), "production-mesh");
+        assert_eq!(identity.transport(), "tcp");
+        assert_eq!(identity.subject_kind(), SubjectKind::Endpoint);
+        assert_eq!(identity.subject_key(), Some(endpoint));
+        assert_eq!(identity.subject_stability(), SubjectStability::Stable);
+        assert!(identity.subject_verified());
+        assert_eq!(
+            identity.attributes().get("original_assurance"),
+            Some(&serde_json::Value::String("cryptographic_peer".into()))
+        );
+        assert_eq!(identity.source_address(), Some(endpoint));
+        let immediate = peer.to_string();
+        assert_eq!(identity.proxy_address(), Some(immediate.as_str()));
+        assert!(snapshot.auth.authenticated);
+        assert_eq!(snapshot.auth.domain, "iroh");
+
+        let mut following = [0; 3];
+        reader.read_exact(&mut following).unwrap();
+        assert_eq!(&following, b"VGI");
+    }
+
+    #[test]
+    fn forwarded_iroh_configuration_and_missing_identity_fail_closed() {
+        let without_proxy = TcpIdentityOptions {
+            iroh_proxy_issuer: Some("production-mesh".into()),
+            ..TcpIdentityOptions::default()
+        };
+        assert_eq!(
+            without_proxy.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let bad_issuer = TcpIdentityOptions {
+            proxy_protocol_v2_required: true,
+            trusted_proxy_addresses: BTreeSet::from([IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+            iroh_proxy_issuer: Some("bad\nissuer".into()),
+            ..TcpIdentityOptions::default()
+        };
+        assert!(bad_issuer.validate().is_err());
+
+        let (mut client, connection, peer) = tcp_pair();
+        client
+            .write_all(&proxy_v4([100, 64, 0, 8], [100, 64, 0, 9]))
+            .unwrap();
+        let mut reader = connection.try_clone().unwrap();
+        let options = TcpIdentityOptions {
+            proxy_protocol_v2_required: true,
+            trusted_proxy_addresses: BTreeSet::from([IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+            iroh_proxy_issuer: Some("production-mesh".into()),
+            policy: Some(peer_identity_primary("iroh")),
+            ..TcpIdentityOptions::default()
+        };
+        let slots = Arc::new(ResolverSlots {
+            active: AtomicUsize::new(0),
+            maximum: 1,
+        });
+        assert_eq!(
+            prepare_tcp_identity(&mut reader, &connection, peer, &options, &slots)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
@@ -1476,6 +1661,7 @@ mod identity_tests {
             immediate,
             asserted: None,
             destination: "127.0.0.1:9400".into(),
+            iroh_endpoint_id: None,
         };
         assert_eq!(
             resolve_tcp_identity(peer, &duplicate_options, &slots, Some(direct))

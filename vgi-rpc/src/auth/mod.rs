@@ -22,6 +22,7 @@
 pub mod bearer;
 pub mod identity;
 pub mod introspect;
+pub mod iroh;
 pub mod mtls;
 pub mod oauth;
 pub mod spiffe_proxy;

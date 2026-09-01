@@ -65,6 +65,9 @@ pub use auth::identity::{
     PeerIdentity, PeerIdentityLinker, PeerIdentityProvider, PeerIdentityResult, PeerIdentityStatus,
     PeerResolutionContext, SubjectKind, SubjectStability,
 };
+pub use auth::iroh::{
+    iroh_forwarded_header_provider, IrohForwardedHeaderConfig, IROH_FORWARDED_ENDPOINT_HEADER,
+};
 pub use auth::oauth::OAuthResourceMetadata;
 #[cfg(feature = "mtls-pem")]
 pub use auth::spiffe_proxy::{
@@ -96,8 +99,9 @@ pub use intermediary::{
 pub use introspect::{DESCRIBE_METHOD_NAME, DESCRIBE_VERSION};
 pub use log::{LogLevel, LogMessage};
 pub use proxy_protocol::{
-    parse_proxy_protocol_v2, read_proxy_protocol_v2, ProxyProtocolV2Address,
-    DEFAULT_MAX_PROXY_V2_BYTES,
+    parse_proxy_protocol_v2, parse_proxy_protocol_v2_with_options, read_proxy_protocol_v2,
+    read_proxy_protocol_v2_with_options, ParsedProxyProtocolV2, ProxyProtocolV2Address,
+    ProxyProtocolV2ParseOptions, DEFAULT_MAX_PROXY_V2_BYTES, VGI_IROH_ENDPOINT_TLV,
 };
 pub use retry::RetryConfig;
 pub use server::{

@@ -30,7 +30,8 @@ Stock `arrow-rs` 59.x dependency tree, MSRV 1.97, no
   pages, RFC 9728 Protected Resource Metadata, configurable response
   / externalised-response caps.
 - **Auth** — provider-neutral peer evidence, strict Tailscale Serve/LocalAPI
-  adapters and PROXY v2 TCP identity snapshots; bearer (constant-time compare), mTLS via RFC 8705
+  and forwarded-Iroh adapters, plus PROXY v2 TCP identity snapshots; bearer
+  (constant-time compare), mTLS via RFC 8705
   `x-forwarded-client-cert`, OAuth 2 Protected Resource Metadata;
   JWKS-backed JWT (single-flight refresh) and OAuth 2 PKCE
   primitives behind Cargo features.
@@ -59,6 +60,8 @@ See [cloud and trusted-proxy SPIFFE identity](docs/cloud-and-proxy-identity.md)
 for strict Envoy, nginx, AWS, GCP, and Azure ingress profiles.
 See [direct TCP mutual-TLS SPIFFE identity](docs/direct-tcp-mtls.md) for
 rustls client-chain verification, PROXY v2 ordering, and policy composition.
+See [forwarded Iroh identity](docs/iroh-forwarded-identity.md) for ordinary
+TCP and HTTP workers behind an identity-preserving bridge.
 
 ## Cargo features
 

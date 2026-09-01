@@ -5071,15 +5071,18 @@ name = "vgi-rpc-iroh-browser"
 version = "0.23.3"
 dependencies = [
  "bytes",
+ "futures-util",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
  "iroh",
  "iroh-http-core",
+ "js-sys",
  "thiserror 2.0.18",
  "tokio",
  "tower",
+ "wasm-bindgen",
  "wasm-bindgen-futures",
 ]
 

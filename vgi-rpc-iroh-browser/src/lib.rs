@@ -24,6 +24,12 @@ pub use iroh::{Endpoint, EndpointAddr, EndpointId};
 /// ALPN used by the iroh-http version-2 wire protocol.
 pub const IROH_HTTP_ALPN: &[u8] = b"iroh-http/2";
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+mod wasm;
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub use wasm::{create_iroh_node, BrowserHttpResponse, BrowserIrohNode, BrowserVgiStream};
+
 /// Fully materialized request body supported by the initial browser client.
 pub type RequestBody = Full<Bytes>;
 

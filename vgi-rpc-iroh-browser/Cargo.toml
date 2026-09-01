@@ -23,9 +23,11 @@ thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "rt", "sync"] }
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+futures-util = "0.3"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 iroh-http-core = "=0.6.2"
 tower = { version = "0.5", features = ["util"] }
-

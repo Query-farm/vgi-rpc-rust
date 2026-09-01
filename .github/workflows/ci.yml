@@ -11,6 +11,40 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  browser-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain and browser target
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Check browser transport
+        env:
+          CC_wasm32_unknown_unknown: clang
+          AR_wasm32_unknown_unknown: llvm-ar
+        run: >-
+          cargo clippy -p vgi-rpc-iroh-browser
+          --target wasm32-unknown-unknown --locked -- -D warnings
+
+      - name: Typecheck WHATWG stream wrapper
+        run: >-
+          npx --yes --package typescript tsc --noEmit --strict
+          --target ES2022 --lib ES2022,DOM
+          vgi-rpc-iroh-browser/js/index.ts
+
+      - name: Test WHATWG stream wrapper
+        run: npx --yes tsx --test vgi-rpc-iroh-browser/js/index.test.ts
+
   fmt-clippy-test:
     runs-on: ubuntu-latest
     steps:

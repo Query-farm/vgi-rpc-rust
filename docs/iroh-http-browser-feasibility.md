@@ -94,13 +94,28 @@ not merely endpoint/ALPN registration.
 
 ## Remaining VGI work
 
-This proof is transport-only. A complete browser VGI client still needs:
+The initial transport implementation now includes:
+
+- wasm-bindgen node construction with ephemeral or persisted identity and
+  default or custom relays;
+- one application-owned endpoint shared across mux and HTTP;
+- protocol-specific pooling with single-flight connection establishment;
+- raw mux stream operations plus a WHATWG duplex-stream wrapper;
+- streaming HTTP response bodies, duplicate header retention, an explicit raw
+  representation flag, AbortSignal integration, and an optional application
+  target resolver/authorizer;
+- wasm-target Clippy and TypeScript wrapper checks in CI.
+
+A complete browser VGI release still needs:
 
 - VGI HTTP request construction and Arrow IPC serialization/decoding.
 - Response-body byte limits and explicit request deadlines/cancellation.
-- A connection pool with stale-connection retry rules for idempotent calls.
-- wasm-bindgen or another JavaScript-facing API and browser execution tests.
-- Relay/WebSocket configuration and real-browser Tailnet/Iroh qualification.
+- VGI-aware stale-connection retry rules for provably idempotent calls. The
+  transport itself never replays an ambiguous request.
+- generated wasm-bindgen package publication and DuckDB/Haybarn integration.
+- real Chromium, Firefox, and Safari relay qualification against a deployed
+  worker; the current CI gate compiles wasm and executes the WHATWG wrapper
+  tests under Node.
 - Bundle-size, startup-time, and memory measurements.
 
 Browser operation is client-only. A browser does not become a general

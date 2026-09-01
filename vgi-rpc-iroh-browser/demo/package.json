@@ -5,6 +5,7 @@
   "scripts": {
     "build": "node build.mjs",
     "serve": "node serve.mjs",
-    "test": "npx --yes tsx --test config.test.ts"
+    "test": "npx --yes tsx --test config.test.ts",
+    "typecheck": "npx --yes --package typescript tsc -p tsconfig.page.json && npx --yes --package typescript tsc -p tsconfig.worker.json"
   }
 }

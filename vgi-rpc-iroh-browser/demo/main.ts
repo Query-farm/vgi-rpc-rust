@@ -46,8 +46,7 @@ if (
 
 runButton.addEventListener("click", () => void runDemo());
 window.addEventListener("beforeunload", () => {
-  adapterWorker?.terminate();
-  void database?.terminate();
+  void teardown();
 });
 
 async function runDemo(): Promise<void> {
@@ -56,10 +55,7 @@ async function runDemo(): Promise<void> {
   resultRoot.replaceChildren();
   logOutput.textContent = "";
   try {
-    adapterWorker?.terminate();
-    adapterWorker = undefined;
-    await database?.terminate();
-    database = undefined;
+    await teardown();
     browserEndpointId = undefined;
     if (!self.crossOriginIsolated || typeof SharedArrayBuffer === "undefined") {
       throw new Error(
@@ -91,9 +87,16 @@ async function runDemo(): Promise<void> {
       const message = event.data as
         { type?: string; endpointId?: string; error?: string } | undefined;
       if (message?.type === "demo-iroh-identity") {
-        browserEndpointId = message.endpointId;
-        appendLog(`Local browser EndpointId: ${message.endpointId}`);
-        if (message.endpointId) resolveBrowserIdentity(message.endpointId);
+        try {
+          const endpointId = parseEndpointId(message.endpointId ?? "");
+          browserEndpointId = endpointId;
+          appendLog(`Local browser EndpointId: ${endpointId}`);
+          resolveBrowserIdentity(endpointId);
+        } catch (error) {
+          rejectBrowserIdentity(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+        }
       } else if (message?.type === "demo-iroh-error") {
         appendLog(`Iroh adapter error: ${message.error}`);
         rejectBrowserIdentity(
@@ -152,7 +155,9 @@ async function runDemo(): Promise<void> {
       }
       const observedPrincipal = String(identityResult.getChildAt(0)?.get(0));
       const localIdentity = await browserIdentity;
-      if (!observedPrincipal.endsWith(`/${localIdentity}`)) {
+      const expectedPrincipal =
+        `peer/iroh/iroh%3Abrowser-demo/${localIdentity}`;
+      if (observedPrincipal !== expectedPrincipal) {
         throw new Error(
           "worker CallContext identity mismatch: " +
             `browser=${localIdentity}, worker=${observedPrincipal}`,
@@ -195,8 +200,22 @@ async function runDemo(): Promise<void> {
     };
     setStatus("Failed — see the log below.", "error");
   } finally {
+    try {
+      await teardown();
+    } catch (error) {
+      appendLog(`Teardown failed: ${String(error)}`);
+    }
     runButton.disabled = false;
   }
+}
+
+async function teardown(): Promise<void> {
+  const currentAdapter = adapterWorker;
+  adapterWorker = undefined;
+  currentAdapter?.terminate();
+  const currentDatabase = database;
+  database = undefined;
+  await currentDatabase?.terminate();
 }
 
 function resultRows(result: ArrowLikeResult): unknown[][] {

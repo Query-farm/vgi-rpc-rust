@@ -27,7 +27,32 @@ declare module "demo-haybarn-vgi" {
 }
 
 declare module "demo-iroh-bindings" {
-  import type { WasmIrohNode } from "../js/index.ts";
+  interface WasmVgiStream {
+    write(chunk: Uint8Array): Promise<void>;
+    read(maxBytes: number): Promise<Uint8Array | undefined>;
+    closeWrite(): Promise<void>;
+    abort(): void;
+  }
+
+  interface WasmHttpResponse {
+    readonly status: number;
+    readonly headers: Array<readonly [string, string]>;
+    read(): Promise<Uint8Array | undefined>;
+    cancel(): void;
+  }
+
+  interface WasmIrohNode {
+    readonly endpointId: string;
+    openVgiStream(endpointId: string): Promise<WasmVgiStream>;
+    fetchHttpi(
+      endpointId: string,
+      method: string,
+      path: string,
+      headers: Array<readonly [string, string]>,
+      body: Uint8Array,
+    ): Promise<WasmHttpResponse>;
+    close(): Promise<void>;
+  }
 
   export default function initWasm(): Promise<unknown>;
   export function createIrohNode(options?: {

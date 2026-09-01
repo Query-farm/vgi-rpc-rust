@@ -106,3 +106,10 @@ form. The Iroh adapter authenticates that peer cryptographically. The bridge
 still forwards identity evidence rather than an authorization decision: the
 HTTP worker must independently configure its trusted bridge boundary and
 authorization policy.
+
+The included worker mode is development-only. It trusts the loopback address,
+so another process in the same network namespace could forge the forwarded
+header, and `peer_identity_primary("iroh")` accepts any cryptographically valid
+Iroh EndpointId rather than enforcing an application caller allowlist. A
+deployment must isolate the bridge-to-worker listener, trust only the bridge's
+exact private address, and apply its own EndpointId authorization policy.

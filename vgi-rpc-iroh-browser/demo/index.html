@@ -220,7 +220,9 @@ SELECT remote.main.whoami(1) AS identity;</textarea>
             The page authorizes only the EndpointId entered above. The bridge
             must be running
             <code>vgi-iroh-bridge --http …</code> in front of a VGI HTTP worker
-            whose catalog contains the selected function.
+            whose catalog contains the selected function. The included
+            loopback worker mode is for local development, not a production
+            trust boundary.
           </div>
         </div>
         <div class="output">

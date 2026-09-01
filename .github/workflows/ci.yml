@@ -90,6 +90,14 @@ jobs:
           vgi-rpc-iroh-browser/js/*.test.ts
           vgi-rpc-iroh-browser/demo/*.test.ts
 
+      - name: Typecheck Iroh browser demo
+        working-directory: vgi-rpc-iroh-browser/demo
+        run: npm run typecheck
+
+      - name: Test Iroh browser launcher
+        working-directory: vgi-rpc-iroh-browser/demo
+        run: python3 -m unittest test_launch.py
+
   fmt-clippy-test:
     runs-on: ubuntu-latest
     steps:

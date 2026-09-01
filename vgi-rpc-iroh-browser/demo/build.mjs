@@ -1,8 +1,15 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
-import { copyFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -23,7 +30,9 @@ const extension =
     "wasm_threads",
     "vgi.duckdb_extension.wasm",
   );
-const output = process.env.DEMO_DIST ?? join(here, "dist");
+const defaultOutput = join(here, "dist");
+const output = resolve(process.env.DEMO_DIST ?? defaultOutput);
+const outputMarker = ".vgi-iroh-browser-demo-output";
 const engineWasmCandidates = [
   join(
     engineRoot,
@@ -79,8 +88,31 @@ try {
   );
 }
 
+const forbiddenOutputs = new Set([
+  parse(output).root,
+  resolve(homedir()),
+  resolve(repository),
+  resolve(here),
+  resolve(haybarn),
+  resolve(engineRoot),
+]);
+if (forbiddenOutputs.has(output)) {
+  throw new Error(`refusing unsafe DEMO_DIST: ${output}`);
+}
+if (existsSync(output)) {
+  const metadata = lstatSync(output);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error(`DEMO_DIST must be a real directory: ${output}`);
+  }
+  if (output !== resolve(defaultOutput) && !existsSync(join(output, outputMarker))) {
+    throw new Error(
+      `refusing to replace unmarked DEMO_DIST: ${output}; choose a new directory`,
+    );
+  }
+}
 rmSync(output, { recursive: true, force: true });
 mkdirSync(output, { recursive: true });
+writeFileSync(join(output, outputMarker), "VGI Iroh browser demo output\n");
 copyFileSync(join(here, "index.html"), join(output, "index.html"));
 for (const file of [
   "duckdb-browser-coi.worker.js",

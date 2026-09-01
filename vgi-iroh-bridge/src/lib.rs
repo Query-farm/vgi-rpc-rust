@@ -589,18 +589,20 @@ impl RawBridgeProtocol {
         self.admit_stream(first, remote, Arc::clone(&local_streams), &mut tasks);
 
         loop {
+            let idle = tokio::time::sleep(self.options.connection_idle_timeout);
+            tokio::pin!(idle);
             tokio::select! {
                 _ = self.shutdown.cancelled() => break,
-                accepted = timeout(self.options.connection_idle_timeout, connection.accept_bi()) => match accepted {
-                    Ok(Ok(stream)) => self.admit_stream(stream, remote, Arc::clone(&local_streams), &mut tasks),
-                    Ok(Err(_)) => break,
-                    Err(_) => {
-                        connection.close(CLOSE_CODE.into(), b"raw connection idle timeout");
-                        break;
-                    }
+                accepted = connection.accept_bi() => match accepted {
+                    Ok(stream) => self.admit_stream(stream, remote, Arc::clone(&local_streams), &mut tasks),
+                    Err(_) => break,
                 },
                 completed = tasks.join_next(), if !tasks.is_empty() => {
                     report_stream(completed);
+                },
+                _ = &mut idle, if tasks.is_empty() => {
+                    connection.close(CLOSE_CODE.into(), b"raw connection idle timeout");
+                    break;
                 }
             }
         }

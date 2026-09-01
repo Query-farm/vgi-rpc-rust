@@ -28,6 +28,11 @@ jobs:
         with:
           node-version: "24"
 
+      - name: Install LLVM archive tool for ring WebAssembly build
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes llvm
+
       - name: Check browser transport
         env:
           CC_wasm32_unknown_unknown: clang

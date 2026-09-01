@@ -103,18 +103,26 @@ export interface CreateIrohOptions {
   relayUrls?: string[];
   /** Optional application-owned alias resolver and authorization boundary. */
   resolveTarget?: TargetResolver;
+  /** Hard cap on wasm connect/request futures, including abandoned late settlers. Default: 16. */
+  maxPendingOperations?: number;
+}
+
+export interface IrohNodeOptions {
+  maxPendingOperations?: number;
 }
 
 export type WasmIrohNodeFactory = (
-  options?: Omit<CreateIrohOptions, "resolveTarget">,
+  options?: Omit<CreateIrohOptions, "resolveTarget" | "maxPendingOperations">,
 ) => Promise<WasmIrohNode>;
 
 export async function createIrohNode(
   wasmFactory: WasmIrohNodeFactory,
   options: CreateIrohOptions = {},
 ): Promise<IrohNode> {
-  const { resolveTarget, ...transportOptions } = options;
-  return new IrohNode(await wasmFactory(transportOptions), resolveTarget);
+  const { resolveTarget, maxPendingOperations, ...transportOptions } = options;
+  return new IrohNode(await wasmFactory(transportOptions), resolveTarget, {
+    maxPendingOperations,
+  });
 }
 
 /**
@@ -125,10 +133,60 @@ export async function createIrohNode(
  * authorization can resolve/reject them without teaching VGI a policy system.
  */
 export class IrohNode {
+  private pendingOperations = 0;
+  private readonly maxPendingOperations: number;
+
   constructor(
     private readonly wasm: WasmIrohNode,
     private readonly resolveTarget?: TargetResolver,
-  ) {}
+    options: IrohNodeOptions = {},
+  ) {
+    this.maxPendingOperations = options.maxPendingOperations ?? 16;
+    if (
+      !Number.isSafeInteger(this.maxPendingOperations) ||
+      this.maxPendingOperations <= 0
+    ) {
+      throw new RangeError(
+        "maxPendingOperations must be a positive safe integer",
+      );
+    }
+  }
+
+  private admitted<T>(
+    start: () => Promise<T>,
+    signal?: AbortSignal,
+    disposeLate?: (value: T) => void,
+  ): Promise<T> {
+    if (this.pendingOperations >= this.maxPendingOperations) {
+      return Promise.reject(
+        new HttpiTransportError(
+          "connect",
+          "unavailable",
+          "not_dispatched",
+          new Error("browser Iroh pending-operation admission limit reached"),
+        ),
+      );
+    }
+    this.pendingOperations++;
+    let underlying: Promise<T>;
+    try {
+      underlying = start();
+    } catch (error) {
+      this.pendingOperations--;
+      return Promise.reject(error);
+    }
+    // Admission remains charged after the caller aborts. Only the actual wasm
+    // future settling releases it, which hard-bounds abandoned connects.
+    underlying.then(
+      () => {
+        this.pendingOperations--;
+      },
+      () => {
+        this.pendingOperations--;
+      },
+    );
+    return abortable(underlying, signal, disposeLate);
+  }
 
   get endpointId(): string {
     return this.wasm.endpointId;
@@ -146,9 +204,16 @@ export class IrohNode {
     options: OpenOptions = {},
   ): Promise<VgiDuplexStream> {
     throwIfAborted(options.signal);
-    const endpointId = await this.resolve(target, "vgi-rpc/arrow-mux/1");
+    const endpointId = await abortable(
+      Promise.resolve(this.resolve(target, "vgi-rpc/arrow-mux/1")),
+      options.signal,
+    );
     throwIfAborted(options.signal);
-    const stream = await this.wasm.openVgiStream(endpointId);
+    const stream = await this.admitted(
+      () => this.wasm.openVgiStream(endpointId),
+      options.signal,
+      (lateStream) => lateStream.abort(),
+    );
     const chunkBytes = options.readChunkBytes ?? 64 * 1024;
     if (!Number.isSafeInteger(chunkBytes) || chunkBytes <= 0) {
       stream.abort();
@@ -221,7 +286,10 @@ export class IrohNode {
     }
     let endpointId: string;
     try {
-      endpointId = await this.resolve(target, "iroh-http/2");
+      endpointId = await abortable(
+        Promise.resolve(this.resolve(target, "iroh-http/2")),
+        signal,
+      );
       throwIfAborted(signal);
     } catch (error) {
       throw new HttpiTransportError(
@@ -233,14 +301,21 @@ export class IrohNode {
     }
     let response: WasmHttpResponse;
     try {
-      response = await this.wasm.fetchHttpi(
-        endpointId,
-        method,
-        path,
-        headers,
-        body,
+      response = await this.admitted(
+        () => this.wasm.fetchHttpi(endpointId, method, path, headers, body),
+        signal,
+        (lateResponse) => lateResponse.cancel(),
       );
     } catch (error) {
+      if (signal?.aborted) {
+        throw new HttpiTransportError(
+          "request",
+          "cancelled",
+          "ambiguous",
+          error,
+        );
+      }
+      if (error instanceof HttpiTransportError) throw error;
       const evidence = readHttpiEvidence(error);
       throw new HttpiTransportError(
         evidence?.stage ?? "request",
@@ -288,6 +363,44 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
       new DOMException("The operation was aborted", "AbortError")
     );
   }
+}
+
+async function abortable<T>(
+  promise: Promise<T>,
+  signal?: AbortSignal,
+  disposeLate?: (value: T) => void,
+): Promise<T> {
+  throwIfAborted(signal);
+  if (!signal) return promise;
+  let settled = false;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      reject(
+        signal.reason ??
+          new DOMException("The operation was aborted", "AbortError"),
+      );
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        if (settled) {
+          disposeLate?.(value);
+          return;
+        }
+        settled = true;
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        if (settled) return;
+        settled = true;
+        reject(error);
+      },
+    );
+  });
 }
 
 function readHttpiEvidence(error: unknown):

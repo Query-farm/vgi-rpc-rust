@@ -5,7 +5,9 @@ import {
   HttpiTransportError,
   IrohNode,
   type HeaderPair,
+  type WasmHttpResponse,
   type WasmIrohNode,
+  type WasmVgiStream,
 } from "./index.ts";
 
 test("raw VGI wasm stream is exposed as one WHATWG duplex stream", async () => {
@@ -182,3 +184,103 @@ test("httpi preserves stable wasm transport evidence and resolver failures are n
       error.dispatchCertainty === "not_dispatched",
   );
 });
+
+test("abort promptly rejects pending raw opens and disposes a late stream", async () => {
+  let resolveOpen!: (stream: WasmVgiStream) => void;
+  let lateAborted = false;
+  let fetchCalls = 0;
+  const wasm = {
+    endpointId: "01".repeat(32),
+    openVgiStream: () =>
+      new Promise<WasmVgiStream>((resolve) => {
+        resolveOpen = resolve;
+      }),
+    async fetchHttpi() {
+      fetchCalls++;
+      throw new Error("must remain admission-blocked");
+    },
+    async close() {},
+  } as WasmIrohNode;
+  const abort = new AbortController();
+  const node = new IrohNode(wasm, undefined, { maxPendingOperations: 1 });
+  const opening = node.openVgiStream("02".repeat(32), {
+    signal: abort.signal,
+  });
+  await until(() => typeof resolveOpen === "function");
+  abort.abort(new Error("claim released"));
+  await assert.rejects(opening, /claim released/);
+  await assert.rejects(
+    node.fetchHttpi("03".repeat(32), "POST", "/vgi", [], new Uint8Array()),
+    (error: unknown) =>
+      error instanceof HttpiTransportError &&
+      error.category === "unavailable" &&
+      error.dispatchCertainty === "not_dispatched",
+  );
+  assert.equal(
+    fetchCalls,
+    0,
+    "abandoned wasm future must retain its admission slot",
+  );
+  resolveOpen({
+    async write() {},
+    async read() {
+      return undefined;
+    },
+    closeWrite() {},
+    abort() {
+      lateAborted = true;
+    },
+  });
+  await until(() => lateAborted);
+});
+
+test("abort promptly rejects pending httpi fetches and cancels a late response", async () => {
+  let resolveFetch!: (response: WasmHttpResponse) => void;
+  let lateCancelled = false;
+  const wasm = {
+    endpointId: "01".repeat(32),
+    async openVgiStream() {
+      throw new Error("unused");
+    },
+    fetchHttpi: () =>
+      new Promise<WasmHttpResponse>((resolve) => {
+        resolveFetch = resolve;
+      }),
+    async close() {},
+  } as WasmIrohNode;
+  const abort = new AbortController();
+  const fetching = new IrohNode(wasm).fetchHttpi(
+    "02".repeat(32),
+    "POST",
+    "/vgi",
+    [],
+    new Uint8Array(),
+    abort.signal,
+  );
+  await until(() => typeof resolveFetch === "function");
+  abort.abort(new Error("query cancelled"));
+  await assert.rejects(
+    fetching,
+    (error: unknown) =>
+      error instanceof HttpiTransportError && error.category === "cancelled",
+  );
+  resolveFetch({
+    status: 200,
+    headers: [],
+    async read() {
+      return undefined;
+    },
+    cancel() {
+      lateCancelled = true;
+    },
+  });
+  await until(() => lateCancelled);
+});
+
+async function until(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 1000;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("condition timed out");
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}

@@ -41,12 +41,14 @@ const HTTPI_VERSION = 1;
 const HTTPI_REQUEST = 1;
 const HTTPI_RESPONSE = 2;
 const HTTPI_RAW_REPRESENTATION = 1;
+const HTTPI_TERMINAL_ONLY = 2;
 const BODY_CHUNK = 1;
 const BODY_END = 2;
 const BODY_TERMINAL = 3;
 const MAX_HEADERS = 1024;
 const MAX_HEADER_BYTES = 1024 * 1024;
-const MAX_BODY_BYTES = 1024 * 1024 * 1024;
+const DEFAULT_MAX_REQUEST_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MAX_AGGREGATE_REQUEST_BYTES = 128 * 1024 * 1024;
 const MAX_DETAIL_BYTES = 512;
 
 const STAGE_PARSE = 1;
@@ -95,8 +97,36 @@ interface Region {
   ringCap: number;
   stride: number;
   slotsOffset: number;
-  running: Map<number, number>;
+  running: Map<number, ActiveClaim>;
   stopped: boolean;
+}
+
+interface ActiveClaim {
+  claim: number;
+  controller: AbortController;
+}
+
+export interface IrohVgiAdapterOptions {
+  maxHttpiRequestBytes?: number;
+  maxHttpiAggregateRequestBytes?: number;
+}
+
+class RequestBodyBudget {
+  used = 0;
+  constructor(
+    readonly perRequest: number,
+    readonly aggregate: number,
+  ) {}
+  reserve(current: number, additional: number): void {
+    if (current + additional > this.perRequest)
+      throw new Error("HTTPI request body exceeds per-request limit");
+    if (this.used + additional > this.aggregate)
+      throw new Error("HTTPI aggregate request-body budget exhausted");
+    this.used += additional;
+  }
+  release(bytes: number): void {
+    this.used = Math.max(0, this.used - bytes);
+  }
 }
 
 type WaitAsyncResult =
@@ -134,8 +164,14 @@ function slotWord(region: Region, slot: number): number {
   return (region.base + region.slotsOffset + slot * region.stride) >> 2;
 }
 
-function claimStillOwned(region: Region, slot: number, claim: number): boolean {
+function claimStillOwned(
+  region: Region,
+  slot: number,
+  claim: number,
+  signal?: AbortSignal,
+): boolean {
   return (
+    !signal?.aborted &&
     !region.stopped &&
     Atomics.load(region.words, slotWord(region, slot) + STATE) === claim
   );
@@ -184,11 +220,12 @@ async function readClientChunk(
   region: Region,
   slot: number,
   claim: number,
+  signal?: AbortSignal,
 ): Promise<Uint8Array | undefined> {
   const control = slotWord(region, slot);
   const dataOffset = (control << 2) + SLOT_CONTROL_BYTES;
   for (;;) {
-    if (!claimStillOwned(region, slot, claim)) return undefined;
+    if (!claimStillOwned(region, slot, claim, signal)) return undefined;
     const write = Atomics.load(region.words, control + C2W_WRITE);
     const read = Atomics.load(region.words, control + C2W_READ);
     const available = write - read;
@@ -216,12 +253,13 @@ async function writeWorkerChunk(
   slot: number,
   claim: number,
   chunk: Uint8Array,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   const control = slotWord(region, slot);
   const dataOffset = (control << 2) + SLOT_CONTROL_BYTES + region.ringCap;
   let offset = 0;
   while (offset < chunk.length) {
-    if (!claimStillOwned(region, slot, claim)) return false;
+    if (!claimStillOwned(region, slot, claim, signal)) return false;
     const write = Atomics.load(region.words, control + W2C_WRITE);
     const read = Atomics.load(region.words, control + W2C_READ);
     const free = region.ringCap - (write - read);
@@ -254,11 +292,18 @@ class RingReader {
   private readonly region: Region;
   private readonly slot: number;
   private readonly claim: number;
+  private readonly signal?: AbortSignal;
 
-  constructor(region: Region, slot: number, claim: number) {
+  constructor(
+    region: Region,
+    slot: number,
+    claim: number,
+    signal?: AbortSignal,
+  ) {
     this.region = region;
     this.slot = slot;
     this.claim = claim;
+    this.signal = signal;
   }
 
   async exact(length: number): Promise<Uint8Array> {
@@ -268,7 +313,12 @@ class RingReader {
     let offset = 0;
     while (offset < length) {
       if (this.pending.length === 0) {
-        const chunk = await readClientChunk(this.region, this.slot, this.claim);
+        const chunk = await readClientChunk(
+          this.region,
+          this.slot,
+          this.claim,
+          this.signal,
+        );
         if (chunk === undefined)
           throw new Error("request envelope ended early");
         this.pending = chunk;
@@ -304,7 +354,11 @@ function putU32(view: DataView, offset: number, value: number): void {
   view.setUint32(offset, value, true);
 }
 
-function responseHead(status: number, headers: HeaderPair[]): Uint8Array {
+function responseHead(
+  status: number,
+  headers: HeaderPair[],
+  terminalOnly = false,
+): Uint8Array {
   const encoder = new TextEncoder();
   const encoded = headers.map(
     ([name, value]) => [encoder.encode(name), encoder.encode(value)] as const,
@@ -327,7 +381,11 @@ function responseHead(status: number, headers: HeaderPair[]): Uint8Array {
   bytes[4] = HTTPI_VERSION;
   bytes[5] = HTTPI_RESPONSE;
   const view = new DataView(bytes.buffer);
-  putU16(view, 6, HTTPI_RAW_REPRESENTATION);
+  putU16(
+    view,
+    6,
+    HTTPI_RAW_REPRESENTATION | (terminalOnly ? HTTPI_TERMINAL_ONLY : 0),
+  );
   putU16(view, 8, status);
   putU16(view, 10, 0);
   putU32(view, 12, headers.length);
@@ -381,10 +439,17 @@ async function terminal(
   certainty: number,
   error: unknown,
   includeHead: boolean,
+  signal?: AbortSignal,
 ): Promise<void> {
   if (
     includeHead &&
-    !(await writeWorkerChunk(region, slot, claim, responseHead(0, [])))
+    !(await writeWorkerChunk(
+      region,
+      slot,
+      claim,
+      responseHead(0, [], true),
+      signal,
+    ))
   )
     return;
   await writeWorkerChunk(
@@ -392,6 +457,7 @@ async function terminal(
     slot,
     claim,
     frame(BODY_TERMINAL, sanitizedDetail(error), stage, category, certainty),
+    signal,
   );
   closeWorkerOutput(region, slot, claim);
 }
@@ -401,87 +467,97 @@ interface HttpiRequest {
   path: string;
   headers: HeaderPair[];
   body: Uint8Array;
+  reservedBytes: number;
 }
 
-async function readHttpiRequest(reader: RingReader): Promise<HttpiRequest> {
-  const prefix = await reader.exact(20);
-  if (
-    !HTTPI_MAGIC.every((value, index) => prefix[index] === value) ||
-    prefix[4] !== HTTPI_VERSION ||
-    prefix[5] !== HTTPI_REQUEST ||
-    u16(prefix, 6) !== 0
-  ) {
-    throw new Error("invalid HTTPI request envelope");
-  }
-  const methodLength = u16(prefix, 8);
-  const pathLength = u32(prefix, 12);
-  const headerCount = u32(prefix, 16);
-  if (
-    methodLength === 0 ||
-    methodLength > 16 ||
-    pathLength === 0 ||
-    pathLength > 16 * 1024 ||
-    headerCount > MAX_HEADERS
-  ) {
-    throw new Error("HTTPI request head exceeds limits");
-  }
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  const method = decoder.decode(await reader.exact(methodLength));
-  const path = decoder.decode(await reader.exact(pathLength));
-  if (
-    !/^[A-Z]+$/.test(method) ||
-    !/^\/(?:[A-Za-z0-9._~!$&'()*+,;=:@-]+(?:\/[A-Za-z0-9._~!$&'()*+,;=:@-]+)*)?$/.test(
-      path,
-    )
-  ) {
-    throw new Error("invalid HTTPI method or path");
-  }
-  const headers: HeaderPair[] = [];
-  let headerBytes = 0;
-  for (let i = 0; i < headerCount; i++) {
-    const lengths = await reader.exact(8);
-    const nameLength = u32(lengths, 0);
-    const valueLength = u32(lengths, 4);
-    headerBytes += nameLength + valueLength;
-    if (nameLength === 0 || headerBytes > MAX_HEADER_BYTES)
-      throw new Error("HTTPI request headers exceed limits");
-    const name = decoder.decode(await reader.exact(nameLength));
-    const value = decoder.decode(await reader.exact(valueLength));
+async function readHttpiRequest(
+  reader: RingReader,
+  budget: RequestBodyBudget,
+): Promise<HttpiRequest> {
+  let reservedBytes = 0;
+  try {
+    const prefix = await reader.exact(20);
     if (
-      !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) ||
-      /[\u0000-\u0008\u000a-\u001f\u007f]/.test(value)
+      !HTTPI_MAGIC.every((value, index) => prefix[index] === value) ||
+      prefix[4] !== HTTPI_VERSION ||
+      prefix[5] !== HTTPI_REQUEST ||
+      u16(prefix, 6) !== 0
     ) {
-      throw new Error("invalid HTTPI header");
+      throw new Error("invalid HTTPI request envelope");
     }
-    headers.push([name, value]);
-  }
-  const chunks: Uint8Array[] = [];
-  let bodyBytes = 0;
-  for (;;) {
-    const head = await reader.exact(8);
-    const length = u32(head, 4);
-    if (head[0] === BODY_END && length === 0) break;
+    const methodLength = u16(prefix, 8);
+    const pathLength = u32(prefix, 12);
+    const headerCount = u32(prefix, 16);
     if (
-      head[0] !== BODY_CHUNK ||
-      head[1] !== 0 ||
-      head[2] !== 0 ||
-      head[3] !== 0 ||
-      length > IO_CHUNK_BYTES
+      methodLength === 0 ||
+      methodLength > 16 ||
+      pathLength === 0 ||
+      pathLength > 16 * 1024 ||
+      headerCount > MAX_HEADERS
     ) {
-      throw new Error("invalid HTTPI request body frame");
+      throw new Error("HTTPI request head exceeds limits");
     }
-    bodyBytes += length;
-    if (bodyBytes > MAX_BODY_BYTES)
-      throw new Error("HTTPI request body exceeds buffered limit");
-    chunks.push(await reader.exact(length));
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    const method = decoder.decode(await reader.exact(methodLength));
+    const path = decoder.decode(await reader.exact(pathLength));
+    if (
+      !/^[A-Z]+$/.test(method) ||
+      !/^\/(?:[A-Za-z0-9._~!$&'()*+,;=:@-]+(?:\/[A-Za-z0-9._~!$&'()*+,;=:@-]+)*)?$/.test(
+        path,
+      )
+    ) {
+      throw new Error("invalid HTTPI method or path");
+    }
+    const headers: HeaderPair[] = [];
+    let headerBytes = 0;
+    for (let i = 0; i < headerCount; i++) {
+      const lengths = await reader.exact(8);
+      const nameLength = u32(lengths, 0);
+      const valueLength = u32(lengths, 4);
+      headerBytes += nameLength + valueLength;
+      if (nameLength === 0 || headerBytes > MAX_HEADER_BYTES)
+        throw new Error("HTTPI request headers exceed limits");
+      const name = decoder.decode(await reader.exact(nameLength));
+      const value = decoder.decode(await reader.exact(valueLength));
+      if (
+        !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) ||
+        /[\u0000-\u0008\u000a-\u001f\u007f]/.test(value)
+      ) {
+        throw new Error("invalid HTTPI header");
+      }
+      headers.push([name, value]);
+    }
+    const chunks: Uint8Array[] = [];
+    let bodyBytes = 0;
+    for (;;) {
+      const head = await reader.exact(8);
+      const length = u32(head, 4);
+      if (head[0] === BODY_END && length === 0) break;
+      if (
+        head[0] !== BODY_CHUNK ||
+        head[1] !== 0 ||
+        head[2] !== 0 ||
+        head[3] !== 0 ||
+        length > IO_CHUNK_BYTES
+      ) {
+        throw new Error("invalid HTTPI request body frame");
+      }
+      budget.reserve(bodyBytes, length);
+      reservedBytes += length;
+      bodyBytes += length;
+      chunks.push(await reader.exact(length));
+    }
+    const body = new Uint8Array(bodyBytes);
+    let bodyOffset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, bodyOffset);
+      bodyOffset += chunk.length;
+    }
+    return { method, path, headers, body, reservedBytes };
+  } catch (error) {
+    budget.release(reservedBytes);
+    throw error;
   }
-  const body = new Uint8Array(bodyBytes);
-  let bodyOffset = 0;
-  for (const chunk of chunks) {
-    body.set(chunk, bodyOffset);
-    bodyOffset += chunk.length;
-  }
-  return { method, path, headers, body };
 }
 
 function closeWorkerOutput(region: Region, slot: number, claim: number): void {
@@ -517,12 +593,19 @@ async function pumpClientToIroh(
   slot: number,
   claim: number,
   stream: VgiDuplexStream,
+  signal: AbortSignal,
 ): Promise<void> {
   const writer = stream.writable.getWriter();
   try {
     for (;;) {
-      const chunk = await readClientChunk(region, slot, claim);
-      if (chunk === undefined) break;
+      const chunk = await readClientChunk(region, slot, claim, signal);
+      if (chunk === undefined) {
+        if (signal.aborted)
+          throw signal.reason ?? new Error("raw Iroh pump cancelled");
+        break;
+      }
+      if (signal.aborted)
+        throw signal.reason ?? new Error("raw Iroh pump cancelled");
       await writer.write(chunk);
     }
     await writer.close();
@@ -536,13 +619,22 @@ async function pumpIrohToClient(
   slot: number,
   claim: number,
   stream: VgiDuplexStream,
+  signal: AbortSignal,
 ): Promise<void> {
   const reader = stream.readable.getReader();
   try {
     for (;;) {
       const result = await reader.read();
       if (result.done) break;
-      if (!(await writeWorkerChunk(region, slot, claim, result.value))) break;
+      if (
+        !(await writeWorkerChunk(region, slot, claim, result.value, signal))
+      ) {
+        if (signal.aborted)
+          throw signal.reason ?? new Error("raw Iroh pump cancelled");
+        break;
+      }
+      if (signal.aborted)
+        throw signal.reason ?? new Error("raw Iroh pump cancelled");
     }
   } finally {
     reader.releaseLock();
@@ -554,25 +646,57 @@ async function serveClaim(
   region: Region,
   slot: number,
   claim: number,
+  signal: AbortSignal,
 ): Promise<void> {
   let stream: VgiDuplexStream;
   try {
-    stream = await node.openVgiStream(region.endpointId);
+    stream = await node.openVgiStream(region.endpointId, { signal });
   } catch {
-    closeWorkerError(region, slot, claim, ERROR_OPEN);
+    if (!signal.aborted) closeWorkerError(region, slot, claim, ERROR_OPEN);
     return;
   }
-
-  const input = pumpClientToIroh(region, slot, claim, stream);
-  const output = pumpIrohToClient(region, slot, claim, stream);
+  const pumps = new AbortController();
+  const cancelPumps = () => {
+    pumps.abort(signal.reason ?? new Error("Iroh claim cancelled"));
+    stream.abort(signal.reason);
+  };
+  signal.addEventListener("abort", cancelPumps, { once: true });
+  let published = false;
+  const fail = (code: number, error: unknown) => {
+    if (published) return;
+    published = true;
+    pumps.abort(error);
+    stream.abort(error);
+    closeWorkerError(region, slot, claim, code);
+  };
+  const input = pumpClientToIroh(
+    region,
+    slot,
+    claim,
+    stream,
+    pumps.signal,
+  ).catch((error) => {
+    fail(ERROR_CLIENT_TO_IROH, error);
+    throw error;
+  });
+  const output = pumpIrohToClient(
+    region,
+    slot,
+    claim,
+    stream,
+    pumps.signal,
+  ).catch((error) => {
+    fail(ERROR_IROH_TO_CLIENT, error);
+    throw error;
+  });
   const [inputResult, outputResult] = await Promise.allSettled([input, output]);
-  if (inputResult.status === "rejected") {
-    stream.abort(inputResult.reason);
-    closeWorkerError(region, slot, claim, ERROR_CLIENT_TO_IROH);
-  } else if (outputResult.status === "rejected") {
-    stream.abort(outputResult.reason);
-    closeWorkerError(region, slot, claim, ERROR_IROH_TO_CLIENT);
-  } else {
+  signal.removeEventListener("abort", cancelPumps);
+  if (
+    !published &&
+    inputResult.status === "fulfilled" &&
+    outputResult.status === "fulfilled" &&
+    !signal.aborted
+  ) {
     closeWorkerOutput(region, slot, claim);
   }
 }
@@ -582,11 +706,17 @@ async function serveHttpiClaim(
   region: Region,
   slot: number,
   claim: number,
+  signal: AbortSignal,
+  budget: RequestBodyBudget,
 ): Promise<void> {
   let request: HttpiRequest;
   try {
-    request = await readHttpiRequest(new RingReader(region, slot, claim));
+    request = await readHttpiRequest(
+      new RingReader(region, slot, claim, signal),
+      budget,
+    );
   } catch (error) {
+    if (signal.aborted) return;
     await terminal(
       region,
       slot,
@@ -596,6 +726,7 @@ async function serveHttpiClaim(
       DISPATCH_NOT_DISPATCHED,
       error,
       true,
+      signal,
     );
     return;
   }
@@ -608,8 +739,10 @@ async function serveHttpiClaim(
       request.path,
       request.headers,
       request.body,
+      signal,
     );
   } catch (error) {
+    if (signal.aborted) return;
     const structured = error instanceof HttpiTransportError ? error : undefined;
     const stages = {
       parse: STAGE_PARSE,
@@ -650,8 +783,12 @@ async function serveHttpiClaim(
       certainty,
       error,
       true,
+      signal,
     );
     return;
+  } finally {
+    budget.release(request.reservedBytes);
+    request.body = new Uint8Array();
   }
 
   try {
@@ -670,6 +807,7 @@ async function serveHttpiClaim(
         slot,
         claim,
         responseHead(response.status, response.headers),
+        signal,
       ))
     ) {
       await response.body.cancel(
@@ -688,6 +826,7 @@ async function serveHttpiClaim(
       DISPATCH_DISPATCHED,
       error,
       true,
+      signal,
     );
     return;
   }
@@ -712,6 +851,7 @@ async function serveHttpiClaim(
                 BODY_CHUNK,
                 result.value.subarray(offset, offset + IO_CHUNK_BYTES),
               ),
+              signal,
             ))
           ) {
             await reader.cancel(
@@ -726,13 +866,14 @@ async function serveHttpiClaim(
           slot,
           claim,
           frame(BODY_CHUNK, result.value),
+          signal,
         ))
       ) {
         await reader.cancel("VGI HTTPI SAB slot released during response body");
         return;
       }
     }
-    await writeWorkerChunk(region, slot, claim, frame(BODY_END));
+    await writeWorkerChunk(region, slot, claim, frame(BODY_END), signal);
     closeWorkerOutput(region, slot, claim);
   } catch (error) {
     await terminal(
@@ -744,6 +885,7 @@ async function serveHttpiClaim(
       DISPATCH_DISPATCHED,
       error,
       false,
+      signal,
     );
   } finally {
     reader.releaseLock();
@@ -814,11 +956,37 @@ function parseRegion(message: RegionMessage): Region {
  */
 export function installIrohVgiAdapter(
   nodePromise: Promise<IrohNode>,
+  options: IrohVgiAdapterOptions = {},
 ): () => void {
   const regions = new Map<string, Region>();
   let node: IrohNode | undefined;
   let polling = false;
   let installed = true;
+  const perRequest = options.maxHttpiRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES;
+  const aggregate =
+    options.maxHttpiAggregateRequestBytes ??
+    DEFAULT_MAX_AGGREGATE_REQUEST_BYTES;
+  if (
+    !Number.isSafeInteger(perRequest) ||
+    perRequest <= 0 ||
+    !Number.isSafeInteger(aggregate) ||
+    aggregate < perRequest
+  ) {
+    throw new RangeError(
+      "HTTPI request limits must be positive safe integers and aggregate >= per-request",
+    );
+  }
+  const bodyBudget = new RequestBodyBudget(perRequest, aggregate);
+  const cancelActive = (region: Region, reason: unknown) => {
+    region.stopped = true;
+    for (const [slot, active] of region.running) {
+      active.controller.abort(reason);
+      const control = slotWord(region, slot);
+      Atomics.notify(region.words, control + C2W_WRITE);
+      Atomics.notify(region.words, control + W2C_READ);
+    }
+    region.running.clear();
+  };
 
   const poll = async (): Promise<void> => {
     if (polling || !node) return;
@@ -835,18 +1003,33 @@ export function installIrohVgiAdapter(
             );
             const lastClaim = region.running.get(slot);
             if (claim === 0) {
-              if (lastClaim !== undefined) region.running.delete(slot);
+              if (lastClaim !== undefined) {
+                lastClaim.controller.abort(new Error("VGI SAB claim released"));
+                const control = slotWord(region, slot);
+                Atomics.notify(region.words, control + C2W_WRITE);
+                Atomics.notify(region.words, control + W2C_READ);
+                region.running.delete(slot);
+              }
               continue;
             }
             active = true;
-            if (lastClaim !== claim) {
-              region.running.set(slot, claim);
+            if (!lastClaim || lastClaim.claim !== claim) {
+              lastClaim?.controller.abort(new Error("VGI SAB claim replaced"));
+              const controller = new AbortController();
+              region.running.set(slot, { claim, controller });
               // Retain the completed claim marker until STATE changes. A
               // failed open publishes one terminal error and must not redial
               // the same claim in a tight loop before the client releases it.
               void (region.protocol === "httpi"
-                ? serveHttpiClaim(node, region, slot, claim)
-                : serveClaim(node, region, slot, claim));
+                ? serveHttpiClaim(
+                    node,
+                    region,
+                    slot,
+                    claim,
+                    controller.signal,
+                    bodyBudget,
+                  )
+                : serveClaim(node, region, slot, claim, controller.signal));
             }
           }
         }
@@ -863,7 +1046,7 @@ export function installIrohVgiAdapter(
     if (message.type === "vgi-unregister-target") {
       const region = regions.get(message.target);
       if (region && region.base === message.offset) {
-        region.stopped = true;
+        cancelActive(region, new Error("VGI target unregistered"));
         regions.delete(message.target);
       }
       return;
@@ -876,7 +1059,7 @@ export function installIrohVgiAdapter(
         node = resolvedNode;
         const region = parseRegion(message);
         const old = regions.get(region.target);
-        if (old) old.stopped = true;
+        if (old) cancelActive(old, new Error("VGI target region replaced"));
         regions.set(region.target, region);
         void poll();
         if (message.type === "vgi-init") {
@@ -904,7 +1087,8 @@ export function installIrohVgiAdapter(
   self.addEventListener("message", onMessage as EventListener);
   return () => {
     installed = false;
-    for (const region of regions.values()) region.stopped = true;
+    for (const region of regions.values())
+      cancelActive(region, new Error("Iroh adapter stopped"));
     regions.clear();
     self.removeEventListener("message", onMessage as EventListener);
   };

@@ -20,7 +20,15 @@ HTTP claims decode a bounded binary envelope and call `fetchHttpi`, preserving
 ordered duplicate headers and streaming request/response chunks through the
 rings. Terminal HTTP evidence records stage, stable category, and dispatch
 certainty. Ambiguous POST failures are never replayed, and releasing a claim
-cancels its response stream.
+cancels pending resolution, connect/request wrappers, and response streams.
+Because the current wasm API materializes request bodies, the adapter defaults
+to 64 MiB per claim and 128 MiB across all active claims; applications may lower
+these values through `installIrohVgiAdapter` options. Raw duplex pump failures
+abort the sibling direction immediately rather than waiting on a blocked ring.
+The public wrapper also admits at most 16 underlying wasm connect/request
+futures by default. An aborted caller returns promptly, but its admission slot
+is deliberately retained until the actual Rust future settles; this prevents
+repeated network outages from accumulating unbounded background connects.
 
 One node should be shared by the whole DuckDB engine so raw and HTTP requests
 present the same cryptographic endpoint identity. HTTP response bodies are raw

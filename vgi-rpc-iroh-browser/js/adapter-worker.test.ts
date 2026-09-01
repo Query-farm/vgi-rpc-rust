@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { installIrohVgiAdapter } from "./adapter-worker.ts";
+import { HttpiTransportError } from "./index.ts";
 import type {
   HeaderPair,
   HttpiResponse,
@@ -286,6 +287,230 @@ test("httpi adapter cancels an orphaned response stream when its SAB claim is re
   stop();
 });
 
+test("raw output failure aborts a sibling SAB input pump and publishes promptly", async () => {
+  const listeners = installTestScope();
+  let aborted = 0;
+  const node = {
+    endpointId: "01".repeat(32),
+    async openVgiStream(): Promise<VgiDuplexStream> {
+      return {
+        readable: new ReadableStream({
+          pull() {
+            throw new Error("remote reset");
+          },
+        }),
+        writable: new WritableStream(),
+        abort() {
+          aborted++;
+        },
+      };
+    },
+  } as IrohNode;
+  const { buffer, words, stride } = makeRegion(1, 1024);
+  const stop = installIrohVgiAdapter(Promise.resolve(node));
+  const target = `iroh://${"02".repeat(32)}`;
+  for (const listener of listeners)
+    listener({ data: { type: "vgi-init", target, buffer, offset: 0 } });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const control = HEADER_BYTES >> 2;
+  const started = Date.now();
+  Atomics.store(words, control, 101);
+  await until(() => Atomics.load(words, control + 6) === 101);
+  assert.ok(
+    Date.now() - started < 500,
+    "terminal state should not wait for the sibling pump",
+  );
+  assert.equal(Atomics.load(words, control + 8), 3);
+  assert.ok(aborted >= 1);
+  assert.ok(stride > 0);
+  stop();
+});
+
+test("httpi pre-response failures use a terminal-only head with decodable evidence", async () => {
+  const listeners = installTestScope();
+  const node = {
+    endpointId: "01".repeat(32),
+    async fetchHttpi(): Promise<HttpiResponse> {
+      throw new HttpiTransportError(
+        "connect",
+        "unavailable",
+        "not_dispatched",
+        new Error("offline"),
+      );
+    },
+  } as IrohNode;
+  const { buffer, words } = makeRegion(1, 2048);
+  const stop = installIrohVgiAdapter(Promise.resolve(node));
+  const target = `httpi://${"02".repeat(32)}`;
+  for (const listener of listeners)
+    listener({ data: { type: "vgi-init", target, buffer, offset: 0 } });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  writeClaim(
+    buffer,
+    words,
+    0,
+    2048,
+    111,
+    encodeHttpiRequest("POST", "/vgi", [], new Uint8Array()),
+  );
+  const control = HEADER_BYTES >> 2;
+  await until(() => Atomics.load(words, control + 6) === 111);
+  const bytes = new Uint8Array(
+    buffer,
+    HEADER_BYTES + SLOT_CONTROL_BYTES + 2048,
+    Atomics.load(words, control + 4),
+  );
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  assert.equal(view.getUint16(6, true), 3);
+  assert.equal(view.getUint16(8, true), 0);
+  assert.equal(bytes[16], 3);
+  assert.deepEqual(Array.from(bytes.subarray(17, 20)), [3, 3, 1]);
+  stop();
+});
+
+test("claim release and adapter stop cancel pending raw and httpi opens", async () => {
+  const listeners = installTestScope();
+  let rawCancelled = false;
+  let httpCancelled = false;
+  const node = {
+    endpointId: "01".repeat(32),
+    openVgiStream(_target: string, options: { signal?: AbortSignal }) {
+      return new Promise<VgiDuplexStream>((_resolve, reject) =>
+        options.signal?.addEventListener(
+          "abort",
+          () => {
+            rawCancelled = true;
+            reject(options.signal?.reason);
+          },
+          { once: true },
+        ),
+      );
+    },
+    fetchHttpi(
+      _target: string,
+      _method: string,
+      _path: string,
+      _headers: HeaderPair[],
+      _body: Uint8Array,
+      signal?: AbortSignal,
+    ) {
+      return new Promise<HttpiResponse>((_resolve, reject) =>
+        signal?.addEventListener(
+          "abort",
+          () => {
+            httpCancelled = true;
+            reject(signal.reason);
+          },
+          { once: true },
+        ),
+      );
+    },
+  } as IrohNode;
+  const rawRegion = makeRegion(1, 1024);
+  const httpRegion = makeRegion(1, 1024);
+  const stop = installIrohVgiAdapter(Promise.resolve(node));
+  for (const listener of listeners) {
+    listener({
+      data: {
+        type: "vgi-init",
+        target: `iroh://${"02".repeat(32)}`,
+        buffer: rawRegion.buffer,
+        offset: 0,
+      },
+    });
+    listener({
+      data: {
+        type: "vgi-register-target",
+        requestId: "h",
+        target: `httpi://${"03".repeat(32)}`,
+        buffer: httpRegion.buffer,
+        offset: 0,
+      },
+    });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  Atomics.store(rawRegion.words, HEADER_BYTES >> 2, 121);
+  writeClaim(
+    httpRegion.buffer,
+    httpRegion.words,
+    0,
+    1024,
+    122,
+    encodeHttpiRequest("POST", "/vgi", [], new Uint8Array()),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  Atomics.store(rawRegion.words, HEADER_BYTES >> 2, 0);
+  await until(() => rawCancelled);
+  stop();
+  await until(() => httpCancelled);
+});
+
+test("httpi aggregate admission prevents concurrent buffered claims from multiplying the cap", async () => {
+  const listeners = installTestScope();
+  let firstStarted = false;
+  const node = {
+    endpointId: "01".repeat(32),
+    fetchHttpi(
+      _target: string,
+      _method: string,
+      _path: string,
+      _headers: HeaderPair[],
+      _body: Uint8Array,
+      signal?: AbortSignal,
+    ) {
+      firstStarted = true;
+      return new Promise<HttpiResponse>((_resolve, reject) =>
+        signal?.addEventListener("abort", () => reject(signal.reason), {
+          once: true,
+        }),
+      );
+    },
+  } as IrohNode;
+  const cap = 1024;
+  const { buffer, words } = makeRegion(2, cap);
+  const stop = installIrohVgiAdapter(Promise.resolve(node), {
+    maxHttpiRequestBytes: 8,
+    maxHttpiAggregateRequestBytes: 8,
+  });
+  const target = `httpi://${"02".repeat(32)}`;
+  for (const listener of listeners)
+    listener({ data: { type: "vgi-init", target, buffer, offset: 0 } });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  writeClaim(
+    buffer,
+    words,
+    0,
+    cap,
+    131,
+    encodeHttpiRequest("POST", "/vgi", [], new Uint8Array(6)),
+  );
+  await until(() => firstStarted);
+  writeClaim(
+    buffer,
+    words,
+    1,
+    cap,
+    132,
+    encodeHttpiRequest("POST", "/vgi", [], new Uint8Array(6)),
+  );
+  const secondControl = (HEADER_BYTES + (SLOT_CONTROL_BYTES + cap * 2)) >> 2;
+  await until(() => Atomics.load(words, secondControl + 6) === 132);
+  const out = new Uint8Array(
+    buffer,
+    (secondControl << 2) + SLOT_CONTROL_BYTES + cap,
+    Atomics.load(words, secondControl + 4),
+  );
+  assert.equal(
+    new DataView(out.buffer, out.byteOffset, out.byteLength).getUint16(6, true),
+    3,
+  );
+  assert.match(
+    new TextDecoder().decode(out),
+    /aggregate request-body budget exhausted/,
+  );
+  stop();
+});
+
 function encodeHttpiRequest(
   method: string,
   path: string,
@@ -382,6 +607,60 @@ function decodeHttpiResponse(bytes: Uint8Array): {
     bodyOffset += chunk.length;
   }
   return { status, raw: view.getUint16(6, true) === 1, headers, body };
+}
+
+function installTestScope(): Set<(event: { data: unknown }) => void> {
+  const listeners = new Set<(event: { data: unknown }) => void>();
+  Object.assign(globalThis, {
+    self: {
+      addEventListener(
+        _type: string,
+        listener: (event: { data: unknown }) => void,
+      ) {
+        listeners.add(listener);
+      },
+      removeEventListener(
+        _type: string,
+        listener: (event: { data: unknown }) => void,
+      ) {
+        listeners.delete(listener);
+      },
+      postMessage() {},
+    },
+  });
+  return listeners;
+}
+
+function makeRegion(
+  nSlots: number,
+  ringCapacity: number,
+): {
+  buffer: SharedArrayBuffer;
+  words: Int32Array;
+  stride: number;
+} {
+  const stride = SLOT_CONTROL_BYTES + ringCapacity * 2;
+  const buffer = new SharedArrayBuffer(HEADER_BYTES + nSlots * stride);
+  const words = new Int32Array(buffer);
+  words.set([MAGIC, 1, nSlots, ringCapacity, stride, HEADER_BYTES, 1]);
+  return { buffer, words, stride };
+}
+
+function writeClaim(
+  buffer: SharedArrayBuffer,
+  words: Int32Array,
+  slot: number,
+  ringCapacity: number,
+  claim: number,
+  request: Uint8Array,
+): void {
+  const stride = SLOT_CONTROL_BYTES + ringCapacity * 2;
+  const control = (HEADER_BYTES + slot * stride) >> 2;
+  new Uint8Array(buffer).set(request, (control << 2) + SLOT_CONTROL_BYTES);
+  Atomics.store(words, control + 1, request.length);
+  Atomics.store(words, control + 3, 1);
+  Atomics.store(words, control, claim);
+  Atomics.notify(words, control + 1);
 }
 
 async function until(predicate: () => boolean): Promise<void> {

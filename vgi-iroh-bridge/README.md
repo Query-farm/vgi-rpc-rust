@@ -67,10 +67,11 @@ hop: request decompression is disabled even when other limits are customized.
 Raw connections default to 8 per EndpointId and 256 total; after their first
 stream they are closed after 60 seconds with no active logical streams and no
 new stream. An active stream is intentionally never expired by this
-connection-level idle timer; its TCP and Iroh I/O remain governed by the raw
-stream timeout instead. These limits prevent one authenticated but unauthorized
-peer from occupying the bridge before worker-level policy can inspect a
-forwarded request.
+connection-level idle timer. It remains open until the peer or upstream
+completes it, admission rejects it, or the bridge's drain deadline expires
+during shutdown. These limits prevent one authenticated but unauthorized peer
+from occupying the bridge before worker-level policy can inspect a forwarded
+request.
 
 Raw `tcp://` destinations accept IP literals or DNS names, so the one fixed
 destination may be an internal Envoy/nginx stream listener or cloud network

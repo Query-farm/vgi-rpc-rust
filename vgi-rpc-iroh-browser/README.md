@@ -13,6 +13,12 @@ resolver/authorizer. A literal lowercase 64-hex EndpointId requires no resolver.
 The node factory accepts an optional persisted secret key and custom relay URL
 set; default construction uses n0's browser-compatible relay/address lookup.
 
+`js/adapter-worker.ts` is the complete adapter Worker pump expected by
+Haybarn's `irohAdapterWorker` option. It registers multiple ABI-v1 SAB regions,
+discovers claimed slots, opens one mux stream per claim, and applies async ring
+backpressure without blocking the Worker event loop. Terminal transport errors
+are published with claim tokens so a late failure cannot poison a reused slot.
+
 One node should be shared by the whole DuckDB engine so raw and HTTP requests
 present the same cryptographic endpoint identity. HTTP response bodies are raw
 representation bytes; VGI retains responsibility for content decoding, OAuth,

@@ -39,11 +39,13 @@ jobs:
       - name: Typecheck WHATWG stream wrapper
         run: >-
           npx --yes --package typescript tsc --noEmit --strict
-          --target ES2022 --lib ES2022,DOM
+          --target ES2022 --lib ES2022,WebWorker
+          --allowImportingTsExtensions
           vgi-rpc-iroh-browser/js/index.ts
+          vgi-rpc-iroh-browser/js/adapter-worker.ts
 
       - name: Test WHATWG stream wrapper
-        run: npx --yes tsx --test vgi-rpc-iroh-browser/js/index.test.ts
+        run: npx --yes tsx --test vgi-rpc-iroh-browser/js/*.test.ts
 
   fmt-clippy-test:
     runs-on: ubuntu-latest

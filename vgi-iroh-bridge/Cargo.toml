@@ -1,0 +1,22 @@
+[package]
+name = "vgi-iroh-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Narrow Iroh ingress bridge for VGI RPC workers"
+publish = false
+
+[dependencies]
+iroh = { version = "=1.1.0", default-features = false, features = ["tls-ring"] }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing.workspace = true
+vgi-rpc-iroh = { path = "../vgi-rpc-iroh" }
+
+[dev-dependencies]
+hex = "0.4"

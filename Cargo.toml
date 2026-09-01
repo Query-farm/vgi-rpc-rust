@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["vgi-rpc", "vgi-rpc-macros", "vgi-rpc-client", "vgi-rpc-iroh", "vgi-rpc-iroh-browser", "conformance-client-driver", "conformance-worker", "tailnet-integration", "benchmark-worker", "vgi-rpc-s3", "vgi-rpc-gcs"]
+members = ["vgi-rpc", "vgi-rpc-macros", "vgi-rpc-client", "vgi-rpc-iroh", "vgi-rpc-iroh-browser", "vgi-iroh-bridge", "conformance-client-driver", "conformance-worker", "tailnet-integration", "benchmark-worker", "vgi-rpc-s3", "vgi-rpc-gcs"]
 
 [workspace.package]
 version = "0.23.3"

@@ -368,7 +368,10 @@ impl RpcClient {
             shm_md.as_ref().or(metadata),
         );
         let relax = self.relax_nullability;
+        #[cfg(feature = "shm")]
         let shm = self.shm.clone();
+        #[cfg(not(feature = "shm"))]
+        let shm = self.shm;
         let on_log = &mut self.on_log;
         let (r, w) = self.transport.split();
 

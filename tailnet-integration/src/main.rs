@@ -1,18 +1,24 @@
 // © Copyright 2025-2026, Query.Farm LLC - https://query.farm
 // SPDX-License-Identifier: Apache-2.0
 
-//! Live-Tailnet qualification adapter for the Rust implementation.
+//! Live network-transport qualification adapter for the Rust implementation.
 //!
 //! This binary exists only for cross-language conformance. It is not a
 //! production proxy, ingress, or alternate worker API.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use arrow_array::{RecordBatch, StringArray};
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Field, Schema};
+use iroh::{endpoint::presets, Endpoint, EndpointAddr, RelayMode};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use vgi_rpc::{
@@ -21,6 +27,9 @@ use vgi_rpc::{
 };
 
 const PROVIDER: &str = "tailscale";
+const PROXY_V2_SIGNATURE: &[u8; 12] = b"\r\n\r\n\0\r\nQUIT\n";
+const MAX_IROH_ADDRESS_BYTES: u64 = 64 * 1024;
+const MAX_PROXY_RELAY_CONNECTIONS: usize = 32;
 
 #[derive(Clone)]
 struct Expectation {
@@ -40,6 +49,29 @@ struct Expectation {
 
 struct TailnetProbe {
     expected: Expectation,
+}
+
+struct IrohProbe {
+    issuer: String,
+}
+
+#[vgi_rpc::service]
+impl IrohProbe {
+    #[unary]
+    fn confirm_endpoint(
+        &self,
+        ctx: &vgi_rpc::CallContext,
+        endpoint_id: String,
+        expected_issuer: String,
+    ) -> vgi_rpc::Result<String> {
+        if expected_issuer != self.issuer {
+            return Err(vgi_rpc::RpcError::permission_error(
+                "Iroh qualification issuer did not match",
+            ));
+        }
+        validate_iroh_context(ctx, &self.issuer, &endpoint_id)?;
+        Ok(endpoint_id)
+    }
 }
 
 #[vgi_rpc::service]
@@ -65,10 +97,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("client-http") => run_http_client(&args[2..]),
         Some("server-tcp") => run_tcp_server(&args[2..]),
         Some("server-http") => run_http_server(&args[2..]),
-        _ => Err(
-            "usage: vgi-rpc-tailnet-rust client-tcp|client-http|server-tcp|server-http [options]"
-                .into(),
-        ),
+        Some("iroh-client") => run_iroh_client(&args[2..]),
+        Some("iroh-server") => run_iroh_server(&args[2..]),
+        Some("proxy-v2-relay") => run_proxy_v2_relay(&args[2..]),
+        _ => Err("usage: vgi-rpc-tailnet-rust client-tcp|client-http|server-tcp|server-http|iroh-client|iroh-server|proxy-v2-relay [options]".into()),
     }
 }
 
@@ -139,6 +171,7 @@ fn run_http_client(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_tcp_server(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let issuer = required(args, "--issuer")?;
+    let service_name = optional(args, "--service-name").map(str::to_owned);
     let socket =
         optional(args, "--localapi-socket").unwrap_or("/var/run/tailscale/tailscaled.sock");
     let expected = Expectation {
@@ -148,17 +181,30 @@ fn run_tcp_server(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         subject_kind: SubjectKind::TaggedNode,
         subject_stability: SubjectStability::Stable,
         capability: required(args, "--expected-capability")?.into(),
-        capability_target_kind: Some("destination_ip".into()),
-        capability_target_value: None,
+        capability_target_kind: Some(if service_name.is_some() {
+            "service".into()
+        } else {
+            "destination_ip".into()
+        }),
+        capability_target_value: service_name.clone(),
         tag: Some(required(args, "--expected-tag")?.into()),
         authenticated: true,
-        proxy_present: false,
+        proxy_present: has_flag(args, "--proxy-protocol-v2"),
         spoofed_subject_fingerprint: None,
     };
     let provider = vgi_rpc::tailscale_localapi_provider(
         vgi_rpc::TailscaleLocalApiConfig::new(issuer)?.with_unix_socket(socket)?,
     )?;
+    let proxy_protocol_v2_required = has_flag(args, "--proxy-protocol-v2");
+    let trusted_proxy_addresses = optional(args, "--trusted-proxy-address")
+        .map(|value| value.parse::<IpAddr>())
+        .transpose()?
+        .into_iter()
+        .collect();
     let identity = vgi_rpc::tcp::TcpIdentityOptions {
+        proxy_protocol_v2_required,
+        trusted_proxy_addresses,
+        service_name,
         providers: Arc::from([provider]),
         policy: Some(peer_identity_primary(PROVIDER)),
         ..Default::default()
@@ -177,6 +223,305 @@ fn run_tcp_server(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         |bound_host, bound_port| println!("TCP:{bound_host}:{bound_port}"),
     )?;
     Ok(())
+}
+
+fn run_iroh_server(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let issuer = required(args, "--issuer")?.to_owned();
+    let address_file = required(args, "--address-file")?.to_owned();
+    let relay_disabled = has_flag(args, "--disable-relay");
+    let shutdown = install_shutdown();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let mut builder =
+            Endpoint::builder(presets::N0).alpns(vec![vgi_rpc_iroh::VGI_IROH_ALPN.to_vec()]);
+        if relay_disabled {
+            builder = builder.relay_mode(RelayMode::Disabled);
+        }
+        let endpoint = builder.bind().await?;
+        if !relay_disabled {
+            tokio::time::timeout(Duration::from_secs(30), endpoint.online())
+                .await
+                .map_err(|_| "Iroh endpoint did not become relay-reachable within 30 seconds")?;
+        }
+        write_endpoint_address(Path::new(&address_file), &endpoint.addr())?;
+        println!("IROH:{}", endpoint.id());
+
+        let cancellation = vgi_rpc_iroh::CancellationToken::new();
+        let cancellation_signal = cancellation.clone();
+        tokio::spawn(async move {
+            while !shutdown.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            cancellation_signal.cancel();
+        });
+
+        let mut rpc = vgi_rpc::RpcServer::builder()
+            .protocol_name("IrohQualification")
+            .protocol_version("1.0.0")
+            .build();
+        IrohProbe::register_with(
+            &mut rpc,
+            Arc::new(IrohProbe {
+                issuer: issuer.clone(),
+            }),
+        );
+        let options = vgi_rpc_iroh::IrohServerOptions::default()
+            .with_issuer(issuer)
+            .with_policy(peer_identity_primary("iroh"))
+            .with_max_active_connections_per_endpoint(8);
+        vgi_rpc_iroh::IrohServer::with_options(Arc::new(rpc), options)
+            .serve(endpoint, cancellation)
+            .await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+}
+
+fn run_iroh_client(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let address = read_endpoint_address(Path::new(required(args, "--address-file")?))?;
+    let issuer = required(args, "--expected-issuer")?.to_owned();
+    let relay_disabled = has_flag(args, "--disable-relay");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let mut builder = Endpoint::builder(presets::N0);
+        if relay_disabled {
+            builder = builder.relay_mode(RelayMode::Disabled);
+        }
+        let endpoint = builder.bind().await?;
+        let local_id = endpoint.id().to_string();
+        let expected_remote = address.id;
+        let transport = vgi_rpc_iroh::IrohTransport::connect_addr(
+            endpoint.clone(),
+            address,
+            vgi_rpc_iroh::IrohClientOptions::default().with_rpc_timeout(Duration::from_secs(20)),
+        )
+        .await?;
+        if transport.remote_id() != expected_remote {
+            return Err("Iroh authenticated a different server endpoint".into());
+        }
+        let rpc_issuer = issuer.clone();
+        let rpc_result = tokio::task::spawn_blocking(move || {
+            let mut client = transport.into_client();
+            for _ in 0..2 {
+                let params = iroh_params(&local_id, &rpc_issuer)?;
+                let (result, _) = client.call_unary("confirm_endpoint", &params, None)?;
+                let echoed = result
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or("Iroh qualification result was not a string")?
+                    .value(0);
+                if echoed != local_id {
+                    return Err("Iroh worker did not confirm the client endpoint identity".into());
+                }
+            }
+            client.close()?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        })
+        .await
+        .map_err(|_| "Iroh qualification client task failed")?;
+        rpc_result.map_err(|error| std::io::Error::other(error.to_string()))?;
+        endpoint.close().await;
+        println!("Rust Iroh bidirectional identity probe passed for issuer {issuer}");
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+}
+
+fn validate_iroh_context(
+    ctx: &vgi_rpc::CallContext,
+    issuer: &str,
+    expected_endpoint_id: &str,
+) -> vgi_rpc::Result<()> {
+    if ctx.peer_evidence.status("iroh") != PeerIdentityStatus::Available {
+        return Err(vgi_rpc::RpcError::permission_error(
+            "Iroh endpoint evidence was not available",
+        ));
+    }
+    let identities = ctx.peer_evidence.for_provider("iroh").collect::<Vec<_>>();
+    let [identity] = identities.as_slice() else {
+        return Err(vgi_rpc::RpcError::permission_error(
+            "expected exactly one Iroh endpoint identity",
+        ));
+    };
+    let canonical = identity.canonical_principal()?;
+    if identity.issuer() != issuer
+        || identity.evidence_source() != "iroh_quic_handshake"
+        || identity.assurance() != IdentityAssurance::CryptographicPeer
+        || identity.transport() != "iroh"
+        || identity.subject_kind() != SubjectKind::Endpoint
+        || identity.subject_stability() != SubjectStability::Stable
+        || !identity.subject_verified()
+        || identity.subject_key() != Some(expected_endpoint_id)
+        || !ctx.auth.authenticated
+        || ctx.auth.domain != "iroh"
+        || ctx.auth.principal != canonical
+        || ctx.auth.claims.get("issuer").map(String::as_str) != Some(issuer)
+        || ctx.auth.claims.get("subject").map(String::as_str) != Some(expected_endpoint_id)
+        || ctx.auth.claims.get("subject_kind").map(String::as_str) != Some("endpoint")
+        || ctx.auth.claims.get("assurance").map(String::as_str) != Some("cryptographic_peer")
+        || ctx.auth.claims.get("evidence_source").map(String::as_str) != Some("iroh_quic_handshake")
+        || !valid_binding(ctx.auth.claims.get("peer_evidence_binding"))
+    {
+        return Err(vgi_rpc::RpcError::permission_error(
+            "unexpected Iroh identity or authentication context",
+        ));
+    }
+    Ok(())
+}
+
+fn iroh_params(
+    endpoint_id: &str,
+    expected_issuer: &str,
+) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("endpoint_id", DataType::Utf8, false),
+            Field::new("expected_issuer", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec![endpoint_id])),
+            Arc::new(StringArray::from(vec![expected_issuer])),
+        ],
+    )?)
+}
+
+fn write_endpoint_address(
+    path: &Path,
+    address: &EndpointAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = path.with_extension("tmp");
+    let payload = serde_json::to_vec(address)?;
+    if payload.len() as u64 > MAX_IROH_ADDRESS_BYTES {
+        return Err("Iroh endpoint address exceeded the qualification limit".into());
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(&payload)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn read_endpoint_address(path: &Path) -> Result<EndpointAddr, Box<dyn std::error::Error>> {
+    let mut payload = Vec::new();
+    File::open(path)?
+        .take(MAX_IROH_ADDRESS_BYTES + 1)
+        .read_to_end(&mut payload)?;
+    if payload.len() as u64 > MAX_IROH_ADDRESS_BYTES {
+        return Err("Iroh endpoint address exceeded the qualification limit".into());
+    }
+    Ok(serde_json::from_slice(&payload)?)
+}
+
+fn run_proxy_v2_relay(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let listen = required(args, "--listen-address")?.parse::<SocketAddr>()?;
+    let backend = required(args, "--backend-address")?.parse::<SocketAddr>()?;
+    let listener = TcpListener::bind(listen)?;
+    listener.set_nonblocking(true)?;
+    let shutdown = install_shutdown();
+    let active = Arc::new(AtomicUsize::new(0));
+    println!("PROXY_V2_RELAY:{}", listener.local_addr()?);
+    while !shutdown.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((client, source)) => {
+                let destination = client.local_addr()?;
+                if active
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        (count < MAX_PROXY_RELAY_CONNECTIONS).then_some(count + 1)
+                    })
+                    .is_err()
+                {
+                    continue;
+                }
+                let connection_active = Arc::clone(&active);
+                let spawn_result = thread::Builder::new()
+                    .name("vgi-proxy-v2-qualification".into())
+                    .spawn(move || {
+                        if let Err(error) = relay_proxy_v2(client, source, destination, backend) {
+                            eprintln!("PROXY v2 qualification relay connection failed: {error}");
+                        }
+                        connection_active.fetch_sub(1, Ordering::Release);
+                    });
+                if let Err(error) = spawn_result {
+                    active.fetch_sub(1, Ordering::Release);
+                    return Err(error.into());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn relay_proxy_v2(
+    mut client: TcpStream,
+    source: SocketAddr,
+    destination: SocketAddr,
+    backend: SocketAddr,
+) -> std::io::Result<()> {
+    let mut upstream = TcpStream::connect_timeout(&backend, Duration::from_secs(5))?;
+    for stream in [&client, &upstream] {
+        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(60)))?;
+    }
+    upstream.write_all(&proxy_v2_header(source, destination)?)?;
+    let mut client_reader = client.try_clone()?;
+    let mut upstream_writer = upstream.try_clone()?;
+    let forward = thread::Builder::new()
+        .name("vgi-proxy-v2-forward".into())
+        .spawn(move || {
+            let result = std::io::copy(&mut client_reader, &mut upstream_writer);
+            let _ = upstream_writer.shutdown(Shutdown::Write);
+            result
+        })?;
+    let reverse = std::io::copy(&mut upstream, &mut client);
+    let _ = client.shutdown(Shutdown::Write);
+    let forward = forward
+        .join()
+        .map_err(|_| std::io::Error::other("PROXY v2 relay task failed"))?;
+    reverse?;
+    forward?;
+    Ok(())
+}
+
+fn proxy_v2_header(source: SocketAddr, destination: SocketAddr) -> std::io::Result<Vec<u8>> {
+    let mut output = PROXY_V2_SIGNATURE.to_vec();
+    output.push(0x21);
+    let mut addresses = Vec::new();
+    match (source, destination) {
+        (SocketAddr::V4(source), SocketAddr::V4(destination)) => {
+            output.push(0x11);
+            addresses.extend_from_slice(&source.ip().octets());
+            addresses.extend_from_slice(&destination.ip().octets());
+            addresses.extend_from_slice(&source.port().to_be_bytes());
+            addresses.extend_from_slice(&destination.port().to_be_bytes());
+        }
+        (SocketAddr::V6(source), SocketAddr::V6(destination)) => {
+            output.push(0x21);
+            addresses.extend_from_slice(&source.ip().octets());
+            addresses.extend_from_slice(&destination.ip().octets());
+            addresses.extend_from_slice(&source.port().to_be_bytes());
+            addresses.extend_from_slice(&destination.port().to_be_bytes());
+        }
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "PROXY v2 relay source and destination address families differ",
+            ));
+        }
+    }
+    output.extend_from_slice(&(addresses.len() as u16).to_be_bytes());
+    output.extend_from_slice(&addresses);
+    Ok(output)
 }
 
 fn run_http_server(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -678,5 +1023,30 @@ mod tests {
         let mut wrong = auth;
         wrong.domain = "bearer".into();
         assert!(validate_evidence_and_auth(&evidence, &wrong, &expected).is_err());
+    }
+
+    #[test]
+    fn qualification_relay_emits_exact_proxy_v2_ipv4_and_ipv6_addresses() {
+        for (source, destination) in [
+            ("100.64.0.8:32123", "100.64.0.9:19401"),
+            ("[fd7a:115c:a1e0::8]:32123", "[fd7a:115c:a1e0::9]:19401"),
+        ] {
+            let source = source.parse::<SocketAddr>().unwrap();
+            let destination = destination.parse::<SocketAddr>().unwrap();
+            let header = proxy_v2_header(source, destination).unwrap();
+            let parsed = vgi_rpc::proxy_protocol::parse_proxy_protocol_v2(&header, 536).unwrap();
+            assert_eq!(parsed.source, source);
+            assert_eq!(parsed.destination, destination);
+        }
+    }
+
+    #[test]
+    fn qualification_relay_rejects_mixed_address_families() {
+        let source = "100.64.0.8:32123".parse::<SocketAddr>().unwrap();
+        let destination = "[fd7a:115c:a1e0::9]:19401".parse::<SocketAddr>().unwrap();
+        assert_eq!(
+            proxy_v2_header(source, destination).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 }

@@ -4880,11 +4880,13 @@ dependencies = [
  "arrow-schema",
  "axum",
  "ctrlc",
+ "iroh",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
  "vgi-rpc",
  "vgi-rpc-client",
+ "vgi-rpc-iroh",
 ]
 
 [[package]]

@@ -127,10 +127,8 @@ Do not share a public listener that blindly forwards
 `VGI-Forwarded-Iroh-Endpoint`. A generic cloud load balancer does not turn this
 header into cryptographic evidence by itself.
 
-## Temporary upstream dependency
+## Upstream dependency
 
-Development currently points `iroh-http-core` at the local
-`projects/iroh-http-upstream-feasibility` checkout so the negotiated-connection
-API can be tested before upstream publication. This local path is a merge and
-release blocker. Replace it with the pushed immutable Git commit SHA (and
-update `Cargo.lock`) before merging or releasing this workspace.
+`iroh-http-core` is pinned to an immutable commit in the Query-farm
+`iroh-http` fork. Advance that revision and `Cargo.lock` together after the
+fork's CI and this bridge's native/browser compatibility tests pass.

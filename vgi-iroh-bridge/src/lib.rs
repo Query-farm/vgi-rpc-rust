@@ -7,6 +7,12 @@
 //! lifetime.  The upstream receives a fixed, versioned PROXY-v2 TLV containing
 //! the cryptographically authenticated Iroh EndpointId.  The worker chooses a
 //! local issuer and authorization policy; the bridge cannot assert either.
+//!
+//! For `iroh-http/2`, [`HttpBridgeProtocol`] streams requests through one
+//! shared iroh-http connection runtime and a pooled Hyper client to one fixed
+//! HTTP(S) origin. It overwrites forwarded identity from the typed raw
+//! EndpointId and applies reverse-proxy header boundary rules in both
+//! directions. Neither protocol chooses among upstream workers.
 
 use std::io;
 use std::pin::Pin;
@@ -14,16 +20,32 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use http::header::{CONNECTION, HOST};
+use http::{HeaderMap, HeaderName, HeaderValue, Uri};
+use hyper::{Request, Response, StatusCode};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::EndpointId;
+use iroh_http_core::{
+    Body as IrohHttpBody, ConnectionServeOptions, ConnectionServeRuntime, RemoteEndpointId,
+};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+use tower::Service;
 
 pub use vgi_rpc_iroh::VGI_IROH_ALPN;
+
+/// Iroh HTTP ALPN accepted by [`HttpBridgeProtocol`].
+pub const IROH_HTTP_ALPN: &[u8] = iroh_http_core::ALPN;
+/// Verified identity header injected into every upstream HTTP request.
+pub const IROH_FORWARDED_ENDPOINT_HEADER: &str = "vgi-forwarded-iroh-endpoint";
 
 /// Private-use PROXY-v2 TLV assigned by the VGI transport identity contract.
 pub const IROH_ENDPOINT_TLV: u8 = 0xe0;
@@ -36,6 +58,339 @@ const PROXY_V2_UNSPEC: u8 = 0x00;
 const IDENTITY_PAYLOAD_LEN: usize = 33;
 const IDENTITY_TLV_LEN: usize = 1 + 2 + IDENTITY_PAYLOAD_LEN;
 const CLOSE_CODE: u32 = 0;
+
+type PooledHttpClient = Client<HttpsConnector<HttpConnector>, IrohHttpBody>;
+
+/// HTTP serving limits and lifecycle policy for [`HttpBridgeProtocol`].
+#[derive(Clone, Debug, Default)]
+pub struct HttpBridgeOptions {
+    /// Shared HTTP connection runtime settings.
+    pub connection: ConnectionServeOptions,
+}
+
+/// A non-balancing HTTP bridge protocol suitable for an `iroh::protocol::Router`.
+///
+/// Every request is streamed to one fixed HTTP(S) origin and base path. The
+/// pooled Hyper client may reuse connections to that origin, but this type
+/// never selects among worker destinations, follows redirects, or retries a
+/// request.
+#[derive(Clone)]
+pub struct HttpBridgeProtocol {
+    upstream: FixedHttpUpstream,
+    runtime: ConnectionServeRuntime,
+}
+
+impl std::fmt::Debug for HttpBridgeProtocol {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpBridgeProtocol")
+            .field("upstream", &self.upstream)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpBridgeProtocol {
+    /// Configure one fixed HTTP(S) upstream, including an optional base path.
+    ///
+    /// For example, an incoming `/catalog?limit=1` request sent through an
+    /// upstream base of `https://worker.example/vgi` reaches
+    /// `https://worker.example/vgi/catalog?limit=1`.
+    pub fn new(upstream_base: &str, options: HttpBridgeOptions) -> Result<Self> {
+        let upstream = FixedHttpUpstream::parse(upstream_base)?;
+        let service = HttpProxyService::new(upstream.clone());
+        let runtime =
+            ConnectionServeRuntime::new(options.connection, service).map_err(|error| {
+                BridgeError::HttpRuntime {
+                    message: error.to_string(),
+                }
+            })?;
+        Ok(Self { upstream, runtime })
+    }
+
+    /// Gracefully stop all shared HTTP connection handlers and drain response
+    /// delivery within the configured runtime deadline.
+    pub async fn shutdown(&self) -> bool {
+        self.runtime.shutdown().await
+    }
+
+    async fn serve_connection(&self, connection: Connection) -> Result<()> {
+        self.runtime
+            .serve_connection(connection)
+            .await
+            .map(|_| ())
+            .map_err(|error| BridgeError::HttpRuntime {
+                message: error.to_string(),
+            })
+    }
+}
+
+impl ProtocolHandler for HttpBridgeProtocol {
+    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        self.serve_connection(connection).await.map_err(|error| {
+            tracing::warn!(%error, "HTTP VGI bridge connection failed");
+            AcceptError::from_err(io::Error::other("HTTP bridge connection failed"))
+        })
+    }
+
+    async fn shutdown(&self) {
+        if !HttpBridgeProtocol::shutdown(self).await {
+            tracing::warn!("HTTP VGI bridge response drain timed out");
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FixedHttpUpstream {
+    scheme: http::uri::Scheme,
+    authority: http::uri::Authority,
+    base_path: String,
+}
+
+impl FixedHttpUpstream {
+    fn parse(value: &str) -> Result<Self> {
+        let uri = value
+            .parse::<Uri>()
+            .map_err(|_| BridgeError::InvalidHttpUpstream {
+                reason: "must be an absolute HTTP(S) URI",
+            })?;
+        let scheme = uri
+            .scheme()
+            .filter(|scheme| {
+                *scheme == &http::uri::Scheme::HTTP || *scheme == &http::uri::Scheme::HTTPS
+            })
+            .cloned()
+            .ok_or(BridgeError::InvalidHttpUpstream {
+                reason: "scheme must be http or https",
+            })?;
+        let authority = uri
+            .authority()
+            .cloned()
+            .ok_or(BridgeError::InvalidHttpUpstream {
+                reason: "authority is required",
+            })?;
+        if authority.as_str().contains('@') {
+            return Err(BridgeError::InvalidHttpUpstream {
+                reason: "userinfo is forbidden",
+            });
+        }
+        if uri.query().is_some() {
+            return Err(BridgeError::InvalidHttpUpstream {
+                reason: "base URI must not contain a query",
+            });
+        }
+        let path = uri.path();
+        let base_path = if path == "/" {
+            String::new()
+        } else {
+            path.trim_end_matches('/').to_owned()
+        };
+        Ok(Self {
+            scheme,
+            authority,
+            base_path,
+        })
+    }
+
+    fn rewrite_uri(&self, incoming: &Uri) -> Result<Uri> {
+        let incoming_path = incoming.path();
+        let mut path_and_query = String::with_capacity(
+            self.base_path
+                .len()
+                .saturating_add(incoming_path.len())
+                .saturating_add(
+                    incoming
+                        .query()
+                        .map_or(0, |query| query.len().saturating_add(1)),
+                ),
+        );
+        path_and_query.push_str(&self.base_path);
+        if incoming_path.starts_with('/') {
+            path_and_query.push_str(incoming_path);
+        } else {
+            path_and_query.push('/');
+            path_and_query.push_str(incoming_path);
+        }
+        if path_and_query.is_empty() {
+            path_and_query.push('/');
+        }
+        if let Some(query) = incoming.query() {
+            path_and_query.push('?');
+            path_and_query.push_str(query);
+        }
+        Uri::builder()
+            .scheme(self.scheme.clone())
+            .authority(self.authority.clone())
+            .path_and_query(path_and_query)
+            .build()
+            .map_err(|_| BridgeError::InvalidHttpRequest)
+    }
+
+    fn host_header(&self) -> Result<HeaderValue> {
+        HeaderValue::from_str(self.authority.as_str()).map_err(|_| BridgeError::InvalidHttpRequest)
+    }
+}
+
+#[derive(Clone)]
+struct HttpProxyService {
+    upstream: FixedHttpUpstream,
+    client: PooledHttpClient,
+}
+
+impl HttpProxyService {
+    fn new(upstream: FixedHttpUpstream) -> Self {
+        let connector = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let mut builder = Client::builder(TokioExecutor::new());
+        builder.retry_canceled_requests(false);
+        let client = builder.build(connector);
+        Self { upstream, client }
+    }
+
+    async fn proxy(&self, request: Request<IrohHttpBody>) -> Response<IrohHttpBody> {
+        let endpoint_id = match request.extensions().get::<RemoteEndpointId>() {
+            Some(identity) => identity.0,
+            None => {
+                tracing::error!("HTTP bridge request missing authenticated Iroh identity");
+                return bad_gateway();
+            }
+        };
+        let (mut parts, body) = request.into_parts();
+        let rewritten_uri = match self.upstream.rewrite_uri(&parts.uri) {
+            Ok(uri) => uri,
+            Err(error) => {
+                tracing::warn!(%error, "HTTP bridge rejected request target");
+                return bad_gateway();
+            }
+        };
+        let mut headers = sanitize_request_headers(&parts.headers);
+        let host = match self.upstream.host_header() {
+            Ok(host) => host,
+            Err(error) => {
+                tracing::warn!(%error, "HTTP bridge could not construct upstream Host header");
+                return bad_gateway();
+            }
+        };
+        let identity = match HeaderValue::from_str(&hex::encode(endpoint_id.as_bytes())) {
+            Ok(identity) => identity,
+            Err(_) => return bad_gateway(),
+        };
+        headers.insert(HOST, host);
+        headers.insert(
+            HeaderName::from_static(IROH_FORWARDED_ENDPOINT_HEADER),
+            identity,
+        );
+        parts.uri = rewritten_uri;
+        parts.headers = headers;
+
+        let response = match self.client.request(Request::from_parts(parts, body)).await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(%error, "HTTP VGI upstream request failed");
+                return bad_gateway();
+            }
+        };
+        let (mut parts, body) = response.into_parts();
+        parts.headers = sanitize_response_headers(&parts.headers);
+        Response::from_parts(parts, IrohHttpBody::new(body))
+    }
+}
+
+impl Service<Request<IrohHttpBody>> for HttpProxyService {
+    type Response = Response<IrohHttpBody>;
+    type Error = std::convert::Infallible;
+    type Future = Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<Self::Response, Self::Error>>
+                + Send,
+        >,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _context: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<IrohHttpBody>) -> Self::Future {
+        let service = self.clone();
+        Box::pin(async move { Ok(service.proxy(request).await) })
+    }
+}
+
+fn strip_hop_by_hop(headers: &HeaderMap) -> HeaderMap {
+    let nominated = connection_nominated_headers(headers);
+    let mut clean = HeaderMap::with_capacity(headers.len());
+    for name in headers.keys() {
+        if is_hop_by_hop(name) || nominated.contains(name) {
+            continue;
+        }
+        for value in headers.get_all(name) {
+            clean.append(name.clone(), value.clone());
+        }
+    }
+    clean
+}
+
+fn sanitize_request_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut clean = strip_hop_by_hop(headers);
+    clean.remove(HOST);
+    clean.remove(IROH_FORWARDED_ENDPOINT_HEADER);
+    clean
+}
+
+fn sanitize_response_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut clean = strip_hop_by_hop(headers);
+    clean.remove(IROH_FORWARDED_ENDPOINT_HEADER);
+    clean
+}
+
+fn connection_nominated_headers(headers: &HeaderMap) -> std::collections::HashSet<HeaderName> {
+    let mut nominated = std::collections::HashSet::new();
+    for value in headers.get_all(CONNECTION) {
+        for token in value.as_bytes().split(|byte| *byte == b',') {
+            let token = trim_optional_whitespace(token);
+            if let Ok(name) = HeaderName::from_bytes(token) {
+                nominated.insert(name);
+            }
+        }
+    }
+    nominated
+}
+
+fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
+    while matches!(value.first(), Some(b' ' | b'\t')) {
+        value = &value[1..];
+    }
+    while matches!(value.last(), Some(b' ' | b'\t')) {
+        value = &value[..value.len().saturating_sub(1)];
+    }
+    value
+}
+
+fn is_hop_by_hop(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn bad_gateway() -> Response<IrohHttpBody> {
+    let mut response = Response::new(IrohHttpBody::full("Bad Gateway"));
+    *response.status_mut() = StatusCode::BAD_GATEWAY;
+    response
+}
 
 /// One non-balancing raw-worker destination.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +443,12 @@ impl RawBridgeOptions {
 pub enum BridgeError {
     #[error("bridge timeouts and admission limits must be positive")]
     InvalidConfiguration,
+    #[error("invalid HTTP upstream: {reason}")]
+    InvalidHttpUpstream { reason: &'static str },
+    #[error("invalid HTTP request target")]
+    InvalidHttpRequest,
+    #[error("HTTP connection runtime: {message}")]
+    HttpRuntime { message: String },
     #[error("{operation} timed out")]
     Timeout { operation: &'static str },
     #[error("{operation}: {source}")]
@@ -406,8 +767,45 @@ fn report_stream(completed: Option<std::result::Result<Result<()>, tokio::task::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
     use iroh::{endpoint::presets, Endpoint, RelayMode};
+    use iroh_http_core::{
+        fetch_request, IrohEndpoint, NetworkingOptions, NodeOptions, StackConfig,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn loopback_http_endpoint() -> IrohEndpoint {
+        IrohEndpoint::bind(NodeOptions {
+            networking: NetworkingOptions {
+                disabled: true,
+                bind_addrs: vec!["127.0.0.1:0".into()],
+                ..NetworkingOptions::default()
+            },
+            ..NodeOptions::default()
+        })
+        .await
+        .expect("bind HTTP endpoint")
+    }
+
+    fn endpoint_address(endpoint: &IrohEndpoint) -> iroh::EndpointAddr {
+        let mut address = iroh::EndpointAddr::new(endpoint.raw().id());
+        for socket in endpoint.raw().addr().ip_addrs() {
+            address = address.with_ip_addr(*socket);
+        }
+        address
+    }
+
+    fn values(headers: &HeaderMap, name: &str) -> Vec<String> {
+        headers
+            .get_all(name)
+            .iter()
+            .map(|value| value.to_str().expect("test header is text").to_owned())
+            .collect()
+    }
 
     #[test]
     fn proxy_preamble_matches_canonical_vector() {
@@ -443,6 +841,281 @@ mod tests {
             ),
             Err(BridgeError::InvalidConfiguration)
         ));
+    }
+
+    #[test]
+    fn fixed_http_upstream_rejects_unsafe_forms_and_joins_paths() {
+        let upstream = FixedHttpUpstream::parse("https://worker.example/vgi/base/")
+            .expect("valid HTTPS upstream");
+        assert_eq!(upstream.scheme, http::uri::Scheme::HTTPS);
+        assert_eq!(
+            upstream
+                .rewrite_uri(&"/method?first=1&second=two".parse().expect("request URI"))
+                .expect("rewrite"),
+            "https://worker.example/vgi/base/method?first=1&second=two"
+                .parse::<Uri>()
+                .expect("expected URI")
+        );
+        assert!(matches!(
+            FixedHttpUpstream::parse("http://user:password@worker.example/vgi"),
+            Err(BridgeError::InvalidHttpUpstream {
+                reason: "userinfo is forbidden"
+            })
+        ));
+        assert!(matches!(
+            FixedHttpUpstream::parse("http://worker.example/vgi?tenant=unsafe"),
+            Err(BridgeError::InvalidHttpUpstream {
+                reason: "base URI must not contain a query"
+            })
+        ));
+        assert!(FixedHttpUpstream::parse("ftp://worker.example/vgi").is_err());
+    }
+
+    #[test]
+    fn header_sanitizers_strip_spoofs_hops_and_nominated_headers() {
+        let mut request = HeaderMap::new();
+        request.append(
+            HeaderName::from_static(IROH_FORWARDED_ENDPOINT_HEADER),
+            HeaderValue::from_static("spoof-one"),
+        );
+        request.append(
+            HeaderName::from_static(IROH_FORWARDED_ENDPOINT_HEADER),
+            HeaderValue::from_static("spoof-two"),
+        );
+        request.insert(HOST, HeaderValue::from_static("attacker.invalid"));
+        request.insert(
+            CONNECTION,
+            HeaderValue::from_static("x-client-hop, VGI-Forwarded-Iroh-Endpoint, content-length"),
+        );
+        request.insert("x-client-hop", HeaderValue::from_static("secret"));
+        request.insert("content-length", HeaderValue::from_static("123"));
+        request.append("x-end-to-end", HeaderValue::from_static("one"));
+        request.append("x-end-to-end", HeaderValue::from_static("two"));
+        let clean = sanitize_request_headers(&request);
+        assert!(!clean.contains_key(IROH_FORWARDED_ENDPOINT_HEADER));
+        assert!(!clean.contains_key(HOST));
+        assert!(!clean.contains_key(CONNECTION));
+        assert!(!clean.contains_key("x-client-hop"));
+        assert!(!clean.contains_key("content-length"));
+        assert_eq!(values(&clean, "x-end-to-end"), ["one", "two"]);
+
+        let mut response = HeaderMap::new();
+        response.insert(
+            CONNECTION,
+            HeaderValue::from_static("x-upstream-hop, set-cookie-shadow"),
+        );
+        response.insert("x-upstream-hop", HeaderValue::from_static("secret"));
+        response.insert(
+            HeaderName::from_static(IROH_FORWARDED_ENDPOINT_HEADER),
+            HeaderValue::from_static("must-not-reflect"),
+        );
+        response.append("set-cookie", HeaderValue::from_static("a=1; Path=/"));
+        response.append("set-cookie", HeaderValue::from_static("b=2; Path=/"));
+        let clean = sanitize_response_headers(&response);
+        assert!(!clean.contains_key(CONNECTION));
+        assert!(!clean.contains_key("x-upstream-hop"));
+        assert!(!clean.contains_key(IROH_FORWARDED_ENDPOINT_HEADER));
+        assert_eq!(values(&clean, "set-cookie"), ["a=1; Path=/", "b=2; Path=/"]);
+    }
+
+    #[tokio::test]
+    async fn upstream_failure_returns_generic_502_without_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve address");
+        let address = listener.local_addr().expect("reserved address");
+        drop(listener);
+        let service = HttpProxyService::new(
+            FixedHttpUpstream::parse(&format!("http://{address}/vgi")).expect("valid upstream"),
+        );
+        let endpoint_id = iroh::SecretKey::generate().public();
+        let mut request = Request::builder()
+            .uri("/method")
+            .body(IrohHttpBody::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(RemoteEndpointId(endpoint_id));
+        let response = service.proxy(request).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!response
+            .headers()
+            .contains_key(IROH_FORWARDED_ENDPOINT_HEADER));
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("error body")
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"Bad Gateway");
+        assert!(!String::from_utf8_lossy(&body).contains(&hex::encode(endpoint_id.as_bytes())));
+    }
+
+    #[derive(Debug)]
+    struct HttpObservation {
+        uri: String,
+        host: String,
+        identities: Vec<String>,
+        duplicate_headers: Vec<String>,
+        client_hop_present: bool,
+        body: Bytes,
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn loopback_http_bridge_preserves_semantics_and_verified_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP upstream");
+        let upstream_address = listener.local_addr().expect("upstream address");
+        let (observation_tx, mut observation_rx) = tokio::sync::mpsc::unbounded_channel();
+        let upstream_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept HTTP upstream");
+            let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+                let observation_tx = observation_tx.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let body = body
+                        .collect()
+                        .await
+                        .expect("upstream request body")
+                        .to_bytes();
+                    observation_tx
+                        .send(HttpObservation {
+                            uri: parts.uri.to_string(),
+                            host: parts
+                                .headers
+                                .get(HOST)
+                                .expect("rewritten Host")
+                                .to_str()
+                                .expect("text Host")
+                                .to_owned(),
+                            identities: values(&parts.headers, IROH_FORWARDED_ENDPOINT_HEADER),
+                            duplicate_headers: values(&parts.headers, "x-end-to-end"),
+                            client_hop_present: parts.headers.contains_key("x-client-hop"),
+                            body,
+                        })
+                        .expect("test observation receiver");
+
+                    let mut response =
+                        Response::new(Full::new(Bytes::from_static(b"streamed upstream response")));
+                    *response.status_mut() = StatusCode::MULTI_STATUS;
+                    response
+                        .headers_mut()
+                        .append("set-cookie", HeaderValue::from_static("a=1; Path=/"));
+                    response
+                        .headers_mut()
+                        .append("set-cookie", HeaderValue::from_static("b=2; Path=/"));
+                    response
+                        .headers_mut()
+                        .append("x-end-to-end-response", HeaderValue::from_static("one"));
+                    response
+                        .headers_mut()
+                        .append("x-end-to-end-response", HeaderValue::from_static("two"));
+                    response
+                        .headers_mut()
+                        .insert(CONNECTION, HeaderValue::from_static("x-upstream-hop"));
+                    response
+                        .headers_mut()
+                        .insert("x-upstream-hop", HeaderValue::from_static("secret"));
+                    response.headers_mut().insert(
+                        HeaderName::from_static(IROH_FORWARDED_ENDPOINT_HEADER),
+                        HeaderValue::from_static("must-not-reflect"),
+                    );
+                    Ok::<_, std::convert::Infallible>(response)
+                }
+            });
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo::new(socket), service)
+                .await;
+        });
+
+        let server_endpoint = loopback_http_endpoint().await;
+        let client_endpoint = loopback_http_endpoint().await;
+        let expected_identity = hex::encode(client_endpoint.raw().id().as_bytes());
+        let protocol = HttpBridgeProtocol::new(
+            &format!("http://{upstream_address}/fixed/base/"),
+            HttpBridgeOptions::default(),
+        )
+        .expect("HTTP bridge configuration");
+        let router = iroh::protocol::Router::builder(server_endpoint.raw().clone())
+            .accept(IROH_HTTP_ALPN, protocol.clone())
+            .spawn();
+
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/method?first=1&second=two")
+            .header(HOST, "attacker.invalid")
+            .header(CONNECTION, "x-client-hop, vgi-forwarded-iroh-endpoint")
+            .header("x-client-hop", "must-not-forward")
+            .body(IrohHttpBody::full("streamed request body"))
+            .expect("client request");
+        request.headers_mut().append(
+            HeaderName::from_static(IROH_FORWARDED_ENDPOINT_HEADER),
+            HeaderValue::from_static("spoof-one"),
+        );
+        request.headers_mut().append(
+            HeaderName::from_static(IROH_FORWARDED_ENDPOINT_HEADER),
+            HeaderValue::from_static("spoof-two"),
+        );
+        request
+            .headers_mut()
+            .append("x-end-to-end", HeaderValue::from_static("one"));
+        request
+            .headers_mut()
+            .append("x-end-to-end", HeaderValue::from_static("two"));
+
+        let response = fetch_request(
+            &client_endpoint,
+            &endpoint_address(&server_endpoint),
+            request,
+            &StackConfig::default(),
+        )
+        .await
+        .expect("Iroh HTTP bridge response");
+        assert_eq!(response.status(), StatusCode::MULTI_STATUS);
+        assert_eq!(
+            values(response.headers(), "set-cookie"),
+            ["a=1; Path=/", "b=2; Path=/"]
+        );
+        assert_eq!(
+            values(response.headers(), "x-end-to-end-response"),
+            ["one", "two"]
+        );
+        // iroh-http may add its own hop-local `connection: close` framing
+        // after the proxy service returns. The upstream's nominated header
+        // must still be gone.
+        assert!(!response.headers().contains_key("x-upstream-hop"));
+        assert!(!response
+            .headers()
+            .contains_key(IROH_FORWARDED_ENDPOINT_HEADER));
+        let response_body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("bridged response body")
+            .to_bytes();
+        assert_eq!(response_body.as_ref(), b"streamed upstream response");
+
+        let observation = tokio::time::timeout(Duration::from_secs(5), observation_rx.recv())
+            .await
+            .expect("upstream observation deadline")
+            .expect("upstream observation");
+        assert_eq!(observation.uri, "/fixed/base/method?first=1&second=two");
+        assert_eq!(observation.host, upstream_address.to_string());
+        assert_eq!(observation.identities, [expected_identity]);
+        assert_eq!(observation.duplicate_headers, ["one", "two"]);
+        assert!(!observation.client_hop_present);
+        assert_eq!(observation.body.as_ref(), b"streamed request body");
+
+        tokio::time::timeout(Duration::from_secs(5), router.shutdown())
+            .await
+            .expect("router shutdown deadline")
+            .expect("router shutdown");
+        assert!(protocol.shutdown().await, "shutdown remains idempotent");
+        upstream_task.abort();
+        let _ = upstream_task.await;
+        client_endpoint.close().await;
+        server_endpoint.close().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1993,6 +1993,34 @@ dependencies = [
 [[package]]
 name = "iroh-http-core"
 version = "0.6.2"
+dependencies = [
+ "base32",
+ "bytes",
+ "dashmap",
+ "futures",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "iroh",
+ "moka",
+ "pin-project-lite",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "slotmap",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tower-http 0.7.1",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "iroh-http-core"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ebe3e3ff38d9e4ce6e78c11bfc0818b0001e08019cc0ac69b76f75c5f8c7b71"
 dependencies = [
@@ -4924,11 +4952,19 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vgi-iroh-bridge"
 version = "0.23.3"
 dependencies = [
+ "bytes",
  "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "iroh",
+ "iroh-http-core 0.6.2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "vgi-rpc-iroh",
 ]
@@ -5090,7 +5126,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "iroh",
- "iroh-http-core",
+ "iroh-http-core 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "js-sys",
  "thiserror 2.0.18",
  "tokio",

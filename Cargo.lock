@@ -2089,6 +2089,8 @@ dependencies = [
 [[package]]
 name = "iroh-http-core"
 version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ebe3e3ff38d9e4ce6e78c11bfc0818b0001e08019cc0ac69b76f75c5f8c7b71"
 dependencies = [
  "base32",
  "bytes",
@@ -2117,8 +2119,7 @@ dependencies = [
 [[package]]
 name = "iroh-http-core"
 version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ebe3e3ff38d9e4ce6e78c11bfc0818b0001e08019cc0ac69b76f75c5f8c7b71"
+source = "git+https://github.com/Query-farm/iroh-http.git?rev=7b53384a9c72881a470d879d33adb636582ff495#7b53384a9c72881a470d879d33adb636582ff495"
 dependencies = [
  "base32",
  "bytes",
@@ -5082,7 +5083,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "iroh",
- "iroh-http-core 0.6.2",
+ "iroh-http-core 0.6.2 (git+https://github.com/Query-farm/iroh-http.git?rev=7b53384a9c72881a470d879d33adb636582ff495)",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

@@ -5186,6 +5186,7 @@ dependencies = [
  "serde",
  "serde_json",
  "vgi-rpc",
+ "vgi-rpc-client",
 ]
 
 [[package]]
@@ -5210,7 +5211,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vgi-rpc",
- "vgi-rpc-client",
  "vgi-rpc-s3",
 ]
 

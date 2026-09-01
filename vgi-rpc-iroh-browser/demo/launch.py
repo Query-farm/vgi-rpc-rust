@@ -231,6 +231,11 @@ def parse_args(argv=None):
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--no-open", action="store_true")
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="run the headless Chrome identity assertion and exit",
+    )
     parser.add_argument("--no-autorun", action="store_true")
     parser.add_argument("--no-relay", action="store_true")
     parser.add_argument("--ready-timeout", type=float, default=30.0)
@@ -300,6 +305,16 @@ def main(argv=None) -> int:
             print(f"HTTPI_TARGET=httpi://{endpoint}", flush=True)
             print(f"BROWSER_URL={url}", flush=True)
             print("Press Ctrl-C to stop the browser server, bridge, and worker.", flush=True)
+            if args.verify:
+                verify_env = os.environ.copy()
+                if args.haybarn:
+                    verify_env["HAYBARN_WASM"] = str(args.haybarn.resolve())
+                run_checked(
+                    ["node", "verify.mjs", url],
+                    repo / "vgi-rpc-iroh-browser" / "demo",
+                    verify_env,
+                )
+                return 0
             if not args.no_open:
                 webbrowser.open(url)
             while True:

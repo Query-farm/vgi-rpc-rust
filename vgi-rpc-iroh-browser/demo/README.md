@@ -49,6 +49,10 @@ cargo run -p vgi-iroh-bridge -- \
 `--ephemeral` is development-only. Use `--secret-key-file` for a stable bridge
 identity.
 
+For the automated Chrome assertion, add `--verify`. It exits non-zero unless
+the page is cross-origin isolated, ATTACH and SELECT succeed, and the worker's
+authenticated Iroh principal matches the browser EndpointId.
+
 ## Build and run
 
 From the repository root:

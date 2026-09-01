@@ -56,6 +56,11 @@ async function runDemo(): Promise<void> {
   resultRoot.replaceChildren();
   logOutput.textContent = "";
   try {
+    adapterWorker?.terminate();
+    adapterWorker = undefined;
+    await database?.terminate();
+    database = undefined;
+    browserEndpointId = undefined;
     if (!self.crossOriginIsolated || typeof SharedArrayBuffer === "undefined") {
       throw new Error(
         "cross-origin isolation is required; start this page with npm run serve",

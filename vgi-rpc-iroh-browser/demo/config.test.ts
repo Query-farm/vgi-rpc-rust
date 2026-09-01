@@ -24,6 +24,10 @@ test("requireSelect rejects obviously non-query input", () => {
     () => requireSelect("DROP TABLE remote.main.x"),
     /SELECT or WITH/,
   );
+  assert.throws(
+    () => requireSelect("SELECT 1; DROP TABLE remote.main.x"),
+    /exactly one/,
+  );
 });
 
 test("displayValue renders Arrow-friendly values without BigInt JSON failures", () => {

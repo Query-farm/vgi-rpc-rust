@@ -15,6 +15,10 @@ export function requireSelect(sql: string): string {
   if (!/^(?:select|with)\b/i.test(statement)) {
     throw new Error("the demo query must start with SELECT or WITH");
   }
+  const withoutTrailingSemicolon = statement.replace(/;\s*$/, "");
+  if (withoutTrailingSemicolon.includes(";")) {
+    throw new Error("the demo accepts exactly one SQL statement");
+  }
   return statement;
 }
 

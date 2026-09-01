@@ -1468,4 +1468,177 @@ mod tests {
         connection.close(CLOSE_CODE.into(), b"test complete");
         client_endpoint.close().await;
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn router_shutdown_waits_for_active_raw_response_to_finish() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let upstream_address = listener.local_addr().expect("upstream address");
+        let (response_pending_tx, response_pending_rx) = tokio::sync::oneshot::channel();
+        let (release_response_tx, release_response_rx) = tokio::sync::oneshot::channel();
+        let (response_written_tx, response_written_rx) = tokio::sync::oneshot::channel();
+        let (finish_upstream_tx, finish_upstream_rx) = tokio::sync::oneshot::channel();
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept upstream");
+            let mut preamble = [0_u8; 52];
+            socket
+                .read_exact(&mut preamble)
+                .await
+                .expect("read identity preamble");
+            let mut request = [0_u8; 4];
+            socket
+                .read_exact(&mut request)
+                .await
+                .expect("read bridged request");
+            response_pending_tx
+                .send(())
+                .expect("signal pending response");
+            release_response_rx.await.expect("release response");
+            socket
+                .write_all(b"pong")
+                .await
+                .expect("write bridged response");
+            socket.flush().await.expect("flush bridged response");
+            response_written_tx
+                .send(())
+                .expect("signal written response");
+            finish_upstream_rx.await.expect("finish upstream response");
+            preamble
+        });
+
+        let server_endpoint = Endpoint::builder(presets::N0)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind bridge endpoint");
+        let server_address = server_endpoint.addr();
+        let protocol = RawBridgeProtocol::new(
+            RawUpstream::Tcp(upstream_address),
+            RawBridgeOptions {
+                drain_timeout: Duration::from_secs(2),
+                ..RawBridgeOptions::default()
+            },
+        )
+        .expect("bridge config");
+        let router = iroh::protocol::Router::builder(server_endpoint)
+            .accept(VGI_IROH_ALPN, protocol)
+            .spawn();
+        let client_endpoint = Endpoint::builder(presets::N0)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind client endpoint");
+        let connection = client_endpoint
+            .connect(server_address, VGI_IROH_ALPN)
+            .await
+            .expect("connect bridge");
+        let (mut send, mut recv) = connection.open_bi().await.expect("open stream");
+        send.write_all(b"ping").await.expect("write request");
+        send.finish().expect("finish request");
+        response_pending_rx
+            .await
+            .expect("upstream observed request");
+
+        let shutdown = tokio::spawn(async move { router.shutdown().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "Router shutdown must await the active raw response"
+        );
+
+        release_response_tx.send(()).expect("release response");
+        response_written_rx.await.expect("upstream wrote response");
+        let mut response = [0_u8; 4];
+        recv.read_exact(&mut response)
+            .await
+            .expect("read response during drain");
+        assert_eq!(&response, b"pong");
+        finish_upstream_tx.send(()).expect("finish upstream");
+        let preamble = upstream.await.expect("upstream task");
+        assert_eq!(preamble, encode_iroh_proxy_v2(client_endpoint.id()));
+        tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .expect("Router shutdown deadline")
+            .expect("Router shutdown task")
+            .expect("Router shutdown result");
+        client_endpoint.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn router_shutdown_force_ends_stalled_raw_stream_at_drain_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let upstream_address = listener.local_addr().expect("upstream address");
+        let (stream_stalled_tx, stream_stalled_rx) = tokio::sync::oneshot::channel();
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept upstream");
+            let mut preamble = [0_u8; 52];
+            socket
+                .read_exact(&mut preamble)
+                .await
+                .expect("read identity preamble");
+            let mut request = [0_u8; 4];
+            socket
+                .read_exact(&mut request)
+                .await
+                .expect("read bridged request");
+            stream_stalled_tx.send(()).expect("signal stalled stream");
+            let mut trailing = [0_u8; 1];
+            socket
+                .read(&mut trailing)
+                .await
+                .expect("observe bridge close")
+        });
+
+        let server_endpoint = Endpoint::builder(presets::N0)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind bridge endpoint");
+        let server_address = server_endpoint.addr();
+        let protocol = RawBridgeProtocol::new(
+            RawUpstream::Tcp(upstream_address),
+            RawBridgeOptions {
+                drain_timeout: Duration::from_millis(150),
+                ..RawBridgeOptions::default()
+            },
+        )
+        .expect("bridge config");
+        let router = iroh::protocol::Router::builder(server_endpoint)
+            .accept(VGI_IROH_ALPN, protocol)
+            .spawn();
+        let client_endpoint = Endpoint::builder(presets::N0)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind client endpoint");
+        let connection = client_endpoint
+            .connect(server_address, VGI_IROH_ALPN)
+            .await
+            .expect("connect bridge");
+        let (mut send, _recv) = connection.open_bi().await.expect("open stream");
+        send.write_all(b"ping").await.expect("write request");
+        stream_stalled_rx.await.expect("upstream observed request");
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(2), router.shutdown())
+            .await
+            .expect("bounded Router shutdown")
+            .expect("Router shutdown result");
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "shutdown returned before the configured drain deadline"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), upstream)
+                .await
+                .expect("upstream close deadline")
+                .expect("upstream task"),
+            0,
+            "bridge must close the stalled upstream stream"
+        );
+        client_endpoint.close().await;
+    }
 }

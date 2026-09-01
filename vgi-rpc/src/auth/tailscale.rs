@@ -436,6 +436,9 @@ fn resolve_localapi(
     config: &TailscaleLocalApiConfig,
     context: &PeerResolutionContext,
 ) -> crate::Result<PeerIdentityResult> {
+    if localapi_proxy_address(context).is_err() {
+        return PeerIdentityResult::without_identity(PROVIDER, PeerIdentityStatus::Invalid);
+    }
     let Some(source) = context
         .asserted_peer()
         .or(context.source_endpoint())
@@ -668,7 +671,7 @@ fn localapi_identity(
         let stable_id = stable_id.filter(|value| !value.is_empty()).ok_or(())?;
         (SubjectKind::TaggedNode, format!("node:{stable_id}"))
     };
-    PeerIdentity::new(
+    let identity = PeerIdentity::new(
         PROVIDER,
         "localapi",
         IdentityAssurance::LocalDaemon,
@@ -681,17 +684,27 @@ fn localapi_identity(
     .with_attributes(attributes)
     .map_err(|_| ())?
     .with_capabilities(capabilities, true)
-    .map_err(|_| ())
-    .map(|identity| {
-        identity.with_addresses(
-            context
-                .asserted_peer()
-                .or(context.source_endpoint())
-                .or(context.immediate_peer())
-                .and_then(normalized_endpoint_ip),
-            None::<String>,
-        )
-    })
+    .map_err(|_| ())?;
+    let proxy_address = localapi_proxy_address(context)?;
+    Ok(identity.with_addresses(
+        context
+            .asserted_peer()
+            .or(context.source_endpoint())
+            .or(context.immediate_peer())
+            .and_then(normalized_endpoint_ip),
+        proxy_address,
+    ))
+}
+
+fn localapi_proxy_address(context: &PeerResolutionContext) -> Result<Option<String>, ()> {
+    match context.asserted_peer() {
+        Some(_) => context
+            .immediate_peer()
+            .and_then(normalized_endpoint_ip)
+            .map(Some)
+            .ok_or(()),
+        None => Ok(None),
+    }
 }
 
 fn normalized_endpoint_ip(value: &str) -> Option<String> {
@@ -1375,6 +1388,56 @@ mod tests {
             .with_deadline(Instant::now() + Duration::from_secs(2))
     }
 
+    #[test]
+    fn localapi_records_proxy_address_only_for_an_asserted_peer() {
+        let body =
+            br#"{"Node":{"StableID":"node-1","Tags":[]},"UserProfile":{"ID":42},"CapMap":{}}"#;
+        let target = capability_target("node", None);
+        let proxied = PeerResolutionContext::new("tcp")
+            .unwrap()
+            .with_peers(Some("[::ffff:127.0.0.1]:9999"), Some("100.64.0.8:12345"));
+        let identity = localapi_identity(body, &proxied, target.clone(), "tailnet:test").unwrap();
+        assert_eq!(identity.source_address(), Some("100.64.0.8"));
+        assert_eq!(identity.proxy_address(), Some("127.0.0.1"));
+
+        let direct = PeerResolutionContext::new("tcp")
+            .unwrap()
+            .with_peers(Some("100.64.0.8:12345"), None::<String>);
+        let identity = localapi_identity(body, &direct, target, "tailnet:test").unwrap();
+        assert_eq!(identity.source_address(), Some("100.64.0.8"));
+        assert_eq!(identity.proxy_address(), None);
+    }
+
+    #[test]
+    fn localapi_rejects_asserted_peer_without_normalizable_immediate_peer_before_io() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let provider = tailscale_localapi_provider(
+            TailscaleLocalApiConfig::new("tailnet:test")
+                .unwrap()
+                .with_http_endpoint(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap()
+                .with_timeout(Duration::from_millis(25))
+                .unwrap(),
+        )
+        .unwrap();
+
+        for immediate in [None, Some("not-an-endpoint")] {
+            let context = PeerResolutionContext::new("tcp")
+                .unwrap()
+                .with_peers(immediate, Some("100.64.0.8:12345"));
+            assert_eq!(
+                provider(&context).unwrap().status(),
+                PeerIdentityStatus::Invalid
+            );
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "invalid proxy context must be rejected before LocalAPI I/O"
+            );
+        }
+    }
+
     fn local_provider(endpoint: &str) -> PeerIdentityProvider {
         tailscale_localapi_provider(
             TailscaleLocalApiConfig::new("tailnet:test")
@@ -1404,7 +1467,7 @@ mod tests {
         assert_eq!(identity.subject_key(), Some("user:42"));
         assert_eq!(identity.subject_stability(), SubjectStability::Stable);
         assert_eq!(identity.source_address(), Some("100.64.0.8"));
-        assert_eq!(identity.proxy_address(), None);
+        assert_eq!(identity.proxy_address(), Some("127.0.0.1"));
         assert_eq!(
             identity.attributes()["capability_target"]["kind"],
             "service"
@@ -1435,6 +1498,7 @@ mod tests {
         let result = local_provider(&endpoint)(&context).unwrap();
         assert_eq!(result.status(), PeerIdentityStatus::Available);
         assert_eq!(result.identities()[0].source_address(), Some("100.64.0.8"));
+        assert_eq!(result.identities()[0].proxy_address(), None);
         let request = request.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(request.starts_with(
             "GET /localapi/v0/whois?addr=100.64.0.8%3A54321&proto=tcp&svc_name=svc%3Aworker HTTP/1.1\r\n"

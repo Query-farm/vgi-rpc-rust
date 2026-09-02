@@ -182,6 +182,7 @@ class RustClientProxy:
             )
             resp = self._recv()
             if not resp.get("ok"):
+                self._raise_if_error(resp)
                 raise RpcError("TransportError", str(resp.get("error")), "")
             self._replay_logs(resp.get("logs"))
             self._raise_if_error(resp)

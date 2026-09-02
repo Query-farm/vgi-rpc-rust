@@ -515,7 +515,7 @@ fn run_stream(
             };
             match session {
                 Ok(mut s) => stream_sub_loop(&mut s, log_buf, reader, out),
-                Err(e) => write_response(out, &json!({"ok": false, "error": e.to_string()})),
+                Err(e) => write_response(out, &json!({"ok": false, "error": error_to_json(&e)})),
             }
         }
         Conn::Http(c) => {
@@ -526,7 +526,7 @@ fn run_stream(
             };
             match session {
                 Ok(mut s) => stream_sub_loop(&mut s, log_buf, reader, out),
-                Err(e) => write_response(out, &json!({"ok": false, "error": e.to_string()})),
+                Err(e) => write_response(out, &json!({"ok": false, "error": error_to_json(&e)})),
             }
         }
     }

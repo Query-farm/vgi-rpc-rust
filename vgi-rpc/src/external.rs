@@ -663,6 +663,28 @@ pub fn prepare_externalize_batch(
     inline_metadata: Option<&Metadata>,
     cfg: &ExternalLocationConfig,
 ) -> Result<Option<PreparedExternal>> {
+    prepare_externalize_batch_inner(batch, declared_schema, inline_metadata, cfg, false)
+}
+
+/// Prepare a non-empty batch even when it is below the configured normal
+/// externalization threshold. HTTP uses this as a last-chance rescue when an
+/// inline response would exceed the caller's negotiated hard limit.
+pub fn prepare_externalize_batch_forced(
+    batch: &RecordBatch,
+    declared_schema: &Schema,
+    inline_metadata: Option<&Metadata>,
+    cfg: &ExternalLocationConfig,
+) -> Result<Option<PreparedExternal>> {
+    prepare_externalize_batch_inner(batch, declared_schema, inline_metadata, cfg, true)
+}
+
+fn prepare_externalize_batch_inner(
+    batch: &RecordBatch,
+    declared_schema: &Schema,
+    inline_metadata: Option<&Metadata>,
+    cfg: &ExternalLocationConfig,
+    force: bool,
+) -> Result<Option<PreparedExternal>> {
     if batch.num_rows() == 0 {
         return Ok(None);
     }
@@ -688,7 +710,7 @@ pub fn prepare_externalize_batch(
         declared_schema,
         if md.is_empty() { None } else { Some(&md) },
     )?;
-    if ipc_bytes.len() < cfg.threshold_bytes {
+    if !force && ipc_bytes.len() < cfg.threshold_bytes {
         return Ok(None);
     }
     let raw_len = ipc_bytes.len();

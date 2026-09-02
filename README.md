@@ -44,6 +44,9 @@ integration tests pass with all features enabled. Workspace-wide
 | `vgi-rpc-client/` | Blocking client for stateful byte streams and HTTP. |
 | `vgi-rpc-iroh/` | Optional authenticated Iroh/QUIC adapter. Carries the raw stateful Arrow framing without adding Iroh to the base crates. |
 | `vgi-rpc-iroh-browser/` | Experimental browser-capable, client-only Hyper request path over a shared Iroh endpoint. |
+
+HTTP response-size negotiation and worker-visible batching budgets are
+documented in [`docs/response-budgets.md`](docs/response-budgets.md).
 | `conformance-worker/` | Binary `vgi-rpc-conformance-rust` — registers the full Python `ConformanceService` and serves stdio / `--http` / `--unix`. Drives the conformance test harness. |
 | `vgi-rpc-s3/` | `PresignedS3Storage` + shared `HttpFetcher` for the external-location flow. |
 | `vgi-rpc-gcs/` | `SignedGcsStorage` for Google Cloud Storage V4 signed URLs. |

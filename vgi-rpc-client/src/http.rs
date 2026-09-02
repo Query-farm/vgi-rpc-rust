@@ -58,6 +58,8 @@ const ECHO_HEADER_PREFIX: &str = "VGI-Echo-";
 const SUPPORTED_ENCODINGS_HEADER: &str = "VGI-Supported-Encodings";
 const MAX_REQUEST_BYTES_HEADER: &str = "VGI-Max-Request-Bytes";
 const MAX_RESPONSE_BYTES_HEADER: &str = "VGI-Max-Response-Bytes";
+const ACCEPT_MAX_RESPONSE_BYTES_HEADER: &str = "VGI-Accept-Max-Response-Bytes";
+const ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER: &str = "VGI-Accept-Max-Response-Bytes-Support";
 const MAX_EXTERNALIZED_RESPONSE_BYTES_HEADER: &str = "VGI-Max-Externalized-Response-Bytes";
 const EXTERNALIZATION_ENABLED_HEADER: &str = "VGI-Externalization-Enabled";
 const MAX_UPLOAD_BYTES_HEADER: &str = "VGI-Max-Upload-Bytes";
@@ -71,6 +73,9 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
 const DEFAULT_MAX_ENCODED_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_MAX_DECODED_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_ACCEPTED_MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+const MIN_ACCEPTED_MAX_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_SAFE_RESPONSE_BYTES: u64 = (1u64 << 53) - 1;
 /// The only coding this client can produce for request bodies. Also the
 /// assumed server capability when `VGI-Supported-Encodings` is absent.
 const DEFAULT_REQUEST_ENCODING: &str = "zstd";
@@ -93,6 +98,7 @@ pub struct HttpServerCapabilities {
     pub upload_url_support: bool,
     pub max_request_bytes: Option<u64>,
     pub max_response_bytes: Option<u64>,
+    pub accept_max_response_bytes_support: bool,
     pub max_externalized_response_bytes: Option<u64>,
     pub externalization_enabled: bool,
     pub max_upload_bytes: Option<u64>,
@@ -128,6 +134,7 @@ impl Default for HttpServerCapabilities {
             upload_url_support: false,
             max_request_bytes: None,
             max_response_bytes: None,
+            accept_max_response_bytes_support: false,
             max_externalized_response_bytes: None,
             externalization_enabled: false,
             max_upload_bytes: None,
@@ -313,7 +320,10 @@ pub struct HttpClientBuilder {
     compression_level: Option<i32>,
     external_validator: Option<UrlValidator>,
     max_encoded_response_bytes: usize,
+    max_encoded_response_bytes_explicit: bool,
     max_decoded_response_bytes: usize,
+    max_decoded_response_bytes_explicit: bool,
+    accepted_max_response_bytes: usize,
 }
 
 impl HttpClientBuilder {
@@ -378,7 +388,12 @@ impl HttpClientBuilder {
     /// Hard ceiling on response bytes read from the network, before content
     /// decoding. Applies with or without `Content-Length` (default 256 MiB).
     pub fn max_encoded_response_bytes(mut self, n: usize) -> Self {
+        assert!(
+            n >= MIN_ACCEPTED_MAX_RESPONSE_BYTES && (n as u64) <= MAX_SAFE_RESPONSE_BYTES,
+            "max_encoded_response_bytes must be in 65536..=2^53-1"
+        );
         self.max_encoded_response_bytes = n;
+        self.max_encoded_response_bytes_explicit = true;
         self
     }
 
@@ -386,7 +401,30 @@ impl HttpClientBuilder {
     /// This is independent from the encoded-byte ceiling, so a small zstd
     /// response cannot expand without bound.
     pub fn max_decoded_response_bytes(mut self, n: usize) -> Self {
+        assert!(
+            n >= MIN_ACCEPTED_MAX_RESPONSE_BYTES && (n as u64) <= MAX_SAFE_RESPONSE_BYTES,
+            "max_decoded_response_bytes must be in 65536..=2^53-1"
+        );
         self.max_decoded_response_bytes = n;
+        self.max_decoded_response_bytes_explicit = true;
+        self
+    }
+
+    /// Maximum decoded response this client is willing to accept. Sent on
+    /// every request as `VGI-Accept-Max-Response-Bytes` and also enforced
+    /// locally. Native clients default to 256 MiB.
+    pub fn accepted_max_response_bytes(mut self, n: usize) -> Self {
+        assert!(
+            n >= MIN_ACCEPTED_MAX_RESPONSE_BYTES && (n as u64) <= MAX_SAFE_RESPONSE_BYTES,
+            "accepted_max_response_bytes must be in 65536..=2^53-1"
+        );
+        self.accepted_max_response_bytes = n;
+        if !self.max_encoded_response_bytes_explicit {
+            self.max_encoded_response_bytes = n;
+        }
+        if !self.max_decoded_response_bytes_explicit {
+            self.max_decoded_response_bytes = n;
+        }
         self
     }
 
@@ -445,6 +483,10 @@ impl HttpClientBuilder {
             compression_level: self.compression_level,
             max_encoded_response_bytes: self.max_encoded_response_bytes,
             max_decoded_response_bytes: self.max_decoded_response_bytes,
+            accepted_max_response_bytes: self
+                .accepted_max_response_bytes
+                .min(self.max_decoded_response_bytes)
+                .min(self.max_encoded_response_bytes),
             external,
             caps: RefCell::new(None),
             send_compressed: RefCell::new(self.compression_level.is_some()),
@@ -482,6 +524,7 @@ pub struct HttpClient {
     compression_level: Option<i32>,
     max_encoded_response_bytes: usize,
     max_decoded_response_bytes: usize,
+    accepted_max_response_bytes: usize,
     external: Option<ExternalLocationConfig>,
     caps: RefCell<Option<HttpServerCapabilities>>,
     /// Whether to zstd-compress request bodies (disabled after a 415).
@@ -509,7 +552,10 @@ impl HttpClient {
             compression_level: Some(DEFAULT_COMPRESSION_LEVEL),
             external_validator: None,
             max_encoded_response_bytes: DEFAULT_MAX_ENCODED_RESPONSE_BYTES,
+            max_encoded_response_bytes_explicit: false,
             max_decoded_response_bytes: DEFAULT_MAX_DECODED_RESPONSE_BYTES,
+            max_decoded_response_bytes_explicit: false,
+            accepted_max_response_bytes: DEFAULT_ACCEPTED_MAX_RESPONSE_BYTES,
         }
     }
 
@@ -522,6 +568,11 @@ impl HttpClient {
     fn build_headers(&self, content_encoding: Option<&str>) -> HeaderMap {
         let mut h = self.headers.clone();
         h.insert(CONTENT_TYPE, HeaderValue::from_static(ARROW_CONTENT_TYPE));
+        h.insert(
+            ACCEPT_MAX_RESPONSE_BYTES_HEADER,
+            HeaderValue::from_str(&self.accepted_max_response_bytes.to_string())
+                .expect("validated response budget is a valid header"),
+        );
         if let Some(enc) = content_encoding {
             if let Ok(v) = HeaderValue::from_str(enc) {
                 h.insert(reqwest::header::CONTENT_ENCODING, v);
@@ -584,6 +635,10 @@ impl HttpClient {
     /// externalization (413), explicitly configured connection replay, and
     /// sticky-session header capture. Returns the response body bytes.
     fn post(&mut self, path: &str, body: Vec<u8>, retryable: bool) -> Result<Vec<u8>> {
+        // The advertised/default receive budget is meaningful only after the
+        // server has positively acknowledged the contract. This auth-exempt
+        // probe is cached for the client lifetime.
+        self.capabilities()?;
         // Proactive externalization when caps are known and the body is large.
         let body = self.maybe_externalize_request(body)?;
         let (mut resp_headers, mut bytes, mut status) = self.send(path, &body, retryable)?;
@@ -670,11 +725,63 @@ impl HttpClient {
                 Ok(resp) => {
                     let status = resp.status();
                     let resp_headers = resp.headers().clone();
+                    if !has_single_response_budget_support(&resp_headers) {
+                        return Err(RpcError::new(
+                            "ProtocolError",
+                            "server response does not advertise VGI-Accept-Max-Response-Bytes-Support: true",
+                        ));
+                    }
                     let response_encoding = resp_headers
                         .get(reqwest::header::CONTENT_ENCODING)
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_ascii_lowercase);
-                    let raw = read_bounded_response(resp, self.max_encoded_response_bytes)?;
+                    let discovered_server_limit = self
+                        .caps
+                        .borrow()
+                        .as_ref()
+                        .and_then(|caps| caps.max_response_bytes);
+                    let response_server_limit = parse_max_response_bytes(&resp_headers)?;
+                    let decoded_limit = [
+                        Some(self.max_decoded_response_bytes as u64),
+                        Some(self.accepted_max_response_bytes as u64),
+                        discovered_server_limit,
+                        response_server_limit,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .expect("local decoded response limits are always configured")
+                        as usize;
+                    // Encoded and decoded limits are independent for compressed
+                    // representations. Identity bytes are already decoded, so
+                    // bound them during the socket read instead of allocating up
+                    // to the larger encoded safety ceiling first.
+                    let identity_response = response_encoding
+                        .as_deref()
+                        .is_none_or(|encoding| encoding == "identity");
+                    let decoded_budget_is_tighter =
+                        decoded_limit <= self.max_encoded_response_bytes;
+                    let encoded_limit = if identity_response {
+                        self.max_encoded_response_bytes.min(decoded_limit)
+                    } else {
+                        self.max_encoded_response_bytes
+                    };
+                    let encoded_error_type = if identity_response && decoded_budget_is_tighter {
+                        "ResponseTooLargeError"
+                    } else {
+                        "TransportError"
+                    };
+                    let encoded_description = if identity_response && decoded_budget_is_tighter {
+                        "decoded HTTP identity response"
+                    } else {
+                        "encoded HTTP response (max_encoded_response_bytes)"
+                    };
+                    let raw = read_bounded_response(
+                        resp,
+                        encoded_limit,
+                        encoded_description,
+                        encoded_error_type,
+                    )?;
                     let decoded = match response_encoding.as_deref() {
                         Some("zstd") => {
                             let mut decoder = zstd::Decoder::new(Cursor::new(raw.as_slice()))
@@ -685,9 +792,7 @@ impl HttpClient {
                                     )
                                 })?;
                             decoder
-                                .window_log_max(zstd_window_log_for_limit(
-                                    self.max_decoded_response_bytes,
-                                ))
+                                .window_log_max(zstd_window_log_for_limit(decoded_limit))
                                 .map_err(|e| {
                                     RpcError::new(
                                         "TransportError",
@@ -696,22 +801,24 @@ impl HttpClient {
                                 })?;
                             read_bounded(
                                 decoder,
-                                self.max_decoded_response_bytes,
+                                decoded_limit,
                                 "decoded HTTP response (max_decoded_response_bytes)",
+                                "ResponseTooLargeError",
                             )?
                         }
                         Some("gzip") => read_bounded(
                             flate2::read::GzDecoder::new(raw.as_slice()),
-                            self.max_decoded_response_bytes,
+                            decoded_limit,
                             "decoded HTTP response (max_decoded_response_bytes)",
+                            "ResponseTooLargeError",
                         )?,
                         _ => {
-                            if raw.len() > self.max_decoded_response_bytes {
+                            if raw.len() > decoded_limit {
                                 return Err(RpcError::new(
-                                    "TransportError",
+                                    "ResponseTooLargeError",
                                     format!(
-                                        "decoded HTTP response exceeds max_decoded_response_bytes={}",
-                                        self.max_decoded_response_bytes
+                                        "decoded HTTP response exceeds max_response_bytes ({} > {})",
+                                        raw.len(), decoded_limit
                                     ),
                                 ));
                             }
@@ -872,13 +979,23 @@ impl HttpClient {
     }
 
     fn fetch_capabilities(&self) -> Result<HttpServerCapabilities> {
+        let mut headers = self.headers.clone();
+        headers.insert(
+            ACCEPT_MAX_RESPONSE_BYTES_HEADER,
+            HeaderValue::from_str(&self.accepted_max_response_bytes.to_string())
+                .expect("validated response budget is a valid header"),
+        );
         let resp = self
             .inner
             .request(Method::OPTIONS, self.url("health"))
-            .headers(self.headers.clone())
+            .headers(headers)
             .send()
             .map_err(|e| RpcError::new("TransportError", format!("options health: {e}")))?;
-        Ok(parse_caps(resp.headers()))
+        require_response_budget_discovery(resp.status(), resp.headers())?;
+        let max_response_bytes = parse_max_response_bytes(resp.headers())?;
+        let mut caps = parse_caps(resp.headers());
+        caps.max_response_bytes = max_response_bytes;
+        Ok(caps)
     }
 
     /// Harvest `VGI-Supported-Encodings` from a response and cache it.
@@ -1057,24 +1174,26 @@ fn put_external_body(client: &HttpInner, url: &str, body: &[u8]) -> Result<()> {
 fn read_bounded_response(
     mut response: reqwest::blocking::Response,
     max_bytes: usize,
+    description: &str,
+    limit_error_type: &str,
 ) -> Result<Vec<u8>> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > max_bytes as u64)
-    {
-        return Err(RpcError::new(
-            "TransportError",
-            format!("encoded HTTP response exceeds max_encoded_response_bytes={max_bytes}"),
-        ));
+    if let Some(length) = response.content_length() {
+        if length > max_bytes as u64 {
+            return Err(RpcError::new(
+                limit_error_type,
+                format!("{description} exceeds max_response_bytes ({length} > {max_bytes})"),
+            ));
+        }
     }
-    read_bounded(
-        &mut response,
-        max_bytes,
-        "encoded HTTP response (max_encoded_response_bytes)",
-    )
+    read_bounded(&mut response, max_bytes, description, limit_error_type)
 }
 
-fn read_bounded(mut reader: impl Read, max_bytes: usize, description: &str) -> Result<Vec<u8>> {
+fn read_bounded(
+    mut reader: impl Read,
+    max_bytes: usize,
+    description: &str,
+    limit_error_type: &str,
+) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(max_bytes.min(64 * 1024));
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -1085,9 +1204,10 @@ fn read_bounded(mut reader: impl Read, max_bytes: usize, description: &str) -> R
             return Ok(out);
         }
         if out.len().checked_add(n).is_none_or(|size| size > max_bytes) {
+            let actual = out.len().saturating_add(n);
             return Err(RpcError::new(
-                "TransportError",
-                format!("{description} exceeds configured limit={max_bytes}"),
+                limit_error_type,
+                format!("{description} exceeds max_response_bytes ({actual} > {max_bytes})"),
             ));
         }
         out.extend_from_slice(&buf[..n]);
@@ -1643,6 +1763,44 @@ fn parse_supported_encodings(h: &HeaderMap) -> Option<Vec<String>> {
     )
 }
 
+fn parse_max_response_bytes(headers: &HeaderMap) -> Result<Option<u64>> {
+    let mut values = headers.get_all(MAX_RESPONSE_BYTES_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(RpcError::new(
+            "ProtocolError",
+            "VGI-Max-Response-Bytes must occur exactly once",
+        ));
+    }
+    let raw = value.to_str().map_err(|_| {
+        RpcError::new(
+            "ProtocolError",
+            "VGI-Max-Response-Bytes must be canonical ASCII digits",
+        )
+    })?;
+    if raw.is_empty() || raw.starts_with('0') || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(RpcError::new(
+            "ProtocolError",
+            "VGI-Max-Response-Bytes must match [1-9][0-9]*",
+        ));
+    }
+    let parsed = raw.parse::<u64>().map_err(|_| {
+        RpcError::new(
+            "ProtocolError",
+            "VGI-Max-Response-Bytes is outside the supported range",
+        )
+    })?;
+    if !(MIN_ACCEPTED_MAX_RESPONSE_BYTES as u64..=MAX_SAFE_RESPONSE_BYTES).contains(&parsed) {
+        return Err(RpcError::new(
+            "ProtocolError",
+            "VGI-Max-Response-Bytes must be in 65536..=2^53-1",
+        ));
+    }
+    Ok(Some(parsed))
+}
+
 fn parse_caps(h: &HeaderMap) -> HttpServerCapabilities {
     let get = |name: &str| {
         h.get(name)
@@ -1666,7 +1824,8 @@ fn parse_caps(h: &HeaderMap) -> HttpServerCapabilities {
         sticky_echo_headers: split(STICKY_ECHO_HEADERS_HEADER),
         upload_url_support: get(UPLOAD_URL_HEADER).as_deref() == Some("true"),
         max_request_bytes: parse_u64(MAX_REQUEST_BYTES_HEADER),
-        max_response_bytes: parse_u64(MAX_RESPONSE_BYTES_HEADER),
+        max_response_bytes: parse_max_response_bytes(h).ok().flatten(),
+        accept_max_response_bytes_support: has_single_response_budget_support(h),
         max_externalized_response_bytes: parse_u64(MAX_EXTERNALIZED_RESPONSE_BYTES_HEADER),
         externalization_enabled: get(EXTERNALIZATION_ENABLED_HEADER).as_deref() == Some("true"),
         max_upload_bytes: parse_u64(MAX_UPLOAD_BYTES_HEADER),
@@ -1675,6 +1834,32 @@ fn parse_caps(h: &HeaderMap) -> HttpServerCapabilities {
         supported_encodings: parse_supported_encodings(h)
             .unwrap_or_else(|| vec![DEFAULT_REQUEST_ENCODING.to_string()]),
     }
+}
+
+fn has_single_response_budget_support(headers: &HeaderMap) -> bool {
+    let mut values = headers
+        .get_all(ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER)
+        .iter();
+    matches!(
+        values.next().and_then(|value| value.to_str().ok()),
+        Some("true")
+    ) && values.next().is_none()
+}
+
+fn require_response_budget_discovery(status: StatusCode, headers: &HeaderMap) -> Result<()> {
+    if !status.is_success() {
+        return Err(RpcError::new(
+            "ProtocolError",
+            format!("response-budget discovery returned HTTP {status}"),
+        ));
+    }
+    if !has_single_response_budget_support(headers) {
+        return Err(RpcError::new(
+            "ProtocolError",
+            "server does not advertise exactly one VGI-Accept-Max-Response-Bytes-Support: true",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1692,6 +1877,157 @@ mod tests {
             );
         }
         h
+    }
+
+    #[test]
+    fn capability_parser_reports_accept_max_response_support() {
+        assert!(!parse_caps(&HeaderMap::new()).accept_max_response_bytes_support);
+        assert!(
+            parse_caps(&headers(&[(
+                ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER,
+                "true"
+            )]))
+            .accept_max_response_bytes_support
+        );
+        assert!(
+            !parse_caps(&headers(&[(
+                ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER,
+                "TRUE"
+            )]))
+            .accept_max_response_bytes_support
+        );
+        assert!(
+            !parse_caps(&headers(&[(
+                ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER,
+                "false"
+            )]))
+            .accept_max_response_bytes_support
+        );
+        let mut duplicate = HeaderMap::new();
+        duplicate.append(
+            HeaderName::from_static("vgi-accept-max-response-bytes-support"),
+            HeaderValue::from_static("true"),
+        );
+        duplicate.append(
+            HeaderName::from_static("vgi-accept-max-response-bytes-support"),
+            HeaderValue::from_static("true"),
+        );
+        assert!(!parse_caps(&duplicate).accept_max_response_bytes_support);
+    }
+
+    #[test]
+    fn response_budget_discovery_requires_success_and_exact_support() {
+        let supported = headers(&[(ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER, "true")]);
+        assert!(require_response_budget_discovery(StatusCode::OK, &supported).is_ok());
+        assert!(require_response_budget_discovery(StatusCode::NO_CONTENT, &supported).is_ok());
+        assert!(
+            require_response_budget_discovery(StatusCode::INTERNAL_SERVER_ERROR, &supported)
+                .is_err()
+        );
+        assert!(require_response_budget_discovery(StatusCode::OK, &HeaderMap::new()).is_err());
+    }
+
+    #[test]
+    fn advertised_max_response_bytes_uses_strict_safe_integer_grammar() {
+        for valid in ["65536", "9007199254740991"] {
+            let parsed =
+                parse_max_response_bytes(&headers(&[(MAX_RESPONSE_BYTES_HEADER, valid)])).unwrap();
+            assert_eq!(parsed, Some(valid.parse::<u64>().unwrap()));
+        }
+        for invalid in [
+            "",
+            "0",
+            "065536",
+            "+65536",
+            "65535",
+            "9007199254740992",
+            "65536, 65536",
+            " 65536",
+        ] {
+            assert!(
+                parse_max_response_bytes(&headers(&[(MAX_RESPONSE_BYTES_HEADER, invalid)]))
+                    .is_err(),
+                "accepted invalid VGI-Max-Response-Bytes={invalid:?}"
+            );
+        }
+        let mut duplicate = HeaderMap::new();
+        duplicate.append(
+            HeaderName::from_static("vgi-max-response-bytes"),
+            HeaderValue::from_static("65536"),
+        );
+        duplicate.append(
+            HeaderName::from_static("vgi-max-response-bytes"),
+            HeaderValue::from_static("65536"),
+        );
+        assert!(parse_max_response_bytes(&duplicate).is_err());
+    }
+
+    #[test]
+    fn native_client_sends_and_locally_enforces_the_same_default_budget() {
+        let client = HttpClient::connect("http://127.0.0.1").build().unwrap();
+        assert_eq!(
+            client
+                .build_headers(None)
+                .get(ACCEPT_MAX_RESPONSE_BYTES_HEADER)
+                .unwrap(),
+            "268435456"
+        );
+        assert_eq!(client.accepted_max_response_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn decoded_acceptance_does_not_redefine_the_independent_encoded_cap() {
+        let client = HttpClient::connect("http://127.0.0.1")
+            .accepted_max_response_bytes(64 * 1024)
+            .max_encoded_response_bytes(128 * 1024)
+            .build()
+            .unwrap();
+        assert_eq!(client.accepted_max_response_bytes, 64 * 1024);
+        assert_eq!(client.max_encoded_response_bytes, 128 * 1024);
+    }
+
+    #[test]
+    fn advertised_acceptance_matches_the_actual_decoded_ceiling_in_any_option_order() {
+        let one_gib = 1024 * 1024 * 1024;
+        let expanded = HttpClient::connect("http://127.0.0.1")
+            .accepted_max_response_bytes(one_gib)
+            .build()
+            .unwrap();
+        assert_eq!(expanded.accepted_max_response_bytes, one_gib);
+        assert_eq!(expanded.max_decoded_response_bytes, one_gib);
+        assert_eq!(expanded.max_encoded_response_bytes, one_gib);
+        assert_eq!(
+            expanded
+                .build_headers(None)
+                .get(ACCEPT_MAX_RESPONSE_BYTES_HEADER)
+                .unwrap(),
+            "1073741824"
+        );
+
+        for constrained in [
+            HttpClient::connect("http://127.0.0.1")
+                .accepted_max_response_bytes(one_gib)
+                .max_decoded_response_bytes(128 * 1024),
+            HttpClient::connect("http://127.0.0.1")
+                .max_decoded_response_bytes(128 * 1024)
+                .accepted_max_response_bytes(one_gib),
+            HttpClient::connect("http://127.0.0.1")
+                .accepted_max_response_bytes(one_gib)
+                .max_encoded_response_bytes(128 * 1024),
+            HttpClient::connect("http://127.0.0.1")
+                .max_encoded_response_bytes(128 * 1024)
+                .accepted_max_response_bytes(one_gib),
+        ] {
+            let client = constrained.build().unwrap();
+            assert_eq!(client.accepted_max_response_bytes, 128 * 1024);
+            assert_eq!(
+                client
+                    .build_headers(None)
+                    .get(ACCEPT_MAX_RESPONSE_BYTES_HEADER)
+                    .unwrap(),
+                "131072"
+            );
+        }
     }
 
     #[test]

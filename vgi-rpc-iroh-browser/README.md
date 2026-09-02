@@ -48,6 +48,9 @@ handling, Arrow framing, deadlines, and retry policy. External payload URLs
 remain ordinary HTTPS locations rather than nested `httpi://` requests.
 
 Experimental client-only `iroh-http/2` transport seam for browser builds.
+HTTPI requests carry `VGI-Accept-Max-Response-Bytes`; the browser default and
+local streaming ceiling are 64 MiB. See
+[`../docs/response-budgets.md`](../docs/response-budgets.md).
 
 The crate wraps an application-owned `iroh::Endpoint`, preserving one Iroh
 identity across protocols. It opens a bidirectional stream with the

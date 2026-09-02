@@ -6,7 +6,7 @@
 //! authenticated Iroh byte transport shared by `vgi-rpc/arrow-mux/1` and
 //! `iroh-http/2`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -24,6 +24,31 @@ use crate::{IrohHttpEndpoint, IrohHttpError, RequestBody, IROH_HTTP_ALPN};
 
 const VGI_MUX_ALPN: &[u8] = b"vgi-rpc/arrow-mux/1";
 const CLOSE_CODE: u32 = 0;
+const ACCEPT_MAX_RESPONSE_BYTES_HEADER: &str = "vgi-accept-max-response-bytes";
+const DEFAULT_ACCEPTED_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MIN_ACCEPTED_MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+const MAX_SAFE_RESPONSE_BYTES: u64 = (1u64 << 53) - 1;
+
+fn parse_response_budget(value: &str) -> Result<usize, JsValue> {
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.as_bytes().iter().all(u8::is_ascii_digit)
+    {
+        return Err(
+            js_sys::TypeError::new("VGI-Accept-Max-Response-Bytes must match [1-9][0-9]*").into(),
+        );
+    }
+    let parsed = value.parse::<u64>().map_err(|_| {
+        js_sys::TypeError::new("VGI-Accept-Max-Response-Bytes is outside the supported range")
+    })?;
+    if !(MIN_ACCEPTED_MAX_RESPONSE_BYTES..=MAX_SAFE_RESPONSE_BYTES).contains(&parsed) {
+        return Err(js_sys::RangeError::new(
+            "VGI-Accept-Max-Response-Bytes must be between 65536 and 2^53-1",
+        )
+        .into());
+    }
+    Ok(parsed as usize)
+}
 
 fn js_error(context: &str, error: impl std::fmt::Display) -> JsValue {
     js_sys::Error::new(&format!("{context}: {error}")).into()
@@ -177,6 +202,7 @@ impl BrowserIrohNode {
         let mut builder = hyper::Request::builder()
             .method(method.as_str())
             .uri(path.as_str());
+        let mut accepted_max = None;
         for item in headers.iter() {
             let pair = Array::from(&item);
             if pair.length() != 2 {
@@ -192,8 +218,20 @@ impl BrowserIrohNode {
                 .get(1)
                 .as_string()
                 .ok_or_else(|| js_sys::TypeError::new("header value must be a string"))?;
-            builder = builder.header(name, value);
+            if name.eq_ignore_ascii_case(ACCEPT_MAX_RESPONSE_BYTES_HEADER) {
+                if accepted_max.is_some() {
+                    return Err(js_sys::TypeError::new(
+                        "VGI-Accept-Max-Response-Bytes must occur exactly once",
+                    )
+                    .into());
+                }
+                accepted_max = Some(parse_response_budget(&value)?);
+            } else {
+                builder = builder.header(name, value);
+            }
         }
+        let accepted_max = accepted_max.unwrap_or(DEFAULT_ACCEPTED_MAX_RESPONSE_BYTES);
+        builder = builder.header(ACCEPT_MAX_RESPONSE_BYTES_HEADER, accepted_max.to_string());
         let request = builder
             .body(RequestBody::from(bytes::Bytes::from(body.to_vec())))
             .map_err(|error| {
@@ -247,6 +285,7 @@ impl BrowserIrohNode {
             headers: response_headers,
             body: Rc::new(Mutex::new(Some(response.into_body()))),
             cancel: watch::channel(false).0,
+            remaining_bytes: Rc::new(Cell::new(accepted_max)),
             #[cfg(feature = "browser-smoke")]
             smoke: false,
         })
@@ -437,6 +476,7 @@ pub struct BrowserHttpResponse {
     headers: Vec<(String, String)>,
     body: Rc<Mutex<Option<hyper::body::Incoming>>>,
     cancel: watch::Sender<bool>,
+    remaining_bytes: Rc<Cell<usize>>,
     #[cfg(feature = "browser-smoke")]
     smoke: bool,
 }
@@ -486,6 +526,15 @@ impl BrowserHttpResponse {
             let frame =
                 frame.map_err(|error| js_error("reading HTTP response body failed", error))?;
             if let Ok(data) = frame.into_data() {
+                let remaining = self.remaining_bytes.get();
+                if data.len() > remaining {
+                    *guard = None;
+                    return Err(js_sys::RangeError::new(
+                        "HTTP response exceeds accepted_max_response_bytes",
+                    )
+                    .into());
+                }
+                self.remaining_bytes.set(remaining - data.len());
                 return Ok(Some(Uint8Array::from(data.as_ref())));
             }
         }
@@ -525,6 +574,7 @@ pub fn http_borrow_smoke() -> BrowserHttpResponse {
         headers: Vec::new(),
         body: Rc::new(Mutex::new(None)),
         cancel: watch::channel(false).0,
+        remaining_bytes: Rc::new(Cell::new(DEFAULT_ACCEPTED_MAX_RESPONSE_BYTES)),
         smoke: true,
     }
 }

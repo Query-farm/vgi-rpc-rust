@@ -124,6 +124,10 @@ const VGI_CONTENT_ENCODING_HEADER: &str = "x-vgi-content-encoding";
 /// Marks a 200 response whose Arrow body carries an RPC error rather than a
 /// result. Browser clients must be able to read it, so it is CORS-exposed.
 const RPC_ERROR_HEADER: &str = "x-vgi-rpc-error";
+pub const ACCEPT_MAX_RESPONSE_BYTES_HEADER: &str = "vgi-accept-max-response-bytes";
+pub const ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER: &str = "vgi-accept-max-response-bytes-support";
+const MAX_SAFE_RESPONSE_BYTES: u64 = (1u64 << 53) - 1;
+const MIN_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// A response content coding vgi-rpc knows how to negotiate.
 ///
@@ -369,19 +373,20 @@ pub struct HttpState {
     describe_page_enabled: bool,
     health_enabled: bool,
     max_request_bytes: Option<usize>,
+    hosting_max_request_bytes: Option<usize>,
     /// Hard cap on the HTTP body size for unary and stream-exchange
     /// responses (advertised via `VGI-Max-Response-Bytes`).  `None` =
     /// unbounded.  Externalised payloads do not count toward this — they
     /// leave only tiny pointer batches on the wire.
     max_response_bytes: Option<usize>,
+    hosting_max_response_bytes: Option<usize>,
+    preferred_response_bytes: Option<usize>,
     /// Cap on bytes uploaded to external storage while producing one HTTP
     /// response (advertised via `VGI-Max-Externalized-Response-Bytes`).
     /// `None` = unbounded.
     ///
-    /// **Hard on every method type**, unlike `max_response_bytes` which is
-    /// soft for producers: a wire overshoot can be carried to the next turn
-    /// by a continuation token, but bytes already uploaded cannot be
-    /// un-uploaded, so there is nothing for a continuation to rescue.
+    /// **Hard on every method type**. Bytes already uploaded cannot be
+    /// un-uploaded, so this is preflighted before storage I/O.
     /// Enforced by pre-flighting the payload size before each upload (see
     /// [`crate::external::prepare_externalize_batch`]) with a post-flush
     /// backstop on the unary path.
@@ -440,8 +445,11 @@ pub struct HttpStateBuilder {
     describe_page_enabled: Option<bool>,
     health_enabled: Option<bool>,
     max_request_bytes: Option<usize>,
+    hosting_max_request_bytes: Option<usize>,
     max_upload_bytes: Option<usize>,
     max_response_bytes: Option<usize>,
+    hosting_max_response_bytes: Option<usize>,
+    preferred_response_bytes: Option<usize>,
     max_externalized_response_bytes: Option<usize>,
     upload_url_provider: Option<Arc<dyn crate::external::UploadUrlProvider>>,
     enable_sticky: Option<bool>,
@@ -711,7 +719,16 @@ impl HttpStateBuilder {
     /// with [`Self::upload_url_provider`], clients can externalize
     /// oversize requests via `__upload_url__/init` + a pointer batch.
     pub fn max_request_bytes(mut self, n: usize) -> Self {
+        assert!(n > 0, "max_request_bytes must be positive");
         self.max_request_bytes = Some(n);
+        self
+    }
+
+    /// Deployment/platform hard ceiling for a decoded application request.
+    /// Intersected with [`Self::max_request_bytes`] when both are configured.
+    pub fn hosting_max_request_bytes(mut self, n: usize) -> Self {
+        assert!(n > 0, "hosting_max_request_bytes must be positive");
+        self.hosting_max_request_bytes = Some(n);
         self
     }
 
@@ -729,7 +746,33 @@ impl HttpStateBuilder {
     /// `X-VGI-RPC-Error: true`. Externalised payloads do not count
     /// toward this cap.
     pub fn max_response_bytes(mut self, n: usize) -> Self {
+        assert!(
+            n >= MIN_RESPONSE_BYTES && (n as u64) <= MAX_SAFE_RESPONSE_BYTES,
+            "max_response_bytes must be between 65536 and 9007199254740991"
+        );
         self.max_response_bytes = Some(n);
+        self
+    }
+
+    /// Deployment/platform hard response ceiling. The per-request hard limit
+    /// also intersects the application limit and the client's accepted max.
+    pub fn hosting_max_response_bytes(mut self, n: usize) -> Self {
+        assert!(
+            n >= MIN_RESPONSE_BYTES && (n as u64) <= MAX_SAFE_RESPONSE_BYTES,
+            "hosting_max_response_bytes must be between 65536 and 9007199254740991"
+        );
+        self.hosting_max_response_bytes = Some(n);
+        self
+    }
+
+    /// Advisory response target exposed to worker code, clamped per request
+    /// to the effective hard response limit.
+    pub fn preferred_response_bytes(mut self, n: usize) -> Self {
+        assert!(
+            n >= MIN_RESPONSE_BYTES && (n as u64) <= MAX_SAFE_RESPONSE_BYTES,
+            "preferred_response_bytes must be between 65536 and 9007199254740991"
+        );
+        self.preferred_response_bytes = Some(n);
         self
     }
 
@@ -916,8 +959,14 @@ impl HttpStateBuilder {
             .unwrap_or(Some(DEFAULT_RESPONSE_COMPRESSION_LEVEL));
         let (capability_headers, capability_has_any, cors_expose_headers) =
             build_capability_headers(CapabilityInputs {
-                max_request_bytes: self.max_request_bytes,
-                max_response_bytes: self.max_response_bytes,
+                max_request_bytes: [self.max_request_bytes, self.hosting_max_request_bytes]
+                    .into_iter()
+                    .flatten()
+                    .min(),
+                max_response_bytes: [self.max_response_bytes, self.hosting_max_response_bytes]
+                    .into_iter()
+                    .flatten()
+                    .min(),
                 max_externalized_response_bytes: self.max_externalized_response_bytes,
                 externalization_enabled: server.external_config().is_some(),
                 upload_url_support: self.upload_url_provider.is_some(),
@@ -961,7 +1010,10 @@ impl HttpStateBuilder {
             describe_page_enabled: self.describe_page_enabled.unwrap_or(true),
             health_enabled: self.health_enabled.unwrap_or(true),
             max_request_bytes: self.max_request_bytes,
+            hosting_max_request_bytes: self.hosting_max_request_bytes,
             max_response_bytes: self.max_response_bytes,
+            hosting_max_response_bytes: self.hosting_max_response_bytes,
+            preferred_response_bytes: self.preferred_response_bytes,
             max_externalized_response_bytes: self.max_externalized_response_bytes,
             upload_url_provider: self.upload_url_provider,
             sticky,
@@ -1061,6 +1113,12 @@ fn build_capability_headers(inputs: CapabilityInputs<'_>) -> (HeaderMap, bool, H
             any = true;
         }
     }
+    // Always present: a capability-aware client may send its hard acceptance
+    // ceiling without risking that a legacy server ignores it.
+    out.insert(
+        ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER,
+        HeaderValue::from_static("true"),
+    );
     if let Some(n) = max_externalized_response_bytes {
         if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
             out.insert("vgi-max-externalized-response-bytes", v);
@@ -1216,29 +1274,17 @@ impl HttpState {
         &self,
         auth: &crate::auth::AuthContext,
         call_id: &[u8; CALL_ID_LEN],
-        output_schema_bytes: &[u8],
-        input_schema_bytes: &[u8],
-        stream_id: &str,
+        resolved: ResolvedCall,
     ) -> String {
         let aad = compute_call_aad(auth);
         let token = pack_call_token(
             &self.token_key,
             &aad,
             call_id,
-            output_schema_bytes,
-            input_schema_bytes,
-            stream_id,
+            &resolved,
             current_unix_secs(),
         );
-        self.cache_call(
-            auth,
-            call_id,
-            Arc::new(ResolvedCall {
-                output_schema_bytes: output_schema_bytes.to_vec(),
-                input_schema_bytes: input_schema_bytes.to_vec(),
-                stream_id: stream_id.to_string(),
-            }),
-        );
+        self.cache_call(auth, call_id, Arc::new(resolved));
         token
     }
 
@@ -1485,13 +1531,15 @@ fn peer_evidence_binding(auth: &crate::auth::AuthContext) -> Option<&str> {
 /// Cursor history: v4 = AEAD over the framed plaintext; v5 = AEAD over a
 /// codec-tagged, compressed payload; v6 = cursor-only, with the schemas and
 /// stream id moved into the call token.
+/// Call history: v1 = schemas and stream id; v2 = v1 plus the immutable
+/// effective response budget for continuation requests.
 ///
 /// Each bump matters for rolling deploys: an older plaintext frames
 /// differently, so a newer reader would mis-parse it. Rejecting the old
 /// version outright turns that into the same clean failure as any other
 /// stale token.
 pub(crate) const CURSOR_TOKEN_VERSION: u8 = 0x06;
-pub(crate) const CALL_TOKEN_VERSION: u8 = 0x01;
+pub(crate) const CALL_TOKEN_VERSION: u8 = 0x02;
 
 /// Length of the random per-stream id minted at `/init` that binds a call
 /// token to its cursors.
@@ -1583,6 +1631,8 @@ pub(crate) struct ResolvedCall {
     /// way the Go port does.
     #[allow(dead_code)]
     pub stream_id: String,
+    pub response_limit_bytes: Option<usize>,
+    pub preferred_response_bytes: Option<usize>,
 }
 
 /// Current time as seconds since the UNIX epoch.
@@ -1607,6 +1657,8 @@ fn current_unix_secs() -> u64 {
 ///          [4]  len(output_schema_bytes)   [M] output_schema_bytes
 ///          [4]  len(input_schema_bytes)    [K] input_schema_bytes
 ///          [4]  len(stream_id_bytes)       [L] stream_id_bytes (UTF-8)
+///          [8]  response_limit_bytes (0 = none)
+///          [8]  preferred_response_bytes (0 = none)
 ///        [16]   Poly1305 tag (appended by AEAD construction)
 /// ```
 ///
@@ -1646,28 +1698,30 @@ pub(crate) fn pack_call_token(
     token_key: &[u8; 32],
     aad: &[u8],
     call_id: &[u8; CALL_ID_LEN],
-    output_schema_bytes: &[u8],
-    input_schema_bytes: &[u8],
-    stream_id: &str,
+    resolved: &ResolvedCall,
     created_at: u64,
 ) -> String {
     let mut plaintext = Vec::with_capacity(
         8 + CALL_ID_LEN
             + 4
-            + output_schema_bytes.len()
+            + resolved.output_schema_bytes.len()
             + 4
-            + input_schema_bytes.len()
+            + resolved.input_schema_bytes.len()
             + 4
-            + stream_id.len(),
+            + resolved.stream_id.len()
+            + 16,
     );
     plaintext.extend_from_slice(&created_at.to_le_bytes());
     plaintext.extend_from_slice(call_id);
-    plaintext.extend_from_slice(&(output_schema_bytes.len() as u32).to_le_bytes());
-    plaintext.extend_from_slice(output_schema_bytes);
-    plaintext.extend_from_slice(&(input_schema_bytes.len() as u32).to_le_bytes());
-    plaintext.extend_from_slice(input_schema_bytes);
-    plaintext.extend_from_slice(&(stream_id.len() as u32).to_le_bytes());
-    plaintext.extend_from_slice(stream_id.as_bytes());
+    plaintext.extend_from_slice(&(resolved.output_schema_bytes.len() as u32).to_le_bytes());
+    plaintext.extend_from_slice(&resolved.output_schema_bytes);
+    plaintext.extend_from_slice(&(resolved.input_schema_bytes.len() as u32).to_le_bytes());
+    plaintext.extend_from_slice(&resolved.input_schema_bytes);
+    plaintext.extend_from_slice(&(resolved.stream_id.len() as u32).to_le_bytes());
+    plaintext.extend_from_slice(resolved.stream_id.as_bytes());
+    plaintext.extend_from_slice(&(resolved.response_limit_bytes.unwrap_or(0) as u64).to_le_bytes());
+    plaintext
+        .extend_from_slice(&(resolved.preferred_response_bytes.unwrap_or(0) as u64).to_le_bytes());
 
     crate::crypto::seal_base64(
         &pack_token_payload(&plaintext),
@@ -1771,18 +1825,33 @@ pub(crate) fn unpack_call_token(
     let output_schema_bytes = read_segment(&plaintext, &mut pos)?;
     let input_schema_bytes = read_segment(&plaintext, &mut pos)?;
     let stream_id_bytes = read_segment(&plaintext, &mut pos)?;
-    if pos != plaintext.len() {
-        return Err(RpcError::runtime_error("Malformed state token"));
-    }
     let stream_id = String::from_utf8(stream_id_bytes)
         .map_err(|_| RpcError::runtime_error("Malformed state token"))?;
-
+    if pos + 16 != plaintext.len() {
+        return Err(RpcError::runtime_error("Malformed state token"));
+    }
+    let response_limit = u64::from_le_bytes(plaintext[pos..pos + 8].try_into().unwrap());
+    let preferred = u64::from_le_bytes(plaintext[pos + 8..pos + 16].try_into().unwrap());
+    let response_limit_bytes = (response_limit != 0)
+        .then_some(response_limit)
+        .map(|value| {
+            usize::try_from(value).map_err(|_| RpcError::runtime_error("Malformed state token"))
+        })
+        .transpose()?;
+    let preferred_response_bytes = (preferred != 0)
+        .then_some(preferred)
+        .map(|value| {
+            usize::try_from(value).map_err(|_| RpcError::runtime_error("Malformed state token"))
+        })
+        .transpose()?;
     Ok((
         call_id,
         ResolvedCall {
             output_schema_bytes,
             input_schema_bytes,
             stream_id,
+            response_limit_bytes,
+            preferred_response_bytes,
         },
     ))
 }
@@ -1884,31 +1953,16 @@ pub async fn serve_with_shutdown(
     .await
 }
 
-/// Absolute ceiling on a buffered HTTP response body in the
-/// post-processing middleware — large enough for any reasonable Arrow
-/// batch, small enough that the middleware can never be driven to
-/// exhaust the heap. Deliberately *not* tied to
-/// `wire::MAX_IPC_MESSAGE_BYTES`, which is a sanity bound on a claimed
-/// frame size rather than a policy limit on a response.
-///
-/// This is **distinct** from the operator's `max_response_bytes`, which
-/// is a *soft* producer-side cap: a producer is allowed to overshoot it
-/// by one batch and then mint a continuation token, so the response
-/// body on the wire can legitimately exceed `max_response_bytes`. The
-/// middleware therefore caps at `max(this, 2 × max_response_bytes)` —
-/// see [`response_buffer_ceiling`].
-const MAX_RESPONSE_BYTES_HARD_CAP: usize = 256 * 1024 * 1024;
-
-/// Hard ceiling the post-processing middleware buffers a response under.
-/// Always at least [`MAX_RESPONSE_BYTES_HARD_CAP`]; when a (soft)
-/// `max_response_bytes` is configured, it leaves headroom for the
-/// one-batch producer overshoot that the continuation-token design
-/// permits.
-fn response_buffer_ceiling(state: &HttpState) -> usize {
-    match state.max_response_bytes {
-        Some(soft) => MAX_RESPONSE_BYTES_HARD_CAP.max(soft.saturating_mul(2)),
-        None => MAX_RESPONSE_BYTES_HARD_CAP,
-    }
+/// Buffer ceiling for post-processing. Response handlers have already
+/// applied the negotiated hard cap; retain a small allowance so their
+/// structured error envelope is not itself replaced by a plain middleware
+/// error. With no configured or client-supplied limit the server deliberately
+/// has no universal hidden ceiling.
+fn response_buffer_ceiling(state: &HttpState, headers: &HeaderMap) -> usize {
+    effective_response_budget(state, headers)
+        .ok()
+        .and_then(|(hard, _)| hard)
+        .map_or(usize::MAX, |hard| hard.max(64 * 1024))
 }
 
 /// Build the Axum router for an HTTP RPC server.
@@ -1991,6 +2045,7 @@ async fn postprocess_middleware(
             .insert(HeaderName::from_static(REQUEST_ID_RESPONSE_HEADER), v);
     }
     let req_encoding = pick_response_encoding(req.headers(), state.response_compression_level);
+    let response_buffer_limit = response_buffer_ceiling(&state, req.headers());
     let req_method = req.method().clone();
     let req_path = req.uri().path().to_owned();
 
@@ -1998,7 +2053,11 @@ async fn postprocess_middleware(
     // handler. The upload-URL control body is client-controlled and must be
     // capped before it can allocate storage; only payload-free health routes
     // are exempt.
-    if let Some(limit) = state.max_request_bytes {
+    if let Some(limit) = [state.max_request_bytes, state.hosting_max_request_bytes]
+        .into_iter()
+        .flatten()
+        .min()
+    {
         let exempt = req_path == "/health" || req_path.ends_with("/health");
         if !exempt {
             if let Some(cl) = req
@@ -2069,15 +2128,14 @@ async fn postprocess_middleware(
     // Buffer the response under a hard ceiling. `usize::MAX` here let a
     // large handler response exhaust the heap; on overflow fail loud
     // with a 500 rather than `unwrap_or_default()` silently shipping an
-    // empty 200. The ceiling is *not* `max_response_bytes` (a soft
-    // producer-side cap the wire may legitimately overshoot) — see
-    // `response_buffer_ceiling`. Externalised payloads leave only tiny
+    // empty 200. Handlers enforce the negotiated response budget and this
+    // middleware retains only structured-error headroom. Externalised payloads leave only tiny
     // pointer batches on the wire, so they never approach this bound.
-    let response_limit = response_buffer_ceiling(&state);
-    let bytes = match to_bytes(body, response_limit).await {
+    let bytes = match to_bytes(body, response_buffer_limit).await {
         Ok(b) => b,
         Err(_) => {
             let mut h = HeaderMap::new();
+            attach_capability_headers(&state, &mut h, &req_method);
             attach_cors_headers(&state, &mut h, req_acrh.as_ref(), false);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2413,6 +2471,9 @@ fn introspect_json(status: StatusCode, body: String, retry_after: Option<u32>) -
 }
 
 async fn handle_preflight(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> Response {
+    if let Err(err) = parse_accepted_max_response_bytes(&headers) {
+        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, "");
+    }
     let mut h = HeaderMap::new();
     attach_cors_headers(
         &state,
@@ -2592,7 +2653,7 @@ fn attach_cors_headers(
                 HeaderValue::from_static(
                     "Content-Type, Authorization, Cookie, Accept-Encoding, \
                      X-VGI-Accept-Encoding, VGI-Session, VGI-Session-Accept, \
-                     VGI-Proxy-Proof",
+                     VGI-Proxy-Proof, VGI-Accept-Max-Response-Bytes",
                 ),
             );
         }
@@ -3026,25 +3087,27 @@ fn arrow_response(status: StatusCode, body: Vec<u8>) -> Response {
 /// rebuilds the response as an EXCEPTION-only IPC stream surfaced via
 /// 200 + `X-VGI-RPC-Error: true`.
 fn enforce_response_body_cap(
-    state: &Arc<HttpState>,
+    limit: Option<usize>,
     schema: &arrow_schema::Schema,
     body: Vec<u8>,
     method: &str,
     server_id: &str,
     request_id: &str,
 ) -> Response {
-    if let Some(limit) = state.max_response_bytes {
+    if let Some(limit) = limit {
         if body.len() > limit {
-            let err = RpcError::runtime_error(format!(
-                "HTTP body exceeds max_response_bytes ({} > {}) for method {:?}",
-                body.len(),
-                limit,
-                method
-            ));
+            let err = response_cap_error(body.len(), limit, method);
             return cap_error_response(schema, &err, server_id, request_id);
         }
     }
     arrow_response(StatusCode::OK, body)
+}
+
+fn response_cap_error(bytes: usize, limit: usize, method: &str) -> RpcError {
+    RpcError::new(
+        "ResponseTooLargeError",
+        format!("max_response_bytes ({bytes} > {limit}) for method {method:?}"),
+    )
 }
 
 /// The one message shape for a `max_externalized_response_bytes` overshoot.
@@ -3142,10 +3205,66 @@ fn zstd_window_log_for_limit(max_size: usize) -> u32 {
 }
 
 fn request_decode_limit(state: &HttpState) -> usize {
-    state
-        .max_request_bytes
-        .unwrap_or(state.max_body_size)
-        .min(state.max_body_size)
+    [
+        Some(state.max_body_size),
+        state.max_request_bytes,
+        state.hosting_max_request_bytes,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(state.max_body_size)
+}
+
+fn parse_accepted_max_response_bytes(headers: &HeaderMap) -> Result<Option<usize>> {
+    let mut values = headers.get_all(ACCEPT_MAX_RESPONSE_BYTES_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(RpcError::value_error(
+            "VGI-Accept-Max-Response-Bytes must occur exactly once",
+        ));
+    }
+    let raw = value.to_str().map_err(|_| {
+        RpcError::value_error("VGI-Accept-Max-Response-Bytes must be ASCII decimal")
+    })?;
+    if raw.is_empty() || raw.starts_with('0') || !raw.as_bytes().iter().all(u8::is_ascii_digit) {
+        return Err(RpcError::value_error(
+            "VGI-Accept-Max-Response-Bytes must match [1-9][0-9]*",
+        ));
+    }
+    let parsed = raw.parse::<u64>().map_err(|_| {
+        RpcError::value_error("VGI-Accept-Max-Response-Bytes is outside the supported range")
+    })?;
+    if parsed < MIN_RESPONSE_BYTES as u64
+        || parsed > MAX_SAFE_RESPONSE_BYTES
+        || parsed > usize::MAX as u64
+    {
+        return Err(RpcError::value_error(format!(
+            "VGI-Accept-Max-Response-Bytes must be between {MIN_RESPONSE_BYTES} and {MAX_SAFE_RESPONSE_BYTES}"
+        )));
+    }
+    Ok(Some(parsed as usize))
+}
+
+fn effective_response_budget(
+    state: &HttpState,
+    headers: &HeaderMap,
+) -> Result<(Option<usize>, Option<usize>)> {
+    let accepted = parse_accepted_max_response_bytes(headers)?;
+    let hard = [
+        state.max_response_bytes,
+        state.hosting_max_response_bytes,
+        accepted,
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    let preferred = state
+        .preferred_response_bytes
+        .map(|value| hard.map_or(value, |limit| value.min(limit)));
+    Ok((hard, preferred))
 }
 
 fn request_decode_error(state: &Arc<HttpState>, error: &RpcError) -> Response {
@@ -3434,6 +3553,10 @@ async fn handle_upload_url(
         Err(resp) => return resp,
     };
     let _ = identity;
+    let (response_limit, _) = match effective_response_budget(&state, &headers) {
+        Ok(budget) => budget,
+        Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
+    };
     if !has_arrow_ct(&headers) {
         return plain_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -3536,7 +3659,14 @@ async fn handle_upload_url(
                         let _ = sw.write(&empty_batch(schema_ref).unwrap(), Some(&md));
                         let _ = sw.finish();
                         drop(sw);
-                        return arrow_response(StatusCode::OK, body_buf);
+                        return enforce_response_body_cap(
+                            response_limit,
+                            schema_ref,
+                            body_buf,
+                            UPLOAD_URL_METHOD,
+                            &state.server.server_id,
+                            &req.request_id,
+                        );
                     }
                 };
                 let _ = sw.write(&batch, None);
@@ -3548,7 +3678,14 @@ async fn handle_upload_url(
         }
         let _ = sw.finish();
     }
-    arrow_response(StatusCode::OK, body_buf)
+    enforce_response_body_cap(
+        response_limit,
+        schema_ref,
+        body_buf,
+        UPLOAD_URL_METHOD,
+        &state.server.server_id,
+        &req.request_id,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3601,6 +3738,10 @@ async fn handle_unary(
         Err(resp) => return resp,
     };
     let RequestIdentity { auth, evidence } = identity;
+    let (response_limit, preferred_response) = match effective_response_budget(&state, &headers) {
+        Ok(budget) => budget,
+        Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
+    };
     if !has_arrow_ct(&headers) {
         return plain_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -3686,7 +3827,14 @@ async fn handle_unary(
         };
         let mut buf = Vec::new();
         let _ = crate::introspect::write_describe_response(&mut buf, &batch, &md);
-        return arrow_response(StatusCode::OK, buf);
+        return enforce_response_body_cap(
+            response_limit,
+            batch.schema().as_ref(),
+            buf,
+            &method,
+            &server.server_id,
+            &req.request_id,
+        );
     }
 
     let Some(info) = server
@@ -3701,6 +3849,7 @@ async fn handle_unary(
     }
 
     let mut ctx = CallContext::with_auth_cookies(&server, &req, auth.clone(), evidence, cookies);
+    ctx.set_response_budget(response_limit, preferred_response);
     if let Some(s) = sticky_sink.clone() {
         ctx.set_sticky(s);
     }
@@ -3791,6 +3940,19 @@ async fn handle_unary(
                             None,
                             cfg,
                         )?;
+                        let prepared = match (prepared, response_limit) {
+                            (Some(prepared), _) => Some(prepared),
+                            (None, Some(limit)) => {
+                                crate::external::prepare_externalize_batch_forced(
+                                    &out_batch,
+                                    &info.result_schema,
+                                    None,
+                                    cfg,
+                                )?
+                                .filter(|prepared| prepared.cap_bytes() > limit)
+                            }
+                            (None, None) => None,
+                        };
                         match prepared {
                             None => Ok(None),
                             Some(p) => {
@@ -3853,17 +4015,9 @@ async fn handle_unary(
     // The external cap has already been pre-flighted above, before the
     // upload; this is the backstop that catches an upload path added later
     // that forgot to pre-flight.
-    let body_cap_error = state
-        .max_response_bytes
+    let body_cap_error = response_limit
         .filter(|limit| buf.len() > *limit)
-        .map(|limit| {
-            RpcError::runtime_error(format!(
-                "HTTP body exceeds max_response_bytes ({} > {}) for method {:?}",
-                buf.len(),
-                limit,
-                method
-            ))
-        })
+        .map(|limit| response_cap_error(buf.len(), limit, &method))
         .or_else(|| {
             state
                 .max_externalized_response_bytes
@@ -3933,6 +4087,10 @@ async fn handle_stream_init(
         Err(resp) => return resp,
     };
     let RequestIdentity { auth, evidence } = identity;
+    let (response_limit, preferred_response) = match effective_response_budget(&state, &headers) {
+        Ok(budget) => budget,
+        Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
+    };
     if !has_arrow_ct(&headers) {
         return plain_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -3999,6 +4157,7 @@ async fn handle_stream_init(
     }
 
     let mut ctx = CallContext::with_auth_cookies(&server, &req, auth, evidence.clone(), cookies);
+    ctx.set_response_budget(response_limit, preferred_response);
     if let Some(s) = sticky_sink.clone() {
         ctx.set_sticky(s);
     }
@@ -4074,6 +4233,8 @@ async fn handle_stream_init(
                 &evidence,
                 sticky_sink.as_ref(),
                 Some(req.metadata.as_ref()),
+                response_limit,
+                preferred_response,
             );
             finished = turn.finished;
             wrote_error |= turn.errored;
@@ -4086,6 +4247,7 @@ async fn handle_stream_init(
                 &output_schema,
                 input_schema.as_ref(),
                 &stream_id,
+                (response_limit, preferred_response),
             ) {
                 Ok((token, call_token)) => {
                     // /init is the one response that hands over the call
@@ -4109,7 +4271,14 @@ async fn handle_stream_init(
         let _ = sw.finish();
     }
 
-    let mut resp = arrow_response(StatusCode::OK, body_buf);
+    let mut resp = enforce_response_body_cap(
+        response_limit,
+        output_schema.as_ref(),
+        body_buf,
+        &method,
+        &server.server_id,
+        &req.request_id,
+    );
     if wrote_error {
         // The body is an EXCEPTION envelope behind a 200; without the flag a
         // client reads the failure as a result.
@@ -4133,6 +4302,7 @@ fn build_init_tokens(
     output_schema: &SchemaRef,
     input_schema: Option<&SchemaRef>,
     stream_id: &str,
+    response_budget: (Option<usize>, Option<usize>),
 ) -> Result<(String, String)> {
     let out_schema_bytes = write_schema_bytes(output_schema.as_ref())?;
     let in_schema_bytes = match input_schema {
@@ -4145,9 +4315,13 @@ fn build_init_tokens(
     let call_token = state.pack_call_token(
         auth,
         &call_id,
-        &out_schema_bytes,
-        &in_schema_bytes,
-        stream_id,
+        ResolvedCall {
+            output_schema_bytes: out_schema_bytes,
+            input_schema_bytes: in_schema_bytes,
+            stream_id: stream_id.to_owned(),
+            response_limit_bytes: response_budget.0,
+            preferred_response_bytes: response_budget.1,
+        },
     );
     let cursor = build_cursor_token(state, auth, ss, &call_id)?;
     Ok((cursor, call_token))
@@ -4202,11 +4376,8 @@ enum StreamEmit {
 /// units the cap is expressed in, and is advanced only when an upload is
 /// actually performed.
 ///
-/// The cap is checked **before** the upload and is hard: a producer's *wire*
-/// overshoot (`max_response_bytes`) is absorbed by minting a continuation
-/// token, but there is no equivalent rescue for the external channel —
-/// by the time a continuation could be minted the bytes are already in
-/// object storage. So an overshoot ends the turn with an error instead.
+/// The cap is checked **before** the upload and is hard: by the time a
+/// continuation could be minted the bytes are already in object storage.
 fn externalize_stream_batch(
     state: &Arc<HttpState>,
     batch: &RecordBatch,
@@ -4214,6 +4385,7 @@ fn externalize_stream_batch(
     metadata: Option<&Metadata>,
     method: &str,
     cumulative_external: &mut usize,
+    response_limit: Option<usize>,
 ) -> StreamEmit {
     let Some(cfg) = state.server.external_config() else {
         return StreamEmit::Inline;
@@ -4229,7 +4401,19 @@ fn externalize_stream_batch(
         let prepared =
             match crate::external::prepare_externalize_batch(batch, output_schema, metadata, cfg) {
                 Ok(Some(p)) => p,
-                Ok(None) => return StreamEmit::Inline,
+                Ok(None) => match response_limit {
+                    Some(limit) => match crate::external::prepare_externalize_batch_forced(
+                        batch,
+                        output_schema,
+                        metadata,
+                        cfg,
+                    ) {
+                        Ok(Some(p)) if p.cap_bytes() > limit => p,
+                        Ok(_) => return StreamEmit::Inline,
+                        Err(err) => return StreamEmit::Failed(err),
+                    },
+                    None => return StreamEmit::Inline,
+                },
                 Err(err) => return StreamEmit::Failed(err),
             };
         let cap_bytes = prepared.cap_bytes();
@@ -4303,6 +4487,8 @@ fn run_producer<W: std::io::Write>(
     evidence: &Arc<crate::auth::identity::PeerEvidenceSet>,
     sticky: Option<&Arc<crate::sticky::StickySinkImpl>>,
     tick_md: Option<&Metadata>,
+    response_limit: Option<usize>,
+    preferred_response: Option<usize>,
 ) -> ProducerTurn {
     let server = &state.server;
     let mut ctx = CallContext::with_auth_cookies(
@@ -4318,6 +4504,7 @@ fn run_producer<W: std::io::Write>(
     if let Some(md) = tick_md {
         ctx.set_tick_metadata(md.clone());
     }
+    ctx.set_response_budget(response_limit, preferred_response);
     let producer = match ss {
         StreamStateKind::Producer(p) => p,
         StreamStateKind::Exchange(_) => unreachable!(),
@@ -4327,6 +4514,7 @@ fn run_producer<W: std::io::Write>(
     // per-response ceiling.
     let mut cumulative_external = 0usize;
     let mut out = OutputCollector::new(output_schema.clone(), true);
+    out.set_response_budget(response_limit, preferred_response);
     let result = dispatch_sync(|| {
         crate::server::call_guard(|| producer.produce(&mut out, &ctx)).and_then(|result| result)
     });
@@ -4358,6 +4546,7 @@ fn run_producer<W: std::io::Write>(
                     metadata.as_ref(),
                     method,
                     &mut cumulative_external,
+                    response_limit,
                 ) {
                     StreamEmit::Pointer(ptr, md) => {
                         let _ = sw.write(&ptr, Some(&md));
@@ -4412,6 +4601,11 @@ async fn handle_stream_exchange(
         Err(resp) => return resp,
     };
     let RequestIdentity { auth, evidence } = identity;
+    let (mut response_limit, mut preferred_response) =
+        match effective_response_budget(&state, &headers) {
+            Ok(budget) => budget,
+            Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
+        };
     if !has_arrow_ct(&headers) {
         return plain_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -4473,6 +4667,15 @@ async fn handle_stream_exchange(
         Ok(c) => c,
         Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
     };
+    response_limit = [response_limit, call.response_limit_bytes]
+        .into_iter()
+        .flatten()
+        .min();
+    preferred_response = [preferred_response, call.preferred_response_bytes]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|preferred| response_limit.map_or(preferred, |hard| preferred.min(hard)));
 
     // Reconstruct schemas from the call token's IPC bytes.
     let output_schema = match read_schema_bytes(&call.output_schema_bytes) {
@@ -4527,6 +4730,7 @@ async fn handle_stream_exchange(
                 .and_then(|value| value.to_str().ok()),
         ),
     );
+    ctx.set_response_budget(response_limit, preferred_response);
     if let Some(s) = sticky_sink.clone() {
         ctx.set_sticky(s);
     }
@@ -4552,7 +4756,14 @@ async fn handle_stream_exchange(
             }
             let _ = sw.finish();
         }
-        let mut resp = arrow_response(StatusCode::OK, body_buf);
+        let mut resp = enforce_response_body_cap(
+            response_limit,
+            output_schema.as_ref(),
+            body_buf,
+            &method,
+            &server.server_id,
+            &req.request_id,
+        );
         if cancel_result.is_err() {
             stamp_rpc_error(&mut resp);
         }
@@ -4589,6 +4800,8 @@ async fn handle_stream_exchange(
                 &evidence,
                 sticky_sink.as_ref(),
                 Some(&continuation_md),
+                response_limit,
+                preferred_response,
             );
             wrote_error |= turn.errored;
             if !turn.finished {
@@ -4606,7 +4819,14 @@ async fn handle_stream_exchange(
             }
             let _ = sw.finish();
         }
-        let mut resp = arrow_response(StatusCode::OK, body_buf);
+        let mut resp = enforce_response_body_cap(
+            response_limit,
+            output_schema.as_ref(),
+            body_buf,
+            &method,
+            &server.server_id,
+            &req.request_id,
+        );
         if wrote_error {
             stamp_rpc_error(&mut resp);
         }
@@ -4649,6 +4869,7 @@ async fn handle_stream_exchange(
     ctx.set_tick_metadata(strip_framework_tick_metadata(&metadata));
 
     let mut out = OutputCollector::new(output_schema.clone(), false);
+    out.set_response_budget(response_limit, preferred_response);
     let res = dispatch_sync(|| {
         crate::server::call_guard(|| match &mut ss {
             StreamStateKind::Exchange(e) => e.exchange(&casted, &mut out, &ctx),
@@ -4705,6 +4926,7 @@ async fn handle_stream_exchange(
                             Some(&md),
                             &method,
                             &mut cumulative_external,
+                            response_limit,
                         ) {
                             StreamEmit::Pointer(ptr, ptr_md) => {
                                 let _ = sw.write(&ptr, Some(&ptr_md));
@@ -4739,7 +4961,7 @@ async fn handle_stream_exchange(
     }
 
     let mut resp = enforce_response_body_cap(
-        &state,
+        response_limit,
         output_schema.as_ref(),
         body_buf,
         &method,
@@ -4803,6 +5025,131 @@ mod tests {
             .token_ttl(Duration::from_millis(50))
             .max_body_size(1024)
             .build()
+    }
+
+    #[test]
+    fn accepted_response_budget_uses_strict_safe_integer_grammar() {
+        for invalid in [
+            "",
+            "0",
+            "01",
+            "+1",
+            " 1",
+            "1 ",
+            "1.0",
+            "65535",
+            "9007199254740992",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                ACCEPT_MAX_RESPONSE_BYTES_HEADER,
+                HeaderValue::from_str(invalid).unwrap(),
+            );
+            assert!(
+                parse_accepted_max_response_bytes(&headers).is_err(),
+                "{invalid:?}"
+            );
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCEPT_MAX_RESPONSE_BYTES_HEADER,
+            HeaderValue::from_static("65536"),
+        );
+        assert_eq!(
+            parse_accepted_max_response_bytes(&headers).unwrap(),
+            Some(MIN_RESPONSE_BYTES)
+        );
+        headers.append(
+            ACCEPT_MAX_RESPONSE_BYTES_HEADER,
+            HeaderValue::from_static("9007199254740991"),
+        );
+        assert!(parse_accepted_max_response_bytes(&headers).is_err());
+    }
+
+    #[test]
+    fn response_budget_intersects_app_host_client_and_clamps_preference() {
+        use crate::server::RpcServer;
+        let server = Arc::new(RpcServer::builder().server_id("budget").build());
+        let state = HttpState::builder()
+            .server(server)
+            .max_response_bytes(100_000)
+            .hosting_max_response_bytes(80_000)
+            .preferred_response_bytes(90_000)
+            .build();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCEPT_MAX_RESPONSE_BYTES_HEADER,
+            HeaderValue::from_static("70000"),
+        );
+        assert_eq!(
+            effective_response_budget(&state, &headers).unwrap(),
+            (Some(70_000), Some(70_000))
+        );
+        assert_eq!(
+            state
+                .capability_headers
+                .get(ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER)
+                .unwrap(),
+            "true"
+        );
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn response_budget_configuration_rejects_values_above_safe_integer() {
+        use crate::server::RpcServer;
+        let too_large = (MAX_SAFE_RESPONSE_BYTES + 1) as usize;
+        let make = || Arc::new(RpcServer::builder().server_id("budget").build());
+        assert!(std::panic::catch_unwind(|| {
+            HttpState::builder()
+                .server(make())
+                .max_response_bytes(too_large)
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            HttpState::builder()
+                .server(make())
+                .hosting_max_response_bytes(too_large)
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            HttpState::builder()
+                .server(make())
+                .preferred_response_bytes(too_large)
+        })
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn hard_response_cap_replaces_output_without_a_cursor() {
+        let response = enforce_response_body_cap(
+            Some(1),
+            &Schema::empty(),
+            vec![0; 2],
+            "producer",
+            "budget-server",
+            "budget-request",
+        );
+        assert_eq!(response.headers().get(RPC_ERROR_HEADER).unwrap(), "true");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut reader = StreamReader::new(body.as_ref()).unwrap();
+        let mut saw_exception = false;
+        while let Some((_batch, metadata)) = reader.read_next().unwrap() {
+            saw_exception |= md_get(&metadata, crate::metadata::LOG_LEVEL_KEY) == Some("EXCEPTION");
+            if let Some(extra) = md_get(&metadata, crate::metadata::LOG_EXTRA_KEY) {
+                let extra: serde_json::Value = serde_json::from_str(extra).unwrap();
+                assert_eq!(extra["exception_type"], "ResponseTooLargeError");
+                assert!(extra["exception_message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("max_response_bytes (2 > 1) for method"));
+            }
+            assert!(md_get(&metadata, STATE_KEY).is_none());
+            assert!(md_get(&metadata, CALL_STATE_KEY).is_none());
+        }
+        assert!(saw_exception);
     }
 
     const TEST_CALL_ID: [u8; CALL_ID_LEN] = [9u8; CALL_ID_LEN];
@@ -4916,11 +5263,23 @@ mod tests {
         assert_eq!(unpacked.call_id, TEST_CALL_ID);
 
         // The schemas and stream id ride the call token now, not the cursor.
-        let call_token = s.pack_call_token(&auth, &TEST_CALL_ID, &out_sch, &in_sch, "sid-123");
+        let call_token = s.pack_call_token(
+            &auth,
+            &TEST_CALL_ID,
+            ResolvedCall {
+                output_schema_bytes: out_sch.clone(),
+                input_schema_bytes: in_sch.clone(),
+                stream_id: "sid-123".into(),
+                response_limit_bytes: Some(4096),
+                preferred_response_bytes: Some(2048),
+            },
+        );
         let call = s.resolve_call(&auth, &unpacked, Some(&call_token)).unwrap();
         assert_eq!(call.output_schema_bytes, out_sch);
         assert_eq!(call.input_schema_bytes, in_sch);
         assert_eq!(call.stream_id, "sid-123");
+        assert_eq!(call.response_limit_bytes, Some(4096));
+        assert_eq!(call.preferred_response_bytes, Some(2048));
     }
 
     #[test]
@@ -4939,7 +5298,17 @@ mod tests {
         assert!(state.unpack_cursor_token(&second, &cursor).is_err());
 
         let schema = sample_schema_bytes();
-        let call = state.pack_call_token(&first, &TEST_CALL_ID, &schema, &schema, "stream");
+        let call = state.pack_call_token(
+            &first,
+            &TEST_CALL_ID,
+            ResolvedCall {
+                output_schema_bytes: schema.clone(),
+                input_schema_bytes: schema,
+                stream_id: "stream".into(),
+                response_limit_bytes: None,
+                preferred_response_bytes: None,
+            },
+        );
         assert!(unpack_call_token(
             &state.token_key,
             &compute_call_aad(&second),
@@ -5969,30 +6338,25 @@ mod tests {
     }
 
     #[test]
-    fn response_buffer_ceiling_never_below_hard_cap() {
+    fn response_buffer_ceiling_follows_effective_budget_without_universal_cap() {
         use crate::server::RpcServer;
-        let mk = |soft: Option<usize>| {
+        let mk = |limit: Option<usize>| {
             let server = Arc::new(RpcServer::builder().server_id("t").build());
             let mut b = HttpState::builder().server(server).token_key(&[9u8; 32]);
-            if let Some(n) = soft {
+            if let Some(n) = limit {
                 b = b.max_response_bytes(n);
             }
             b.build()
         };
-        // No soft cap → exactly the hard cap.
+        let headers = HeaderMap::new();
+        assert_eq!(response_buffer_ceiling(&mk(None), &headers), usize::MAX);
+        // The smallest valid negotiated limit also retains enough room for a
+        // structured error.
         assert_eq!(
-            response_buffer_ceiling(&mk(None)),
-            MAX_RESPONSE_BYTES_HARD_CAP
+            response_buffer_ceiling(&mk(Some(MIN_RESPONSE_BYTES)), &headers),
+            MIN_RESPONSE_BYTES
         );
-        // A small soft cap must NOT shrink the middleware ceiling — the
-        // soft cap is a producer knob the wire may legitimately
-        // overshoot.
-        assert_eq!(
-            response_buffer_ceiling(&mk(Some(8))),
-            MAX_RESPONSE_BYTES_HARD_CAP
-        );
-        // A soft cap larger than the hard cap leaves overshoot headroom.
-        let big = MAX_RESPONSE_BYTES_HARD_CAP;
-        assert_eq!(response_buffer_ceiling(&mk(Some(big))), big * 2);
+        let big = 512 * 1024 * 1024;
+        assert_eq!(response_buffer_ceiling(&mk(Some(big)), &headers), big);
     }
 }

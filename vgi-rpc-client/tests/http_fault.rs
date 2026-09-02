@@ -93,7 +93,7 @@ fn ok_response() -> Vec<u8> {
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![42i64]))]).unwrap();
     let body = write_one_batch(&batch, Some(&Metadata::new())).unwrap();
     let mut resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apache.arrow.stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apache.arrow.stream\r\nVGI-Accept-Max-Response-Bytes-Support: true\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -117,11 +117,22 @@ fn mock_server(behavior: impl Fn(usize, TcpStream) + Send + 'static) -> String {
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         let mut attempt = 0;
-        for stream in listener.incoming() {
-            attempt += 1;
-            if let Ok(s) = stream {
-                behavior(attempt, s);
+        for mut s in listener.incoming().flatten() {
+            let mut peek = [0u8; 16];
+            let is_options = s
+                .peek(&mut peek)
+                .map(|n| peek[..n].starts_with(b"OPTIONS "))
+                .unwrap_or(false);
+            if is_options {
+                drain_request(&s);
+                let _ = s.write_all(
+                    b"HTTP/1.1 204 No Content\r\nVGI-Accept-Max-Response-Bytes-Support: true\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = s.flush();
+                continue;
             }
+            attempt += 1;
+            behavior(attempt, s);
         }
     });
     format!("http://127.0.0.1:{port}")
@@ -201,7 +212,7 @@ fn unary_connection_failure_is_not_retried_by_default() {
 
 fn http_body(status: &str, body: &[u8]) -> Vec<u8> {
     let mut resp = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/vnd.apache.arrow.stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: application/vnd.apache.arrow.stream\r\nVGI-Accept-Max-Response-Bytes-Support: true\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -211,7 +222,7 @@ fn http_body(status: &str, body: &[u8]) -> Vec<u8> {
 
 fn capped_response(body: &[u8], encoding: Option<&str>, chunked: bool) -> Vec<u8> {
     let mut response =
-        b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apache.arrow.stream\r\n".to_vec();
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apache.arrow.stream\r\nVGI-Accept-Max-Response-Bytes-Support: true\r\n".to_vec();
     if let Some(encoding) = encoding {
         write!(response, "Content-Encoding: {encoding}\r\n").unwrap();
     }
@@ -273,63 +284,100 @@ fn assert_response_cap_then_recovery(
 #[test]
 fn identity_known_length_encoded_response_is_bounded_and_recovers() {
     assert_response_cap_then_recovery(
-        vec![b'x'; 2048],
+        vec![b'x'; 70_000],
         None,
         false,
-        1024,
-        4096,
-        "max_encoded_response_bytes",
+        64 * 1024,
+        64 * 1024,
+        "max_response_bytes",
     );
 }
 
 #[test]
 fn identity_chunked_encoded_response_is_bounded_and_recovers() {
     assert_response_cap_then_recovery(
-        vec![b'x'; 2048],
+        vec![b'x'; 70_000],
         None,
         true,
-        1024,
-        4096,
-        "max_encoded_response_bytes",
+        64 * 1024,
+        64 * 1024,
+        "max_response_bytes",
     );
 }
 
 #[test]
 fn identity_decoded_response_has_an_independent_cap_and_recovers() {
     assert_response_cap_then_recovery(
-        vec![b'x'; 2048],
+        vec![b'x'; 70_000],
         None,
         false,
-        4096,
-        1024,
-        "max_decoded_response_bytes",
+        128 * 1024,
+        64 * 1024,
+        "max_response_bytes",
     );
 }
 
 #[test]
+fn identity_response_is_bounded_by_the_server_advertised_maximum() {
+    let oversized = vec![b'x'; 70_000];
+    let url = mock_server(move |attempt, mut stream| {
+        drain_request(&stream);
+        let response = if attempt == 1 {
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apache.arrow.stream\r\nVGI-Accept-Max-Response-Bytes-Support: true\r\nVGI-Max-Response-Bytes: 65536\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                oversized.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&oversized);
+            response
+        } else {
+            ok_response()
+        };
+        stream.write_all(&response).unwrap();
+        stream.flush().unwrap();
+    });
+    let mut client = HttpClient::connect(url)
+        .retry(RetryConfig::disabled())
+        .max_encoded_response_bytes(128 * 1024)
+        .max_decoded_response_bytes(128 * 1024)
+        .build()
+        .unwrap();
+    let error = client
+        .call_unary("echo_int", &echo_params(), None)
+        .expect_err("advertised response cap must be enforced while reading identity bytes");
+    assert_eq!(error.error_type, "ResponseTooLargeError");
+    assert!(error.message.contains("70000 > 65536"), "got: {error:?}");
+
+    let (batch, _) = client
+        .call_unary("echo_int", &echo_params(), None)
+        .expect("client must recover after rejecting the oversized response");
+    assert_eq!(batch.column(0).as_primitive::<Int64Type>().value(0), 42);
+}
+
+#[test]
 fn zstd_known_length_decoded_response_is_bounded_and_recovers() {
-    let encoded = zstd::encode_all(&vec![b'x'; 16 * 1024][..], 1).unwrap();
+    let encoded = zstd::encode_all(&vec![b'x'; 128 * 1024][..], 1).unwrap();
     assert!(encoded.len() < 1024);
     assert_response_cap_then_recovery(
         encoded,
         Some("zstd"),
         false,
-        1024,
-        1024,
+        64 * 1024,
+        64 * 1024,
         "max_decoded_response_bytes",
     );
 }
 
 #[test]
 fn zstd_chunked_decoded_response_is_bounded_and_recovers() {
-    let encoded = zstd::encode_all(&vec![b'x'; 16 * 1024][..], 1).unwrap();
+    let encoded = zstd::encode_all(&vec![b'x'; 128 * 1024][..], 1).unwrap();
     assert!(encoded.len() < 1024);
     assert_response_cap_then_recovery(
         encoded,
         Some("zstd"),
         true,
-        1024,
-        1024,
+        64 * 1024,
+        64 * 1024,
         "max_decoded_response_bytes",
     );
 }
@@ -337,15 +385,15 @@ fn zstd_chunked_decoded_response_is_bounded_and_recovers() {
 #[test]
 fn gzip_decoded_response_is_bounded_and_recovers() {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    encoder.write_all(&vec![b'x'; 16 * 1024]).unwrap();
+    encoder.write_all(&vec![b'x'; 128 * 1024]).unwrap();
     let encoded = encoder.finish().unwrap();
     assert!(encoded.len() < 1024);
     assert_response_cap_then_recovery(
         encoded,
         Some("gzip"),
         false,
-        1024,
-        1024,
+        64 * 1024,
+        64 * 1024,
         "max_decoded_response_bytes",
     );
 }
@@ -387,8 +435,8 @@ fn zstd_large_window_is_rejected_even_for_tiny_output_and_recovers() {
         frame,
         Some("zstd"),
         false,
-        1024,
-        1024,
+        64 * 1024,
+        64 * 1024,
         "max_decoded_response_bytes",
     );
 }
@@ -399,6 +447,14 @@ fn known_length_oversize_keep_alive_response_is_discarded_before_recovery() {
     let port = listener.local_addr().unwrap().port();
     let (reuse_tx, reuse_rx) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
+        let (mut options, _) = listener.accept().unwrap();
+        read_one_request(&mut options).unwrap();
+        options
+            .write_all(
+                b"HTTP/1.1 204 No Content\r\nVGI-Accept-Max-Response-Bytes-Support: true\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        options.flush().unwrap();
         let (mut first, _) = listener.accept().unwrap();
         first
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -410,7 +466,7 @@ fn known_length_oversize_keep_alive_response_is_discarded_before_recovery() {
         // buffering) is the only safe recovery path.
         first
             .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apache.arrow.stream\r\nContent-Length: 2048\r\nConnection: keep-alive\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apache.arrow.stream\r\nVGI-Accept-Max-Response-Bytes-Support: true\r\nContent-Length: 70000\r\nConnection: keep-alive\r\n\r\n",
             )
             .unwrap();
         first.flush().unwrap();
@@ -437,14 +493,14 @@ fn known_length_oversize_keep_alive_response_is_discarded_before_recovery() {
     let mut client = HttpClient::connect(format!("http://127.0.0.1:{port}"))
         .timeout(Some(Duration::from_secs(5)))
         .retry(RetryConfig::disabled())
-        .max_encoded_response_bytes(1024)
-        .max_decoded_response_bytes(4096)
+        .max_encoded_response_bytes(64 * 1024)
+        .max_decoded_response_bytes(64 * 1024)
         .build()
         .unwrap();
     let error = client
         .call_unary("echo_int", &echo_params(), None)
         .expect_err("known oversized response must be rejected before reading");
-    assert!(error.message.contains("max_encoded_response_bytes"));
+    assert!(error.message.contains("max_response_bytes"));
     let (batch, _) = client
         .call_unary("echo_int", &echo_params(), None)
         .expect("recovery must reconnect and succeed");

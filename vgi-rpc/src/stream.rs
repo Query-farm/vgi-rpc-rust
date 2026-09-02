@@ -25,6 +25,8 @@ pub struct OutputCollector {
     data_emitted: bool,
     finished: bool,
     is_producer: bool,
+    response_limit_bytes: Option<usize>,
+    preferred_response_bytes: Option<usize>,
 }
 
 impl OutputCollector {
@@ -35,7 +37,30 @@ impl OutputCollector {
             data_emitted: false,
             finished: false,
             is_producer,
+            response_limit_bytes: None,
+            preferred_response_bytes: None,
         }
+    }
+
+    #[cfg(feature = "http")]
+    pub(crate) fn set_response_budget(
+        &mut self,
+        response_limit_bytes: Option<usize>,
+        preferred_response_bytes: Option<usize>,
+    ) {
+        self.response_limit_bytes = response_limit_bytes;
+        self.preferred_response_bytes = preferred_response_bytes
+            .map(|preferred| response_limit_bytes.map_or(preferred, |hard| preferred.min(hard)));
+    }
+
+    /// Hard encoded-response budget for this producer/exchange turn.
+    pub fn response_limit_bytes(&self) -> Option<usize> {
+        self.response_limit_bytes
+    }
+
+    /// Advisory target for sizing the next emitted batch.
+    pub fn preferred_response_bytes(&self) -> Option<usize> {
+        self.preferred_response_bytes
     }
 
     /// The stream's output schema.
@@ -280,5 +305,14 @@ mod tests {
         out.client_log(LogLevel::Info, "still allowed");
 
         assert_eq!(out.items.len(), 2);
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn collector_exposes_clamped_response_budget_snapshot() {
+        let mut out = OutputCollector::new(empty_schema(), true);
+        out.set_response_budget(Some(1024), Some(4096));
+        assert_eq!(out.response_limit_bytes(), Some(1024));
+        assert_eq!(out.preferred_response_bytes(), Some(1024));
     }
 }

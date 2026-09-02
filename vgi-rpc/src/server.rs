@@ -184,6 +184,13 @@ pub struct CallContext {
     /// framework has observed the transport (i.e. before the first
     /// [`RpcServer::notify_transport`] call).
     pub kind: Option<crate::transport::TransportKind>,
+    /// Hard response-body budget for this invocation after intersecting the
+    /// application, hosting platform, and (on HTTP) client-advertised limits.
+    /// `None` means that none of those parties supplied a limit.
+    pub response_limit_bytes: Option<usize>,
+    /// Advisory batching target, never larger than [`Self::response_limit_bytes`].
+    /// Workers may emit less, but the transport still enforces the hard limit.
+    pub preferred_response_bytes: Option<usize>,
     pub(crate) log_sink: Arc<Mutex<Vec<LogMessage>>>,
     /// Per-tick input-batch custom metadata (updated each producer/exchange
     /// iteration). Carries e.g. `vgi_pushdown_filters` for dynamic filters.
@@ -287,6 +294,8 @@ impl CallContext {
             peer_evidence: Arc::clone(&connection.peer_evidence),
             cookies: std::collections::BTreeMap::new(),
             kind: server.transport_kind(),
+            response_limit_bytes: None,
+            preferred_response_bytes: None,
             log_sink: Arc::new(Mutex::new(Vec::new())),
             tick_metadata: Arc::new(Mutex::new(Metadata::default())),
             sticky: None,
@@ -314,6 +323,8 @@ impl CallContext {
             peer_evidence,
             cookies,
             kind: server.transport_kind(),
+            response_limit_bytes: None,
+            preferred_response_bytes: None,
             log_sink: Arc::new(Mutex::new(Vec::new())),
             tick_metadata: Arc::new(Mutex::new(Metadata::default())),
             sticky: None,
@@ -327,6 +338,17 @@ impl CallContext {
     #[cfg(feature = "http")]
     pub(crate) fn set_sticky(&mut self, sink: Arc<dyn StickySink>) {
         self.sticky = Some(sink);
+    }
+
+    #[cfg(feature = "http")]
+    pub(crate) fn set_response_budget(
+        &mut self,
+        response_limit_bytes: Option<usize>,
+        preferred_response_bytes: Option<usize>,
+    ) {
+        self.response_limit_bytes = response_limit_bytes;
+        self.preferred_response_bytes = preferred_response_bytes
+            .map(|preferred| response_limit_bytes.map_or(preferred, |hard| preferred.min(hard)));
     }
 
     // --- Sticky sessions (HTTP-only) -----------------------------------

@@ -877,13 +877,11 @@ async fn body_limit_above_axums_default_is_honoured() {
 }
 
 #[tokio::test]
-async fn small_response_under_soft_cap_is_not_rejected() {
-    // `max_response_bytes` is a *soft* producer-side cap — a normal
-    // response (here, a small Arrow error stream) that happens to be
-    // larger than the soft cap must NOT be turned into a 500 by the
-    // post-processing middleware. The middleware's hard ceiling is
-    // separate and far higher; see `response_buffer_ceiling`.
-    let state = state_configured(|b| b.max_response_bytes(8));
+async fn structured_request_error_survives_the_minimum_response_cap() {
+    // `max_response_bytes` is a hard cap on successful VGI results. A request
+    // rejected before dispatch still needs enough bounded middleware room for
+    // its structured Arrow error, rather than being replaced by an opaque 500.
+    let state = state_configured(|b| b.max_response_bytes(64 * 1024));
     let app = vgi_rpc::http::build_router(state);
     let resp = app
         .oneshot(
@@ -896,7 +894,6 @@ async fn small_response_under_soft_cap_is_not_rejected() {
         )
         .await
         .unwrap();
-    // Empty body → request parse error → 400 (NOT a 500 from the
-    // middleware buffer cap).
+    // Empty body → request parse error → 400 (not a middleware 500).
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

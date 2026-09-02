@@ -97,6 +97,41 @@ test("httpi retains duplicate headers and declares raw representation bytes", as
   );
 });
 
+test("httpi forwards OPTIONS for VGI capability discovery", async () => {
+  let seen = false;
+  const wasm: WasmIrohNode = {
+    endpointId: "01".repeat(32),
+    async openVgiStream() {
+      throw new Error("unused");
+    },
+    async fetchHttpi(_id, method, path, headers, body) {
+      assert.equal(method, "OPTIONS");
+      assert.equal(path, "/health");
+      assert.deepEqual(headers, []);
+      assert.equal(body.length, 0);
+      seen = true;
+      return {
+        status: 204,
+        headers: [["vgi-accept-max-response-bytes-support", "true"]],
+        async read() {
+          return undefined;
+        },
+        cancel() {},
+      };
+    },
+    async close() {},
+  };
+  const response = await new IrohNode(wasm).fetchHttpi(
+    "02".repeat(32),
+    "OPTIONS",
+    "/health",
+    [],
+    new Uint8Array(),
+  );
+  assert.equal(response.status, 204);
+  assert.equal(seen, true);
+});
+
 test("application resolver is the optional authorization boundary", async () => {
   let resolved = false;
   const wasm: WasmIrohNode = {

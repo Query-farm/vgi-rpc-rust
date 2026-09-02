@@ -5094,6 +5094,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "vgi-iroh-cabi"
+version = "0.23.3"
+dependencies = [
+ "bytes",
+ "iroh",
+ "tokio",
+ "tokio-util",
+ "vgi-iroh-transport",
+ "zeroize",
+]
+
+[[package]]
+name = "vgi-iroh-transport"
+version = "0.23.3"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "iroh",
+ "iroh-http-core 0.6.2 (git+https://github.com/Query-farm/iroh-http.git?rev=fe64a5512fc711a016033daa02ed487555023518)",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tower",
+]
+
+[[package]]
 name = "vgi-rpc"
 version = "0.23.3"
 dependencies = [
@@ -5235,6 +5265,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "vgi-iroh-transport",
  "vgi-rpc",
  "vgi-rpc-client",
 ]

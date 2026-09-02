@@ -19,15 +19,13 @@ use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{timeout, Instant};
 pub use tokio_util::sync::CancellationToken;
+pub use vgi_iroh_transport::VGI_IROH_ALPN;
 use vgi_rpc::{
     AuthContext, ConnectionContext, IdentityAssurance, PeerAuthenticationPolicy, PeerEvidenceSet,
     PeerIdentity, PeerIdentityResult, RpcError, RpcServer, SubjectKind, SubjectStability,
 };
 use vgi_rpc_client::transport::RpcDeadline;
 use vgi_rpc_client::{RpcClient, Transport};
-
-/// ALPN used by the multiplexed, stateful VGI-over-Iroh protocol.
-pub const VGI_IROH_ALPN: &[u8] = b"vgi-rpc/arrow-mux/1";
 
 const CLOSE_CODE: u32 = 0;
 const CLOSE_REASON: &[u8] = b"vgi-rpc transport closed";
@@ -78,13 +76,7 @@ fn redacted_policy_error(error: RpcError) -> RpcError {
 }
 
 fn endpoint_subject(endpoint: EndpointId) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut subject = String::with_capacity(64);
-    for byte in endpoint.as_bytes() {
-        subject.push(HEX[usize::from(byte >> 4)] as char);
-        subject.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    subject
+    vgi_iroh_transport::endpoint_id_hex(endpoint)
 }
 
 fn adapter_error_class(error: &IrohAdapterError) -> &'static str {

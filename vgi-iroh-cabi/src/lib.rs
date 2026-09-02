@@ -355,6 +355,14 @@ pub extern "C" fn vgi_iroh_abi_version() -> u32 {
     ABI_VERSION
 }
 
+/// Creates an Iroh endpoint and transfers its ownership to the caller.
+///
+/// # Safety
+///
+/// `config` must point to a readable configuration whose nested strings and
+/// arrays remain valid for the duration of the call. `out` must be writable.
+/// If non-null, `error` must be writable. On success, the returned endpoint
+/// must eventually be passed exactly once to [`vgi_iroh_endpoint_free`].
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_endpoint_create(
     config: *const vgi_iroh_endpoint_config,
@@ -405,6 +413,13 @@ pub unsafe extern "C" fn vgi_iroh_endpoint_create(
     })
 }
 
+/// Cancels operations currently using an endpoint.
+///
+/// # Safety
+///
+/// `endpoint` may be null; otherwise it must be a live handle returned by
+/// [`vgi_iroh_endpoint_create`]. It must not be freed concurrently with this
+/// call.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_endpoint_cancel(endpoint: *mut vgi_iroh_endpoint) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -413,6 +428,13 @@ pub unsafe extern "C" fn vgi_iroh_endpoint_cancel(endpoint: *mut vgi_iroh_endpoi
         }
     }));
 }
+/// Closes and releases an endpoint handle.
+///
+/// # Safety
+///
+/// `endpoint` may be null; otherwise it must have been returned by
+/// [`vgi_iroh_endpoint_create`] and not previously freed. No operation may use
+/// the handle concurrently, and the pointer must not be used after this call.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_endpoint_free(endpoint: *mut vgi_iroh_endpoint) {
     if endpoint.is_null() {
@@ -423,6 +445,14 @@ pub unsafe extern "C" fn vgi_iroh_endpoint_free(endpoint: *mut vgi_iroh_endpoint
         endpoint.runtime.block_on(endpoint.inner.close());
     }));
 }
+/// Copies the endpoint's hexadecimal identifier into a caller-owned buffer.
+///
+/// # Safety
+///
+/// `endpoint` must be a live endpoint handle. `buffer` must either be null
+/// with zero `capacity`, or point to `capacity` writable bytes. If non-null,
+/// `required` and `error` must each be writable. The endpoint must not be
+/// freed concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_endpoint_id(
     endpoint: *const vgi_iroh_endpoint,
@@ -443,6 +473,15 @@ pub unsafe extern "C" fn vgi_iroh_endpoint_id(
     })
 }
 
+/// Opens a raw VGI stream.
+///
+/// # Safety
+///
+/// `endpoint` must be a live endpoint handle. `remote` and all of its nested
+/// strings and arrays must be readable for the duration of the call. `out`
+/// must be writable, and a successful returned stream must eventually be
+/// freed exactly once. If non-null, `error` must be writable. The endpoint
+/// must not be freed concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_stream_open(
     endpoint: *mut vgi_iroh_endpoint,
@@ -453,6 +492,15 @@ pub unsafe extern "C" fn vgi_iroh_stream_open(
     unsafe { stream_open_impl(endpoint, remote, None, out, ptr::null_mut(), error) }
 }
 
+/// Opens a raw VGI stream with a caller-supplied timeout.
+///
+/// # Safety
+///
+/// `endpoint` must be a live endpoint handle. `remote` and all of its nested
+/// strings and arrays must be readable for the duration of the call. `out`
+/// and `timed_out` must be writable. If non-null, `error` must be writable. A
+/// successful returned stream must eventually be freed exactly once. The
+/// endpoint must not be freed concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_stream_open_timeout(
     endpoint: *mut vgi_iroh_endpoint,
@@ -465,6 +513,17 @@ pub unsafe extern "C" fn vgi_iroh_stream_open_timeout(
     unsafe { stream_open_impl(endpoint, remote, Some(timeout_ms), out, timed_out, error) }
 }
 
+/// Opens a raw VGI stream while polling a host cancellation callback.
+///
+/// # Safety
+///
+/// `endpoint` must be a live endpoint handle. `remote` and its nested data
+/// must be readable for the call, and `out` must be writable. If non-null,
+/// `error` must be writable. `cancel_check` must be present and safe to call
+/// repeatedly on this thread with `userdata`; its referenced state must stay
+/// valid for the entire call, and it must not unwind or re-enter this handle.
+/// A successful returned stream must eventually be freed exactly once. The
+/// endpoint must not be freed concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_stream_open_cancellable(
     endpoint: *mut vgi_iroh_endpoint,
@@ -545,6 +604,14 @@ unsafe fn stream_open_impl(
         Ok(())
     })
 }
+/// Copies the authenticated remote endpoint identifier for a stream.
+///
+/// # Safety
+///
+/// `stream` must be a live stream handle. `buffer` must either be null with
+/// zero `capacity`, or point to `capacity` writable bytes. If non-null,
+/// `required` and `error` must each be writable. The stream must not be freed
+/// concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_stream_remote_id(
     stream: *const vgi_iroh_stream,
@@ -564,6 +631,14 @@ pub unsafe extern "C" fn vgi_iroh_stream_remote_id(
         )
     })
 }
+/// Reads bytes from a raw VGI stream.
+///
+/// # Safety
+///
+/// `stream` must be a live stream handle. `buffer` must point to `capacity`
+/// writable bytes when `capacity` is nonzero. `read` must be writable. If
+/// non-null, `error` must be writable. The stream must not be freed
+/// concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_stream_read(
     stream: *mut vgi_iroh_stream,
@@ -588,6 +663,14 @@ pub unsafe extern "C" fn vgi_iroh_stream_read(
         Ok(())
     })
 }
+/// Reads bytes from a raw VGI stream with a polling timeout.
+///
+/// # Safety
+///
+/// `stream` must be a live stream handle. `buffer` must point to `capacity`
+/// writable bytes when `capacity` is nonzero. `read` and `timed_out` must be
+/// writable. If non-null, `error` must be writable. The stream must not be
+/// freed concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_stream_read_timeout(
     stream: *mut vgi_iroh_stream,
@@ -630,6 +713,14 @@ pub unsafe extern "C" fn vgi_iroh_stream_read_timeout(
         }
     })
 }
+/// Writes an entire byte slice to a raw VGI stream.
+///
+/// # Safety
+///
+/// `stream` must be a live stream handle. `buffer` must point to `length`
+/// readable bytes when `length` is nonzero and remain valid for the call. If
+/// non-null, `error` must be writable. The stream must not be freed
+/// concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_stream_write(
     stream: *mut vgi_iroh_stream,
@@ -645,6 +736,14 @@ pub unsafe extern "C" fn vgi_iroh_stream_write(
             .block_on(lock(&stream.inner)?.write_all(input))
     })
 }
+/// Writes an entire byte slice to a raw VGI stream with a timeout.
+///
+/// # Safety
+///
+/// `stream` must be a live stream handle. `buffer` must point to `length`
+/// readable bytes when `length` is nonzero and remain valid for the call. If
+/// non-null, `error` must be writable. The stream must not be freed
+/// concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_stream_write_timeout(
     stream: *mut vgi_iroh_stream,
@@ -665,6 +764,16 @@ pub unsafe extern "C" fn vgi_iroh_stream_write_timeout(
     })
 }
 
+/// Writes bytes while polling a host cancellation callback.
+///
+/// # Safety
+///
+/// `stream` must be a live stream handle. `buffer` must point to `length`
+/// readable bytes when `length` is nonzero and remain valid for the call. If
+/// non-null, `error` must be writable. `cancel_check` must be present and safe
+/// to call repeatedly on this thread with `userdata`; its referenced state
+/// must stay valid for the call, and it must not unwind or re-enter this
+/// handle. The stream must not be freed concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_stream_write_cancellable(
     stream: *mut vgi_iroh_stream,
@@ -694,6 +803,12 @@ pub unsafe extern "C" fn vgi_iroh_stream_write_cancellable(
         result
     })
 }
+/// Sends the raw stream's write-side finish signal.
+///
+/// # Safety
+///
+/// `stream` must be a live stream handle and must not be freed concurrently.
+/// If non-null, `error` must be writable.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_stream_finish(
     stream: *mut vgi_iroh_stream,
@@ -704,6 +819,12 @@ pub unsafe extern "C" fn vgi_iroh_stream_finish(
         stream.runtime.block_on(lock(&stream.inner)?.finish())
     })
 }
+/// Cancels a raw stream's pending operations.
+///
+/// # Safety
+///
+/// `stream` may be null; otherwise it must be a live stream handle returned by
+/// this library. It must not be freed concurrently with this call.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_stream_cancel(stream: *mut vgi_iroh_stream) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -712,6 +833,13 @@ pub unsafe extern "C" fn vgi_iroh_stream_cancel(stream: *mut vgi_iroh_stream) {
         }
     }));
 }
+/// Releases a raw stream handle.
+///
+/// # Safety
+///
+/// `stream` may be null; otherwise it must be a handle returned by this
+/// library that has not previously been freed. No operation may use the
+/// handle concurrently, and the pointer must not be used after this call.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_stream_free(stream: *mut vgi_iroh_stream) {
     if !stream.is_null() {
@@ -768,6 +896,15 @@ unsafe fn parse_http_request(
     })
 }
 
+/// Starts an HTTP-over-Iroh request and returns its response head.
+///
+/// # Safety
+///
+/// `endpoint` must be a live endpoint handle. `remote`, `request`, and every
+/// nested string, header array, header byte slice, and body slice must be
+/// readable for the call. `out` must be writable. If non-null, `error` must
+/// be writable. A successful returned response must eventually be freed
+/// exactly once. The endpoint must not be freed concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_http_request_start(
     endpoint: *mut vgi_iroh_endpoint,
@@ -779,6 +916,15 @@ pub unsafe extern "C" fn vgi_iroh_http_request_start(
     unsafe { http_request_start_impl(endpoint, remote, request, None, out, error) }
 }
 
+/// Starts an HTTP-over-Iroh request with a response-head timeout.
+///
+/// # Safety
+///
+/// `endpoint` must be a live endpoint handle. `remote`, `request`, and every
+/// nested string, header array, header byte slice, and body slice must be
+/// readable for the call. `out` must be writable. If non-null, `error` must
+/// be writable. A successful returned response must eventually be freed
+/// exactly once. The endpoint must not be freed concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_http_request_start_timeout(
     endpoint: *mut vgi_iroh_endpoint,
@@ -791,6 +937,17 @@ pub unsafe extern "C" fn vgi_iroh_http_request_start_timeout(
     unsafe { http_request_start_impl(endpoint, remote, request, Some(timeout_ms), out, error) }
 }
 
+/// Starts an HTTP-over-Iroh request while polling host cancellation.
+///
+/// # Safety
+///
+/// `endpoint` must be live. `remote`, `request`, and all nested strings,
+/// arrays, and byte slices must be readable for the call. `out` must be
+/// writable, and if non-null, `error` must be writable. `cancel_check` must be
+/// present and safe to call repeatedly on this thread with `userdata`; its
+/// referenced state must stay valid for the call, and it must not unwind or
+/// re-enter this handle. A successful response must eventually be freed
+/// exactly once. The endpoint must not be freed concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_http_request_start_cancellable(
     endpoint: *mut vgi_iroh_endpoint,
@@ -869,6 +1026,12 @@ unsafe fn http_request_start_impl(
         Ok(())
     })
 }
+/// Returns the HTTP response status code.
+///
+/// # Safety
+///
+/// `response` may be null; otherwise it must be a live response handle
+/// returned by this library and must not be freed concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_http_response_status(
     response: *const vgi_iroh_http_response,
@@ -878,6 +1041,14 @@ pub unsafe extern "C" fn vgi_iroh_http_response_status(
     }))
     .unwrap_or(0)
 }
+/// Copies the authenticated remote endpoint identifier for a response.
+///
+/// # Safety
+///
+/// `response` must be a live response handle. `buffer` must either be null
+/// with zero `capacity`, or point to `capacity` writable bytes. If non-null,
+/// `required` and `error` must each be writable. The response must not be
+/// freed concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_http_response_remote_id(
     response: *const vgi_iroh_http_response,
@@ -897,6 +1068,12 @@ pub unsafe extern "C" fn vgi_iroh_http_response_remote_id(
         )
     })
 }
+/// Returns the number of headers in an HTTP response.
+///
+/// # Safety
+///
+/// `response` may be null; otherwise it must be a live response handle
+/// returned by this library and must not be freed concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_http_response_header_count(
     response: *const vgi_iroh_http_response,
@@ -906,6 +1083,14 @@ pub unsafe extern "C" fn vgi_iroh_http_response_header_count(
     }))
     .unwrap_or(0)
 }
+/// Copies one HTTP response header into caller-owned buffers.
+///
+/// # Safety
+///
+/// `response` must be a live response handle. Each of `name` and `value` must
+/// either be null with a zero corresponding capacity, or point to that many
+/// writable bytes. If non-null, `name_required`, `value_required`, and
+/// `error` must each be writable. The response must not be freed concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_http_response_header(
     response: *const vgi_iroh_http_response,
@@ -940,6 +1125,14 @@ pub unsafe extern "C" fn vgi_iroh_http_response_header(
         )
     })
 }
+/// Reads bytes from an HTTP response body.
+///
+/// # Safety
+///
+/// `response` must be a live response handle. `buffer` must point to
+/// `capacity` writable bytes when `capacity` is nonzero. `read` must be
+/// writable. If non-null, `error` must be writable. The response must not be
+/// freed concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_http_response_read(
     response: *mut vgi_iroh_http_response,
@@ -966,6 +1159,14 @@ pub unsafe extern "C" fn vgi_iroh_http_response_read(
         Ok(())
     })
 }
+/// Reads bytes from an HTTP response body with a polling timeout.
+///
+/// # Safety
+///
+/// `response` must be a live response handle. `buffer` must point to
+/// `capacity` writable bytes when `capacity` is nonzero. `read` and
+/// `timed_out` must be writable. If non-null, `error` must be writable. The
+/// response must not be freed concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_http_response_read_timeout(
     response: *mut vgi_iroh_http_response,
@@ -1008,6 +1209,12 @@ pub unsafe extern "C" fn vgi_iroh_http_response_read_timeout(
         }
     })
 }
+/// Cancels an HTTP response's pending operations.
+///
+/// # Safety
+///
+/// `response` may be null; otherwise it must be a live response handle
+/// returned by this library. It must not be freed concurrently with this call.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_http_response_cancel(response: *mut vgi_iroh_http_response) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -1016,6 +1223,13 @@ pub unsafe extern "C" fn vgi_iroh_http_response_cancel(response: *mut vgi_iroh_h
         }
     }));
 }
+/// Releases an HTTP response handle.
+///
+/// # Safety
+///
+/// `response` may be null; otherwise it must be a handle returned by this
+/// library that has not previously been freed. No operation may use the
+/// handle concurrently, and the pointer must not be used after this call.
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_http_response_free(response: *mut vgi_iroh_http_response) {
     if !response.is_null() {

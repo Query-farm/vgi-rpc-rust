@@ -39,7 +39,7 @@ pub enum ErrorStage {
     Write = 7,
     Read = 8,
     Cancel = 9,
-    Shutdown = 10,
+    Close = 10,
     Internal = 11,
 }
 
@@ -50,6 +50,7 @@ impl ErrorStage {
     pub const WriteRequest: Self = Self::Write;
     pub const ReadResponse: Self = Self::Read;
     pub const Finish: Self = Self::Write;
+    pub const Shutdown: Self = Self::Close;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,7 +63,9 @@ pub enum ErrorCategory {
     Protocol = 5,
     ConnectionReset = 6,
     Cancelled = 7,
-    Internal = 8,
+    Authentication = 8,
+    ResourceExhausted = 9,
+    Internal = 10,
 }
 
 #[allow(non_upper_case_globals)]
@@ -502,9 +505,9 @@ impl ClientEndpoint {
                 format!("Iroh HTTP handshake failed: {error}"),
             )
         })?;
-        let driver = tokio::spawn(async move {
+        let mut driver = AbortOnDrop(Some(tokio::spawn(async move {
             let _ = driver.await;
-        });
+        })));
         let hyper_request = request.into_hyper(remote.id)?;
         let response = cancellable(
             &cancellation,
@@ -528,10 +531,10 @@ impl ClientEndpoint {
             Ok(response) => response,
             Err(error) => {
                 cancellation.cancel();
-                driver.abort();
                 return Err(error);
             }
         };
+        driver.detach();
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -850,6 +853,22 @@ where
 struct IrohIo {
     send: SendStream,
     recv: RecvStream,
+}
+
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    fn detach(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
 }
 
 impl AsyncRead for IrohIo {

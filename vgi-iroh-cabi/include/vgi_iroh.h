@@ -15,6 +15,11 @@ typedef struct vgi_iroh_endpoint vgi_iroh_endpoint;
 typedef struct vgi_iroh_stream vgi_iroh_stream;
 typedef struct vgi_iroh_http_response vgi_iroh_http_response;
 
+/* Invoked on the calling thread while a cancellable operation is pending.
+ * Return nonzero to cancel only that logical operation. The callback must not
+ * throw, block, or re-enter a function using the same handle. */
+typedef uint8_t (*vgi_iroh_cancel_check)(void *userdata);
+
 typedef enum vgi_iroh_result {
     VGI_IROH_OK = 0,
     VGI_IROH_ERROR = 1
@@ -30,7 +35,7 @@ typedef enum vgi_iroh_error_stage {
     VGI_IROH_STAGE_WRITE = 7,
     VGI_IROH_STAGE_READ = 8,
     VGI_IROH_STAGE_CANCEL = 9,
-    VGI_IROH_STAGE_SHUTDOWN = 10,
+    VGI_IROH_STAGE_CLOSE = 10,
     VGI_IROH_STAGE_INTERNAL = 11
 } vgi_iroh_error_stage;
 
@@ -42,7 +47,9 @@ typedef enum vgi_iroh_error_category {
     VGI_IROH_CATEGORY_PROTOCOL = 5,
     VGI_IROH_CATEGORY_CONNECTION_RESET = 6,
     VGI_IROH_CATEGORY_CANCELLED = 7,
-    VGI_IROH_CATEGORY_INTERNAL = 8
+    VGI_IROH_CATEGORY_AUTHENTICATION = 8,
+    VGI_IROH_CATEGORY_RESOURCE_EXHAUSTED = 9,
+    VGI_IROH_CATEGORY_INTERNAL = 10
 } vgi_iroh_error_category;
 
 typedef enum vgi_iroh_dispatch_certainty {
@@ -57,6 +64,7 @@ typedef enum vgi_iroh_dispatch_certainty {
 #define VGI_IROH_STAGE_WRITE_REQUEST VGI_IROH_STAGE_WRITE
 #define VGI_IROH_STAGE_READ_RESPONSE VGI_IROH_STAGE_READ
 #define VGI_IROH_STAGE_FINISH VGI_IROH_STAGE_WRITE
+#define VGI_IROH_STAGE_SHUTDOWN VGI_IROH_STAGE_CLOSE
 #define VGI_IROH_CATEGORY_INVALID_ARGUMENT VGI_IROH_CATEGORY_INVALID_INPUT
 #define VGI_IROH_CATEGORY_IO VGI_IROH_CATEGORY_CONNECTION_RESET
 #define VGI_IROH_DISPATCH_NOT_APPLICABLE VGI_IROH_DISPATCH_NOT_SENT
@@ -136,6 +144,13 @@ vgi_iroh_result vgi_iroh_stream_open_timeout(vgi_iroh_endpoint *endpoint,
                                              uint64_t timeout_ms,
                                              vgi_iroh_stream **out, uint8_t *timed_out,
                                              vgi_iroh_error *error);
+/* Uses the endpoint's configured deadline while polling cancel_check. */
+vgi_iroh_result vgi_iroh_stream_open_cancellable(vgi_iroh_endpoint *endpoint,
+                                                 const vgi_iroh_remote *remote,
+                                                 vgi_iroh_cancel_check cancel_check,
+                                                 void *userdata,
+                                                 vgi_iroh_stream **out,
+                                                 vgi_iroh_error *error);
 vgi_iroh_result vgi_iroh_stream_remote_id(const vgi_iroh_stream *stream,
                                           char *buffer, size_t capacity,
                                           size_t *required,
@@ -158,6 +173,12 @@ vgi_iroh_result vgi_iroh_stream_write_timeout(vgi_iroh_stream *stream,
                                               const uint8_t *buffer, size_t length,
                                               uint64_t timeout_ms,
                                               vgi_iroh_error *error);
+/* Cancellation poisons only this logical stream; dispatch certainty is unknown. */
+vgi_iroh_result vgi_iroh_stream_write_cancellable(vgi_iroh_stream *stream,
+                                                  const uint8_t *buffer, size_t length,
+                                                  vgi_iroh_cancel_check cancel_check,
+                                                  void *userdata,
+                                                  vgi_iroh_error *error);
 vgi_iroh_result vgi_iroh_stream_finish(vgi_iroh_stream *stream,
                                        vgi_iroh_error *error);
 void vgi_iroh_stream_cancel(vgi_iroh_stream *stream);
@@ -175,6 +196,16 @@ vgi_iroh_result vgi_iroh_http_request_start_timeout(vgi_iroh_endpoint *endpoint,
                                                     uint64_t timeout_ms,
                                                     vgi_iroh_http_response **out,
                                                     vgi_iroh_error *error);
+/* Uses configured deadlines while polling cancel_check until response headers.
+ * Cancellation tears down only this request; dispatch certainty is unknown. */
+vgi_iroh_result vgi_iroh_http_request_start_cancellable(
+    vgi_iroh_endpoint *endpoint,
+    const vgi_iroh_remote *remote,
+    const vgi_iroh_http_request *request,
+    vgi_iroh_cancel_check cancel_check,
+    void *userdata,
+    vgi_iroh_http_response **out,
+    vgi_iroh_error *error);
 uint16_t vgi_iroh_http_response_status(const vgi_iroh_http_response *response);
 vgi_iroh_result vgi_iroh_http_response_remote_id(const vgi_iroh_http_response *response,
                                                  char *buffer, size_t capacity,

@@ -1,7 +1,8 @@
 //! Stable C ABI for the Arrow-free native VGI Iroh transport.
 #![allow(non_camel_case_types)]
 
-use std::ffi::{c_char, CStr};
+use std::ffi::{c_char, c_void, CStr};
+use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
@@ -20,6 +21,9 @@ use zeroize::Zeroizing;
 
 const ABI_VERSION: u32 = 1;
 const ERROR_MESSAGE_CAPACITY: usize = 512;
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+pub type vgi_iroh_cancel_check = Option<unsafe extern "C" fn(*mut c_void) -> u8>;
 
 #[repr(C)]
 pub struct vgi_iroh_error {
@@ -125,6 +129,34 @@ fn invalid(message: impl Into<String>) -> TransportError {
         DispatchCertainty::NotApplicable,
         message,
     )
+}
+
+async fn host_cancellable<T, F>(
+    operation: F,
+    cancel_check: vgi_iroh_cancel_check,
+    userdata: *mut c_void,
+    dispatch: DispatchCertainty,
+) -> Result<T, TransportError>
+where
+    F: Future<Output = Result<T, TransportError>>,
+{
+    let cancel_check = cancel_check.ok_or_else(|| invalid("cancel_check must not be null"))?;
+    tokio::pin!(operation);
+    loop {
+        if unsafe { cancel_check(userdata) } != 0 {
+            return Err(TransportError::new(
+                ErrorStage::Cancel,
+                ErrorCategory::Cancelled,
+                dispatch,
+                "Iroh operation cancelled by host",
+            ));
+        }
+        tokio::select! {
+            biased;
+            result = &mut operation => return result,
+            _ = tokio::time::sleep(CANCEL_POLL_INTERVAL) => {}
+        }
+    }
 }
 
 unsafe fn required_ref<'a, T>(value: *const T, name: &str) -> Result<&'a T, TransportError> {
@@ -433,6 +465,46 @@ pub unsafe extern "C" fn vgi_iroh_stream_open_timeout(
     unsafe { stream_open_impl(endpoint, remote, Some(timeout_ms), out, timed_out, error) }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn vgi_iroh_stream_open_cancellable(
+    endpoint: *mut vgi_iroh_endpoint,
+    remote: *const vgi_iroh_remote,
+    cancel_check: vgi_iroh_cancel_check,
+    userdata: *mut c_void,
+    out: *mut *mut vgi_iroh_stream,
+    error: *mut vgi_iroh_error,
+) -> u32 {
+    ffi(error, || {
+        let endpoint = unsafe { required_ref(endpoint, "endpoint") }?;
+        let out = unsafe { required_mut(out, "out") }?;
+        *out = ptr::null_mut();
+        let remote = unsafe { parse_remote(remote) }?;
+        let remote_id = remote.id;
+        let stream = endpoint.runtime.block_on(host_cancellable(
+            endpoint.inner.open_raw(&remote),
+            cancel_check,
+            userdata,
+            DispatchCertainty::NotSent,
+        ))?;
+        *out = make_stream_handle(endpoint, remote_id, stream);
+        Ok(())
+    })
+}
+
+fn make_stream_handle(
+    endpoint: &vgi_iroh_endpoint,
+    remote_id: EndpointId,
+    stream: RawStream,
+) -> *mut vgi_iroh_stream {
+    let cancellation = stream.cancellation_token();
+    Box::into_raw(Box::new(vgi_iroh_stream {
+        inner: Mutex::new(stream),
+        cancellation,
+        remote_id,
+        runtime: Arc::clone(&endpoint.runtime),
+    }))
+}
+
 unsafe fn stream_open_impl(
     endpoint: *mut vgi_iroh_endpoint,
     remote: *const vgi_iroh_remote,
@@ -469,13 +541,7 @@ unsafe fn stream_open_impl(
             }
             Err(failure) => return Err(failure),
         };
-        let cancellation = stream.cancellation_token();
-        *out = Box::into_raw(Box::new(vgi_iroh_stream {
-            inner: Mutex::new(stream),
-            cancellation,
-            remote_id,
-            runtime: Arc::clone(&endpoint.runtime),
-        }));
+        *out = make_stream_handle(endpoint, remote_id, stream);
         Ok(())
     })
 }
@@ -598,6 +664,36 @@ pub unsafe extern "C" fn vgi_iroh_stream_write_timeout(
         )
     })
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn vgi_iroh_stream_write_cancellable(
+    stream: *mut vgi_iroh_stream,
+    buffer: *const u8,
+    length: usize,
+    cancel_check: vgi_iroh_cancel_check,
+    userdata: *mut c_void,
+    error: *mut vgi_iroh_error,
+) -> u32 {
+    ffi(error, || {
+        let stream = unsafe { required_ref(stream, "stream") }?;
+        let input = unsafe { byte_slice(buffer, length, "write buffer") }?;
+        let runtime = Arc::clone(&stream.runtime);
+        let mut inner = lock(&stream.inner)?;
+        let result = runtime.block_on(host_cancellable(
+            inner.write_all(input),
+            cancel_check,
+            userdata,
+            DispatchCertainty::Unknown,
+        ));
+        if matches!(
+            &result,
+            Err(failure) if failure.category == ErrorCategory::Cancelled
+        ) {
+            inner.cancel();
+        }
+        result
+    })
+}
 #[no_mangle]
 pub unsafe extern "C" fn vgi_iroh_stream_finish(
     stream: *mut vgi_iroh_stream,
@@ -695,6 +791,51 @@ pub unsafe extern "C" fn vgi_iroh_http_request_start_timeout(
     unsafe { http_request_start_impl(endpoint, remote, request, Some(timeout_ms), out, error) }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn vgi_iroh_http_request_start_cancellable(
+    endpoint: *mut vgi_iroh_endpoint,
+    remote: *const vgi_iroh_remote,
+    request: *const vgi_iroh_http_request,
+    cancel_check: vgi_iroh_cancel_check,
+    userdata: *mut c_void,
+    out: *mut *mut vgi_iroh_http_response,
+    error: *mut vgi_iroh_error,
+) -> u32 {
+    ffi(error, || {
+        let endpoint = unsafe { required_ref(endpoint, "endpoint") }?;
+        let out = unsafe { required_mut(out, "out") }?;
+        *out = ptr::null_mut();
+        let remote = unsafe { parse_remote(remote) }?;
+        let request = unsafe { parse_http_request(request) }?;
+        let response = endpoint.runtime.block_on(host_cancellable(
+            endpoint.inner.request(&remote, request),
+            cancel_check,
+            userdata,
+            DispatchCertainty::Unknown,
+        ))?;
+        *out = make_http_response_handle(endpoint, response);
+        Ok(())
+    })
+}
+
+fn make_http_response_handle(
+    endpoint: &vgi_iroh_endpoint,
+    response: HttpResponse,
+) -> *mut vgi_iroh_http_response {
+    let cancellation = response.cancellation_token();
+    let status = response.status();
+    let headers = response.headers().to_vec();
+    let remote_id = response.remote_id();
+    Box::into_raw(Box::new(vgi_iroh_http_response {
+        inner: Mutex::new(response),
+        cancellation,
+        status,
+        headers,
+        remote_id,
+        runtime: Arc::clone(&endpoint.runtime),
+    }))
+}
+
 unsafe fn http_request_start_impl(
     endpoint: *mut vgi_iroh_endpoint,
     remote: *const vgi_iroh_remote,
@@ -724,18 +865,7 @@ unsafe fn http_request_start_impl(
                 .runtime
                 .block_on(endpoint.inner.request(&remote, request))?,
         };
-        let cancellation = response.cancellation_token();
-        let status = response.status();
-        let headers = response.headers().to_vec();
-        let remote_id = response.remote_id();
-        *out = Box::into_raw(Box::new(vgi_iroh_http_response {
-            inner: Mutex::new(response),
-            cancellation,
-            status,
-            headers,
-            remote_id,
-            runtime: Arc::clone(&endpoint.runtime),
-        }));
+        *out = make_http_response_handle(endpoint, response);
         Ok(())
     })
 }
@@ -899,6 +1029,7 @@ pub unsafe extern "C" fn vgi_iroh_http_response_free(response: *mut vgi_iroh_htt
 mod tests {
     use super::*;
     use std::ffi::CString;
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     use iroh::endpoint::presets;
     use iroh::{Endpoint, RelayMode};
@@ -907,6 +1038,41 @@ mod tests {
     #[test]
     fn abi_version_is_stable() {
         assert_eq!(vgi_iroh_abi_version(), 1);
+        assert_eq!(ErrorStage::Close as u32, 10);
+        assert_eq!(ErrorCategory::Authentication as u32, 8);
+        assert_eq!(ErrorCategory::ResourceExhausted as u32, 9);
+        assert_eq!(ErrorCategory::Internal as u32, 10);
+    }
+
+    unsafe extern "C" fn cancel_now(_: *mut c_void) -> u8 {
+        1
+    }
+
+    unsafe extern "C" fn cancel_from_atomic(userdata: *mut c_void) -> u8 {
+        unsafe { &*userdata.cast::<AtomicU8>() }.load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn host_cancel_callback_is_polled_and_classified() {
+        let cancel = AtomicU8::new(0);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(25));
+                cancel.store(1, Ordering::Release);
+            });
+            let failure = runtime()
+                .unwrap()
+                .block_on(host_cancellable(
+                    std::future::pending::<Result<(), TransportError>>(),
+                    Some(cancel_from_atomic),
+                    (&cancel as *const AtomicU8).cast_mut().cast::<c_void>(),
+                    DispatchCertainty::Unknown,
+                ))
+                .unwrap_err();
+            assert_eq!(failure.stage, ErrorStage::Cancel);
+            assert_eq!(failure.category, ErrorCategory::Cancelled);
+            assert_eq!(failure.dispatch, DispatchCertainty::Unknown);
+        });
     }
 
     #[test]
@@ -1010,6 +1176,55 @@ mod tests {
         );
         assert_eq!(required, 65);
 
+        let mut cancelled_stream = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                vgi_iroh_stream_open_cancellable(
+                    endpoint,
+                    &remote,
+                    Some(cancel_now),
+                    ptr::null_mut(),
+                    &mut cancelled_stream,
+                    &mut error,
+                )
+            },
+            1
+        );
+        assert!(cancelled_stream.is_null());
+        assert_eq!(error.stage, ErrorStage::Cancel as u32);
+        assert_eq!(error.category, ErrorCategory::Cancelled as u32);
+        assert_eq!(error.dispatch_certainty, DispatchCertainty::NotSent as u32);
+
+        let method = CString::new("OPTIONS").unwrap();
+        let path = CString::new("/").unwrap();
+        let request = vgi_iroh_http_request {
+            method: method.as_ptr(),
+            path: path.as_ptr(),
+            headers: ptr::null(),
+            header_count: 0,
+            body: ptr::null(),
+            body_len: 0,
+        };
+        let mut cancelled_response = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                vgi_iroh_http_request_start_cancellable(
+                    endpoint,
+                    &remote,
+                    &request,
+                    Some(cancel_now),
+                    ptr::null_mut(),
+                    &mut cancelled_response,
+                    &mut error,
+                )
+            },
+            1
+        );
+        assert!(cancelled_response.is_null());
+        assert_eq!(error.stage, ErrorStage::Cancel as u32);
+        assert_eq!(error.category, ErrorCategory::Cancelled as u32);
+        assert_eq!(error.dispatch_certainty, DispatchCertainty::Unknown as u32);
+
         let mut stream = ptr::null_mut();
         assert_eq!(
             unsafe { vgi_iroh_stream_open(endpoint, &remote, &mut stream, &mut error) },
@@ -1060,6 +1275,23 @@ mod tests {
         assert_eq!(read_result, 0, "{error_message}");
         assert_eq!(read, 4);
         assert_eq!(&output, b"pong");
+
+        assert_eq!(
+            unsafe {
+                vgi_iroh_stream_write_cancellable(
+                    stream,
+                    b"ignored".as_ptr(),
+                    7,
+                    Some(cancel_now),
+                    ptr::null_mut(),
+                    &mut error,
+                )
+            },
+            1
+        );
+        assert_eq!(error.stage, ErrorStage::Cancel as u32);
+        assert_eq!(error.category, ErrorCategory::Cancelled as u32);
+        assert_eq!(error.dispatch_certainty, DispatchCertainty::Unknown as u32);
         response_read_tx.send(()).unwrap();
 
         unsafe {

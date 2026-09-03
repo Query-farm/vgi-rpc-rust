@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::io::Write;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -168,6 +169,9 @@ async fn main() -> Result<()> {
             println!("DIRECT:{address}");
         }
     }
+    std::io::stdout()
+        .flush()
+        .context("flush endpoint discovery output")?;
     tracing::info!(%endpoint_id, "VGI Iroh bridge ready");
     shutdown_signal().await?;
     router.shutdown().await.context("shut down Iroh router")?;

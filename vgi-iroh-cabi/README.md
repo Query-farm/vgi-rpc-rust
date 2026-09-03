@@ -15,8 +15,13 @@ poll their own cancellation state. Its timeout is nonfatal. Writes deliberately
 do not expose a retryable polling timeout because a timed-out `write_all` may
 have already dispatched a prefix of the frame.
 
-Tagged GitHub releases publish relocatable static-library archives for Linux
-x86-64/ARM64, macOS x86-64/ARM64, and Windows x86-64. Each archive contains the
-matching header, library, license files, build manifest, and a sibling SHA-256
-file. The archive version is the Rust workspace release version; hosts must also
-check `vgi_iroh_abi_version()` against `VGI_IROH_ABI_VERSION` before use.
+Tagged GitHub releases publish relocatable archives for Linux x86-64/ARM64,
+macOS x86-64/ARM64, and Windows x86-64. Each is a static library suitable for a
+single-artifact host such as a DuckDB extension. Windows also includes the
+versioned Rust `windows-targets` import libraries required by the static link.
+Each archive contains the matching header, CMake imported target with its
+platform-native link dependencies, dependency license inventory, project
+license files, build manifest, and a sibling SHA-256 file. The archive version
+is the Rust workspace release version; hosts must also check
+`vgi_iroh_abi_version()` against `VGI_IROH_ABI_VERSION` before use. These assets
+begin with vNEXT.

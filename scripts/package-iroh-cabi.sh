@@ -14,17 +14,17 @@ output_dir=$5
 
 case "$target_triple" in
   *-pc-windows-msvc)
-    static_library=vgi_iroh_cabi.lib
+    link_library=vgi_iroh_cabi.lib
     ;;
   *)
-    static_library=libvgi_iroh_cabi.a
+    link_library=libvgi_iroh_cabi.a
     ;;
 esac
 
-library_path="$cargo_target_dir/$target_triple/release/$static_library"
+library_path="$cargo_target_dir/$target_triple/release/$link_library"
 header_path="vgi-iroh-cabi/include/vgi_iroh.h"
 if [ ! -f "$library_path" ]; then
-  echo "missing C ABI static library: $library_path" >&2
+  echo "missing C ABI link library: $library_path" >&2
   exit 1
 fi
 if [ ! -f "$header_path" ]; then
@@ -38,8 +38,29 @@ trap 'rm -rf "$staging_root"' EXIT
 package_root="$staging_root/$package_name"
 mkdir -p "$package_root/include" "$package_root/lib"
 cp "$header_path" "$package_root/include/vgi_iroh.h"
-cp "$library_path" "$package_root/lib/$static_library"
+cp "$library_path" "$package_root/lib/$link_library"
+if [[ "$target_triple" == *-pc-windows-msvc ]]; then
+  import_count=0
+  while IFS= read -r manifest_path; do
+    for import_library in "$(dirname "$manifest_path")"/lib/windows.*.lib; do
+      if [ -f "$import_library" ]; then
+        cp "$import_library" "$package_root/lib/"
+        import_count=$((import_count + 1))
+      fi
+    done
+  done < <(cargo metadata --locked --format-version 1 \
+    | jq -r '.packages[] | select(.name=="windows_x86_64_msvc") | .manifest_path')
+  if [ "$import_count" -eq 0 ]; then
+    echo "no versioned windows_x86_64_msvc import libraries found via cargo metadata" >&2
+    exit 1
+  fi
+fi
+mkdir -p "$package_root/lib/cmake/vgi_iroh_cabi"
+cp vgi-iroh-cabi/cmake/vgi_iroh_cabi-config.cmake \
+  "$package_root/lib/cmake/vgi_iroh_cabi/"
 cp LICENSE NOTICE "$package_root/"
+cargo tree -p vgi-iroh-cabi --edges normal,build --prefix none \
+  --format $'{p}\t{l}\t{r}' | sort -u > "$package_root/THIRD_PARTY_LICENSES.tsv"
 {
   echo "package=vgi-iroh-cabi"
   echo "version=$version"

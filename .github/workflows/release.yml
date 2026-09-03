@@ -30,26 +30,48 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-*"
-  # Manual dispatch is useful for re-runs or for releasing without a
-  # fresh tag (e.g. retrying after a yank).
+  # Manual dispatch validates packaging and cargo-publish inputs without
+  # publishing crates or creating a GitHub Release.
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "If true, run `cargo publish --dry-run` instead of publishing."
+        description: "Manual runs are always dry-run; this input is retained for clarity."
         type: boolean
-        default: false
+        default: true
 
-# Trusted publishing exchanges the workflow's OIDC token for a
-# short-lived crates.io API token.  `id-token: write` is required to
-# mint the OIDC token; `contents: read` lets us check out the repo.
-# `contents: write` additionally lets the final step cut the GitHub Release.
+# Default every job to read-only repository access. Crate publishing and
+# GitHub Release creation elevate only their own narrow jobs below.
 permissions:
-  id-token: write
-  contents: write
+  contents: read
 
 jobs:
+  release-metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Validate tag and workspace version
+        id: metadata
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="vgi-iroh-cabi") | .version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "release tag $GITHUB_REF_NAME does not match workspace version v$version" >&2
+            exit 1
+          fi
+
   cabi-artifacts:
     name: C ABI (${{ matrix.target }})
+    needs: release-metadata
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -67,6 +89,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain (MSRV 1.97)
         uses: dtolnay/rust-toolchain@1.97.0
@@ -77,7 +101,7 @@ jobs:
         with:
           key: iroh-cabi-${{ matrix.target }}
 
-      - name: Build static C ABI
+      - name: Build native C ABI
         env:
           MACOSX_DEPLOYMENT_TARGET: "12.0"
         run: cargo build --locked --release --target "${{ matrix.target }}" -p vgi-iroh-cabi
@@ -85,10 +109,22 @@ jobs:
       - name: Package relocatable C ABI
         shell: bash
         run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name=="vgi-iroh-cabi") | .version')
           scripts/package-iroh-cabi.sh \
-            "${{ matrix.target }}" "$VERSION" "$GITHUB_SHA" target release-assets
+            "${{ matrix.target }}" "${{ needs.release-metadata.outputs.version }}" \
+            "$GITHUB_SHA" target release-assets
+
+      - name: Compile, link, and run staged archive smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.release-metadata.outputs.version }}"
+          package="vgi-iroh-cabi-v${version}-${{ matrix.target }}"
+          mkdir -p staged
+          tar -xzf "release-assets/${package}.tar.gz" -C staged
+          cmake -S vgi-iroh-cabi/smoke -B smoke-build \
+            -DCMAKE_PREFIX_PATH="$PWD/staged/$package"
+          cmake --build smoke-build --config Release
+          ctest --test-dir smoke-build --build-config Release --output-on-failure
 
       - name: Upload C ABI artifact
         uses: actions/upload-artifact@v4
@@ -99,11 +135,16 @@ jobs:
 
   publish:
     name: Publish to crates.io
-    needs: cabi-artifacts
+    needs: release-metadata
     runs-on: ubuntu-latest
     environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain (MSRV 1.97)
         uses: dtolnay/rust-toolchain@1.97.0
@@ -111,13 +152,6 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Download native C ABI release assets
-        uses: actions/download-artifact@v5
-        with:
-          pattern: vgi-iroh-cabi-*
-          path: release-assets
-          merge-multiple: true
 
       - name: Sanity gate — fmt, clippy, test, conformance run (best-effort)
         # The full CI already validates these on every push to main;
@@ -129,6 +163,7 @@ jobs:
           cargo test --workspace --all-features --locked
 
       - name: Authenticate to crates.io via OIDC
+        if: github.event_name == 'push'
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
 
@@ -147,14 +182,18 @@ jobs:
       - name: Publish crates (dependency order, idempotent)
         run: |
           set -euo pipefail
-          DRY_RUN="${{ github.event.inputs.dry_run }}"
+          DRY_RUN=true
+          if [ "$GITHUB_EVENT_NAME" = push ]; then DRY_RUN=false; fi
           UA="vgi-rpc-release (hello@query.farm)"
           for crate in vgi-rpc-macros vgi-rpc vgi-iroh-transport vgi-rpc-client vgi-iroh-cabi vgi-rpc-s3 vgi-rpc-gcs; do
             ver=$(cargo metadata --no-deps --format-version 1 \
               | jq -r --arg c "$crate" '.packages[] | select(.name==$c) | .version')
             if [ "$DRY_RUN" = "true" ]; then
               echo "::group::dry-run $crate $ver"
-              cargo publish --dry-run -p "$crate" --locked
+              # Dependency-order dry runs cannot resolve earlier workspace
+              # crates because dry-run never uploads them. The full sanity
+              # gate compiled the workspace; here validate package contents.
+              cargo publish --dry-run --no-verify -p "$crate" --locked
               echo "::endgroup::"
               continue
             fi
@@ -185,14 +224,38 @@ jobs:
           rm -rf target/tests
           find target -xtype l -delete 2>/dev/null || true
 
-      - name: Create GitHub Release
+      - name: Summarise
+        if: success()
+        run: |
+          echo "Validated release ${GITHUB_REF_NAME} at commit ${GITHUB_SHA}"
+          echo "Crates: vgi-rpc-macros, vgi-rpc, vgi-iroh-transport, vgi-rpc-client, vgi-iroh-cabi, vgi-rpc-s3, vgi-rpc-gcs"
+
+  release-assets:
+    name: Create GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release-metadata, cabi-artifacts, publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Download native C ABI release assets
+        uses: actions/download-artifact@v5
+        with:
+          pattern: vgi-iroh-cabi-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release and attach native C ABI assets
         # This repo publishes on *tag push*, whereas the sibling SDK repos
         # publish in response to a *published Release* — so there, a Release
         # necessarily exists. Here nothing created one, and the repo sat
         # advertising v0.8.0 as "latest" while crates.io had shipped seven
         # versions past it, with a maintained CHANGELOG nobody could see.
         # Idempotent so a re-run after a partial publish doesn't error.
-        if: success() && startsWith(github.ref, 'refs/tags/v') && github.event.inputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -214,17 +277,23 @@ jobs:
               --notes-file /tmp/release-notes.md \
               --verify-tag
           fi
-          gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
-
-      - name: Summarise
-        if: success()
-        run: |
-          echo "Published from tag ${GITHUB_REF_NAME} at commit ${GITHUB_SHA}"
-          echo "Crates released:"
-          echo "  - https://crates.io/crates/vgi-rpc-macros"
-          echo "  - https://crates.io/crates/vgi-rpc"
-          echo "  - https://crates.io/crates/vgi-rpc-client"
-          echo "  - https://crates.io/crates/vgi-iroh-transport"
-          echo "  - https://crates.io/crates/vgi-iroh-cabi"
-          echo "  - https://crates.io/crates/vgi-rpc-s3"
-          echo "  - https://crates.io/crates/vgi-rpc-gcs"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            > /tmp/current-release.json
+          for asset in release-assets/*; do
+            asset_name=$(basename "$asset")
+            local_digest="sha256:$(sha256sum "$asset" | cut -d ' ' -f 1)"
+            if jq -e --arg name "$asset_name" \
+                '.assets[] | select(.name == $name)' \
+                /tmp/current-release.json >/dev/null; then
+              remote_digest=$(jq -r --arg name "$asset_name" \
+                '.assets[] | select(.name == $name) | .digest // empty' \
+                /tmp/current-release.json)
+              if [ "$remote_digest" != "$local_digest" ]; then
+                echo "refusing to replace $asset_name: remote $remote_digest, local $local_digest" >&2
+                exit 1
+              fi
+              echo "$asset_name already exists with the expected digest — skipping"
+            else
+              gh release upload "$GITHUB_REF_NAME" "$asset"
+            fi
+          done

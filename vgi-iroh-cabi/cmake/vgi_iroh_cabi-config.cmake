@@ -29,7 +29,7 @@ if(WIN32)
   endif()
   target_link_libraries(vgi_iroh::cabi INTERFACE
     ${_VGI_IROH_WINDOWS_IMPORT_LIBS}
-    advapi32 bcrypt crypt32 iphlpapi ncrypt ntdll ole32 oleaut32
+    advapi32 bcrypt crypt32 dbghelp iphlpapi ncrypt ntdll ole32 oleaut32
     secur32 shell32 user32 userenv ws2_32
   )
 elseif(APPLE)

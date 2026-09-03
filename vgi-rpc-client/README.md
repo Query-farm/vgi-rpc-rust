@@ -36,6 +36,11 @@ canonical Python client: you build the request parameters as a one-row Arrow
   external-location resolution, sticky sessions, 413 request-externalization,
   415/zstd codec negotiation, a request timeout, and opt-in connection-level
   retries. *(feature `http`, default)*
+- **HTTP over Iroh** — the same typed, stateless HTTP state machine carried on
+  authenticated `iroh-http/2` streams. A canonical
+  `httpi://<endpoint-id>[/base-path]` target selects the peer; direct and relay
+  address hints are optional. Ambiguously dispatched requests are never
+  retried. *(feature `iroh`, optional)*
 - **POSIX shared memory** — the `shm` side-channel for large batches.
   *(feature `shm`)*
 
@@ -62,11 +67,37 @@ Streaming uses `open_producer` / `open_exchange`, which return a
 `StreamSession` (`tick` for producers, `exchange` for bidirectional streams,
 plus `cancel`/`close`). HTTP connections use `HttpClient::connect(url)`.
 
+Native HTTP-over-Iroh uses the same `HttpClient` type and methods:
+
+```rust,no_run
+use std::time::Duration;
+use vgi_rpc_client::HttpClient;
+
+# fn main() -> vgi_rpc_client::Result<()> {
+let mut client = HttpClient::connect_httpi(
+    "httpi://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/vgi",
+)?
+.connect_timeout(Duration::from_secs(15))
+.io_timeout(Duration::from_secs(30))
+.build()?;
+let description = client.describe()?;
+# let _ = description;
+# Ok(()) }
+```
+
+The default key is generated once and remains stable for this process. Use
+`secret_key`, `endpoint_config`, `relay_urls`, `no_relay`,
+`remote_relay_url`, and `direct_addresses` when a deployment needs persistent
+identity or explicit routing. Construction and calls are blocking; use them on
+a blocking thread rather than a Tokio worker. Externalized payload URLs remain
+ordinary HTTP(S) and use the independently configurable external HTTP client.
+
 ## Features
 
 | feature | default | what it adds |
 |---------|:-:|--------------|
 | `http`  | ✅ | `HttpClient` + the HTTP production features above |
+| `iroh`  | — | Native `httpi://` execution through `vgi-iroh-transport`; implies `http` |
 | `unix`  | — | AF_UNIX transport |
 | `shm`   | — | POSIX shared-memory side-channel |
 

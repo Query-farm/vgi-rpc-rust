@@ -41,7 +41,7 @@ integration tests pass with all features enabled. Workspace-wide
 | crate | summary |
 |-------|---------|
 | `vgi-rpc/` | Library. Wire protocol, server dispatch, HTTP, auth, observability, external locations, introspection. |
-| `vgi-rpc-client/` | Blocking client for stateful byte streams and HTTP. |
+| `vgi-rpc-client/` | Blocking client for stateful byte streams, HTTP, and optional native `httpi://`. |
 | `vgi-rpc-iroh/` | Optional authenticated Iroh/QUIC adapter. Carries the raw stateful Arrow framing without adding Iroh to the base crates. |
 | `vgi-rpc-iroh-browser/` | Experimental browser-capable, client-only Hyper request path over a shared Iroh endpoint. |
 

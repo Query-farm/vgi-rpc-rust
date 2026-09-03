@@ -128,3 +128,7 @@ a VGI call or stream turn. `IrohTransport::connect_id` and `connect_addr`
 remain as one-connection/one-stream convenience constructors.
 
 Iroh 1.1.0 has MSRV 1.91; this workspace tests the adapter with Rust 1.97.
+
+For stateless typed VGI calls over `iroh-http/2`, enable the `iroh` feature on
+`vgi-rpc-client` and construct the same `HttpClient` state machine with
+`HttpClient::connect_httpi("httpi://<endpoint-id>[/base-path]")`.

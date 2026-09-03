@@ -1,7 +1,8 @@
 //! Blocking client for the [`vgi-rpc`](vgi_rpc) Arrow-IPC RPC framework.
 //!
-//! Mirrors the canonical Python `vgi_rpc` client over four transports —
-//! subprocess/stdio, AF_UNIX, HTTP, and the POSIX shared-memory side-channel.
+//! Mirrors the canonical Python `vgi_rpc` client over subprocess/stdio,
+//! AF_UNIX, TCP, HTTP, optional native HTTP-over-Iroh, and the POSIX
+//! shared-memory side-channel.
 //! The client is *dynamic* and schema-first: callers build the params
 //! `RecordBatch` (params-as-columns, one row) and receive the result batch,
 //! matching the schema-driven server model.
@@ -27,10 +28,16 @@ pub mod transport;
 #[cfg(feature = "http")]
 pub mod http;
 
+#[cfg(feature = "iroh")]
+pub mod httpi;
+
 #[cfg(feature = "http")]
 pub use http::{
     HttpClient, HttpClientBuilder, HttpServerCapabilities, HttpStreamSession, UploadUrl,
 };
+
+#[cfg(feature = "iroh")]
+pub use httpi::{HttpiClientBuilder, HttpiTarget};
 
 pub use client::{ClientTransportOptions, OnLog, RpcClient, StreamKind, StreamSession};
 pub use envelope::{classify, BatchKind};

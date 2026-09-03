@@ -7,3 +7,7 @@ Iroh endpoint, pools connections by remote endpoint ID and ALPN, opens
 
 This crate is the native transport layer. Arrow framing remains in VGI clients,
 and the browser continues to use `vgi-rpc-iroh-browser`.
+
+`process_secret_key()` supplies an in-memory, lazily generated identity for
+native clients that want stable identity across independently built client
+objects without persisting private key material.

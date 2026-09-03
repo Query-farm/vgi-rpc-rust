@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -26,6 +27,17 @@ use tokio_util::sync::CancellationToken;
 
 pub const VGI_IROH_ALPN: &[u8] = b"vgi-rpc/arrow-mux/1";
 pub const IROH_HTTP_ALPN: &[u8] = b"iroh-http/2";
+
+/// Return the lazily generated process-wide client identity.
+///
+/// Native adapters use this when an application does not supply persistent
+/// key material. It keeps independently constructed clients that opt into this
+/// helper on one cryptographic identity for the lifetime of the process
+/// without writing that private key to disk.
+pub fn process_secret_key() -> SecretKey {
+    static KEY: OnceLock<SecretKey> = OnceLock::new();
+    KEY.get_or_init(SecretKey::generate).clone()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -90,7 +102,7 @@ impl DispatchCertainty {
     pub const Dispatched: Self = Self::Sent;
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct TransportError {
     pub stage: ErrorStage,
@@ -932,6 +944,7 @@ mod tests {
                 .id,
             secret.public()
         );
+        assert_eq!(process_secret_key().public(), process_secret_key().public());
     }
 
     fn hex_string(bytes: &[u8]) -> String {

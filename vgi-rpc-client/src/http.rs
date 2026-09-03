@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
-use reqwest::blocking::Client as HttpInner;
+use reqwest::blocking::Client as ReqwestClient;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use reqwest::{Method, StatusCode};
 
@@ -79,6 +79,145 @@ const MAX_SAFE_RESPONSE_BYTES: u64 = (1u64 << 53) - 1;
 /// The only coding this client can produce for request bodies. Also the
 /// assumed server capability when `VGI-Supported-Encodings` is absent.
 const DEFAULT_REQUEST_ENCODING: &str = "zstd";
+
+enum HttpBackend {
+    Reqwest(ReqwestClient),
+    #[cfg(feature = "iroh")]
+    Iroh(crate::httpi::HttpiExecutor),
+}
+
+struct BackendResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    content_length: Option<u64>,
+    body: Box<dyn Read>,
+}
+
+impl BackendResponse {
+    fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+}
+
+struct BackendRequestError {
+    error: RpcError,
+    retry_safe: bool,
+}
+
+impl HttpBackend {
+    fn execute(
+        &self,
+        method: Method,
+        target: String,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    ) -> std::result::Result<BackendResponse, BackendRequestError> {
+        match self {
+            Self::Reqwest(client) => client
+                .request(method, target)
+                .headers(headers)
+                .body(body)
+                .send()
+                .map(|response| BackendResponse {
+                    status: response.status(),
+                    headers: response.headers().clone(),
+                    content_length: response.content_length(),
+                    body: Box::new(response),
+                })
+                .map_err(|error| BackendRequestError {
+                    // Preserve the existing reqwest retry behavior. Native
+                    // Iroh is stricter below because it carries explicit
+                    // dispatch certainty.
+                    error: RpcError::new("TransportError", error.to_string()),
+                    retry_safe: true,
+                }),
+            #[cfg(feature = "iroh")]
+            Self::Iroh(client) => {
+                let raw_headers = headers
+                    .iter()
+                    .map(|(name, value)| {
+                        (name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec())
+                    })
+                    .collect();
+                client
+                    .execute(method.as_str(), &target, raw_headers, body)
+                    .map_err(|error| {
+                        let retry_safe =
+                            error.dispatch == vgi_iroh_transport::DispatchCertainty::NotSent;
+                        BackendRequestError {
+                            error: crate::httpi::transport_rpc_error(error),
+                            retry_safe,
+                        }
+                    })
+                    .and_then(|response| {
+                        let status = StatusCode::from_u16(response.status).map_err(|error| {
+                            BackendRequestError {
+                                error: RpcError::new(
+                                    "ProtocolError",
+                                    format!("invalid Iroh HTTP response status: {error}"),
+                                ),
+                                retry_safe: false,
+                            }
+                        })?;
+                        let mut headers = HeaderMap::new();
+                        for (name, value) in response.headers {
+                            let name = HeaderName::from_bytes(&name).map_err(|error| {
+                                BackendRequestError {
+                                    error: RpcError::new(
+                                        "ProtocolError",
+                                        format!("invalid Iroh HTTP response header name: {error}"),
+                                    ),
+                                    retry_safe: false,
+                                }
+                            })?;
+                            let value = HeaderValue::from_bytes(&value).map_err(|error| {
+                                BackendRequestError {
+                                    error: RpcError::new(
+                                        "ProtocolError",
+                                        format!("invalid Iroh HTTP response header value: {error}"),
+                                    ),
+                                    retry_safe: false,
+                                }
+                            })?;
+                            headers.append(name, value);
+                        }
+                        let content_length = parse_content_length(&headers).map_err(|error| {
+                            BackendRequestError {
+                                error,
+                                retry_safe: false,
+                            }
+                        })?;
+                        Ok(BackendResponse {
+                            status,
+                            headers,
+                            content_length,
+                            body: Box::new(response.body),
+                        })
+                    })
+            }
+        }
+    }
+
+    fn target(&self, base_url: &str, prefix: &str, path: &str) -> String {
+        match self {
+            Self::Reqwest(_) => format!("{}{}/{}", base_url, prefix, path),
+            #[cfg(feature = "iroh")]
+            Self::Iroh(_) => format!("{prefix}/{path}"),
+        }
+    }
+
+    #[cfg(feature = "iroh")]
+    fn iroh_endpoint_id(&self) -> Option<String> {
+        match self {
+            Self::Reqwest(_) => None,
+            Self::Iroh(client) => Some(client.endpoint_id()),
+        }
+    }
+}
 
 fn zstd_window_log_for_limit(max_size: usize) -> u32 {
     // A level-1 streaming encoder advertises a 512 KiB history window even
@@ -158,7 +297,7 @@ pub struct UploadUrl {
 /// Reqwest-blocking `Fetcher` that returns the still-encoded body under a hard
 /// cap. The shared external-location resolver performs bounded decoding.
 struct ClientHttpFetcher {
-    client: HttpInner,
+    client: ReqwestClient,
 }
 
 fn redact_external_url(url: &str) -> String {
@@ -314,7 +453,7 @@ pub struct HttpClientBuilder {
     on_log: Option<OnLog>,
     relax_nullability: bool,
     protocol_version: Option<String>,
-    inner: Option<HttpInner>,
+    inner: Option<ReqwestClient>,
     timeout: Option<Duration>,
     retry: RetryConfig,
     compression_level: Option<i32>,
@@ -344,7 +483,7 @@ impl HttpClientBuilder {
     }
 
     /// Supply a preconfigured reqwest client (e.g. with custom TLS / auth).
-    pub fn client(mut self, client: HttpInner) -> Self {
+    pub fn client(mut self, client: ReqwestClient) -> Self {
         self.inner = Some(client);
         self
     }
@@ -444,9 +583,9 @@ impl HttpClientBuilder {
 
     pub fn build(self) -> Result<HttpClient> {
         let inner = match self.inner {
-            Some(c) => c,
+            Some(ref c) => c.clone(),
             None => {
-                let mut b = HttpInner::builder();
+                let mut b = ReqwestClient::builder();
                 if let Some(t) = self.timeout {
                     b = b.timeout(t);
                 }
@@ -455,8 +594,36 @@ impl HttpClientBuilder {
                 })?
             }
         };
+        self.build_with_backend(HttpBackend::Reqwest(inner.clone()), inner)
+    }
+
+    #[cfg(feature = "iroh")]
+    pub(crate) fn build_httpi(self, executor: crate::httpi::HttpiExecutor) -> Result<HttpClient> {
+        let external_client = match self.inner.as_ref() {
+            Some(client) => client.clone(),
+            None => {
+                let mut builder = ReqwestClient::builder();
+                if let Some(timeout) = self.timeout {
+                    builder = builder.timeout(timeout);
+                }
+                builder.build().map_err(|error| {
+                    RpcError::new(
+                        "TransportError",
+                        format!("build external HTTP client: {error}"),
+                    )
+                })?
+            }
+        };
+        self.build_with_backend(HttpBackend::Iroh(executor), external_client)
+    }
+
+    fn build_with_backend(
+        self,
+        backend: HttpBackend,
+        external_client: ReqwestClient,
+    ) -> Result<HttpClient> {
         // The fetcher uses its own redirect-free, timed client (SSRF-safer).
-        let fetch_client = HttpInner::builder()
+        let fetch_client = ReqwestClient::builder()
             .timeout(self.timeout.unwrap_or(DEFAULT_TIMEOUT))
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -475,7 +642,8 @@ impl HttpClientBuilder {
             base_url: self.base_url.trim_end_matches('/').to_string(),
             prefix: self.prefix,
             headers: self.headers,
-            inner,
+            backend,
+            external_client,
             on_log: self.on_log,
             relax_nullability: self.relax_nullability,
             protocol_version: self.protocol_version,
@@ -516,7 +684,10 @@ pub struct HttpClient {
     base_url: String,
     prefix: String,
     headers: HeaderMap,
-    inner: HttpInner,
+    backend: HttpBackend,
+    /// Ordinary HTTP(S) remains authoritative for external upload URLs even
+    /// when VGI requests themselves use `httpi://`.
+    external_client: ReqwestClient,
     on_log: Option<OnLog>,
     relax_nullability: bool,
     protocol_version: Option<String>,
@@ -559,8 +730,22 @@ impl HttpClient {
         }
     }
 
-    fn url(&self, path: &str) -> String {
-        format!("{}{}/{}", self.base_url, self.prefix, path)
+    /// Start building a native blocking client for a canonical
+    /// `httpi://<endpoint-id>[/base-path]` target.
+    #[cfg(feature = "iroh")]
+    pub fn connect_httpi(target: &str) -> Result<crate::httpi::HttpiClientBuilder> {
+        crate::httpi::HttpiClientBuilder::connect(target)
+    }
+
+    /// Cryptographic identity presented by this native HTTPi client. Ordinary
+    /// HTTP clients return `None`.
+    #[cfg(feature = "iroh")]
+    pub fn iroh_endpoint_id(&self) -> Option<String> {
+        self.backend.iroh_endpoint_id()
+    }
+
+    fn target(&self, path: &str) -> String {
+        self.backend.target(&self.base_url, &self.prefix, path)
     }
 
     /// Build per-request headers: content type, codec advertisement, and
@@ -703,7 +888,7 @@ impl HttpClient {
             (body.to_vec(), None)
         };
         let headers = self.build_headers(content_encoding);
-        let url = self.url(path);
+        let target = self.target(path);
 
         let attempts = if retryable {
             self.retry.max_attempts.max(1)
@@ -715,12 +900,12 @@ impl HttpClient {
             if attempt > 0 {
                 std::thread::sleep(self.retry.delay_before(attempt));
             }
-            let res = self
-                .inner
-                .post(&url)
-                .headers(headers.clone())
-                .body(payload.clone())
-                .send();
+            let res = self.backend.execute(
+                Method::POST,
+                target.clone(),
+                headers.clone(),
+                payload.clone(),
+            );
             match res {
                 Ok(resp) => {
                     let status = resp.status();
@@ -827,11 +1012,14 @@ impl HttpClient {
                     };
                     return Ok((resp_headers, decoded, status));
                 }
-                Err(e) => {
+                Err(error) => {
                     last_err = Some(RpcError::new(
-                        "TransportError",
-                        format!("http post {path}: {e}"),
+                        error.error.error_type,
+                        format!("http post {path}: {}", error.error.message),
                     ));
+                    if !error.retry_safe {
+                        break;
+                    }
                 }
             }
         }
@@ -986,11 +1174,14 @@ impl HttpClient {
                 .expect("validated response budget is a valid header"),
         );
         let resp = self
-            .inner
-            .request(Method::OPTIONS, self.url("health"))
-            .headers(headers)
-            .send()
-            .map_err(|e| RpcError::new("TransportError", format!("options health: {e}")))?;
+            .backend
+            .execute(Method::OPTIONS, self.target("health"), headers, Vec::new())
+            .map_err(|error| {
+                RpcError::new(
+                    error.error.error_type,
+                    format!("options health: {}", error.error.message),
+                )
+            })?;
         require_response_budget_discovery(resp.status(), resp.headers())?;
         let max_response_bytes = parse_max_response_bytes(resp.headers())?;
         let mut caps = parse_caps(resp.headers());
@@ -1097,11 +1288,12 @@ impl HttpClient {
                     if let Ok(v) = HeaderValue::from_str(&tok) {
                         h.insert(SESSION_HEADER, v);
                     }
-                    let _ = self
-                        .inner
-                        .request(Method::DELETE, self.url(SESSION_ENDPOINT))
-                        .headers(h)
-                        .send();
+                    let _ = self.backend.execute(
+                        Method::DELETE,
+                        self.target(SESSION_ENDPOINT),
+                        h,
+                        Vec::new(),
+                    );
                 }
             }
         }
@@ -1141,7 +1333,7 @@ impl HttpClient {
             .next()
             .ok_or_else(|| RpcError::new("ProtocolError", "server returned no upload URLs"))?;
         // PUT the inline body to the upload URL.
-        put_external_body(&self.inner, &url.upload_url, body)?;
+        put_external_body(&self.external_client, &url.upload_url, body)?;
         // Build the pointer body: zero-row batch (original schema) + original
         // dispatch metadata + vgi_rpc.location.
         md.insert(LOCATION_KEY.to_string(), url.download_url);
@@ -1150,7 +1342,7 @@ impl HttpClient {
     }
 }
 
-fn put_external_body(client: &HttpInner, url: &str, body: &[u8]) -> Result<()> {
+fn put_external_body(client: &ReqwestClient, url: &str, body: &[u8]) -> Result<()> {
     let response = client
         .put(url)
         .header(CONTENT_TYPE, ARROW_CONTENT_TYPE)
@@ -1172,12 +1364,12 @@ fn put_external_body(client: &HttpInner, url: &str, body: &[u8]) -> Result<()> {
 }
 
 fn read_bounded_response(
-    mut response: reqwest::blocking::Response,
+    mut response: BackendResponse,
     max_bytes: usize,
     description: &str,
     limit_error_type: &str,
 ) -> Result<Vec<u8>> {
-    if let Some(length) = response.content_length() {
+    if let Some(length) = response.content_length {
         if length > max_bytes as u64 {
             return Err(RpcError::new(
                 limit_error_type,
@@ -1185,7 +1377,7 @@ fn read_bounded_response(
             ));
         }
     }
-    read_bounded(&mut response, max_bytes, description, limit_error_type)
+    read_bounded(&mut response.body, max_bytes, description, limit_error_type)
 }
 
 fn read_bounded(
@@ -1197,9 +1389,16 @@ fn read_bounded(
     let mut out = Vec::with_capacity(max_bytes.min(64 * 1024));
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| RpcError::new("TransportError", format!("read {description}: {e}")))?;
+        let n = reader.read(&mut buf).map_err(|error| {
+            #[cfg(feature = "iroh")]
+            if let Some(error) = error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<vgi_iroh_transport::TransportError>())
+            {
+                return crate::httpi::transport_rpc_error(error.clone());
+            }
+            RpcError::new("TransportError", format!("read {description}: {error}"))
+        })?;
         if n == 0 {
             return Ok(out);
         }
@@ -1801,6 +2000,36 @@ fn parse_max_response_bytes(headers: &HeaderMap) -> Result<Option<u64>> {
     Ok(Some(parsed))
 }
 
+#[cfg(feature = "iroh")]
+fn parse_content_length(headers: &HeaderMap) -> Result<Option<u64>> {
+    let mut values = headers.get_all(reqwest::header::CONTENT_LENGTH).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(RpcError::new(
+            "ProtocolError",
+            "Iroh HTTP Content-Length must occur at most once",
+        ));
+    }
+    let value = value.to_str().map_err(|_| {
+        RpcError::new(
+            "ProtocolError",
+            "Iroh HTTP Content-Length must contain ASCII digits",
+        )
+    })?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(RpcError::new(
+            "ProtocolError",
+            "Iroh HTTP Content-Length must contain ASCII digits",
+        ));
+    }
+    value
+        .parse()
+        .map(Some)
+        .map_err(|_| RpcError::new("ProtocolError", "Iroh HTTP Content-Length is too large"))
+}
+
 fn parse_caps(h: &HeaderMap) -> HttpServerCapabilities {
     let get = |name: &str| {
         h.get(name)
@@ -2153,7 +2382,7 @@ mod tests {
         drop(listener);
         let secret = "UPLOAD_QUERY_SECRET_7f33";
         let url = format!("http://{address}/upload?signature={secret}");
-        let client = HttpInner::builder()
+        let client = ReqwestClient::builder()
             .timeout(Duration::from_millis(250))
             .build()
             .unwrap();

@@ -185,15 +185,21 @@ jobs:
           DRY_RUN=true
           if [ "$GITHUB_EVENT_NAME" = push ]; then DRY_RUN=false; fi
           UA="vgi-rpc-release (hello@query.farm)"
+          dry_run_patches=(
+            --config 'patch.crates-io.vgi-rpc-macros.path="vgi-rpc-macros"'
+            --config 'patch.crates-io.vgi-rpc.path="vgi-rpc"'
+            --config 'patch.crates-io.vgi-iroh-transport.path="vgi-iroh-transport"'
+            --config 'patch.crates-io.vgi-rpc-client.path="vgi-rpc-client"'
+          )
           for crate in vgi-rpc-macros vgi-rpc vgi-iroh-transport vgi-rpc-client vgi-iroh-cabi vgi-rpc-s3 vgi-rpc-gcs; do
             ver=$(cargo metadata --no-deps --format-version 1 \
               | jq -r --arg c "$crate" '.packages[] | select(.name==$c) | .version')
             if [ "$DRY_RUN" = "true" ]; then
               echo "::group::dry-run $crate $ver"
-              # Dependency-order dry runs cannot resolve earlier workspace
-              # crates because dry-run never uploads them. The full sanity
-              # gate compiled the workspace; here validate package contents.
-              cargo publish --dry-run --no-verify -p "$crate" --locked
+              # Dry-run never uploads earlier workspace crates. Patch their
+              # crates.io identities back to this checkout so later packages
+              # receive the same verification build as a real ordered publish.
+              cargo publish --dry-run -p "$crate" --locked "${dry_run_patches[@]}"
               echo "::endgroup::"
               continue
             fi

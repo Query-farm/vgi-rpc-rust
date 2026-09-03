@@ -85,7 +85,8 @@ async function runDemo(): Promise<void> {
     });
     adapterWorker.addEventListener("message", (event: MessageEvent) => {
       const message = event.data as
-        { type?: string; endpointId?: string; error?: string } | undefined;
+        | { type?: string; endpointId?: string; error?: string }
+        | undefined;
       if (message?.type === "demo-iroh-identity") {
         try {
           const endpointId = parseEndpointId(message.endpointId ?? "");
@@ -129,13 +130,22 @@ async function runDemo(): Promise<void> {
       allowUnsignedExtensions: true,
       query: { castBigIntToDouble: false },
     });
+    const extensionResponse = await fetch("./vgi.duckdb_extension.wasm");
+    if (!extensionResponse.ok) {
+      throw new Error(
+        `fetch VGI extension failed: ${extensionResponse.status} ${extensionResponse.statusText}`,
+      );
+    }
+    await db.registerFileBuffer(
+      "vgi.duckdb_extension.wasm",
+      new Uint8Array(await extensionResponse.arrayBuffer()),
+    );
     const connection = await db.connect();
     try {
-      await connection.query(
-        `SET custom_extension_repository='${location.origin}/extensions'`,
-      );
-      await connection.query("INSTALL vgi");
-      await connection.query("LOAD vgi");
+      // Loading a registered file avoids DuckDB's extension cache. Browser
+      // builds do not necessarily expose a writable home directory for
+      // INSTALL, and the demo already ships this exact extension artifact.
+      await connection.query("LOAD 'vgi.duckdb_extension.wasm'");
       appendLog("Loaded the VGI extension.");
 
       setStatus(`Attaching ${target}…`);
@@ -155,8 +165,7 @@ async function runDemo(): Promise<void> {
       }
       const observedPrincipal = String(identityResult.getChildAt(0)?.get(0));
       const localIdentity = await browserIdentity;
-      const expectedPrincipal =
-        `peer/iroh/iroh%3Abrowser-demo/${localIdentity}`;
+      const expectedPrincipal = `peer/iroh/iroh%3Abrowser-demo/${localIdentity}`;
       if (observedPrincipal !== expectedPrincipal) {
         throw new Error(
           "worker CallContext identity mismatch: " +
@@ -181,7 +190,7 @@ async function runDemo(): Promise<void> {
       renderResult(result);
       const rows = resultRows(result);
       window.__vgiIrohDemo = {
-        done: true,
+        done: false,
         browserEndpointId,
         rows,
       };
@@ -194,7 +203,7 @@ async function runDemo(): Promise<void> {
       error instanceof Error ? (error.stack ?? error.message) : String(error);
     appendLog(detail);
     window.__vgiIrohDemo = {
-      done: true,
+      done: false,
       browserEndpointId,
       error: detail,
     };
@@ -203,8 +212,21 @@ async function runDemo(): Promise<void> {
     try {
       await teardown();
     } catch (error) {
-      appendLog(`Teardown failed: ${String(error)}`);
+      const detail = `Teardown failed: ${String(error)}`;
+      appendLog(detail);
+      window.__vgiIrohDemo = {
+        ...(window.__vgiIrohDemo ?? { done: false }),
+        done: false,
+        error: [window.__vgiIrohDemo?.error, detail]
+          .filter((value): value is string => Boolean(value))
+          .join("\n"),
+      };
+      setStatus("Failed — see the log below.", "error");
     }
+    window.__vgiIrohDemo = {
+      ...(window.__vgiIrohDemo ?? {}),
+      done: true,
+    };
     runButton.disabled = false;
   }
 }
@@ -220,7 +242,9 @@ async function teardown(): Promise<void> {
 
 function resultRows(result: ArrowLikeResult): unknown[][] {
   return Array.from({ length: result.numRows }, (_, row) =>
-    result.schema.fields.map((_, column) => result.getChildAt(column)?.get(row)),
+    result.schema.fields.map((_, column) =>
+      result.getChildAt(column)?.get(row),
+    ),
   );
 }
 

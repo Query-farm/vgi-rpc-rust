@@ -105,7 +105,9 @@ jobs:
 
       - name: Test Iroh browser launcher
         working-directory: vgi-rpc-iroh-browser/demo
-        run: python3 -m unittest test_launch.py
+        run: |
+          python3 -m unittest test_launch.py
+          node --check verify.mjs
 
   fmt-clippy-test:
     runs-on: ubuntu-latest

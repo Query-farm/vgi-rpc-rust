@@ -236,6 +236,16 @@ def parse_args(argv=None):
         action="store_true",
         help="run the headless Chrome identity assertion and exit",
     )
+    parser.add_argument(
+        "--verify-browser",
+        action="append",
+        choices=("chrome", "firefox", "webkit", "safari"),
+        default=[],
+        help=(
+            "run the identity assertion in a browser engine and exit; repeat for "
+            "multiple engines (Safari requires macOS with safaridriver enabled)"
+        ),
+    )
     parser.add_argument("--no-autorun", action="store_true")
     parser.add_argument("--no-relay", action="store_true")
     parser.add_argument("--ready-timeout", type=float, default=30.0)
@@ -305,15 +315,19 @@ def main(argv=None) -> int:
             print(f"HTTPI_TARGET=httpi://{endpoint}", flush=True)
             print(f"BROWSER_URL={url}", flush=True)
             print("Press Ctrl-C to stop the browser server, bridge, and worker.", flush=True)
-            if args.verify:
+            verify_browsers = list(dict.fromkeys(args.verify_browser))
+            if args.verify and "chrome" not in verify_browsers:
+                verify_browsers.insert(0, "chrome")
+            if verify_browsers:
                 verify_env = os.environ.copy()
                 if args.haybarn:
                     verify_env["HAYBARN_WASM"] = str(args.haybarn.resolve())
-                run_checked(
-                    ["node", "verify.mjs", url],
-                    repo / "vgi-rpc-iroh-browser" / "demo",
-                    verify_env,
-                )
+                for browser in verify_browsers:
+                    run_checked(
+                        ["node", "verify.mjs", url, browser],
+                        repo / "vgi-rpc-iroh-browser" / "demo",
+                        verify_env,
+                    )
                 return 0
             if not args.no_open:
                 webbrowser.open(url)

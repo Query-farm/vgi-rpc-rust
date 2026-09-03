@@ -108,17 +108,22 @@ The initial transport implementation now includes:
 - generated wasm-bindgen runtime smoke coverage in system Chrome, Playwright
   Firefox, and Playwright WebKit.
 
+The Haybarn demo now supplies VGI HTTP request construction, Arrow IPC
+serialization/decoding, response budgets, deadlines/cancellation, direct
+in-memory loading of a loadable VGI extension, and end-to-end relay and
+authenticated-identity assertions. Its verifier supports Chrome, Firefox,
+Playwright WebKit, and Apple Safari through `safaridriver`; Firefox, WebKit, and
+Safari 18.6 have passed that full path locally.
+
 A complete browser VGI release still needs:
 
-- VGI HTTP request construction and Arrow IPC serialization/decoding.
-- Response-body byte limits and explicit request deadlines/cancellation.
-- VGI-aware stale-connection retry rules for provably idempotent calls. The
-  transport itself never replays an ambiguous request.
-- generated wasm-bindgen package publication and DuckDB/Haybarn integration.
-- real release-Chrome, release-Firefox, and Apple Safari relay qualification
-  against a deployed worker. The current cross-engine gate exercises generated
-  bindings without relay traffic, and Playwright WebKit is not Apple Safari.
-- Bundle-size, startup-time, and memory measurements.
+- generated wasm-bindgen package publication and coordinated distribution of a
+  loadable Haybarn engine plus the ABI-matched VGI extension;
+- a stable hosted full-relay regression lane (Linux CI currently runs the
+  generated-binding smoke, while actual Safari requires a macOS host);
+- VGI-aware stale-connection retry rules for provably idempotent calls—the
+  transport itself never replays an ambiguous request;
+- bundle-size, startup-time, and memory measurements.
 
 Browser operation is client-only. A browser does not become a general
 internet-facing Iroh HTTP server through this crate.

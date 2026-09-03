@@ -47,6 +47,19 @@ class LauncherTests(unittest.TestCase):
         with self.assertRaisesRegex(launch.DemoError, "non-canonical"):
             launch.browser_url("127.0.0.1", 8123, endpoint.upper())
 
+    def test_browser_verification_engines_are_repeatable(self) -> None:
+        args = launch.parse_args(
+            [
+                "--verify-browser",
+                "firefox",
+                "--verify-browser",
+                "webkit",
+                "--verify-browser",
+                "safari",
+            ]
+        )
+        self.assertEqual(args.verify_browser, ["firefox", "webkit", "safari"])
+
     def test_asset_server_sets_cross_origin_isolation_headers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             public = Path(temporary)

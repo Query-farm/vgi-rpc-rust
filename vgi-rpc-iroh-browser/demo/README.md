@@ -19,7 +19,7 @@ principal ends in the browser endpoint's own EndpointId.
 
 ## Prerequisites
 
-- A built Haybarn WASM checkout, including its COI engine and VGI page bridge.
+- A loadable Haybarn WASM build, including its COI engine and VGI page bridge.
 - A VGI loadable WASM extension compatible with that engine.
 - Homebrew LLVM on macOS (Apple clang has no WebAssembly backend), or LLVM clang
   and `llvm-ar` on Linux.
@@ -52,6 +52,23 @@ identity.
 For the automated Chrome assertion, add `--verify`. It exits non-zero unless
 the page is cross-origin isolated, ATTACH and SELECT succeed, and the worker's
 authenticated Iroh principal matches the browser EndpointId.
+
+The same full relay path can be qualified in Firefox and the Safari-family
+WebKit engine:
+
+```sh
+python3 vgi-rpc-iroh-browser/demo/launch.py \
+  --verify-browser firefox \
+  --verify-browser webkit \
+  --verify-browser safari
+```
+
+Install those engines once from `vgi-rpc-iroh-browser/js` with
+`npm ci && npx playwright install firefox webkit`. Playwright WebKit is useful
+compatibility coverage, but it is not Apple Safari. `--verify-browser safari`
+uses Apple's `safaridriver` against the installed Safari release on macOS;
+enable Safari's Develop → Allow Remote Automation setting once before running
+it. Safari verification is intentionally unavailable on Linux CI runners.
 
 ## Build and run
 
@@ -89,7 +106,7 @@ Environment overrides understood by `build.mjs`:
 | Variable                 | Default                                           |
 | ------------------------ | ------------------------------------------------- |
 | `HAYBARN_WASM`           | `~/Development/haybarn/haybarn-wasm`              |
-| `VGI_ENGINE_ROOT`        | same as `HAYBARN_WASM`                             |
+| `VGI_ENGINE_ROOT`        | same as `HAYBARN_WASM`; checkout or npm package   |
 | `IROH_BINDINGS`          | repository `target/browser-bindings`              |
 | `VGI_EXT_WASM`           | the extension under the Haybarn version directory |
 | `VGI_ENGINE_VERSION_DIR` | `v1.5.5`                                          |
@@ -98,6 +115,12 @@ Environment overrides understood by `build.mjs`:
 `serve.mjs` sets COOP, COEP, and CORP headers. A generic static server without
 those headers will not expose `SharedArrayBuffer`, and the demo intentionally
 fails before starting Haybarn.
+
+The demo registers the VGI extension bytes directly with Haybarn and loads the
+registered file. This avoids DuckDB's persistent extension cache, which is not
+available when the browser virtual filesystem has no home directory. The
+engine must still be a loadable build; the ordinary non-loadable Haybarn bundle
+will reject the extension.
 
 ## Security boundary
 

@@ -33,23 +33,16 @@ const extension =
 const defaultOutput = join(here, "dist");
 const output = resolve(process.env.DEMO_DIST ?? defaultOutput);
 const outputMarker = ".vgi-iroh-browser-demo-output";
+const enginePackageRoot = existsSync(
+  join(engineRoot, "dist", "duckdb-browser.mjs"),
+)
+  ? engineRoot
+  : join(engineRoot, "packages", "duckdb-wasm");
 const engineWasmCandidates = [
-  join(
-    engineRoot,
-    "packages",
-    "duckdb-wasm",
-    "src",
-    "bindings",
-    "duckdb-coi.wasm",
-  ),
-  join(engineRoot, "packages", "duckdb-wasm", "dist", "duckdb-coi.wasm"),
+  join(enginePackageRoot, "src", "bindings", "duckdb-coi.wasm"),
+  join(enginePackageRoot, "dist", "duckdb-coi.wasm"),
 ];
-const haybarnDist = join(
-  engineRoot,
-  "packages",
-  "duckdb-wasm",
-  "dist",
-);
+const haybarnDist = join(enginePackageRoot, "dist");
 const engineWasm = engineWasmCandidates.find(existsSync);
 const generatedJavaScript = join(generatedBindings, "vgi_rpc_iroh_browser.js");
 const generatedWasm = join(generatedBindings, "vgi_rpc_iroh_browser_bg.wasm");
@@ -104,7 +97,10 @@ if (existsSync(output)) {
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
     throw new Error(`DEMO_DIST must be a real directory: ${output}`);
   }
-  if (output !== resolve(defaultOutput) && !existsSync(join(output, outputMarker))) {
+  if (
+    output !== resolve(defaultOutput) &&
+    !existsSync(join(output, outputMarker))
+  ) {
     throw new Error(
       `refusing to replace unmarked DEMO_DIST: ${output}; choose a new directory`,
     );
@@ -122,14 +118,7 @@ for (const file of [
 }
 copyFileSync(engineWasm, join(output, "duckdb-coi.wasm"));
 copyFileSync(generatedWasm, join(output, "vgi_rpc_iroh_browser_bg.wasm"));
-const extensionOutput = join(
-  output,
-  "extensions",
-  engineVersion,
-  "wasm_threads",
-);
-mkdirSync(extensionOutput, { recursive: true });
-copyFileSync(extension, join(extensionOutput, "vgi.duckdb_extension.wasm"));
+copyFileSync(extension, join(output, "vgi.duckdb_extension.wasm"));
 
 const common = {
   bundle: true,
@@ -159,4 +148,4 @@ await esbuild.build({
 });
 
 console.log(`Browser demo built in ${output}`);
-console.log(`Extension repository version: ${engineVersion}`);
+console.log(`VGI extension ABI version: ${engineVersion}`);

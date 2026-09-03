@@ -11,6 +11,7 @@ declare module "demo-haybarn" {
     constructor(logger: ConsoleLogger, worker: Worker);
     instantiate(mainModule: string, pthreadWorker?: string): Promise<void>;
     open(options: unknown): Promise<void>;
+    registerFileBuffer(name: string, buffer: Uint8Array): Promise<void>;
     connect(): Promise<{
       query(sql: string): Promise<unknown>;
       close(): Promise<void>;

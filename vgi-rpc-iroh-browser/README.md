@@ -42,11 +42,12 @@ wasm-bindgen JavaScript glue in system Chrome, Playwright Firefox, and
 Playwright WebKit.
 
 This is a generated-binding and WebAssembly-runtime compatibility gate in all
-three browser engines. It does not contact a relay or qualify the complete
-Haybarn demo. Playwright WebKit is the closest reproducible Safari-family
-engine available on the Linux CI runner, but it is not Apple Safari and must
-not be treated as Safari certification. The end-to-end relay and authenticated
-identity demo remains a separate real-browser qualification.
+three browser engines. The separate Haybarn demo can run the end-to-end relay,
+query, and authenticated-identity assertions in Chrome, Firefox, Playwright
+WebKit, and Apple Safari through `safaridriver`. Linux CI runs the generated
+binding smoke only; the full relay qualification is an explicit release test.
+Playwright WebKit remains compatibility coverage rather than Safari
+certification.
 
 One node should be shared by the whole DuckDB engine so raw and HTTP requests
 present the same cryptographic endpoint identity. HTTP response bodies are raw

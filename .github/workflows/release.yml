@@ -7,7 +7,8 @@ name: Release
 # Setup checklist (one-time):
 #   1. Register each crate on crates.io as a Trusted Publisher
 #      bound to this repo + this workflow file + the `crates-io`
-#      environment below.
+#      environment below. `vgi-iroh-transport` and `vgi-iroh-cabi` need their
+#      own entries in addition to the five original published crates.
 #   2. Create a GitHub Environment named `crates-io` (Settings →
 #      Environments) with required reviewers.  The environment
 #      gate is what makes a release require a human "approve"
@@ -47,8 +48,58 @@ permissions:
   contents: write
 
 jobs:
+  cabi-artifacts:
+    name: C ABI (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (MSRV 1.97)
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: iroh-cabi-${{ matrix.target }}
+
+      - name: Build static C ABI
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: cargo build --locked --release --target "${{ matrix.target }}" -p vgi-iroh-cabi
+
+      - name: Package relocatable C ABI
+        shell: bash
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="vgi-iroh-cabi") | .version')
+          scripts/package-iroh-cabi.sh \
+            "${{ matrix.target }}" "$VERSION" "$GITHUB_SHA" target release-assets
+
+      - name: Upload C ABI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vgi-iroh-cabi-${{ matrix.target }}
+          path: release-assets/*
+          if-no-files-found: error
+
   publish:
     name: Publish to crates.io
+    needs: cabi-artifacts
     runs-on: ubuntu-latest
     environment: crates-io
     steps:
@@ -60,6 +111,13 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Download native C ABI release assets
+        uses: actions/download-artifact@v5
+        with:
+          pattern: vgi-iroh-cabi-*
+          path: release-assets
+          merge-multiple: true
 
       - name: Sanity gate — fmt, clippy, test, conformance run (best-effort)
         # The full CI already validates these on every push to main;
@@ -91,7 +149,7 @@ jobs:
           set -euo pipefail
           DRY_RUN="${{ github.event.inputs.dry_run }}"
           UA="vgi-rpc-release (hello@query.farm)"
-          for crate in vgi-rpc-macros vgi-rpc vgi-rpc-client vgi-rpc-s3 vgi-rpc-gcs; do
+          for crate in vgi-rpc-macros vgi-rpc vgi-iroh-transport vgi-rpc-client vgi-iroh-cabi vgi-rpc-s3 vgi-rpc-gcs; do
             ver=$(cargo metadata --no-deps --format-version 1 \
               | jq -r --arg c "$crate" '.packages[] | select(.name==$c) | .version')
             if [ "$DRY_RUN" = "true" ]; then
@@ -139,10 +197,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "Release $GITHUB_REF_NAME already exists — skipping"
-            exit 0
-          fi
           VER="${GITHUB_REF_NAME#v}"
           # Extract just this version's section from CHANGELOG.md.
           awk -v ver="$VER" '
@@ -154,10 +208,13 @@ jobs:
             echo "No CHANGELOG section for $VER; falling back to a pointer."
             echo "See CHANGELOG.md for details." > /tmp/release-notes.md
           fi
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --notes-file /tmp/release-notes.md \
-            --verify-tag
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file /tmp/release-notes.md \
+              --verify-tag
+          fi
+          gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
 
       - name: Summarise
         if: success()
@@ -167,5 +224,7 @@ jobs:
           echo "  - https://crates.io/crates/vgi-rpc-macros"
           echo "  - https://crates.io/crates/vgi-rpc"
           echo "  - https://crates.io/crates/vgi-rpc-client"
+          echo "  - https://crates.io/crates/vgi-iroh-transport"
+          echo "  - https://crates.io/crates/vgi-iroh-cabi"
           echo "  - https://crates.io/crates/vgi-rpc-s3"
           echo "  - https://crates.io/crates/vgi-rpc-gcs"

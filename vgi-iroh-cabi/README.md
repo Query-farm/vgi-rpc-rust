@@ -14,3 +14,9 @@ be called while an operation is blocked.
 poll their own cancellation state. Its timeout is nonfatal. Writes deliberately
 do not expose a retryable polling timeout because a timed-out `write_all` may
 have already dispatched a prefix of the frame.
+
+Tagged GitHub releases publish relocatable static-library archives for Linux
+x86-64/ARM64, macOS x86-64/ARM64, and Windows x86-64. Each archive contains the
+matching header, library, license files, build manifest, and a sibling SHA-256
+file. The archive version is the Rust workspace release version; hosts must also
+check `vgi_iroh_abi_version()` against `VGI_IROH_ABI_VERSION` before use.

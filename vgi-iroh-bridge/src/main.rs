@@ -110,6 +110,11 @@ struct Args {
     /// Replace the default Iroh relay set. May be repeated.
     #[arg(long = "relay-url", value_name = "URL")]
     relay_url: Vec<String>,
+
+    /// Print directly dialable socket addresses after the EndpointId.
+    /// Intended for deterministic same-host integration tests and discovery.
+    #[arg(long)]
+    print_direct_addresses: bool,
 }
 
 #[tokio::main]
@@ -141,6 +146,7 @@ async fn main() -> Result<()> {
     }
     let endpoint = endpoint.bind().await.context("bind Iroh endpoint")?;
     let endpoint_id = endpoint.id();
+    let direct_addresses = endpoint.addr().ip_addrs().copied().collect::<Vec<_>>();
 
     let mut router = Router::builder(endpoint);
     if let Some(value) = args.raw_upstream.as_deref() {
@@ -157,6 +163,11 @@ async fn main() -> Result<()> {
     let router = router.spawn();
 
     println!("{endpoint_id}");
+    if args.print_direct_addresses {
+        for address in direct_addresses {
+            println!("DIRECT:{address}");
+        }
+    }
     tracing::info!(%endpoint_id, "VGI Iroh bridge ready");
     shutdown_signal().await?;
     router.shutdown().await.context("shut down Iroh router")?;
@@ -360,6 +371,7 @@ mod tests {
             "11",
             "--http-max-request-body-bytes",
             "4096",
+            "--print-direct-addresses",
         ])
         .unwrap();
 
@@ -376,6 +388,7 @@ mod tests {
         assert_eq!(http.max_request_body_wire_bytes, Some(4096));
         assert_eq!(http.max_request_body_decoded_bytes, Some(4096));
         assert!(!http.decompression);
+        assert!(args.print_direct_addresses);
 
         assert!(Args::try_parse_from([
             "vgi-iroh-bridge",

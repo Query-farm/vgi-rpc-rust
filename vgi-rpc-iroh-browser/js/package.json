@@ -1,0 +1,8 @@
+{
+  "name": "vgi-rpc-iroh-browser-engine-smoke",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

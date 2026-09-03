@@ -104,7 +104,9 @@ The initial transport implementation now includes:
 - streaming HTTP response bodies, duplicate header retention, an explicit raw
   representation flag, AbortSignal integration, and an optional application
   target resolver/authorizer;
-- wasm-target Clippy and TypeScript wrapper checks in CI.
+- wasm-target Clippy and TypeScript wrapper checks in CI;
+- generated wasm-bindgen runtime smoke coverage in system Chrome, Playwright
+  Firefox, and Playwright WebKit.
 
 A complete browser VGI release still needs:
 
@@ -113,9 +115,9 @@ A complete browser VGI release still needs:
 - VGI-aware stale-connection retry rules for provably idempotent calls. The
   transport itself never replays an ambiguous request.
 - generated wasm-bindgen package publication and DuckDB/Haybarn integration.
-- real Chromium, Firefox, and Safari relay qualification against a deployed
-  worker; the current CI gate compiles wasm and executes the WHATWG wrapper
-  tests under Node.
+- real release-Chrome, release-Firefox, and Apple Safari relay qualification
+  against a deployed worker. The current cross-engine gate exercises generated
+  bindings without relay traffic, and Playwright WebKit is not Apple Safari.
 - Bundle-size, startup-time, and memory measurements.
 
 Browser operation is client-only. A browser does not become a general

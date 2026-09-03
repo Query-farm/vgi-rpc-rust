@@ -38,7 +38,15 @@ same raw stream. Writes are serialized for ordering and QUIC backpressure.
 `abort()` and HTTP `cancel()` use independent cancellation state, so they remain
 callable during pending async I/O and wake it before resetting or dropping the
 underlying resource. CI exercises these overlaps through the real generated
-wasm-bindgen JavaScript glue in headless Chrome.
+wasm-bindgen JavaScript glue in system Chrome, Playwright Firefox, and
+Playwright WebKit.
+
+This is a generated-binding and WebAssembly-runtime compatibility gate in all
+three browser engines. It does not contact a relay or qualify the complete
+Haybarn demo. Playwright WebKit is the closest reproducible Safari-family
+engine available on the Linux CI runner, but it is not Apple Safari and must
+not be treated as Safari certification. The end-to-end relay and authenticated
+identity demo remains a separate real-browser qualification.
 
 One node should be shared by the whole DuckDB engine so raw and HTTP requests
 present the same cryptographic endpoint identity. HTTP response bodies are raw

@@ -4,3 +4,4 @@
 .test-run/
 __pycache__/
 *.pyc
+node_modules/

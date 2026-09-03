@@ -69,6 +69,15 @@ jobs:
             target/wasm32-unknown-unknown/debug/vgi_rpc_iroh_browser.wasm
           vgi-rpc-iroh-browser/js/run-generated-bindings-smoke.sh
 
+      - name: Install Firefox and WebKit compatibility browsers
+        working-directory: vgi-rpc-iroh-browser/js
+        run: |
+          npm ci
+          npx playwright install --with-deps firefox webkit
+
+      - name: Smoke generated wasm-bindgen API in Firefox and Playwright WebKit
+        run: vgi-rpc-iroh-browser/js/run-generated-bindings-playwright.sh
+
       - name: Upload browser WebAssembly package
         uses: actions/upload-artifact@v6
         with:

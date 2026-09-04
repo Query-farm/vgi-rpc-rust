@@ -275,9 +275,14 @@ jobs:
             echo "See CHANGELOG.md for details." > /tmp/release-notes.md
           fi
           if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            release_kind=()
+            if [[ "$VER" == *-* ]]; then
+              release_kind+=(--prerelease)
+            fi
             gh release create "$GITHUB_REF_NAME" \
               --title "$GITHUB_REF_NAME" \
               --notes-file /tmp/release-notes.md \
+              "${release_kind[@]}" \
               --verify-tag
           fi
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \

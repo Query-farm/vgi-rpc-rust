@@ -7,20 +7,16 @@ name: Release
 # Setup checklist (one-time):
 #   1. Register each crate on crates.io as a Trusted Publisher
 #      bound to this repo + this workflow file + the `crates-io`
-#      environment below. `vgi-iroh-transport` and `vgi-iroh-cabi` need their
-#      own entries in addition to the five original published crates.
+#      environment below. Every crate in the publish loop needs its own entry.
 #   2. Create a GitHub Environment named `crates-io` (Settings →
-#      Environments) with required reviewers.  The environment
-#      gate is what makes a release require a human "approve"
-#      click — without it, anyone with push access to `main` can
-#      trigger a publish by pushing a tag.
+#      Environments). The environment is part of the OIDC trust boundary;
+#      reviewer protection is optional and is not required by this project.
 #
 # Release flow:
 #   1. Bump the workspace version in the root `Cargo.toml`.
 #   2. Update `CHANGELOG.md`.
 #   3. `git tag v0.1.0 && git push origin v0.1.0`.
-#   4. Approve the workflow run in the `crates-io` environment.
-# The GitHub Release is then cut automatically from the CHANGELOG section
+#   4. The GitHub Release is cut automatically from the CHANGELOG section
 # for that version — see the final step.  Unlike the sibling SDK repos,
 # which publish *in response to* a published Release, this repo publishes
 # on tag push, so nothing else would ever create one.
@@ -191,7 +187,7 @@ jobs:
             --config 'patch.crates-io.vgi-iroh-transport.path="vgi-iroh-transport"'
             --config 'patch.crates-io.vgi-rpc-client.path="vgi-rpc-client"'
           )
-          for crate in vgi-rpc-macros vgi-rpc vgi-iroh-transport vgi-rpc-client vgi-iroh-cabi vgi-rpc-s3 vgi-rpc-gcs; do
+          for crate in vgi-rpc-macros vgi-rpc vgi-iroh-transport vgi-rpc-client vgi-rpc-iroh vgi-rpc-iroh-browser vgi-iroh-cabi vgi-rpc-s3 vgi-rpc-gcs; do
             ver=$(cargo metadata --no-deps --format-version 1 \
               | jq -r --arg c "$crate" '.packages[] | select(.name==$c) | .version')
             if [ "$DRY_RUN" = "true" ]; then
@@ -234,7 +230,7 @@ jobs:
         if: success()
         run: |
           echo "Validated release ${GITHUB_REF_NAME} at commit ${GITHUB_SHA}"
-          echo "Crates: vgi-rpc-macros, vgi-rpc, vgi-iroh-transport, vgi-rpc-client, vgi-iroh-cabi, vgi-rpc-s3, vgi-rpc-gcs"
+          echo "Crates: vgi-rpc-macros, vgi-rpc, vgi-iroh-transport, vgi-rpc-client, vgi-rpc-iroh, vgi-rpc-iroh-browser, vgi-iroh-cabi, vgi-rpc-s3, vgi-rpc-gcs"
 
   release-assets:
     name: Create GitHub Release

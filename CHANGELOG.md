@@ -4,6 +4,38 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## Unreleased
 
+## [0.24.0-rc.1] — 2026-09-04
+
+### Added
+
+- Provider-neutral peer identity and authentication composition for direct
+  Iroh peers, Tailscale, trusted PROXY-v2 listeners, forwarded HTTP identity,
+  and proxy-verified SPIFFE workloads.
+- Native `iroh://` Arrow-mux and `httpi://` HTTP-over-Iroh clients, including
+  the reusable `vgi-iroh-transport` core and stable `vgi-iroh-cabi` embedding
+  surface.
+- A narrow dual-protocol Iroh bridge for existing raw and HTTP VGI workers. It
+  preserves cryptographic Iroh identity while leaving load balancing and
+  authorization to the configured upstream deployment.
+- Browser WebAssembly bindings and a Haybarn demonstration for raw Arrow mux
+  and HTTP-over-Iroh. Generated bindings are exercised in Chrome, Firefox, and
+  WebKit, with an explicit Apple Safari qualification path.
+- Strict HTTP response-budget negotiation across unary calls and continuation
+  turns, separating client acceptance, worker production, and hosting limits.
+
+### Changed
+
+- The release workflow now builds relocatable C ABI archives for Linux, macOS,
+  and Windows, validates them with installed-package consumer smoke tests, and
+  publishes the typed native and browser Iroh crates in dependency order.
+
+### Fixed
+
+- Iroh bridge admission, cancellation, shutdown, idle-connection, and drain
+  behavior is bounded without expiring active raw streams.
+- Forwarded Iroh and Tailnet evidence cannot bypass the configured trusted
+  proxy boundary or silently downgrade invalid application credentials.
+
 ## [0.23.3] — 2026-08-27
 
 ### Fixed

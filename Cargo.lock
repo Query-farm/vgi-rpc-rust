@@ -5071,7 +5071,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi-iroh-bridge"
-version = "0.24.0-rc.1"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5095,7 +5095,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-iroh-cabi"
-version = "0.24.0-rc.1"
+version = "0.24.0"
 dependencies = [
  "bytes",
  "iroh",
@@ -5107,7 +5107,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-iroh-transport"
-version = "0.24.0-rc.1"
+version = "0.24.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -5125,7 +5125,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc"
-version = "0.24.0-rc.1"
+version = "0.24.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5173,7 +5173,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-benchmark-rust"
-version = "0.24.0-rc.1"
+version = "0.24.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5183,7 +5183,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-client"
-version = "0.24.0-rc.1"
+version = "0.24.0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -5212,7 +5212,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-conformance-client-driver"
-version = "0.24.0-rc.1"
+version = "0.24.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -5226,7 +5226,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-conformance-rust"
-version = "0.24.0-rc.1"
+version = "0.24.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5251,7 +5251,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-gcs"
-version = "0.24.0-rc.1"
+version = "0.24.0"
 dependencies = [
  "reqwest 0.12.28",
  "uuid",
@@ -5261,7 +5261,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-iroh"
-version = "0.24.0-rc.1"
+version = "0.24.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5277,7 +5277,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-iroh-browser"
-version = "0.24.0-rc.1"
+version = "0.24.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -5297,7 +5297,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-macros"
-version = "0.24.0-rc.1"
+version = "0.24.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5306,7 +5306,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-s3"
-version = "0.24.0-rc.1"
+version = "0.24.0"
 dependencies = [
  "reqwest 0.12.28",
  "tokio",
@@ -5316,7 +5316,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-tailnet-rust"
-version = "0.24.0-rc.1"
+version = "0.24.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",

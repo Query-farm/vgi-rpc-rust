@@ -117,8 +117,9 @@ Safari 18.6 have passed that full path locally.
 
 A complete browser VGI release still needs:
 
-- generated wasm-bindgen package publication and coordinated distribution of a
-  loadable Haybarn engine plus the ABI-matched VGI extension;
+- coordinated distribution of a loadable Haybarn engine plus its ABI-matched
+  VGI extension (the generated Iroh WebAssembly package is distributed as
+  `@query-farm/vgi-rpc-iroh-browser`);
 - a stable hosted full-relay regression lane (Linux CI currently runs the
   generated-binding smoke, while actual Safari requires a macOS host);
 - VGI-aware stale-connection retry rules for provably idempotent calls—the

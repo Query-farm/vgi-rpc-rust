@@ -79,8 +79,25 @@ AR_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/llvm-ar \
 cargo check -p vgi-rpc-iroh-browser --target wasm32-unknown-unknown
 ```
 
-The library emits both `rlib` and `cdylib`; the latter is the input to
-`wasm-bindgen`. Use a CLI version matching `Cargo.lock`:
+Browser applications should install the prebuilt package:
+
+```sh
+npm install @query-farm/vgi-rpc-iroh-browser
+```
+
+```ts
+import { createIrohNode } from "@query-farm/vgi-rpc-iroh-browser";
+
+const node = await createIrohNode({
+  relayUrls: ["https://relay.example.com"],
+});
+```
+
+The package includes the generated WebAssembly, the WHATWG stream wrapper,
+and the Haybarn SharedArrayBuffer adapter. Applications that build from source
+can still generate the bindings directly. The library emits both `rlib` and
+`cdylib`; the latter is the input to `wasm-bindgen`. Use a CLI version matching
+`Cargo.lock`:
 
 ```sh
 cargo build -p vgi-rpc-iroh-browser --target wasm32-unknown-unknown
@@ -90,9 +107,8 @@ wasm-bindgen --target web --out-dir dist \
 
 CI generates the bindings and verifies the `createIrohNode`, `fetchHttpi`, and
 `openVgiStream` exports so a check-only build cannot hide a missing browser
-artifact. Each CI run uploads the complete generated directory as the
-`vgi-rpc-iroh-browser-<commit>` artifact; applications can publish or bundle
-that immutable output without requiring a Rust toolchain.
+artifact. Each CI run also uploads the complete generated directory as the
+`vgi-rpc-iroh-browser-<commit>` artifact for source-build diagnostics.
 
 For a runnable Haybarn integration that wires this generated package and the
 adapter Worker into `installVgiWebWorkerBridge`, then performs a real VGI

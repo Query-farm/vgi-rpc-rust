@@ -15,16 +15,30 @@ output_dir=$5
 case "$target_triple" in
   *-pc-windows-msvc)
     link_library=vgi_iroh_cabi.lib
+    runtime_library=vgi_iroh_cabi.dll
+    runtime_subdirectory=bin
+    ;;
+  *-apple-darwin)
+    link_library=libvgi_iroh_cabi.a
+    runtime_library=libvgi_iroh_cabi.dylib
+    runtime_subdirectory=lib
     ;;
   *)
     link_library=libvgi_iroh_cabi.a
+    runtime_library=libvgi_iroh_cabi.so
+    runtime_subdirectory=lib
     ;;
 esac
 
 library_path="$cargo_target_dir/$target_triple/release/$link_library"
+runtime_library_path="$cargo_target_dir/$target_triple/release/$runtime_library"
 header_path="vgi-iroh-cabi/include/vgi_iroh.h"
 if [ ! -f "$library_path" ]; then
   echo "missing C ABI link library: $library_path" >&2
+  exit 1
+fi
+if [ ! -f "$runtime_library_path" ]; then
+  echo "missing C ABI runtime library: $runtime_library_path" >&2
   exit 1
 fi
 if [ ! -f "$header_path" ]; then
@@ -36,9 +50,10 @@ package_name="vgi-iroh-cabi-v${version}-${target_triple}"
 staging_root=$(mktemp -d)
 trap 'rm -rf "$staging_root"' EXIT
 package_root="$staging_root/$package_name"
-mkdir -p "$package_root/include" "$package_root/lib"
+mkdir -p "$package_root/include" "$package_root/lib" "$package_root/$runtime_subdirectory"
 cp "$header_path" "$package_root/include/vgi_iroh.h"
 cp "$library_path" "$package_root/lib/$link_library"
+cp "$runtime_library_path" "$package_root/$runtime_subdirectory/$runtime_library"
 if [[ "$target_triple" == *-pc-windows-msvc ]]; then
   import_count=0
   while IFS= read -r manifest_path; do
@@ -67,7 +82,8 @@ cargo tree -p vgi-iroh-cabi --edges normal,build --prefix none \
   echo "abi_version=1"
   echo "target=$target_triple"
   echo "commit=$commit"
-  echo "linkage=static"
+  echo "linkage=static,shared"
+  echo "runtime_library=$runtime_subdirectory/$runtime_library"
 } > "$package_root/manifest.txt"
 
 mkdir -p "$output_dir"

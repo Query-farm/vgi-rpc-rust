@@ -304,6 +304,8 @@ impl BrowserIrohNode {
 /// When omitted, a fresh ephemeral identity is generated.  Persist the secret
 /// only when stable browser identity is an explicit application requirement.
 /// `options.relayUrls`, when supplied, replaces the n0 relay set.
+/// `options.noRelay=true` disables relays entirely. It is mutually exclusive
+/// with `relayUrls` and is mainly useful for controlled direct-address tests.
 #[wasm_bindgen(js_name = createIrohNode)]
 pub async fn create_iroh_node(options: Option<JsValue>) -> Result<BrowserIrohNode, JsValue> {
     let mut builder = Endpoint::builder(presets::N0);
@@ -315,7 +317,19 @@ pub async fn create_iroh_node(options: Option<JsValue>) -> Result<BrowserIrohNod
             .map_err(|error| js_error("invalid Iroh secret key", error))?;
         builder = builder.secret_key(secret_key);
     }
+    let no_relay = match option_property(&options, "noRelay")? {
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| js_sys::TypeError::new("noRelay must be a boolean"))?,
+        None => false,
+    };
     if let Some(relay_urls) = option_property(&options, "relayUrls")? {
+        if no_relay {
+            return Err(js_sys::TypeError::new(
+                "relayUrls and noRelay=true are mutually exclusive",
+            )
+            .into());
+        }
         if !Array::is_array(&relay_urls) {
             return Err(js_sys::TypeError::new("relayUrls must be an array of URLs").into());
         }
@@ -333,6 +347,8 @@ pub async fn create_iroh_node(options: Option<JsValue>) -> Result<BrowserIrohNod
             return Err(js_sys::TypeError::new("relayUrls cannot be empty").into());
         }
         builder = builder.relay_mode(RelayMode::custom(parsed));
+    } else if no_relay {
+        builder = builder.relay_mode(RelayMode::Disabled);
     }
     let endpoint = builder
         .bind()

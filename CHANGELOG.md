@@ -4,6 +4,17 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## Unreleased
 
+## [0.24.1] — 2026-09-04
+
+### Added
+
+- Installable `@query-farm/vgi-rpc-iroh-browser` WebAssembly package for
+  browser `vgi-rpc/arrow-mux/1` and `iroh-http/2` clients, including the
+  Haybarn SharedArrayBuffer adapter and custom or disabled relay selection.
+- Shared C ABI libraries in every native release archive so managed-language
+  packages can load the embedded Iroh transport at runtime as well as C and
+  C++ consumers linking it statically.
+
 ## [0.24.0] — 2026-09-04
 
 ### Added

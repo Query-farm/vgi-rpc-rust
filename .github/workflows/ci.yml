@@ -58,6 +58,13 @@ jobs:
           grep -q 'fetchHttpi' target/browser-bindings/vgi_rpc_iroh_browser.d.ts
           grep -q 'openVgiStream' target/browser-bindings/vgi_rpc_iroh_browser.d.ts
 
+      - name: Build installable browser npm package
+        working-directory: vgi-rpc-iroh-browser/npm
+        run: |
+          npm ci
+          ./build-package.sh ../../target/wasm32-unknown-unknown/debug/vgi_rpc_iroh_browser.wasm
+          npm pack --dry-run
+
       - name: Smoke concurrent generated wasm-bindgen API in Chrome
         env:
           CC_wasm32_unknown_unknown: clang

@@ -1,10 +1,10 @@
-import { HttpiTransportError } from "./index.ts";
+import { HttpiTransportError } from "./index.js";
 import type {
   HeaderPair,
   HttpiResponse,
   IrohNode,
   VgiDuplexStream,
-} from "./index.ts";
+} from "./index.js";
 
 const MAGIC = 0x42534756;
 const VERSION = 1;

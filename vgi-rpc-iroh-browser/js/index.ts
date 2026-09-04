@@ -101,6 +101,8 @@ export interface CreateIrohOptions {
   secretKey?: string;
   /** Replace the default n0 relay set. The array must not be empty. */
   relayUrls?: string[];
+  /** Disable relays. Mutually exclusive with relayUrls. */
+  noRelay?: boolean;
   /** Optional application-owned alias resolver and authorization boundary. */
   resolveTarget?: TargetResolver;
   /** Hard cap on wasm connect/request futures, including abandoned late settlers. Default: 16. */

@@ -129,6 +129,96 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
 
+  browser-npm:
+    name: Build browser npm package
+    needs: release-metadata
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain and browser target
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: iroh-browser-npm
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Install current npm and LLVM archive tool
+        run: |
+          npm install --global npm@latest
+          sudo apt-get update
+          sudo apt-get install --yes llvm
+
+      - name: Verify npm package version
+        run: |
+          package_version=$(node -p "require('./vgi-rpc-iroh-browser/npm/package.json').version")
+          test "$package_version" = "${{ needs.release-metadata.outputs.version }}"
+
+      - name: Build browser WebAssembly
+        env:
+          CC_wasm32_unknown_unknown: clang
+          AR_wasm32_unknown_unknown: llvm-ar
+        run: >-
+          cargo build --locked --release -p vgi-rpc-iroh-browser
+          --target wasm32-unknown-unknown
+
+      - name: Build npm package
+        working-directory: vgi-rpc-iroh-browser/npm
+        run: |
+          npm ci
+          cargo install wasm-bindgen-cli --version 0.2.121 --locked
+          ./build-package.sh
+          npm pack --dry-run
+
+      - name: Pack browser release artifact
+        working-directory: vgi-rpc-iroh-browser/npm
+        run: npm pack
+
+      - name: Upload browser npm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vgi-rpc-iroh-browser-npm
+          path: vgi-rpc-iroh-browser/npm/*.tgz
+          if-no-files-found: error
+
+  publish-browser-npm:
+    name: Publish browser package to npm
+    if: github.event_name == 'push'
+    needs: browser-npm
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: vgi-rpc-iroh-browser-npm
+          path: package
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Install current npm
+        run: npm install --global npm@latest
+
+      - name: Publish with npm trusted publishing
+        run: npm publish package/*.tgz --access public
+
   publish:
     name: Publish to crates.io
     needs: release-metadata
@@ -236,7 +326,7 @@ jobs:
   release-assets:
     name: Create GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [release-metadata, cabi-artifacts, publish]
+    needs: [release-metadata, cabi-artifacts, browser-npm, publish]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -251,6 +341,12 @@ jobs:
           pattern: vgi-iroh-cabi-*
           path: release-assets
           merge-multiple: true
+
+      - name: Download browser npm release asset
+        uses: actions/download-artifact@v5
+        with:
+          name: vgi-rpc-iroh-browser-npm
+          path: release-assets
 
       - name: Create GitHub Release and attach native C ABI assets
         # This repo publishes on *tag push*, whereas the sibling SDK repos

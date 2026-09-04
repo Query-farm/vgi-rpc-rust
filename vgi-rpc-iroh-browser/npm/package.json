@@ -1,0 +1,48 @@
+{
+  "name": "@query-farm/vgi-rpc-iroh-browser",
+  "version": "0.24.1",
+  "description": "Browser WebAssembly transport for VGI RPC over authenticated Iroh connections",
+  "type": "module",
+  "license": "Apache-2.0",
+  "author": "Query Farm LLC <hello@query.farm>",
+  "homepage": "https://github.com/Query-farm/vgi-rpc-rust/tree/main/vgi-rpc-iroh-browser",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Query-farm/vgi-rpc-rust.git",
+    "directory": "vgi-rpc-iroh-browser"
+  },
+  "bugs": "https://github.com/Query-farm/vgi-rpc-rust/issues",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./adapter-worker": {
+      "types": "./dist/adapter-worker.d.ts",
+      "import": "./dist/adapter-worker.js"
+    },
+    "./wasm": {
+      "types": "./dist/wasm/vgi_rpc_iroh_browser.d.ts",
+      "import": "./dist/wasm/vgi_rpc_iroh_browser.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit && npm pack --dry-run"
+  },
+  "devDependencies": {
+    "typescript": "5.9.2"
+  }
+}

@@ -1,0 +1,7 @@
+/dist/
+/src/transport.ts
+/src/adapter-worker.ts
+/src/wasm/
+/LICENSE
+/NOTICE
+/*.tgz

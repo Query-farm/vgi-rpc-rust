@@ -186,6 +186,7 @@ jobs:
             --config 'patch.crates-io.vgi-rpc.path="vgi-rpc"'
             --config 'patch.crates-io.vgi-iroh-transport.path="vgi-iroh-transport"'
             --config 'patch.crates-io.vgi-rpc-client.path="vgi-rpc-client"'
+            --config 'patch.crates-io.vgi-rpc-s3.path="vgi-rpc-s3"'
           )
           for crate in vgi-rpc-macros vgi-rpc vgi-iroh-transport vgi-rpc-client vgi-rpc-iroh vgi-rpc-iroh-browser vgi-iroh-cabi vgi-rpc-s3 vgi-rpc-gcs; do
             ver=$(cargo metadata --no-deps --format-version 1 \

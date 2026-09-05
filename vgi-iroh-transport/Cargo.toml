@@ -23,5 +23,5 @@ tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
 futures-util = "0.3"
-iroh-http-core = { git = "https://github.com/Query-farm/iroh-http.git", rev = "fe64a5512fc711a016033daa02ed487555023518" }
+iroh-http-core = { package = "query-farm-iroh-http-core", version = "0.6.3" }
 tower = { version = "0.5", features = ["util"] }

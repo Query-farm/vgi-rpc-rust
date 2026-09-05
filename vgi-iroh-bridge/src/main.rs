@@ -88,9 +88,17 @@ struct Args {
     #[arg(long, value_name = "COUNT", requires = "http_upstream")]
     http_max_concurrency: Option<NonZeroUsize>,
 
-    /// HTTP request and request-head deadline in seconds.
+    /// Optional HTTP worker execution deadline in seconds. Disabled by default.
     #[arg(long, value_name = "SECONDS", requires = "http_upstream")]
     http_request_timeout: Option<NonZeroU64>,
+
+    /// Deadline for receiving a complete HTTP request head, in seconds.
+    #[arg(long, value_name = "SECONDS", requires = "http_upstream")]
+    http_request_head_timeout: Option<NonZeroU64>,
+
+    /// Maximum no-progress interval while streaming an HTTP request body.
+    #[arg(long, value_name = "SECONDS", requires = "http_upstream")]
+    http_body_idle_timeout: Option<NonZeroU64>,
 
     /// Maximum encoded HTTP request body bytes.
     #[arg(long, value_name = "BYTES", requires = "http_upstream")]
@@ -224,9 +232,14 @@ fn http_bridge_options(args: &Args) -> HttpBridgeOptions {
     if let Some(value) = args.http_request_timeout {
         options.connection.request_timeout = Some(Duration::from_secs(value.get()));
     }
+    if let Some(value) = args.http_request_head_timeout {
+        options.connection.request_head_timeout = Some(Duration::from_secs(value.get()));
+    }
+    if let Some(value) = args.http_body_idle_timeout {
+        options.connection.body_idle_timeout = Some(Duration::from_secs(value.get()));
+    }
     if let Some(value) = args.http_max_request_body_bytes {
         options.connection.max_request_body_wire_bytes = Some(value.get());
-        options.connection.max_request_body_decoded_bytes = Some(value.get());
     }
     if let Some(value) = args.http_max_header_bytes {
         options.connection.max_header_size = value.get();
@@ -390,7 +403,7 @@ mod tests {
         assert_eq!(http.max_total_connections, 17);
         assert_eq!(http.connection_idle_timeout, Duration::from_secs(11));
         assert_eq!(http.max_request_body_wire_bytes, Some(4096));
-        assert_eq!(http.max_request_body_decoded_bytes, Some(4096));
+        assert_eq!(http.max_request_body_decoded_bytes, None);
         assert!(!http.decompression);
         assert!(args.print_direct_addresses);
 

@@ -4,6 +4,23 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## Unreleased
 
+## [0.24.3] — 2026-09-05
+
+### Added
+
+- Publish `vgi-iroh-bridge` executable archives for Linux, macOS, and Windows
+  with checksums and release provenance.
+- Publish a Linux x86-64/ARM64 bridge container to
+  `ghcr.io/query-farm/vgi-iroh-bridge` from the same tested binaries.
+
+### Changed
+
+- Consume the released `query-farm-iroh-http-core` package instead of an
+  internal Git revision.
+- Separate HTTP request-head and streaming body-idle protection from the
+  optional worker execution deadline, and remove the implicit bridge request
+  body ceiling.
+
 ## [0.24.2] — 2026-09-05
 
 ### Fixed

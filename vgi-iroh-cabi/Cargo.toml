@@ -18,5 +18,5 @@ bytes.workspace = true
 iroh = { version = "=1.1.0", default-features = false, features = ["tls-ring"] }
 tokio.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
-vgi-iroh-transport = { path = "../vgi-iroh-transport", version = "0.24.2" }
+vgi-iroh-transport = { path = "../vgi-iroh-transport", version = "0.24.3" }
 zeroize = "1"

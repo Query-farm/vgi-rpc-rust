@@ -51,6 +51,26 @@ vgi-iroh-bridge \
   --http-upstream https://workers.internal.example/vgi
 ```
 
+Tagged releases provide executable archives for Linux (x86-64 and ARM64),
+macOS (x86-64 and Apple Silicon), and Windows x86-64. Production containers
+are published for Linux x86-64 and ARM64 as
+`ghcr.io/query-farm/vgi-iroh-bridge:<version>` and
+`ghcr.io/query-farm/vgi-iroh-bridge:latest`. For example:
+
+```sh
+docker run --rm --network host \
+  --user "$(id -u):$(id -g)" \
+  --mount type=bind,src="$PWD/vgi-iroh-key",dst=/run/secrets/vgi-iroh-key,readonly \
+  ghcr.io/query-farm/vgi-iroh-bridge:0.24.3 \
+  --secret-key-file /run/secrets/vgi-iroh-key \
+  --http-upstream http://127.0.0.1:9400
+```
+
+The container runs as numeric user/group `65532:65532`; the mounted key must
+be readable by that identity. Host networking is only an example for a worker
+bound to host loopback. In an orchestrated deployment, place the bridge and
+worker on a private network and use the worker service name instead.
+
 The first stdout line is the bridge EndpointId. A persistent key is required
 from `--secret-key-file` or `VGI_IROH_SECRET_KEY`; `--ephemeral` is an explicit
 development-only alternative. The key itself is never accepted as a command
@@ -59,11 +79,12 @@ and `--no-relay` selects direct paths only. `SIGINT` and, on Unix, `SIGTERM`
 stop the Router, which in turn drains both protocol handlers within their
 configured bounds.
 
-Every raw and HTTP connection, stream/request, body, header, idle, and drain
-bound has a safe default. The executable exposes scoped `--raw-*` and `--http-*`
-overrides (see `--help`); an override is rejected unless its corresponding
-upstream is enabled, and zero is never accepted. HTTP remains a transparent
-hop: request decompression is disabled even when other limits are customized.
+Raw and HTTP connection admission, concurrency, request-head progress,
+request-body progress, headers, idle connections, and graceful drain have safe
+defaults. The executable exposes scoped `--raw-*` and `--http-*` overrides
+(see `--help`); an override is rejected unless its corresponding upstream is
+enabled, and zero is never accepted. HTTP remains a transparent hop: request
+decompression is disabled even when other limits are customized.
 Raw connections default to 8 per EndpointId and 256 total; after their first
 stream they are closed after 60 seconds with no active logical streams and no
 new stream. An active stream is intentionally never expired by this
@@ -86,14 +107,25 @@ against the public WebPKI root set.
 This remains a bridge, not a load balancer: it has one configured origin, does
 not follow redirects, and does not replay a request. Hyper connection pooling
 only reuses transport connections to that origin. The shared iroh-http runtime
-owns connection-wide admission, request/header/body limits, slowloris defense,
-delivery tracking, and graceful drain.
+owns connection-wide admission, request-head and body-progress slowloris
+defense, optional coarse body ceilings, delivery tracking, and graceful drain.
+Request and response bodies remain streaming and are never collected by the
+bridge.
 
 `HttpBridgeOptions::default()` disables request decompression. Consequently
 `Content-Encoding` and the encoded body pass to the fixed upstream unchanged,
 which is the safe transparent-proxy behavior. An embedding application may
 explicitly enable decompression when the upstream expects decoded application
 bodies rather than HTTP forwarding semantics.
+
+There is no implicit request-size ceiling in the transparent bridge. The VGI
+worker owns its semantic request limit and advertises it via `OPTIONS`.
+Operators that need an independent transport ceiling can set
+`--http-max-request-body-bytes`; they should keep it at or above the worker's
+advertised value. The bridge counts bytes while forwarding and does not buffer
+the complete body. `--http-request-head-timeout` and
+`--http-body-idle-timeout` tune progress protection independently of the
+optional `--http-request-timeout` application deadline.
 
 ### Identity and header boundary
 
@@ -129,6 +161,7 @@ header into cryptographic evidence by itself.
 
 ## Upstream dependency
 
-`iroh-http-core` is pinned to an immutable commit in the Query-farm
-`iroh-http` fork. Advance that revision and `Cargo.lock` together after the
-fork's CI and this bridge's native/browser compatibility tests pass.
+The bridge consumes the released `query-farm-iroh-http-core` crate under the
+conventional Rust alias `iroh-http-core`. `Cargo.lock` fixes the exact release
+used by bridge binaries and containers; update the declared version and lock
+together after the fork's CI and this bridge's compatibility tests pass.

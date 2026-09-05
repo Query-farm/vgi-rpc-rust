@@ -126,7 +126,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -137,7 +137,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1205,7 +1205,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2087,65 +2087,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iroh-http-core"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ebe3e3ff38d9e4ce6e78c11bfc0818b0001e08019cc0ac69b76f75c5f8c7b71"
-dependencies = [
- "base32",
- "bytes",
- "dashmap",
- "futures",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "iroh",
- "moka",
- "pin-project-lite",
- "rand 0.10.2",
- "serde",
- "serde_json",
- "slotmap",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tower-http 0.7.1",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "iroh-http-core"
-version = "0.6.2"
-source = "git+https://github.com/Query-farm/iroh-http.git?rev=fe64a5512fc711a016033daa02ed487555023518#fe64a5512fc711a016033daa02ed487555023518"
-dependencies = [
- "base32",
- "bytes",
- "dashmap",
- "futures",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "iroh",
- "moka",
- "pin-project-lite",
- "rand 0.10.2",
- "serde",
- "serde_json",
- "slotmap",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tower-http 0.7.1",
- "tracing",
- "url",
-]
-
-[[package]]
 name = "iroh-metrics"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2885,7 +2826,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3529,6 +3470,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "query-farm-iroh-http-core"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f2f56dbb411b60a37d4a817661f2687cc51d53badb565ec0c2e8e807760313f"
+dependencies = [
+ "base32",
+ "bytes",
+ "dashmap",
+ "futures",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "iroh",
+ "moka",
+ "pin-project-lite",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "slotmap",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tower-http 0.7.1",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3898,7 +3869,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3956,7 +3927,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4380,7 +4351,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4540,7 +4511,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5071,7 +5042,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi-iroh-bridge"
-version = "0.24.2"
+version = "0.24.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5083,7 +5054,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "iroh",
- "iroh-http-core 0.6.2 (git+https://github.com/Query-farm/iroh-http.git?rev=fe64a5512fc711a016033daa02ed487555023518)",
+ "query-farm-iroh-http-core",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -5095,7 +5066,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-iroh-cabi"
-version = "0.24.2"
+version = "0.24.3"
 dependencies = [
  "bytes",
  "iroh",
@@ -5107,7 +5078,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-iroh-transport"
-version = "0.24.2"
+version = "0.24.3"
 dependencies = [
  "bytes",
  "futures-util",
@@ -5116,7 +5087,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "iroh",
- "iroh-http-core 0.6.2 (git+https://github.com/Query-farm/iroh-http.git?rev=fe64a5512fc711a016033daa02ed487555023518)",
+ "query-farm-iroh-http-core",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -5125,7 +5096,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc"
-version = "0.24.2"
+version = "0.24.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5173,7 +5144,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-benchmark-rust"
-version = "0.24.2"
+version = "0.24.3"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5183,7 +5154,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-client"
-version = "0.24.2"
+version = "0.24.3"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -5195,8 +5166,8 @@ dependencies = [
  "flate2",
  "http-body-util",
  "hyper",
- "iroh-http-core 0.6.2 (git+https://github.com/Query-farm/iroh-http.git?rev=fe64a5512fc711a016033daa02ed487555023518)",
  "libc",
+ "query-farm-iroh-http-core",
  "reqwest 0.12.28",
  "serde_json",
  "sha2 0.10.9",
@@ -5212,7 +5183,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-conformance-client-driver"
-version = "0.24.2"
+version = "0.24.3"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -5226,7 +5197,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-conformance-rust"
-version = "0.24.2"
+version = "0.24.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5251,7 +5222,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-gcs"
-version = "0.24.2"
+version = "0.24.3"
 dependencies = [
  "reqwest 0.12.28",
  "uuid",
@@ -5261,7 +5232,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-iroh"
-version = "0.24.2"
+version = "0.24.3"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5277,7 +5248,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-iroh-browser"
-version = "0.24.2"
+version = "0.24.3"
 dependencies = [
  "bytes",
  "futures-util",
@@ -5286,8 +5257,8 @@ dependencies = [
  "hyper",
  "hyper-util",
  "iroh",
- "iroh-http-core 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "js-sys",
+ "query-farm-iroh-http-core",
  "thiserror 2.0.18",
  "tokio",
  "tower",
@@ -5297,7 +5268,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-macros"
-version = "0.24.2"
+version = "0.24.3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5306,7 +5277,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-s3"
-version = "0.24.2"
+version = "0.24.3"
 dependencies = [
  "reqwest 0.12.28",
  "tokio",
@@ -5316,7 +5287,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-tailnet-rust"
-version = "0.24.2"
+version = "0.24.3"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5551,7 +5522,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

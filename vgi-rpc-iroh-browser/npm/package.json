@@ -1,6 +1,6 @@
 {
   "name": "@query-farm/vgi-rpc-iroh-browser",
-  "version": "0.24.1",
+  "version": "0.24.2",
   "description": "Browser WebAssembly transport for VGI RPC over authenticated Iroh connections",
   "type": "module",
   "license": "Apache-2.0",

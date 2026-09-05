@@ -3,7 +3,7 @@ resolver = "2"
 members = ["vgi-rpc", "vgi-rpc-macros", "vgi-rpc-client", "vgi-iroh-transport", "vgi-iroh-cabi", "vgi-rpc-iroh", "vgi-rpc-iroh-browser", "vgi-iroh-bridge", "conformance-client-driver", "conformance-worker", "tailnet-integration", "benchmark-worker", "vgi-rpc-s3", "vgi-rpc-gcs"]
 
 [workspace.package]
-version = "0.24.1"
+version = "0.24.2"
 edition = "2021"
 rust-version = "1.97"
 license = "Apache-2.0"

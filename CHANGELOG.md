@@ -4,6 +4,14 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## Unreleased
 
+## [0.24.2] — 2026-09-05
+
+### Fixed
+
+- Browser clients normalize trailing DNS root dots in both configured and
+  discovered Iroh relay URLs, avoiding WebKit TLS certificate rejection while
+  preserving authenticated pkarr discovery and the selected relay hosts.
+
 ## [0.24.1] — 2026-09-04
 
 ### Added

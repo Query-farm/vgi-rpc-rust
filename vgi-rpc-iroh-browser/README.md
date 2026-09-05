@@ -97,6 +97,10 @@ const node = await createIrohNode({
 });
 ```
 
+The browser transport normalizes default and custom relay hostnames by removing
+a trailing DNS root dot. This preserves the same host while avoiding a
+WebKit TLS validation incompatibility with otherwise valid relay certificates.
+
 The package includes the generated WebAssembly, the WHATWG stream wrapper,
 and the Haybarn SharedArrayBuffer adapter. Applications that build from source
 can still generate the bindings directly. The library emits both `rlib` and

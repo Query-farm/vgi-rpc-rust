@@ -54,6 +54,27 @@ fn js_error(context: &str, error: impl std::fmt::Display) -> JsValue {
     js_sys::Error::new(&format!("{context}: {error}")).into()
 }
 
+fn normalize_relay_url_for_browser(relay_url: RelayUrl) -> Result<RelayUrl, JsValue> {
+    let mut url = (*relay_url).clone();
+    let Some(host) = url.host_str().map(str::to_owned) else {
+        return Ok(RelayUrl::from(url));
+    };
+    if let Some(host) = host.strip_suffix('.') {
+        url.set_host(Some(host))
+            .map_err(|error| js_error("normalizing Iroh relay URL", error))?;
+    }
+    Ok(RelayUrl::from(url))
+}
+
+fn browser_default_relay_urls() -> Result<Vec<RelayUrl>, JsValue> {
+    RelayMode::Default
+        .relay_map()
+        .urls::<Vec<RelayUrl>>()
+        .into_iter()
+        .map(normalize_relay_url_for_browser)
+        .collect()
+}
+
 fn httpi_error(error: JsValue, stage: &str, category: &str, dispatch: &str) -> JsValue {
     let _ = Reflect::set(&error, &"vgiStage".into(), &stage.into());
     let _ = Reflect::set(&error, &"vgiCategory".into(), &category.into());
@@ -338,10 +359,9 @@ pub async fn create_iroh_node(options: Option<JsValue>) -> Result<BrowserIrohNod
             let relay_url = relay_url
                 .as_string()
                 .ok_or_else(|| js_sys::TypeError::new("relayUrls entries must be strings"))?;
-            parsed.push(
-                RelayUrl::from_str(&relay_url)
-                    .map_err(|error| js_error("invalid Iroh relay URL", error))?,
-            );
+            let relay_url = RelayUrl::from_str(&relay_url)
+                .map_err(|error| js_error("invalid Iroh relay URL", error))?;
+            parsed.push(normalize_relay_url_for_browser(relay_url)?);
         }
         if parsed.is_empty() {
             return Err(js_sys::TypeError::new("relayUrls cannot be empty").into());
@@ -349,6 +369,12 @@ pub async fn create_iroh_node(options: Option<JsValue>) -> Result<BrowserIrohNod
         builder = builder.relay_mode(RelayMode::custom(parsed));
     } else if no_relay {
         builder = builder.relay_mode(RelayMode::Disabled);
+    } else {
+        // Iroh represents its default DNS names as absolute names ending in a
+        // root dot. WebKit includes that dot in TLS hostname validation and
+        // rejects the otherwise valid n0 certificate. Preserve Iroh's current
+        // default relay map while removing only the DNS presentation suffix.
+        builder = builder.relay_mode(RelayMode::custom(browser_default_relay_urls()?));
     }
     let endpoint = builder
         .bind()

@@ -217,7 +217,19 @@ jobs:
         run: npm install --global npm@latest
 
       - name: Publish with npm trusted publishing
-        run: npm publish package/*.tgz --access public
+        run: |
+          set -euo pipefail
+          archive=$(find package -maxdepth 1 -name '*.tgz' -print -quit)
+          metadata=$(tar -xOf "$archive" package/package.json)
+          package_name=$(printf '%s' "$metadata" | node -e \
+            "const fs=require('fs');process.stdout.write(JSON.parse(fs.readFileSync(0,'utf8')).name)")
+          package_version=$(printf '%s' "$metadata" | node -e \
+            "const fs=require('fs');process.stdout.write(JSON.parse(fs.readFileSync(0,'utf8')).version)")
+          if npm view "$package_name@$package_version" version >/dev/null 2>&1; then
+            echo "$package_name@$package_version already on npm — skipping"
+          else
+            npm publish "$archive" --access public
+          fi
 
   publish:
     name: Publish to crates.io

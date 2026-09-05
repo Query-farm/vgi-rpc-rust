@@ -63,7 +63,7 @@ jobs:
             --dir "$RUNNER_TEMP/vgi-extension"
           test -s "$RUNNER_TEMP/vgi-extension/vgi.duckdb_extension.wasm"
           echo "VGI_EXT_WASM=$RUNNER_TEMP/vgi-extension/vgi.duckdb_extension.wasm" >> "$GITHUB_ENV"
-      - name: Install the matching published Haybarn engine
+      - name: Install the compatible published Haybarn WASM wrapper
         env:
           HAYBARN_VERSION: ${{ inputs.haybarn_version }}
         run: |

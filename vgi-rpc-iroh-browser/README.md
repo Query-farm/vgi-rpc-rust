@@ -33,6 +33,10 @@ futures by default. An aborted caller returns promptly, but its admission slot
 is deliberately retained until the actual Rust future settles; this prevents
 repeated network outages from accumulating unbounded background connects.
 
+Haybarn applications need `@haybarn/haybarn-wasm >= 1.5.5-rc4`. That wrapper
+release embeds the multi-region SAB host ABI required by current VGI extensions;
+the underlying Haybarn engine ABI remains `haybarn-v1.5.5-rc1`.
+
 The generated wasm API permits one read and one write to remain pending on the
 same raw stream. Writes are serialized for ordering and QUIC backpressure.
 `abort()` and HTTP `cancel()` use independent cancellation state, so they remain

@@ -3,7 +3,6 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -17,26 +16,22 @@ if (!url)
 if (engineName === "safari") {
   await verifySafari(url);
 } else {
-  const haybarn =
-    process.env.HAYBARN_WASM ??
-    join(homedir(), "Development", "haybarn", "haybarn-wasm");
+  const browserPackage = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "js",
+    "package.json",
+  );
+  const playwright = createRequire(browserPackage)("playwright");
   let browser;
   let browserLabel;
   if (engineName === "chrome") {
-    const puppeteer = createRequire(join(haybarn, "package.json"))("puppeteer");
-    browser = await puppeteer.launch({
-      headless: "new",
-      args: ["--no-sandbox"],
+    browser = await playwright.chromium.launch({
+      channel: "chrome",
+      headless: true,
     });
     browserLabel = "Chrome";
   } else if (engineName === "firefox" || engineName === "webkit") {
-    const browserPackage = join(
-      dirname(fileURLToPath(import.meta.url)),
-      "..",
-      "js",
-      "package.json",
-    );
-    const playwright = createRequire(browserPackage)("playwright");
     browser = await playwright[engineName].launch({ headless: true });
     browserLabel =
       engineName === "firefox"

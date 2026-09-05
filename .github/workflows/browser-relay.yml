@@ -1,0 +1,92 @@
+name: Browser relay qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      extension_run_id:
+        description: Successful haybarn-community-extensions build run containing the WASM artifact
+        required: true
+        default: "33941513981"
+      extension_artifact:
+        description: wasm_threads artifact name in that run
+        required: true
+        default: vgi-haybarn-v1.5.5-rc1-extension-wasm_threads
+      haybarn_version:
+        description: Compatible @haybarn/haybarn-wasm wrapper version
+        required: true
+        default: 1.5.5-rc4
+
+permissions:
+  contents: read
+
+jobs:
+  public-relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: Query-farm/vgi-rust
+          ref: 30db1e0a7de74be244b49addd1cce4ea6fd380d8
+          path: .ci/vgi-rust
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            .ci/vgi-rust -> target
+          key: browser-public-relay
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Install browser and WebAssembly prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes llvm
+          cargo install wasm-bindgen-cli --version 0.2.121 --locked
+          npm ci --prefix vgi-rpc-iroh-browser/js
+          npx --prefix vgi-rpc-iroh-browser/js playwright install --with-deps firefox webkit
+      - name: Download the exact rebuilt VGI extension
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXTENSION_RUN_ID: ${{ inputs.extension_run_id }}
+          EXTENSION_ARTIFACT: ${{ inputs.extension_artifact }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/vgi-extension"
+          gh run download "$EXTENSION_RUN_ID" \
+            --repo Query-farm-haybarn/haybarn-community-extensions \
+            --name "$EXTENSION_ARTIFACT" \
+            --dir "$RUNNER_TEMP/vgi-extension"
+          test -s "$RUNNER_TEMP/vgi-extension/vgi.duckdb_extension.wasm"
+          echo "VGI_EXT_WASM=$RUNNER_TEMP/vgi-extension/vgi.duckdb_extension.wasm" >> "$GITHUB_ENV"
+      - name: Install the matching published Haybarn engine
+        env:
+          HAYBARN_VERSION: ${{ inputs.haybarn_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/haybarn"
+          npm pack "@haybarn/haybarn-wasm@$HAYBARN_VERSION" \
+            --pack-destination "$RUNNER_TEMP/haybarn" >/dev/null
+          tar -xzf "$RUNNER_TEMP/haybarn/haybarn-haybarn-wasm-$HAYBARN_VERSION.tgz" \
+            -C "$RUNNER_TEMP/haybarn"
+          npm install --prefix "$RUNNER_TEMP/haybarn/package" --include=dev
+          echo "HAYBARN_ENGINE_ROOT=$RUNNER_TEMP/haybarn/package" >> "$GITHUB_ENV"
+      - name: Verify Haybarn through the public Iroh relay in three browser engines
+        env:
+          CC_wasm32_unknown_unknown: clang
+          AR_wasm32_unknown_unknown: llvm-ar
+        run: >-
+          python3 vgi-rpc-iroh-browser/demo/launch.py
+          --haybarn "$HAYBARN_ENGINE_ROOT"
+          --engine-root "$HAYBARN_ENGINE_ROOT"
+          --vgi-extension "$VGI_EXT_WASM"
+          --engine-version v1.5.5
+          --vgi-rust .ci/vgi-rust
+          --verify-browser chrome
+          --verify-browser firefox
+          --verify-browser webkit
+          --no-open

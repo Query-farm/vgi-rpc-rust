@@ -70,6 +70,18 @@ uses Apple's `safaridriver` against the installed Safari release on macOS;
 enable Safari's Develop → Allow Remote Automation setting once before running
 it. Safari verification is intentionally unavailable on Linux CI runners.
 
+The manually dispatched `Browser relay qualification` workflow repeats the
+complete Chrome, Firefox, and Playwright WebKit path on a clean Linux runner.
+It requires the build-run ID and `wasm_threads` artifact name from
+`haybarn-community-extensions`, plus the matching published
+`@haybarn/haybarn-wasm` version. The extension and wrapper have independent
+release suffixes: the current extension targets engine `haybarn-v1.5.5-rc1`,
+while `haybarn-wasm@1.5.5-rc4` contains the corresponding multi-region SAB/Iroh
+host glue. The launcher deliberately omits `--no-relay`, so browser Iroh reaches
+the native bridge through the public relay. The workflow pins the VGI worker and
+records both exact artifacts as inputs instead of silently testing whatever is
+current. Apple Safari remains the explicit macOS release gate above.
+
 ## Build and run
 
 From the repository root:

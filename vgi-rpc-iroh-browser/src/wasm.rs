@@ -11,10 +11,14 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::str::FromStr;
 
-use futures_util::future::{FutureExt, LocalBoxFuture, Shared};
+use futures_util::{
+    future::{FutureExt, LocalBoxFuture, Shared},
+    StreamExt,
+};
 use http_body_util::BodyExt;
+use iroh::address_lookup::{AddressLookup, PkarrResolver};
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use js_sys::{Array, Reflect, Uint8Array};
 use tokio::sync::{watch, Mutex};
 use wasm_bindgen::prelude::*;
@@ -54,25 +58,56 @@ fn js_error(context: &str, error: impl std::fmt::Display) -> JsValue {
     js_sys::Error::new(&format!("{context}: {error}")).into()
 }
 
-fn normalize_relay_url_for_browser(relay_url: RelayUrl) -> Result<RelayUrl, JsValue> {
+fn normalize_relay_url_for_browser(relay_url: RelayUrl) -> RelayUrl {
     let mut url = (*relay_url).clone();
     let Some(host) = url.host_str().map(str::to_owned) else {
-        return Ok(RelayUrl::from(url));
+        return RelayUrl::from(url);
     };
     if let Some(host) = host.strip_suffix('.') {
-        url.set_host(Some(host))
-            .map_err(|error| js_error("normalizing Iroh relay URL", error))?;
+        // A hostname returned by `url::Url` remains valid after removing its
+        // optional DNS root dot. Retain the original if that invariant ever
+        // changes in the URL parser.
+        let _ = url.set_host(Some(host));
     }
-    Ok(RelayUrl::from(url))
+    RelayUrl::from(url)
 }
 
-fn browser_default_relay_urls() -> Result<Vec<RelayUrl>, JsValue> {
+fn browser_default_relay_urls() -> Vec<RelayUrl> {
     RelayMode::Default
         .relay_map()
         .urls::<Vec<RelayUrl>>()
         .into_iter()
         .map(normalize_relay_url_for_browser)
         .collect()
+}
+
+fn normalize_endpoint_addr_for_browser(mut remote: EndpointAddr) -> EndpointAddr {
+    remote.addrs = remote
+        .addrs
+        .into_iter()
+        .map(|addr| match addr {
+            TransportAddr::Relay(url) => TransportAddr::Relay(normalize_relay_url_for_browser(url)),
+            other => other,
+        })
+        .collect();
+    remote
+}
+
+async fn resolve_endpoint_for_browser(
+    resolver: &PkarrResolver,
+    remote: EndpointId,
+) -> Result<EndpointAddr, String> {
+    let mut results = resolver
+        .resolve(remote)
+        .ok_or_else(|| "Iroh address resolver is unavailable".to_owned())?;
+    let item = results
+        .next()
+        .await
+        .ok_or_else(|| "Iroh address resolver returned no result".to_owned())?
+        .map_err(|error| error.to_string())?;
+    Ok(normalize_endpoint_addr_for_browser(
+        item.into_endpoint_addr(),
+    ))
 }
 
 fn httpi_error(error: JsValue, stage: &str, category: &str, dispatch: &str) -> JsValue {
@@ -129,6 +164,7 @@ type SharedConnection = Shared<LocalBoxFuture<'static, Result<Connection, String
 #[wasm_bindgen]
 pub struct BrowserIrohNode {
     endpoint: Endpoint,
+    resolver: PkarrResolver,
     connections: Rc<RefCell<HashMap<ConnectionKey, SharedConnection>>>,
 }
 
@@ -145,9 +181,11 @@ impl BrowserIrohNode {
                 Some(connecting) => connecting.await,
                 None => {
                     let endpoint = self.endpoint.clone();
+                    let resolver = self.resolver.clone();
                     let connecting = async move {
+                        let remote = resolve_endpoint_for_browser(&resolver, remote).await?;
                         endpoint
-                            .connect(EndpointAddr::from(remote), protocol.alpn())
+                            .connect(remote, protocol.alpn())
                             .await
                             .map_err(|error| error.to_string())
                     }
@@ -361,7 +399,7 @@ pub async fn create_iroh_node(options: Option<JsValue>) -> Result<BrowserIrohNod
                 .ok_or_else(|| js_sys::TypeError::new("relayUrls entries must be strings"))?;
             let relay_url = RelayUrl::from_str(&relay_url)
                 .map_err(|error| js_error("invalid Iroh relay URL", error))?;
-            parsed.push(normalize_relay_url_for_browser(relay_url)?);
+            parsed.push(normalize_relay_url_for_browser(relay_url));
         }
         if parsed.is_empty() {
             return Err(js_sys::TypeError::new("relayUrls cannot be empty").into());
@@ -374,14 +412,21 @@ pub async fn create_iroh_node(options: Option<JsValue>) -> Result<BrowserIrohNod
         // root dot. WebKit includes that dot in TLS hostname validation and
         // rejects the otherwise valid n0 certificate. Preserve Iroh's current
         // default relay map while removing only the DNS presentation suffix.
-        builder = builder.relay_mode(RelayMode::custom(browser_default_relay_urls()?));
+        builder = builder.relay_mode(RelayMode::custom(browser_default_relay_urls()));
     }
+    // Resolve addresses explicitly so relay URLs advertised by remote native
+    // endpoints receive the same browser TLS normalization as our local relay
+    // map. Leaving the preset resolver installed would reintroduce the dotted
+    // address alongside the normalized one.
+    builder = builder.clear_address_lookup();
     let endpoint = builder
         .bind()
         .await
         .map_err(|error| js_error("binding browser Iroh endpoint failed", error))?;
+    let resolver = PkarrResolver::n0_dns().build(endpoint.tls_config().clone());
     Ok(BrowserIrohNode {
         endpoint,
+        resolver,
         connections: Rc::new(RefCell::new(HashMap::new())),
     })
 }

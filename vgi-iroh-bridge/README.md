@@ -61,7 +61,7 @@ are published for Linux x86-64 and ARM64 as
 docker run --rm --network host \
   --user "$(id -u):$(id -g)" \
   --mount type=bind,src="$PWD/vgi-iroh-key",dst=/run/secrets/vgi-iroh-key,readonly \
-  ghcr.io/query-farm/vgi-iroh-bridge:0.24.3 \
+  ghcr.io/query-farm/vgi-iroh-bridge:0.24.4 \
   --secret-key-file /run/secrets/vgi-iroh-key \
   --http-upstream http://127.0.0.1:9400
 ```

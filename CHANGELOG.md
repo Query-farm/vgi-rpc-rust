@@ -4,6 +4,21 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## Unreleased
 
+## [0.24.4] — 2026-09-11
+
+### Added
+
+- Let supervisors provide the bridge's persistent Iroh secret through inherited
+  standard input without placing it on disk, and zeroize the encoded key after
+  parsing.
+- Add machine-readable bridge discovery output containing the EndpointId,
+  relay URLs, and direct addresses.
+
+### Changed
+
+- Log routine client-initiated raw-stream shutdown at debug level while keeping
+  connection, admission, identity-preamble, and task failures at warning level.
+
 ## [0.24.3] — 2026-09-05
 
 ### Added

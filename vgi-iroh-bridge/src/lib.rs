@@ -959,6 +959,19 @@ impl AsyncWrite for IrohStream {
 
 fn report_stream(completed: Option<std::result::Result<Result<()>, tokio::task::JoinError>>) {
     match completed {
+        // Clients commonly close the QUIC connection immediately after the
+        // final Arrow response. copy_bidirectional then reports the proxy copy
+        // as reset/stopped even though the RPC completed. Keep that routine
+        // per-stream lifecycle event out of production warning logs; connect,
+        // identity-preamble, admission, and task failures remain warnings.
+        Some(Ok(Err(
+            error @ BridgeError::Io {
+                operation: "proxy VGI stream",
+                ..
+            },
+        ))) => {
+            tracing::debug!(%error, "raw VGI bridge stream ended")
+        }
         Some(Ok(Err(error))) => tracing::warn!(%error, "raw VGI bridge stream failed"),
         Some(Err(error)) => tracing::warn!(%error, "raw VGI bridge stream task failed"),
         Some(Ok(Ok(()))) | None => {}

@@ -22,6 +22,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 iroh = { version = "=1.1.0", default-features = false, features = ["tls-ring"] }
 iroh-http-core = { package = "query-farm-iroh-http-core", version = "0.6.3" }
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -29,5 +30,6 @@ tower = "0.5"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 vgi-rpc-iroh = { path = "../vgi-rpc-iroh" }
+zeroize = "1"
 
 [dev-dependencies]

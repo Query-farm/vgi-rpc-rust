@@ -61,7 +61,7 @@ are published for Linux x86-64 and ARM64 as
 docker run --rm --network host \
   --user "$(id -u):$(id -g)" \
   --mount type=bind,src="$PWD/vgi-iroh-key",dst=/run/secrets/vgi-iroh-key,readonly \
-  ghcr.io/query-farm/vgi-iroh-bridge:0.24.3 \
+  ghcr.io/query-farm/vgi-iroh-bridge:0.24.4 \
   --secret-key-file /run/secrets/vgi-iroh-key \
   --http-upstream http://127.0.0.1:9400
 ```
@@ -72,9 +72,13 @@ bound to host loopback. In an orchestrated deployment, place the bridge and
 worker on a private network and use the worker service name instead.
 
 The first stdout line is the bridge EndpointId. A persistent key is required
-from `--secret-key-file` or `VGI_IROH_SECRET_KEY`; `--ephemeral` is an explicit
-development-only alternative. The key itself is never accepted as a command
-line argument. Repeated `--relay-url` values replace the default relay set,
+from `--secret-key-file`, one-shot `--secret-key-stdin`, or
+`VGI_IROH_SECRET_KEY`; `--ephemeral` is an explicit development-only
+alternative. The stdin form is intended for a supervising process that passes
+the key through an inherited pipe without persisting it. The key itself is
+never accepted as a command-line argument. `--discovery-json` emits the
+EndpointId, relay URLs, and direct addresses as one non-secret JSON line.
+Repeated `--relay-url` values replace the default relay set,
 and `--no-relay` selects direct paths only. `SIGINT` and, on Unix, `SIGTERM`
 stop the Router, which in turn drains both protocol handlers within their
 configured bounds.

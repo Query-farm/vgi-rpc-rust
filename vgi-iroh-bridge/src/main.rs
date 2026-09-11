@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -16,6 +16,7 @@ use vgi_iroh_bridge::{
     HttpBridgeOptions, HttpBridgeProtocol, RawBridgeOptions, RawBridgeProtocol, RawUpstream,
     IROH_HTTP_ALPN, VGI_IROH_ALPN,
 };
+use zeroize::Zeroize;
 
 const SECRET_KEY_ENV: &str = "VGI_IROH_SECRET_KEY";
 const MAX_SECRET_FILE_BYTES: u64 = 4096;
@@ -25,11 +26,22 @@ const MAX_SECRET_FILE_BYTES: u64 = 4096;
 #[command(version, about)]
 struct Args {
     /// File containing the persistent Iroh secret key.
-    #[arg(long, value_name = "PATH", conflicts_with = "ephemeral")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["ephemeral", "secret_key_stdin"]
+    )]
     secret_key_file: Option<PathBuf>,
 
+    /// Read the Iroh secret key once from inherited standard input.
+    #[arg(long, conflicts_with_all = ["secret_key_file", "ephemeral"])]
+    secret_key_stdin: bool,
+
     /// Generate a process-lifetime identity. Intended only for development.
-    #[arg(long, conflicts_with = "secret_key_file")]
+    #[arg(
+        long,
+        conflicts_with_all = ["secret_key_file", "secret_key_stdin"]
+    )]
     ephemeral: bool,
 
     /// Raw VGI destination: tcp://host:port or unix:///absolute/path.
@@ -124,6 +136,10 @@ struct Args {
     /// Intended for deterministic same-host integration tests and discovery.
     #[arg(long)]
     print_direct_addresses: bool,
+
+    /// Print one JSON discovery record instead of the line-oriented format.
+    #[arg(long, conflicts_with = "print_direct_addresses")]
+    discovery_json: bool,
 }
 
 #[tokio::main]
@@ -155,7 +171,12 @@ async fn main() -> Result<()> {
     }
     let endpoint = endpoint.bind().await.context("bind Iroh endpoint")?;
     let endpoint_id = endpoint.id();
-    let direct_addresses = endpoint.addr().ip_addrs().copied().collect::<Vec<_>>();
+    let endpoint_addr = endpoint.addr();
+    let direct_addresses = endpoint_addr.ip_addrs().copied().collect::<Vec<_>>();
+    let relay_urls = endpoint_addr
+        .relay_urls()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
 
     let mut router = Router::builder(endpoint);
     if let Some(value) = args.raw_upstream.as_deref() {
@@ -171,8 +192,19 @@ async fn main() -> Result<()> {
     }
     let router = router.spawn();
 
-    println!("{endpoint_id}");
-    if args.print_direct_addresses {
+    if args.discovery_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "endpoint_id": endpoint_id.to_string(),
+                "relay_urls": relay_urls,
+                "direct_addresses": direct_addresses.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            })
+        );
+    } else {
+        println!("{endpoint_id}");
+    }
+    if args.print_direct_addresses && !args.discovery_json {
         for address in direct_addresses {
             println!("DIRECT:{address}");
         }
@@ -282,15 +314,33 @@ fn load_secret_key(args: &Args) -> Result<SecretKey> {
         }
         return Ok(SecretKey::generate());
     }
-    let encoded = match (&args.secret_key_file, environment) {
-        (Some(_), Some(_)) => bail!("--secret-key-file conflicts with {SECRET_KEY_ENV}"),
-        (Some(path), None) => read_secret_file(path)?,
-        (None, Some(value)) => os_secret(value)?,
-        (None, None) => bail!(
-            "a stable identity is required: set --secret-key-file or {SECRET_KEY_ENV}; use --ephemeral only for development"
+    let mut encoded = match (&args.secret_key_file, args.secret_key_stdin, environment) {
+        (Some(_), _, Some(_)) | (_, true, Some(_)) => {
+            bail!("key input options conflict with {SECRET_KEY_ENV}")
+        }
+        (Some(path), false, None) => read_secret_file(path)?,
+        (None, true, None) => read_secret_stdin()?,
+        (None, false, Some(value)) => os_secret(value)?,
+        (None, false, None) => bail!(
+            "a stable identity is required: set --secret-key-file, --secret-key-stdin, or {SECRET_KEY_ENV}; use --ephemeral only for development"
         ),
+        (Some(_), true, None) => unreachable!("clap rejects conflicting key inputs"),
     };
-    SecretKey::from_str(encoded.trim()).context("invalid Iroh secret key")
+    let parsed = SecretKey::from_str(encoded.trim());
+    encoded.zeroize();
+    parsed.context("invalid Iroh secret key")
+}
+
+fn read_secret_stdin() -> Result<String> {
+    let mut encoded = String::new();
+    std::io::stdin()
+        .take(MAX_SECRET_FILE_BYTES + 1)
+        .read_to_string(&mut encoded)
+        .context("read secret key from stdin")?;
+    if encoded.len() as u64 > MAX_SECRET_FILE_BYTES {
+        bail!("secret key from stdin exceeds {MAX_SECRET_FILE_BYTES} bytes");
+    }
+    Ok(encoded)
 }
 
 fn read_secret_file(path: &Path) -> Result<String> {
@@ -423,5 +473,32 @@ mod tests {
             "2",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn secret_key_stdin_is_explicit_and_exclusive() {
+        let accepted = Args::try_parse_from([
+            "vgi-iroh-bridge",
+            "--secret-key-stdin",
+            "--discovery-json",
+            "--raw-upstream",
+            "tcp://worker:9400",
+        ])
+        .unwrap();
+        assert!(accepted.secret_key_stdin);
+        assert!(accepted.discovery_json);
+        for conflicting in ["--ephemeral", "--secret-key-file"] {
+            let mut arguments = vec![
+                "vgi-iroh-bridge",
+                "--secret-key-stdin",
+                "--raw-upstream",
+                "tcp://worker:9400",
+                conflicting,
+            ];
+            if conflicting == "--secret-key-file" {
+                arguments.push("key.txt");
+            }
+            assert!(Args::try_parse_from(arguments).is_err());
+        }
     }
 }

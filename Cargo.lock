@@ -5055,6 +5055,7 @@ dependencies = [
  "hyper-util",
  "iroh",
  "query-farm-iroh-http-core",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -5062,6 +5063,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vgi-rpc-iroh",
+ "zeroize",
 ]
 
 [[package]]

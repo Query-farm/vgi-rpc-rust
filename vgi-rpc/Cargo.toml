@@ -85,6 +85,14 @@ name = "access_log_egress"
 required-features = ["http"]
 
 [[test]]
+name = "access_log_identity"
+required-features = ["http"]
+
+[[test]]
+name = "http_identity"
+required-features = ["http"]
+
+[[test]]
 name = "http_auth"
 required-features = ["http"]
 

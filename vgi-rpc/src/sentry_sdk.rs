@@ -393,7 +393,11 @@ impl DispatchHook for SentrySdkHook {
                 if !err.traceback.is_empty() {
                     event
                         .extra
-                        .insert("traceback".into(), Value::String(err.traceback.clone()));
+                        // `RpcError::traceback` is a `Box<str>` -- written
+                        // once, read many, and narrowed to keep `RpcError`
+                        // under clippy's `result_large_err` threshold. Sentry
+                        // wants an owned `String`.
+                        .insert("traceback".into(), Value::String(err.traceback.to_string()));
                 }
                 let _ = sentry::capture_event(event);
             }

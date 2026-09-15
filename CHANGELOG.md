@@ -30,6 +30,19 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
   canonical registry at all.
 - Reflection calls now produce access records; previously they produced none,
   on any transport.
+- `sentry_sdk.rs` compiles again under `--all-features`. `RpcError::traceback`
+  narrowed to `Box<str>` in the identity round; this site is reachable only
+  with the `sentry-sdk` feature, so nothing in a default build compiled it.
+- `access_log_identity` and `http_identity` declare `required-features =
+  ["http"]`, so a narrow-feature build skips them instead of compiling tests
+  whose imports were configured out.
+
+### Known gaps
+
+- HTTP streaming (`/{method}/init`, `/{method}/exchange`) fires no dispatch
+  hook, so an HTTP stream produces no access record at all. Left visible
+  rather than folded into the labelling fix above: a missing record is loud,
+  and a silently mislabelled one is not. Noted at the site in `http.rs`.
 
 ### Added
 

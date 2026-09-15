@@ -4159,6 +4159,25 @@ fn attach_access_sink(resp: &mut Response, sink: Option<crate::hooks::AccessSink
 // Stream init
 // ---------------------------------------------------------------------------
 
+// KNOWN GAP: neither `handle_stream_init` nor `handle_stream_exchange` fires
+// a dispatch hook, so an HTTP stream produces no access record at all. The
+// byte-stream path (`RpcServer::_serve_one`) records streams; HTTP does not,
+// which means a deployment that serves streams over HTTP has a hole in its
+// access log rather than a wrong entry in it.
+//
+// Deliberately left as a hole. A *missing* record is loud -- traffic the
+// dashboard cannot account for -- and it is a different failure from a
+// silently mislabelled one, which is well-formed, passes the schema and feeds
+// a plausible dashboard while decoding against the wrong description. Folding
+// the two together would have hidden the second behind the first. Closing this
+// needs the deferred-record plumbing (`AccessSink`) threaded through the
+// stream lifecycle, since a stream's stats are not final until it ends.
+//
+// Whoever closes it: take `protocol` and `protocol_hash` from
+// `RpcServer::protocol_identity` via `DispatchInfo::from_request`, like every
+// other emit site. `tests/access_log_identity.rs` walks the source tree and
+// will fail the build if a new site stamps either field itself.
+
 async fn handle_stream_init(
     State(state): State<Arc<HttpState>>,
     connect_info: Option<ConnectInfo<std::net::SocketAddr>>,

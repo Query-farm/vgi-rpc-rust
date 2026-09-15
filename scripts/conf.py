@@ -30,7 +30,22 @@ RUN_DIR = ROOT / ".test-run"
 JUNIT = RUN_DIR / "junit.xml"
 LOG = RUN_DIR / "pytest.log"
 ARGS = RUN_DIR / "args.txt"
-VENV_PY = Path("/Users/rusty/Development/vgi-rpc/.venv/bin/python")
+# The canonical Python reference is the `vgi-rpc-python` checkout, NOT
+# `~/Development/vgi-rpc`. The latter is `main` and carries a numerically
+# *higher* version (0.45.3) while containing none of the multiservice work:
+# no routing key, flat routes, `__describe__` still live. A harness pinned to
+# it tests against a reference that refuses every namespaced call, and reports
+# the resulting failures as if they were the port's.
+#
+# Both defaults are overridable; a machine-specific absolute path baked into a
+# committed script is how the stale pin survived unnoticed.
+#   VGI_RPC_PYTHON_REPO  checkout root of vgi-rpc-python
+#   VGI_RPC_PYTHON       interpreter to run the suite with (default: its .venv)
+REF_REPO = Path(
+    os.environ.get("VGI_RPC_PYTHON_REPO")
+    or Path.home() / "Development" / "vgi-rpc-python"
+)
+VENV_PY = Path(os.environ.get("VGI_RPC_PYTHON") or REF_REPO / ".venv" / "bin" / "python")
 VENV_BIN = VENV_PY.parent
 WORKER = ROOT / "conformance-worker-rust"
 GO_WORKER = Path.home() / "Development" / "vgi-rpc-go" / "vgi-rpc-conformance-go"
@@ -96,12 +111,81 @@ def _resolve_worker(server: str, release: bool, skip: bool) -> Path:
     raise SystemExit(f"[conf] unknown server {server!r}")
 
 
+def _check_reference() -> None:
+    """Fail loudly when the Python reference is missing, stale, or from PyPI.
+
+    Two ways to end up testing against the wrong reference, both silent:
+
+      * a stale *path* -- `~/Development/vgi-rpc` is `main`, carries a
+        numerically higher version, and has none of the multiservice work; and
+      * a stale *version* -- an interpreter whose ``vgi_rpc`` came from PyPI
+        rather than from the checkout. A version constraint is a pin too, and
+        an invisible one: the run looks healthy and every namespaced call fails.
+
+    The second is only reported, not refused: an installed-wheel layout is a
+    legitimate CI shape. But it is reported on every run, because the cost of
+    not noticing is a whole measurement cycle attributed to the port.
+    """
+    if not VENV_PY.exists():
+        raise SystemExit(
+            f"[conf] Python reference interpreter not found at {VENV_PY}\n"
+            f"       Expected a vgi-rpc-python checkout at {REF_REPO}.\n"
+            f"       Override with VGI_RPC_PYTHON_REPO=/path/to/vgi-rpc-python "
+            f"(or VGI_RPC_PYTHON=/path/to/python)."
+        )
+    probe = subprocess.run(
+        [str(VENV_PY), "-c", "import vgi_rpc, sys; print(vgi_rpc.__file__)"],
+        capture_output=True, text=True,
+    )
+    if probe.returncode != 0:
+        raise SystemExit(
+            f"[conf] {VENV_PY} cannot import vgi_rpc:\n{probe.stderr.strip()}"
+        )
+    module = Path(probe.stdout.strip()).resolve()
+    try:
+        module.relative_to(REF_REPO.resolve())
+    except ValueError:
+        print(
+            f"[conf] WARNING: the interpreter's vgi_rpc is NOT the checkout under test.\n"
+            f"[conf]   interpreter: {VENV_PY}\n"
+            f"[conf]   vgi_rpc at:  {module}\n"
+            f"[conf]   expected under: {REF_REPO}\n"
+            f"[conf]   An installed wheel is a pin too. If this is a PyPI release it\n"
+            f"[conf]   predates the multiservice work and every namespaced call will fail."
+        )
+    else:
+        print(f"[conf] python reference -> {module.parent} ({_reference_revision()})")
+
+
+def _reference_revision() -> str:
+    """The reference's git revision, so a reported number names what it measured.
+
+    The reference moves. A failure count with no revision beside it cannot be
+    compared to the next one, and two agents measuring an hour apart will report
+    different numbers for the same port and both be right.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(REF_REPO), "log", "-1", "--format=%h %s"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "revision unknown"
+    return r.stdout.strip() if r.returncode == 0 else "revision unknown"
+
+
 def _run(args: argparse.Namespace, extras: list[str]) -> int:
     RUN_DIR.mkdir(exist_ok=True)
+    _check_reference()
 
     worker = _resolve_worker(args.server, release=args.release, skip=args.no_build)
 
     env = os.environ.copy()
+    # Pin the child to the same reference this script resolved, so the pytest
+    # harness cannot silently fall back to a different (or stale) checkout.
+    env["VGI_RPC_PYTHON_REPO"] = str(REF_REPO)
+    env["VGI_RPC_PYTHON"] = str(VENV_PY)
+    env.setdefault("VGI_PY_TESTS_DIR", str(REF_REPO / "tests"))
     env["RUST_CONFORMANCE_WORKER"] = str(worker)
     env["VGI_CONFORMANCE_ROLE"] = args.role
     env["VGI_CONFORMANCE_SERVER"] = args.server
@@ -126,15 +210,18 @@ def _run(args: argparse.Namespace, extras: list[str]) -> int:
         transports = [t for t in transports if t != "http_externalize_always"]
     env["VGI_TRANSPORTS"] = ",".join(transports)
 
-    # Wall-clock deadline. The fast rust-only server matrix is capped at 59s
+    # Wall-clock deadline. The fast rust-only server matrix defaults to 59s
     # (keeps default foreground runs snappy). The cross-language client matrices
     # (role=client, server=python/go) spawn a fresh, slower server per
-    # pipe/subprocess test, so they legitimately need more time — give them a
-    # 300s floor and a 600s cap.
-    if args.role == "server" and args.server == "rust":
-        args.timeout = min(args.timeout, 59)
+    # pipe/subprocess test, so they default to 300s. An explicit `--timeout`
+    # always wins: these were hard clamps, which meant a suite that outgrew 59s
+    # could only ever report OVERALL TIMEOUT, with no way to see the real result.
+    if args.timeout is not None:
+        pass  # explicit --timeout always wins; the clamps below are defaults
+    elif args.role == "server" and args.server == "rust":
+        args.timeout = 59
     else:
-        args.timeout = min(max(args.timeout, 300), 600)
+        args.timeout = 300
     cmd = [
         str(VENV_PY), "-m", "pytest",
         "test_rust_conformance.py",
@@ -308,8 +395,8 @@ def main() -> int:
     pr.add_argument("--release", action="store_true", default=False,
                     help="release build (default: debug for faster iteration)")
     pr.add_argument("--debug", dest="release", action="store_false")
-    pr.add_argument("--timeout", type=int, default=55,
-                    help="overall wall-clock deadline in seconds (default 55, hard cap 59)")
+    pr.add_argument("--timeout", type=int, default=None,
+                    help="overall wall-clock deadline in seconds (default 59 for role=server/rust, else 300)")
     pr.add_argument("--per-test-timeout", type=int, default=2,
                     help="per-test timeout in seconds (default 2)")
     pr.add_argument("--no-build", action="store_true",

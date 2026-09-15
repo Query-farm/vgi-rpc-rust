@@ -1,7 +1,7 @@
 //! Attach to an existing POSIX shared-memory segment and dump the
 //! allocator state as JSON. Used by the cross-language compatibility
 //! test in the canonical Python repo
-//! (`~/Development/vgi-rpc/tests/test_shm_cross_language.py`).
+//! (`~/Development/vgi-rpc-python/tests/test_shm_cross_language.py`).
 //!
 //! Usage:
 //!   shm_dump --name <shm_name> --size <bytes>

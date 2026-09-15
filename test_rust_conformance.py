@@ -76,13 +76,21 @@ def _worker_cmd(mode: str, path: str | None = None) -> list[str]:
 # --- Python reference HTTP servers (full-featured: sticky, storage, strict,
 # auth) used when SERVER=python so the Rust client's external/sticky/413/strict
 # paths validate against the canonical Python implementation. -----------------
-_VENV_PY = os.environ.get("VGI_PYTHON_BIN", "/Users/rusty/Development/vgi-rpc/.venv/bin/python")
-# Directory holding the Python reference serve_conformance_*.py scripts. These
-# live in the vgi-rpc *repo* (not the PyPI wheel), so cross-language client runs
-# against the Python server set VGI_PY_TESTS_DIR to a checkout of that repo.
-_PY_TESTS = Path(
-    os.environ.get("VGI_PY_TESTS_DIR", str(Path.home() / "Development" / "vgi-rpc" / "tests"))
+# The canonical reference is the `vgi-rpc-python` checkout. `~/Development/
+# vgi-rpc` is `main` — numerically a higher version, but with none of the
+# multiservice work (no routing key, flat routes, `__describe__` still live),
+# so a run pinned there fails every namespaced call and blames the port.
+#   VGI_RPC_PYTHON_REPO  checkout root of vgi-rpc-python
+#   VGI_RPC_PYTHON       interpreter that has that checkout importable
+_REF_REPO = Path(
+    os.environ.get("VGI_RPC_PYTHON_REPO")
+    or Path.home() / "Development" / "vgi-rpc-python"
 )
+_VENV_PY = os.environ.get("VGI_RPC_PYTHON") or str(_REF_REPO / ".venv" / "bin" / "python")
+# Directory holding the Python reference serve_conformance_*.py scripts. These
+# live in the vgi-rpc-python *repo* (not the PyPI wheel), so cross-language
+# client runs against the Python server need a checkout of that repo.
+_PY_TESTS = Path(os.environ.get("VGI_PY_TESTS_DIR") or _REF_REPO / "tests")
 _PY_SERVE_HTTP = str(_PY_TESTS / "serve_conformance_http.py")
 _PY_SERVE_STRICT = str(_PY_TESTS / "serve_conformance_http_strict.py")
 _PY_SERVE_AUTH = str(_PY_TESTS / "serve_conformance_http_auth.py")
@@ -803,7 +811,12 @@ def rust_tcp_addr() -> Iterator[tuple[str, int]]:
         proc.wait(timeout=5)
 
 
-class _KindProbe(Protocol):
+# The class name IS the wire protocol name: `_RpcProxy` / `http_connect` derive
+# the routing key from it, and the worker registers this surface as
+# `TransportKindProbe`. Before routing keys existed the name was free; now a
+# mismatch is refused by the server, so this must stay in step with
+# `conformance-worker/src/main.rs`.
+class TransportKindProbe(Protocol):
     def report_transport_kind(self) -> str: ...
 
 
@@ -832,14 +845,14 @@ def conformance_transport_kind_probes() -> tuple[tuple[str, Callable[[], str]], 
     def probe_pipe() -> str:
         transport = SubprocessTransport([RUST_WORKER, "--transport-kind-probe"])
         try:
-            return str(_RpcProxy(_KindProbe, transport, None).report_transport_kind())
+            return str(_RpcProxy(TransportKindProbe, transport, None).report_transport_kind())
         finally:
             transport.close()
 
     def probe_http() -> str:
         proc, port = _spawn_read_port([RUST_WORKER, "--http", "--transport-kind-probe"])
         try:
-            with http_connect(_KindProbe, f"http://127.0.0.1:{port}") as proxy:
+            with http_connect(TransportKindProbe, f"http://127.0.0.1:{port}") as proxy:
                 return str(proxy.report_transport_kind())
         finally:
             proc.terminate()
@@ -857,7 +870,7 @@ def conformance_transport_kind_probes() -> tuple[tuple[str, Callable[[], str]], 
             line = proc.stdout.readline().decode().strip()
             assert line == f"UNIX:{path}", f"Expected UNIX:{path}, got: {line!r}"
             _wait_for_unix(path)
-            with unix_connect(_KindProbe, path) as proxy:
+            with unix_connect(TransportKindProbe, path) as proxy:
                 return str(proxy.report_transport_kind())
         finally:
             proc.terminate()
@@ -876,7 +889,7 @@ def conformance_transport_kind_probes() -> tuple[tuple[str, Callable[[], str]], 
             host, _, raw_port = line[len("TCP:") :].rpartition(":")
             port = int(raw_port)
             _wait_for_tcp(host, port)
-            with tcp_connect(_KindProbe, host, port) as proxy:
+            with tcp_connect(TransportKindProbe, host, port) as proxy:
                 return str(proxy.report_transport_kind())
         finally:
             proc.terminate()

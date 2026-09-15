@@ -277,8 +277,8 @@ jobs:
         run: |
           if [ "${{ matrix.server }}" = "python" ]; then
             export RUST_CONFORMANCE_WORKER="$(command -v vgi-rpc-conformance)"
-            export VGI_PYTHON_BIN="$(command -v python)"
-            export VGI_PY_TESTS_DIR="${{ github.workspace }}/vgi-python/tests"
+            export VGI_RPC_PYTHON="$(command -v python)"
+            export VGI_RPC_PYTHON_REPO="${{ github.workspace }}/vgi-python"
           else
             export RUST_CONFORMANCE_WORKER="${{ github.workspace }}/conformance-worker-rust"
           fi

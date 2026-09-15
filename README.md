@@ -122,9 +122,18 @@ async fn main() {
 
 ## Running conformance tests
 
-Requires the Python `vgi-rpc` package. By default `scripts/conf.py`
-looks for it at `~/Development/vgi-rpc/.venv`; override with
-`PYTHON=/path/to/python`.
+Requires a checkout of the canonical Python reference,
+[`vgi-rpc-python`](https://github.com/Query-farm/vgi-rpc-python). By default
+`scripts/conf.py` looks for it at `~/Development/vgi-rpc-python` and runs the
+suite with that checkout's `.venv/bin/python`. Override either half:
+
+| variable | meaning | default |
+|---|---|---|
+| `VGI_RPC_PYTHON_REPO` | checkout root of `vgi-rpc-python` | `~/Development/vgi-rpc-python` |
+| `VGI_RPC_PYTHON` | interpreter with that checkout importable | `$VGI_RPC_PYTHON_REPO/.venv/bin/python` |
+
+Note that `~/Development/vgi-rpc` is **not** the reference — it is `main`, and
+despite a numerically higher version it carries none of the multiservice work.
 
 ```bash
 # Build the worker and run the whole suite over all transports.

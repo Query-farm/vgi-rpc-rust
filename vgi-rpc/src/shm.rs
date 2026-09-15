@@ -1464,7 +1464,7 @@ mod tests {
     // ---------- header format pinning (cross-language) ----------
 
     /// Golden bytes for a known segment header state. The mirror Python
-    /// test lives at `~/Development/vgi-rpc/tests/test_shm_header_format.py`
+    /// test lives at `~/Development/vgi-rpc-python/tests/test_shm_header_format.py`
     /// and asserts the same hex. If this diverges, Python and Rust
     /// peers can no longer attach to each other's segments — the layout
     /// is not delegated to arrow-ipc, it is our hand-rolled allocator

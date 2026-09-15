@@ -21,19 +21,30 @@ three internal test/benchmark crates):
 | `conformance-client-driver/` | — | Binary `vgi-rpc-conformance-client-driver` exercising the `vgi-rpc-client` role against a Python/Rust server in the cross-language conformance matrix. |
 | `benchmark-worker/` | — | `vgi-rpc-benchmark-rust` — apples-to-apples benchmark target mirroring the Go / Python benchmark workers. |
 
-The Python canonical lives at `~/Development/vgi-rpc/vgi_rpc/`; the Go port
-at `~/Development/vgi-rpc-go/vgirpc/`. Read them alongside the Rust code
+The Python canonical lives at `~/Development/vgi-rpc-python/vgi_rpc/`
+(branch `multiservice/pr1-internal`); the Go port at
+`~/Development/vgi-rpc-go/vgirpc/`. Read them alongside the Rust code
 when extending — the wire format is Python-canonical and byte-for-byte
 compatibility with the Python conformance suite is the definition of "done"
 for each feature.
+
+> **Not `~/Development/vgi-rpc`.** That tree is `main` and carries a
+> numerically *higher* version (0.45.3) while containing none of the
+> multiservice work — no routing key, flat routes, `__describe__` still live.
+> A harness pinned there refuses every namespaced call and the failures read
+> as the port's. `scripts/conf.py` resolves the reference from
+> `VGI_RPC_PYTHON_REPO` (default `~/Development/vgi-rpc-python`) and
+> `VGI_RPC_PYTHON` (default that checkout's `.venv/bin/python`), exports both
+> to the pytest child, and refuses to run if the interpreter is missing.
 
 ## Daily commands
 
 All via `scripts/conf.py`:
 
 ```bash
-# Build worker + run full 901-test conformance suite across transports.
-./scripts/conf.py run --transport all
+# Build worker + run the full conformance suite across transports.
+# The suite outgrew the old 59s default; pass --timeout when it trips.
+./scripts/conf.py run --transport all --timeout 900 --per-test-timeout 30
 
 # Slice: one test class over one transport (fast iteration).
 ./scripts/conf.py run --transport pipe --class TestProducer
@@ -46,9 +57,19 @@ All via `scripts/conf.py`:
 ```
 
 The script writes `.test-run/{junit.xml, pytest.log, build.log, args.txt}`
-so you can reason about results without re-running tests. A one-minute
-overall deadline and a 2-second per-test deadline are enforced so hangs
-can't swallow a session.
+so you can reason about results without re-running tests. The default
+deadlines (59s overall for role=server/rust, 2s per test) keep a casual run
+snappy; `--timeout` / `--per-test-timeout` override them, and they are
+overrides rather than clamps precisely so a suite that has outgrown the
+default can still report a result instead of only `OVERALL TIMEOUT`.
+
+It prints the Python reference it resolved, with that checkout's git
+revision, on every run. **Read that line.** A failure count is a
+measurement *of a reference*, and the reference moves: two counts taken an
+hour apart are not comparable without it. The script also warns when the
+interpreter's `vgi_rpc` does not live under the checkout — an installed
+wheel is a pin too, and a PyPI release predates the multiservice work, so
+every namespaced call fails and the port gets the blame.
 
 Per-crate Rust tests:
 
@@ -58,14 +79,37 @@ cargo test -p vgi-rpc --lib wire          # one module
 cargo test -p vgi-rpc --test http_auth    # one integration file
 ```
 
-Pre-commit gate (also runs in CI):
+Pre-commit gate. The first four are the quick pass; **the rest are gates CI
+runs that none of the first four reach**, which is how two breaks landed —
+a `--no-default-features` build and a test target missing
+`required-features` are both invisible to an `--all-features` run, by
+construction.
 
 ```bash
+# Quick pass.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-./scripts/conf.py run --transport all
+./scripts/conf.py run --transport all --timeout 900 --per-test-timeout 30
+
+# Narrow feature sets. `--all-features` makes every optional dependency
+# present no matter which feature pulled it in, so it cannot catch a feature
+# that fails to declare its own crates — and `--all-targets` here is what
+# catches a new test file that needs `required-features` in Cargo.toml.
+cargo clippy -p vgi-rpc --no-default-features --all-targets -- -D warnings
+cargo build -p vgi-rpc --no-default-features
+for f in $(cargo metadata --no-deps --format-version 1 \
+    | jq -r '.packages[] | select(.name == "vgi-rpc") | .features | keys[]'); do
+  cargo build -p vgi-rpc --no-default-features --features "$f" || break
+done
+
+# Docs and MSRV — both fail the build in CI.
+cargo doc --workspace --no-deps --all-features
+cargo +1.97.0 build --workspace --all-features
 ```
+
+CI additionally passes `--locked` everywhere; run it locally too if you have
+touched `Cargo.toml`.
 
 ## Architecture, module by module
 
@@ -299,7 +343,7 @@ contract drifted anyway. To reproduce a CI failure locally:
 
 ```bash
 cargo build --release -p vgi-rpc-conformance-rust
-~/Development/vgi-rpc/.venv/bin/vgi-rpc-test \
+~/Development/vgi-rpc-python/.venv/bin/vgi-rpc-test \
   --cmd "target/release/vgi-rpc-conformance-rust --access-log /tmp/rust-al.jsonl --access-log-debug" \
   --access-log /tmp/rust-al.jsonl \
   --require-request-data

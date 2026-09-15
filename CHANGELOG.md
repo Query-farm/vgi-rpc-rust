@@ -17,6 +17,19 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ### Fixed
 
+- **`vgi_rpc.Reflection.v1` describes its own two methods.** The binding was
+  registered without them, so `describe("vgi_rpc.Reflection.v1")` returned an
+  empty method list and the protocol hashed to `fafffd66…` instead of the
+  reference's `3c7db4ca…`. A client discovering a server the documented way —
+  `list_protocols`, then `describe` — was told reflection exists and then told
+  it has nothing to call, so it could not learn to call the protocol it was
+  already calling. Nothing local could see it: `list_protocols` advertised the
+  same digest this port's own `describe` returned, and only a port-to-port
+  comparison disagreed. Dispatch is unchanged — reflection already answered
+  both methods — and the digest is now pinned, with its shape, by
+  `reflection_self_description`. Reflection's hash moves; the application and
+  `vgi_rpc.Identity.v1` digests do not.
+
 - **Access records carry the owning binding's protocol *and* hash.** Both
   fields now come from `RpcServer::protocol_identity`, read off the binding a
   request routes to, so a co-hosted protocol's calls are no longer filed under

@@ -16,13 +16,13 @@
 //! would deny the client the diagnosis it came for.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::builder::{
     ArrayBuilder, BinaryBuilder, BooleanBuilder, ListBuilder, StringBuilder, StructBuilder,
 };
 use arrow_array::{Array, ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Field, Fields, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 
 use crate::errors::{Result, RpcError};
 use crate::protocol_hash::{compute_protocol_hash, HashMethod};
@@ -34,6 +34,12 @@ use crate::stream::empty_schema;
 /// Fixed, and the one protocol name a client may know a priori: it is the
 /// bootstrap, so there is nothing to discover it with.
 pub const REFLECTION_PROTOCOL_NAME: &str = "vgi_rpc.Reflection.v1";
+
+/// The method that returns one protocol's full description.
+pub const DESCRIBE_METHOD: &str = "describe";
+
+/// The method that lists every protocol a server hosts.
+pub const LIST_PROTOCOLS_METHOD: &str = "list_protocols";
 
 /// The method introspection used to be, kept only so the refusal can name its
 /// replacement.
@@ -149,6 +155,91 @@ pub fn service_description_schema() -> Schema {
         false,
     ));
     Schema::new(fields)
+}
+
+/// The params schema of [`DESCRIBE_METHOD`]: the wire name to describe.
+pub fn describe_params_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "protocol",
+        DataType::Utf8,
+        false,
+    )]))
+}
+
+/// The result schema both reflection methods share.
+///
+/// Reflection returns its payload the way every structured return travels
+/// here: serialized into a single non-null `result` binary column. It is an
+/// ordinary protocol, so the convention applies to it too.
+pub fn reflection_result_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "result",
+        DataType::Binary,
+        false,
+    )]))
+}
+
+/// Reflection's own method table -- the two methods it answers.
+///
+/// Registered rather than left empty. An earlier reading had it that the table
+/// is "honestly empty" because reflection's methods are framework-owned rather
+/// than registered; that inverts the contract. The table is what `describe`
+/// reports and what [`binding_hash`] is computed over, so an empty one is not
+/// honesty about an empty protocol -- it is a protocol lying about itself. A
+/// client discovering a server the documented way -- `list_protocols`, then
+/// `describe` for each name it cares about -- would be told reflection exists
+/// and then told it has no methods, leaving it unable to learn how to call the
+/// protocol it is already calling.
+///
+/// The entries carry schemas and an unreachable handler: reflection dispatches
+/// from `RpcServer::serve_reflection`, which matches the method name itself,
+/// and this table is never inserted into a server's registered methods. The
+/// handler is spelled anyway, returning an error, so that a future caller which
+/// *does* register these gets a diagnosis rather than the `unwrap` panic a
+/// handler-less registration would earn.
+pub fn reflection_methods() -> &'static HashMap<String, MethodInfo> {
+    static METHODS: OnceLock<HashMap<String, MethodInfo>> = OnceLock::new();
+    METHODS.get_or_init(|| {
+        let mut methods: HashMap<String, MethodInfo> = HashMap::new();
+        methods.insert(
+            DESCRIBE_METHOD.to_string(),
+            MethodInfo::unary(
+                DESCRIBE_METHOD,
+                describe_params_schema(),
+                reflection_result_schema(),
+                |_req, _ctx| Err(served_by_the_framework(DESCRIBE_METHOD)),
+            )
+            .doc("Return one protocol's full description.")
+            .param_type("protocol", "str"),
+        );
+        methods.insert(
+            LIST_PROTOCOLS_METHOD.to_string(),
+            MethodInfo::unary(
+                LIST_PROTOCOLS_METHOD,
+                empty_schema(),
+                reflection_result_schema(),
+                |_req, _ctx| Err(served_by_the_framework(LIST_PROTOCOLS_METHOD)),
+            )
+            .doc("Return every protocol this server hosts, with versions and hashes."),
+        );
+        methods
+    })
+}
+
+/// Reflection's method names, sorted -- for the "no such method" diagnostic.
+pub fn sorted_reflection_method_names() -> Vec<&'static str> {
+    let mut names: Vec<&str> = reflection_methods().keys().map(String::as_str).collect();
+    names.sort_unstable();
+    names
+}
+
+/// The error a reflection registration's handler would return if one were ever
+/// reached. See [`reflection_methods`].
+fn served_by_the_framework(method: &str) -> RpcError {
+    RpcError::protocol_error(format!(
+        "'{REFLECTION_PROTOCOL_NAME}.{method}' is served by the framework's own dispatcher, \
+         not from a registered handler."
+    ))
 }
 
 /// Whether a method returns a value to its caller.
@@ -394,11 +485,12 @@ impl crate::server::RpcServer {
         req: &crate::server::Request,
     ) -> Result<bool> {
         let app_hash = binding_hash(&self.protocol_name, &self.methods)?;
-        // Reflection describes itself with no methods of its own in the table:
-        // they are framework-owned rather than registered, so the honest hash
-        // is over an empty method set.
-        let refl_methods: HashMap<String, MethodInfo> = HashMap::new();
-        let refl_hash = binding_hash(REFLECTION_PROTOCOL_NAME, &refl_methods)?;
+        // Reflection describes itself out of the same table it answers from,
+        // so its hash covers the two methods it really has. Self-description is
+        // not special-cased: the protocol appears in its own output, methods
+        // and all, or a client cannot learn to call what it is already calling.
+        let refl_methods = reflection_methods();
+        let refl_hash = binding_hash(REFLECTION_PROTOCOL_NAME, refl_methods)?;
         // Identity is registered *after* reflection, so it appears in
         // reflection's output -- which is the whole point of hosting it as an
         // ordinary protocol: a client learns which of its methods this
@@ -407,7 +499,7 @@ impl crate::server::RpcServer {
         let identity = self.identity_binding();
 
         let batch = match req.method.as_str() {
-            "list_protocols" => {
+            LIST_PROTOCOLS_METHOD => {
                 let mut protocols = vec![
                     (
                         self.protocol_name.clone(),
@@ -434,7 +526,7 @@ impl crate::server::RpcServer {
                     &protocols,
                 )?
             }
-            "describe" => {
+            DESCRIBE_METHOD => {
                 let requested = reflection_describe_argument(&req.batch);
                 if requested == self.protocol_name {
                     build_service_description(
@@ -448,7 +540,7 @@ impl crate::server::RpcServer {
                         REFLECTION_PROTOCOL_NAME,
                         "",
                         &refl_hash,
-                        &refl_methods,
+                        refl_methods,
                     )?
                 } else if let Some(binding) =
                     identity.filter(|_| requested == crate::token_identity::IDENTITY_PROTOCOL_NAME)
@@ -482,7 +574,8 @@ impl crate::server::RpcServer {
                     &empty_schema(),
                     &RpcError::attribute_error(format!(
                         "Protocol '{REFLECTION_PROTOCOL_NAME}' has no method '{other}'. \
-                         Available: [\"describe\", \"list_protocols\"]"
+                         Available: {:?}",
+                        sorted_reflection_method_names()
                     )),
                     &self.server_id,
                     &req.request_id,
@@ -565,4 +658,88 @@ pub fn write_unary_response<W: std::io::Write>(
     sw.write(batch, Some(metadata))?;
     sw.finish()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cross-port contract. A mismatch means this port and the reference
+    /// would disagree about whether they speak the same reflection.
+    ///
+    /// A failure is a JSON diff, not a guess: print
+    /// [`crate::protocol_hash::canonical_description`] and compare it against
+    /// the preimage pinned in `canonical_preimage_matches_the_reference`.
+    #[test]
+    fn matches_the_reference_hash() {
+        assert_eq!(
+            binding_hash(REFLECTION_PROTOCOL_NAME, reflection_methods()).unwrap(),
+            "3c7db4cae8cdfc93dc4a76e73b8b759e18e45e6a5811adba4e520366344b919a",
+        );
+    }
+
+    /// Pinned so a digest mismatch is diffable rather than a mystery.
+    #[test]
+    fn canonical_preimage_matches_the_reference() {
+        let entries = hash_methods(reflection_methods());
+        let preimage =
+            crate::protocol_hash::canonical_description(REFLECTION_PROTOCOL_NAME, &entries)
+                .unwrap();
+        assert_eq!(
+            preimage,
+            r#"{"methods":[{"has_header":false,"has_return":true,"name":"describe","params":[{"name":"protocol","nullable":false,"type":"utf8"}],"result":[{"name":"result","nullable":false,"type":"binary"}],"type":"unary"},{"has_header":false,"has_return":true,"name":"list_protocols","params":[],"result":[{"name":"result","nullable":false,"type":"binary"}],"type":"unary"}],"protocol":"vgi_rpc.Reflection.v1"}"#
+        );
+    }
+
+    /// The digest is a consequence of the shape, so the shape is pinned too: a
+    /// digest alone would let a future edit satisfy the vector by accident
+    /// while describing something else.
+    #[test]
+    fn hosts_exactly_its_two_methods() {
+        assert_eq!(
+            sorted_reflection_method_names(),
+            vec![DESCRIBE_METHOD, LIST_PROTOCOLS_METHOD]
+        );
+        for info in reflection_methods().values() {
+            assert!(
+                matches!(info.method_type, MethodType::Unary),
+                "{}",
+                info.name
+            );
+            assert!(unary_has_return(info), "{}", info.name);
+            assert!(info.header_schema.is_none(), "{}", info.name);
+            assert_eq!(
+                info.result_schema.as_ref(),
+                reflection_result_schema().as_ref(),
+                "{}",
+                info.name
+            );
+        }
+        let describe = &reflection_methods()[DESCRIBE_METHOD];
+        assert_eq!(
+            describe.params_schema.as_ref(),
+            describe_params_schema().as_ref()
+        );
+        // The one argument, non-null: a nullable `protocol` would hash
+        // differently and describe a method that can be asked about nothing.
+        let field = describe.params_schema.field_with_name("protocol").unwrap();
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        assert!(!field.is_nullable());
+        assert!(reflection_methods()[LIST_PROTOCOLS_METHOD]
+            .params_schema
+            .fields()
+            .is_empty());
+    }
+
+    /// The table is a description, not a dispatch path: reflection is served
+    /// from `serve_reflection`, which matches names itself. If one of these
+    /// handlers is ever reached it means the table was registered as a
+    /// server's methods, and an error says so where a panic would not.
+    #[test]
+    fn the_registrations_are_descriptions_only() {
+        for info in reflection_methods().values() {
+            assert!(info.stream.is_none(), "{}", info.name);
+            assert!(info.unary.is_some(), "a handler, so a misuse cannot panic");
+        }
+    }
 }

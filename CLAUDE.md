@@ -392,6 +392,16 @@ keeping in mind when extending):
   and `stream`; collapse `Producer | Exchange | Dynamic` → `"stream"` in
   a reflection description. The producer/exchange split rides separately
   on `stream_kind`, where `"unknown"` is a sayable answer.
+- **Reflection describes itself.** `vgi_rpc.Reflection.v1`'s binding carries
+  its own two methods (`vgi_rpc::reflection::reflection_methods`) and its hash
+  is computed over them — `3c7db4ca…`, the digest every port must produce. An
+  empty table is not honesty about a framework-owned surface: `describe`
+  reports the table and the hash is taken over it, so an empty one tells a
+  client that the protocol it is already calling has nothing to call. Pinned
+  locally by `reflection.rs`'s unit tests and
+  `vgi-rpc/tests/reflection_self_description.rs`, because internal consistency
+  cannot see this class of drift — `list_protocols` will happily advertise
+  whatever the port's own `describe` returns.
 - **Error envelopes** are zero-row batches whose custom metadata carries
   `vgi_rpc.log_level = "EXCEPTION"`, `vgi_rpc.log_message`, and a JSON
   `vgi_rpc.log_extra` with at least `exception_type`.

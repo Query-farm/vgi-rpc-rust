@@ -305,18 +305,9 @@ pub(crate) fn empty_schema() -> SchemaRef {
     Arc::new(Schema::empty())
 }
 
-/// The params schema of `vgi_rpc.Reflection.v1`'s `describe`.
-pub(crate) fn describe_params_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![arrow_schema::Field::new(
-        "protocol",
-        arrow_schema::DataType::Utf8,
-        false,
-    )]))
-}
-
 /// A one-row `describe` request batch naming `protocol`.
 pub(crate) fn describe_params(protocol: &str) -> Result<RecordBatch> {
-    let schema = describe_params_schema();
+    let schema = vgi_rpc::reflection::describe_params_schema();
     RecordBatch::try_new(
         schema,
         vec![Arc::new(arrow_array::StringArray::from(vec![protocol])) as arrow_array::ArrayRef],

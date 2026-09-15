@@ -917,13 +917,16 @@ impl RpcServer {
 
     /// The reflection protocol's canonical hash. Computed lazily and cached.
     ///
-    /// Over an empty method set: reflection's two methods are framework-owned
-    /// rather than registered, so an empty table is the honest input.
+    /// Over reflection's own two methods -- the same table `describe` reports.
+    /// The hash and the description are the same statement about the same
+    /// surface, so they are computed from the same input; hashing an empty set
+    /// while answering two methods is how four ports ended up advertising a
+    /// digest no other port could reproduce.
     pub(crate) fn reflection_protocol_hash(&self) -> &str {
         self.reflection_hash.get_or_init(|| {
             crate::reflection::binding_hash(
                 crate::reflection::REFLECTION_PROTOCOL_NAME,
-                &HashMap::new(),
+                crate::reflection::reflection_methods(),
             )
             .unwrap_or_default()
         })

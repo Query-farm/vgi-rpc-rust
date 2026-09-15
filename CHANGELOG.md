@@ -36,13 +36,37 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 - `access_log_identity` and `http_identity` declare `required-features =
   ["http"]`, so a narrow-feature build skips them instead of compiling tests
   whose imports were configured out.
+- **HTTP streams emit access records.** Previously neither `/init` nor
+  `/exchange` fired a dispatch hook, so a deployment serving streams over HTTP
+  had a hole in its log covering the calls that run longest and move the most
+  data. One record per turn now, all sharing the `stream_id` minted at `/init`
+  and carried in the call token — so a continuation handled by another worker
+  still files under the call it belongs to. `request_data` on the init record
+  only; `response_state` (the decrypted cursor) while the stream is resumable
+  and absent on the terminal turn. A port that emits *nothing* here passes
+  every record validator, because a validator validates the records that
+  exist.
+- The conformance worker's `AllTypes::to_record_batch` built columns in the
+  pre-reorder order while `all_types_schema()` declared the corrected one, so
+  every column from index 14 on was one position out and the batch was
+  rejected. The schema is unchanged; the protocol hash does not move.
+- `tcp_serve`, `inproc_roundtrip` and `loopback` stamp `vgi_rpc.protocol` on
+  their requests. All three predate the routing key and were being refused
+  before dispatch.
 
-### Known gaps
+### Changed
 
-- HTTP streaming (`/{method}/init`, `/{method}/exchange`) fires no dispatch
-  hook, so an HTTP stream produces no access record at all. Left visible
-  rather than folded into the labelling fix above: a missing record is loud,
-  and a silently mislabelled one is not. Noted at the site in `http.rs`.
+- `scripts/conf.py` resolves the Python reference from `VGI_RPC_PYTHON_REPO` /
+  `VGI_RPC_PYTHON` (defaulting to `~/Development/vgi-rpc-python`) instead of a
+  hardcoded path to `~/Development/vgi-rpc`, which is `main` and carries none
+  of the multiservice work despite a numerically higher version. It prints the
+  reference's git revision on every run — a failure count is a measurement of a
+  reference, and the reference moves — and warns when the interpreter's
+  `vgi_rpc` does not live under the checkout under test, because an installed
+  wheel is a pin too.
+- `--timeout` / `--per-test-timeout` are defaults rather than clamps. The 59s
+  cap meant a suite that had outgrown it could only ever report
+  `OVERALL TIMEOUT`.
 
 ### Added
 
@@ -52,6 +76,16 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 - `POST {prefix}/{protocol}/{method}` addresses a unary method by the protocol
   that owns it. The bare `/{method}` route cannot reach reflection's `describe`,
   which collides with the human-facing describe *page*.
+- `POST {prefix}/{protocol}/{method}/init` and `/exchange` do the same for
+  streams — the path shape the reference client builds every request from. The
+  path segment is checked against the request's routing key, never substituted
+  for it.
+- `DispatchInfo::response_state`, the decrypted outbound stream cursor, for the
+  access log's `response_state` field.
+- `a_dispatch_record_may_only_be_built_by_the_one_constructor` — a companion to
+  the existing identity guard, which scans for *assignments* and so cannot see
+  an emit site that sets the identity fields to nothing at all. Outside
+  `hooks.rs`, a `DispatchInfo` may only come from `from_request`.
 
 ## [0.24.4] — 2026-09-11
 

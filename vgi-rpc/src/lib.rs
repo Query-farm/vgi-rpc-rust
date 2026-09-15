@@ -37,11 +37,13 @@ pub mod stream;
 // stream_codec is pure serde+bincode (no axum/tokio/crypto) and is used by the
 // core dispatch path, so it's available without the full `http` stack — keeping
 // the crate wasm-buildable. `http` still pulls it in transitively.
+pub mod protocol_hash;
 #[cfg(feature = "stream-codec")]
 pub mod stream_codec;
 pub mod tcp;
 pub mod transport;
 pub mod transport_options;
+pub mod type_tokens;
 pub mod unauthorized;
 #[cfg(unix)]
 pub mod unix;

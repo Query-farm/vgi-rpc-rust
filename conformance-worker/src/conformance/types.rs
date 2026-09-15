@@ -196,9 +196,13 @@ pub fn all_types_schema() -> SchemaRef {
         Field::new("optional_int", DataType::Int64, true),
         Field::new("optional_nested", DataType::Struct(point_fields()), true),
         Field::new("list_of_nested", list_point_type(), false),
+        // Declaration order matters: it is part of the schema and therefore of
+        // the protocol hash. This list previously placed nested_list after the
+        // annotated pair, disagreeing both with the reference and with this
+        // file's own AllTypes struct a few lines below.
+        Field::new("nested_list", nested_list_int_type(), false),
         Field::new("annotated_int32", DataType::Int32, false),
         Field::new("annotated_float32", DataType::Float32, false),
-        Field::new("nested_list", nested_list_int_type(), false),
         Field::new("dict_str_str", map_str_str_type(), false),
     ]))
 }

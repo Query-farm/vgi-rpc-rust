@@ -58,15 +58,20 @@ pub struct HashMethod<'a> {
 }
 
 #[derive(serde::Serialize)]
+// Fields are declared in *sorted key order*, because serde_json emits them in
+// declaration order and canonical JSON requires sorted keys. Adding a field in
+// the wrong position here silently changes the digest for every protocol, which
+// is exactly the class of bug the canonical form exists to prevent -- so the
+// order is load bearing, not cosmetic.
 struct MethodEntry {
     has_header: bool,
     has_return: bool,
-    name: String,
-    params: Vec<FieldToken>,
     // Absent and empty are different: a method returning nothing is not a
     // method returning an empty struct, and they must not hash alike.
     #[serde(skip_serializing_if = "Option::is_none")]
     header: Option<Vec<FieldToken>>,
+    name: String,
+    params: Vec<FieldToken>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<Vec<FieldToken>>,
     #[serde(rename = "type")]
@@ -91,13 +96,13 @@ pub fn canonical_description(
         entries.push(MethodEntry {
             has_header: m.has_header,
             has_return: m.has_return,
-            name: m.name.to_string(),
-            params: schema_tokens(m.params_schema)?,
             header: if m.has_header {
                 Some(schema_tokens(m.header_schema)?)
             } else {
                 None
             },
+            name: m.name.to_string(),
+            params: schema_tokens(m.params_schema)?,
             result: if m.has_return {
                 Some(schema_tokens(m.result_schema)?)
             } else {

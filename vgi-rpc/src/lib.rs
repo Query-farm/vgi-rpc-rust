@@ -39,6 +39,7 @@ pub mod stream;
 // the crate wasm-buildable. `http` still pulls it in transitively.
 pub mod binding;
 pub mod protocol_hash;
+pub mod reflection;
 #[cfg(feature = "stream-codec")]
 pub mod stream_codec;
 pub mod tcp;

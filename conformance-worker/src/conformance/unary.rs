@@ -188,13 +188,19 @@ impl UnarySvc {
 
     /// Echo an enum value.
     ///
-    /// Python carries enum parameters as dictionary-encoded Utf8. The
-    /// `DictString` newtype selects that exact wire schema while the describe
-    /// metadata names it `"Status"`.
+    /// Python carries enum parameters *and returns* as dictionary-encoded
+    /// Utf8. The `DictString` newtype selects that exact wire schema while the
+    /// describe metadata names it `"Status"`.
+    ///
+    /// The return is `DictString` too, not `String`: answering plain utf8 where
+    /// the reference answers a dictionary made this method asymmetric -- it
+    /// accepted a dictionary and replied with a string. Nothing caught it until
+    /// protocol_hash became comparable across ports, because the conformance
+    /// assertions check the value rather than the column type.
     #[unary]
     #[param(name = "status", arrow_type = "Status")]
-    fn echo_enum(&self, status: DictString) -> Result<String> {
-        Ok(status.0)
+    fn echo_enum(&self, status: DictString) -> Result<DictString> {
+        Ok(status)
     }
 
     /// Echo a list of strings.

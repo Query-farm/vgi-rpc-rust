@@ -769,7 +769,7 @@ impl MethodInfo {
 
 /// The RPC server — holds method registrations and dispatches requests.
 pub struct RpcServer {
-    methods: HashMap<String, MethodInfo>,
+    pub(crate) methods: HashMap<String, MethodInfo>,
     pub server_id: String,
     pub(crate) server_version: String,
     pub(crate) protocol_name: String,
@@ -1131,6 +1131,15 @@ impl RpcServer {
             return Ok(true);
         }
 
+        // Reflection is a co-hosted protocol, routed by the same key as
+        // everything else and appearing in its own output. Handled *before* the
+        // version gate because it is exempt from it: this is what a
+        // version-mismatched client calls to learn what mismatched, and gating
+        // it would deny the client the diagnosis it came for.
+        if req.protocol == crate::reflection::REFLECTION_PROTOCOL_NAME {
+            return self.serve_reflection(w, &req);
+        }
+
         // Enforce application protocol-version compatibility (the transport
         // capability handshake above remains available for negotiation).
         if let Err(err) = validate_protocol_version(&self.protocol_version, &req.metadata) {
@@ -1172,7 +1181,10 @@ impl RpcServer {
         // hosting exactly one protocol: an exemption would let an intermediary
         // that rebuilds a request and drops the field land silently on
         // whichever protocol happened to be first, rather than being told.
-        let hosted = [self.protocol_name.as_str()];
+        let hosted = [
+            self.protocol_name.as_str(),
+            crate::reflection::REFLECTION_PROTOCOL_NAME,
+        ];
         if req.protocol.is_empty() {
             write_error_stream(
                 w,
@@ -1844,6 +1856,13 @@ pub(crate) fn build_log_metadata(msg: &LogMessage, server_id: &str, request_id: 
     let mut e = EnvelopeMeta::new(server_id, request_id);
     e.log(msg);
     e.md.unwrap()
+}
+
+/// Response envelope metadata: server id and echoed request id.
+pub(crate) fn build_envelope_metadata(server_id: &str, request_id: &str) -> Metadata {
+    EnvelopeMeta::new(server_id, request_id)
+        .md
+        .unwrap_or_default()
 }
 
 pub(crate) fn build_error_metadata(err: &RpcError, server_id: &str, request_id: &str) -> Metadata {

@@ -206,7 +206,7 @@ fn compute_protocol_hash(protocol_name: &str, rows: &[HashRow]) -> String {
 
 /// Serialize a `Schema` as an IPC stream (schema-only, empty body) — matches
 /// pyarrow's `Schema.serialize()`.
-fn schema_to_ipc(schema: &Schema) -> Result<Vec<u8>> {
+pub(crate) fn schema_to_ipc(schema: &Schema) -> Result<Vec<u8>> {
     // An IPC stream with just the schema message followed by the EOS marker.
     let mut buf: Vec<u8> = Vec::new();
     {

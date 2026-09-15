@@ -88,6 +88,12 @@ required-features = ["http"]
 name = "access_log_identity"
 required-features = ["http"]
 
+# Uses `StreamStateCodec` (bincode) for the producer's state, so it needs
+# `stream-codec` as well as the router.
+[[test]]
+name = "access_log_stream"
+required-features = ["http", "stream-codec"]
+
 [[test]]
 name = "http_identity"
 required-features = ["http"]

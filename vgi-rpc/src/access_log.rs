@@ -661,6 +661,15 @@ impl DispatchHook for AccessLogHook {
                 info.stream_id.clone()
             };
             rec.insert("stream_id".into(), json!(sid));
+            // Present exactly when the turn handed back a cursor. Its absence
+            // is what marks the terminal turn, so an empty value must stay
+            // absent rather than be logged as an empty string.
+            if !info.response_state.is_empty() {
+                rec.insert(
+                    "response_state".into(),
+                    json!(base64_encode(&info.response_state)),
+                );
+            }
         }
         if info.cancelled {
             rec.insert("cancelled".into(), json!(true));

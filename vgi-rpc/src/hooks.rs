@@ -141,6 +141,17 @@ pub struct DispatchInfo {
     pub request_data: Vec<u8>,
     /// Stream lifecycle identifier (32-char lowercase hex); empty on unary.
     pub stream_id: String,
+    /// The **decrypted** outbound stream state, in the server's own state
+    /// encoding — what `access-log-spec.md` calls `response_state`. Set on a
+    /// stream `init` and on any continuation that hands back a cursor;
+    /// deliberately empty on the terminal turn, because "the stream ended"
+    /// and "the stream is resumable from here" are the two things a reader
+    /// reconstructing a stream from its records has to tell apart.
+    ///
+    /// Plaintext, not the AEAD-sealed token that travels on the wire: a log
+    /// reader holds no key, so logging the ciphertext would record a value
+    /// nobody can ever decode.
+    pub response_state: Vec<u8>,
     /// True when a stream was cancelled by the client.
     pub cancelled: bool,
     /// Authentication claims — e.g. decoded JWT claims, X.509 cert
@@ -206,6 +217,7 @@ impl DispatchInfo {
             http_status: 0,
             request_data: Vec::new(),
             stream_id: String::new(),
+            response_state: Vec::new(),
             cancelled: false,
             claims: auth.claims.clone(),
             request_bytes: None,

@@ -304,6 +304,12 @@ async fn an_http_reflection_call_is_logged_as_reflection() {
 ///
 /// The whole `src` tree is walked rather than a fixed list of files, because
 /// the thing being guarded against is a site that does not exist yet.
+///
+/// This catches a site that stamps the *wrong* identity. It does not catch one
+/// that stamps *none* -- a hand-built `DispatchInfo` has nothing to assign, so
+/// this scan sees nothing to object to. That half is
+/// `a_dispatch_record_may_only_be_built_by_the_one_constructor` below; neither
+/// test is sufficient alone.
 #[test]
 fn no_emit_site_may_stamp_the_protocol_identity_itself() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -364,6 +370,100 @@ fn no_emit_site_may_stamp_the_protocol_identity_itself() {
         }
     }
     assert!(checked > 10, "the source walk found only {checked} files");
+}
+
+/// The blind spot the scan above does not cover: a site that fills the identity
+/// fields with *nothing*.
+///
+/// `no_emit_site_may_stamp_the_protocol_identity_itself` looks for
+/// *assignments*, so it catches a site that stamps the wrong protocol. It does
+/// not catch one that stamps none -- and forgetting is the likelier mistake.
+/// Mutation-checked in both directions: pointing `info.protocol` at the
+/// server's primary fails that test, while adding a `DispatchInfo { .. }`
+/// literal that never mentions the three fields passed it. Those records carry
+/// `protocol: ""` and `protocol_hash: ""`, which is not a milder failure than
+/// the wrong digest -- it is an unfilterable, undecodable record.
+///
+/// So this pins the stronger property: outside `hooks.rs`, a `DispatchInfo`
+/// may only come into existence through `DispatchInfo::from_request`. Fields
+/// you cannot skip are fields you cannot forget.
+#[test]
+fn a_dispatch_record_may_only_be_built_by_the_one_constructor() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    // Production code only. Every module in this crate keeps its unit tests in
+    // a single trailing `#[cfg(test)] mod tests`, and those legitimately build
+    // `DispatchInfo` literals as fixtures for the *consumer* side (the access
+    // log, otel, sentry) -- which is a different thing from an emit site.
+    // The `saw_emit_sites` assertion at the end is what stops this heuristic
+    // from silently swallowing a whole file and passing vacuously.
+    fn production_code(text: &str) -> &str {
+        match text.find("#[cfg(test)]") {
+            Some(at) => &text[..at],
+            None => text,
+        }
+    }
+
+    let mut saw_emit_sites: Vec<String> = Vec::new();
+    let mut stack = vec![src];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            // `hooks.rs` defines the struct and the constructor; it is the one
+            // place a `DispatchInfo` is allowed to be assembled field by field.
+            if name == "hooks.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let code = production_code(&text);
+            for (n, line) in code.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                for forbidden in ["DispatchInfo {", "DispatchInfo::default()"] {
+                    assert!(
+                        !trimmed.contains(forbidden),
+                        "{name}:{} builds a DispatchInfo itself ({forbidden}). Every record \
+                         must come from DispatchInfo::from_request, which reads protocol, \
+                         protocol_hash and protocol_version off RpcServer::protocol_identity. \
+                         A hand-built record silently leaves them empty -- a record that names \
+                         no protocol and carries no digest cannot be filtered or decoded at \
+                         all, and nothing about it looks wrong.",
+                        n + 1
+                    );
+                }
+            }
+            if (code.contains(".on_dispatch_start(") || code.contains(".on_dispatch_end("))
+                && code.contains("DispatchInfo::from_request(")
+            {
+                // A site that fires a hook either builds its record with the
+                // constructor or was handed one (ChainHook forwards).
+                saw_emit_sites.push(name);
+            }
+        }
+    }
+
+    saw_emit_sites.sort();
+    // The emit sites that exist today. Not a closed list -- a new one is
+    // welcome -- but if the walk stops finding these, the scan above has
+    // stopped looking at production code and every assertion in it is vacuous.
+    for expected in ["http.rs", "reflection.rs", "server.rs"] {
+        assert!(
+            saw_emit_sites.iter().any(|f| f == expected),
+            "the source walk found no hook-firing code in {expected}; it saw \
+             {saw_emit_sites:?}. Either an emit site moved or this scan is \
+             reading the wrong half of the files."
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

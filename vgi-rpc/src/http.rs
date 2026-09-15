@@ -1626,10 +1626,9 @@ pub(crate) struct ResolvedCall {
     pub output_schema_bytes: Vec<u8>,
     pub input_schema_bytes: Vec<u8>,
     /// Chain-correlation id, stable across a stream's init and its
-    /// continuations. Carried so the token round-trips it faithfully; this
-    /// port does not yet surface it on the continuation dispatch path the
-    /// way the Go port does.
-    #[allow(dead_code)]
+    /// continuations. Riding in the call token rather than being re-minted per
+    /// turn is what lets a continuation that lands on a *different* worker
+    /// file its access record under the call it belongs to.
     pub stream_id: String,
     pub response_limit_bytes: Option<usize>,
     pub preferred_response_bytes: Option<usize>,
@@ -2253,21 +2252,30 @@ fn build_router_inner(state: Arc<HttpState>) -> Router {
             "/:method/exchange",
             post(handle_stream_exchange).options(handle_preflight),
         )
-        // A unary method addressed as `{protocol}/{method}`.
+        // The protocol-qualified shape, `{protocol}/{method}[/init|/exchange]`
+        // -- what the rest of the fleet routes on, and what the Python
+        // reference client builds every request path from.
         //
-        // The bare `/:method` route above cannot reach a co-hosted protocol
-        // whose method name collides with something already mounted -- and
-        // reflection's `describe` collides with the human-facing describe
-        // *page*, so on the bare route it resolves to an HTML document that
-        // answers GET and 405s a POST. A protocol-qualified path has no such
-        // collision, and it is the shape the rest of the fleet routes on.
+        // The bare routes above cannot reach a co-hosted protocol whose method
+        // name collides with something already mounted -- reflection's
+        // `describe` collides with the human-facing describe *page*, so on the
+        // bare route it resolves to an HTML document that answers GET and 405s
+        // a POST. A protocol-qualified path has no such collision.
         //
         // Static segments still win at each position, so `/:method/init` and
-        // `/:method/exchange` keep their traffic: streams are not addressable
-        // this way yet, which is why this is one route and not three.
+        // `/:method/exchange` keep their own traffic; a three-segment path can
+        // only ever be the qualified form.
         .route(
             "/:protocol/:method",
             post(handle_protocol_unary).options(handle_preflight),
+        )
+        .route(
+            "/:protocol/:method/init",
+            post(handle_protocol_stream_init).options(handle_preflight),
+        )
+        .route(
+            "/:protocol/:method/exchange",
+            post(handle_protocol_stream_exchange).options(handle_preflight),
         );
 
     let api = if state.upload_url_provider.is_some() {
@@ -3732,6 +3740,31 @@ fn dispatch_sync<T>(callback: impl FnOnce() -> T) -> T {
     }
 }
 
+/// Reconcile a protocol-qualified route with the request's own routing key.
+///
+/// The path segment is *checked* against the key rather than substituted for
+/// it: two carriers naming different protocols is a caller error, and silently
+/// preferring one would let an intermediary that rewrites a path land a call on
+/// a protocol the request never named. A request that carries no key at all
+/// adopts the path's, which is what lets a plain HTTP caller address a
+/// co-hosted protocol without hand-building metadata.
+fn adopt_path_protocol(req: &mut Request, path_protocol: Option<&str>) -> Result<()> {
+    let Some(path_protocol) = path_protocol else {
+        return Ok(());
+    };
+    if req.protocol.is_empty() {
+        req.protocol = path_protocol.to_string();
+        return Ok(());
+    }
+    if req.protocol != path_protocol {
+        return Err(RpcError::protocol_error(format!(
+            "Protocol mismatch: route names '{path_protocol}', request metadata names '{}'",
+            req.protocol
+        )));
+    }
+    Ok(())
+}
+
 async fn handle_unary(
     State(state): State<Arc<HttpState>>,
     connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
@@ -3820,16 +3853,8 @@ async fn unary_dispatch(
         ));
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
-    if let Some(path_protocol) = path_protocol.as_deref() {
-        if req.protocol.is_empty() {
-            req.protocol = path_protocol.to_string();
-        } else if req.protocol != path_protocol {
-            let err = RpcError::protocol_error(format!(
-                "Protocol mismatch: route names '{path_protocol}', request metadata names '{}'",
-                req.protocol
-            ));
-            return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
-        }
+    if let Err(err) = adopt_path_protocol(&mut req, path_protocol.as_deref()) {
+        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
     // `vgi_rpc.Identity.v1` is co-hosted, and -- unlike the application
     // surface, which HTTP addresses by URL path -- resolved through the
@@ -4159,29 +4184,154 @@ fn attach_access_sink(resp: &mut Response, sink: Option<crate::hooks::AccessSink
 // Stream init
 // ---------------------------------------------------------------------------
 
-// KNOWN GAP: neither `handle_stream_init` nor `handle_stream_exchange` fires
-// a dispatch hook, so an HTTP stream produces no access record at all. The
-// byte-stream path (`RpcServer::_serve_one`) records streams; HTTP does not,
-// which means a deployment that serves streams over HTTP has a hole in its
-// access log rather than a wrong entry in it.
+/// One turn of an HTTP stream, as the access log sees it.
+///
+/// `None` from [`begin`](Self::begin) when no dispatch hook is registered: the
+/// `DispatchInfo` is a large struct of owned clones and the request
+/// re-serialization below is pure waste on the hookless path, exactly as on
+/// the unary one.
+struct StreamAccessRecord {
+    hook: Arc<dyn crate::hooks::DispatchHook>,
+    info: crate::hooks::DispatchInfo,
+    token: crate::hooks::HookToken,
+    stats: crate::hooks::CallStatistics,
+    sink: crate::hooks::AccessSink,
+}
+
+impl StreamAccessRecord {
+    /// Open the record for one turn.
+    ///
+    /// `request_batch` is `Some` only on `/init`: `access-log-spec.md` puts
+    /// `request_data` on the init record alone, because a continuation's body
+    /// is a cursor and whatever the caller is feeding back in, not the call's
+    /// arguments -- logging it on every turn would multiply the payload by the
+    /// length of the stream while adding nothing.
+    fn begin(
+        server: &Arc<crate::server::RpcServer>,
+        req: &Request,
+        auth: &crate::auth::AuthContext,
+        headers: &HeaderMap,
+        stream_id: &str,
+        request_wire_bytes: u64,
+        request_batch: Option<&RecordBatch>,
+    ) -> Option<Self> {
+        let hook = server.dispatch_hook.clone()?;
+        // `from_request` reads protocol / protocol_hash / protocol_version off
+        // the binding this request routes to. Nothing here may override them.
+        let mut info = crate::hooks::DispatchInfo::from_request(server, req, "stream", auth);
+        // The HTTP correlation id, not the Arrow-level one -- see the unary
+        // path: `postprocess_middleware` has already normalized the inbound
+        // header to the value it will stamp on the response, so reading it
+        // here is what makes header and record name the same request.
+        if let Some(id) = headers
+            .get(REQUEST_ID_RESPONSE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+        {
+            info.request_id = id.to_string();
+        }
+        info.stream_id = stream_id.to_string();
+        info.request_bytes = Some(request_wire_bytes);
+        let sink = crate::hooks::AccessSink::new();
+        info.access_sink = Some(sink.clone());
+        if let Some(batch) = request_batch {
+            // Best-effort; a failure here must not abort dispatch.
+            if let Ok(bytes) = crate::server::serialize_request_batch(batch) {
+                info.request_data = bytes;
+            }
+        }
+        let token = hook.on_dispatch_start(&info);
+        Some(Self {
+            hook,
+            info,
+            token,
+            stats: crate::hooks::CallStatistics::default(),
+            sink,
+        })
+    }
+
+    /// The plaintext cursor this turn handed back, if it handed one back.
+    /// Left unset on the terminal turn -- that absence is how a reader tells
+    /// "the stream ended" from "resume from here".
+    fn set_response_state(&mut self, state_bytes: Vec<u8>) {
+        self.info.response_state = state_bytes;
+    }
+
+    /// Bytes this turn pushed to external storage. They never reach the HTTP
+    /// body, so transport-level accounting cannot see them at all.
+    fn set_externalized_bytes(&mut self, bytes: u64) {
+        self.info.externalized_bytes = bytes;
+    }
+
+    /// The client asked to tear the stream down on this turn.
+    fn set_cancelled(&mut self, cancelled: bool) {
+        self.info.cancelled = cancelled;
+    }
+
+    /// Close the record and hand it to the response, so the post-processing
+    /// middleware emits it once the body (and its compressed size) is final.
+    fn finish(self, error: Option<&RpcError>, resp: &mut Response) {
+        self.hook
+            .on_dispatch_end(self.token, &self.info, error, &self.stats);
+        attach_access_sink(resp, Some(self.sink));
+    }
+}
+
+/// Close an optional record. The `Option` is the hookless path.
+fn finish_stream_record(
+    record: Option<StreamAccessRecord>,
+    error: Option<&RpcError>,
+    resp: &mut Response,
+) {
+    if let Some(record) = record {
+        record.finish(error, resp);
+    }
+}
+
+// One access record per RPC call -- and for a stream that is the `/init` and
+// every `/exchange`, all carrying the same `stream_id`. The id is minted at
+// `/init` and travels in the call token (`ResolvedCall::stream_id`), so a
+// continuation that lands on a different worker than the one that opened the
+// stream still files its record under the call it belongs to.
 //
-// Deliberately left as a hole. A *missing* record is loud -- traffic the
-// dashboard cannot account for -- and it is a different failure from a
-// silently mislabelled one, which is well-formed, passes the schema and feeds
-// a plausible dashboard while decoding against the wrong description. Folding
-// the two together would have hidden the second behind the first. Closing this
-// needs the deferred-record plumbing (`AccessSink`) threaded through the
-// stream lifecycle, since a stream's stats are not final until it ends.
+// Deferred through `AccessSink` for the same reason unary is: response
+// compression runs after the handler returns, so a record written here could
+// only ever report the uncompressed body.
 //
-// Whoever closes it: take `protocol` and `protocol_hash` from
-// `RpcServer::protocol_identity` via `DispatchInfo::from_request`, like every
-// other emit site. `tests/access_log_identity.rs` walks the source tree and
-// will fail the build if a new site stamps either field itself.
+// `protocol` and `protocol_hash` come from `DispatchInfo::from_request`, which
+// reads them off `RpcServer::protocol_identity` for the binding the request
+// routes to. `tests/access_log_identity.rs` walks the source tree and fails the
+// build if any emit site stamps either field itself.
 
 async fn handle_stream_init(
     State(state): State<Arc<HttpState>>,
     connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     Path(method): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    stream_init_dispatch(state, connect_info, None, method, headers, body).await
+}
+
+/// `POST {prefix}/{protocol}/{method}/init` -- the same stream init, addressed
+/// by the protocol that owns the method. See [`handle_protocol_unary`] for why
+/// the path segment is checked against the routing key rather than substituted
+/// for it.
+async fn handle_protocol_stream_init(
+    State(state): State<Arc<HttpState>>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    Path((protocol, method)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    stream_init_dispatch(state, connect_info, Some(protocol), method, headers, body).await
+}
+
+async fn stream_init_dispatch(
+    state: Arc<HttpState>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    path_protocol: Option<String>,
+    method: String,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -4214,6 +4364,9 @@ async fn handle_stream_init(
     let auth_for_token = auth.clone();
     let cookies = parse_cookies(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let server = state.server.clone();
+    // Measured before decompression: what the peer actually sent. See the
+    // unary path for why this is a different question from `input_bytes`.
+    let request_wire_bytes = body.len() as u64;
     let body = match maybe_decompress(&headers, &body, request_decode_limit(&state)) {
         Ok(b) => b,
         Err(e) => return request_decode_error(&state, &e),
@@ -4227,6 +4380,9 @@ async fn handle_stream_init(
             "Method mismatch: route names '{method}', request metadata names '{}'",
             req.method
         ));
+        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+    }
+    if let Err(err) = adopt_path_protocol(&mut req, path_protocol.as_deref()) {
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
     if let Err(err) = validate_protocol_version(server.protocol_version(), &req.metadata) {
@@ -4266,6 +4422,28 @@ async fn handle_stream_init(
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
 
+    // Minted here rather than after dispatch: it is this call's identity in
+    // the access log, so the record that opens before the handler runs already
+    // needs it, and every continuation will recover the same value from the
+    // call token.
+    let stream_id = new_session_id();
+    let mut record = StreamAccessRecord::begin(
+        &server,
+        &req,
+        &auth_for_token,
+        &headers,
+        &stream_id,
+        request_wire_bytes,
+        Some(&req.batch),
+    );
+    if let Some(record) = record.as_mut() {
+        record.stats.input_batches = 1;
+        record.stats.input_rows = req.batch.num_rows() as u64;
+    }
+    // Externalised uploads never reach the HTTP body, so they are counted
+    // where they happen. No `.await` runs between here and the response below.
+    let externalized = crate::external::ExternalizedScope::new();
+
     let mut ctx = CallContext::with_auth_cookies(&server, &req, auth, evidence.clone(), cookies);
     ctx.set_response_budget(response_limit, preferred_response);
     if let Some(s) = sticky_sink.clone() {
@@ -4286,6 +4464,7 @@ async fn handle_stream_init(
                 error_stream_bytes(&empty_schema(), &err, &server.server_id, &req.request_id),
             );
             stamp_rpc_error(&mut resp);
+            finish_stream_record(record, Some(&err), &mut resp);
             return resp;
         }
     };
@@ -4313,12 +4492,13 @@ async fn handle_stream_init(
     }
 
     let is_producer = matches!(ss, StreamStateKind::Producer(_));
-    let stream_id = new_session_id();
 
     let mut finished = false;
     // Set when the body ends up carrying an EXCEPTION envelope — either the
     // producer's first turn raised, or the state token could not be minted.
     let mut wrote_error = false;
+    // The same failure, kept whole for the access record.
+    let mut turn_error: Option<RpcError> = None;
     {
         let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
         if header.is_none() {
@@ -4347,7 +4527,12 @@ async fn handle_stream_init(
                 preferred_response,
             );
             finished = turn.finished;
-            wrote_error |= turn.errored;
+            if let Some(record) = record.as_mut() {
+                record.stats.output_batches = turn.output_batches;
+                record.stats.output_rows = turn.output_rows;
+            }
+            turn_error = turn.error;
+            wrote_error |= turn_error.is_some();
         }
         if !finished {
             match build_init_tokens(
@@ -4359,7 +4544,7 @@ async fn handle_stream_init(
                 &stream_id,
                 (response_limit, preferred_response),
             ) {
-                Ok((token, call_token)) => {
+                Ok((token, call_token, state_bytes)) => {
                     // /init is the one response that hands over the call
                     // token; continuations re-mint the cursor alone.
                     let md = Metadata::from([
@@ -4367,6 +4552,9 @@ async fn handle_stream_init(
                         (CALL_STATE_KEY.to_string(), call_token),
                     ]);
                     let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                    if let Some(record) = record.as_mut() {
+                        record.set_response_state(state_bytes);
+                    }
                 }
                 Err(err) => {
                     // Handler doesn't implement encode_state — emit as an
@@ -4375,10 +4563,15 @@ async fn handle_stream_init(
                     let md = build_error_metadata(&err, &server.server_id, &req.request_id);
                     let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                     wrote_error = true;
+                    turn_error = Some(err);
                 }
             }
         }
         let _ = sw.finish();
+    }
+
+    if let Some(record) = record.as_mut() {
+        record.set_externalized_bytes(externalized.finish());
     }
 
     let mut resp = enforce_response_body_cap(
@@ -4397,6 +4590,7 @@ async fn handle_stream_init(
     if let Some(s) = sticky_sink.as_ref() {
         stamp_session_headers(&mut resp, &state, s);
     }
+    finish_stream_record(record, turn_error.as_ref(), &mut resp);
     resp
 }
 
@@ -4405,6 +4599,12 @@ async fn handle_stream_init(
 /// verification on the next continuation request.
 /// Mint a stream's pair of tokens at `/init`: the call token, which carries
 /// everything fixed for the life of the call, and the first cursor.
+///
+/// Returns the plaintext state bytes alongside the tokens. The access log's
+/// `response_state` is the *decrypted* state, and re-encoding it at the emit
+/// site would call the handler's `encode_state` a second time — an
+/// application-supplied method, free to be expensive and not obliged to be
+/// pure. One encode, two consumers.
 fn build_init_tokens(
     state: &Arc<HttpState>,
     auth: &crate::auth::AuthContext,
@@ -4413,7 +4613,7 @@ fn build_init_tokens(
     input_schema: Option<&SchemaRef>,
     stream_id: &str,
     response_budget: (Option<usize>, Option<usize>),
-) -> Result<(String, String)> {
+) -> Result<(String, String, Vec<u8>)> {
     let out_schema_bytes = write_schema_bytes(output_schema.as_ref())?;
     let in_schema_bytes = match input_schema {
         Some(s) => write_schema_bytes(s.as_ref())?,
@@ -4433,8 +4633,8 @@ fn build_init_tokens(
             preferred_response_bytes: response_budget.1,
         },
     );
-    let cursor = build_cursor_token(state, auth, ss, &call_id)?;
-    Ok((cursor, call_token))
+    let (cursor, state_bytes) = build_cursor_token(state, auth, ss, &call_id)?;
+    Ok((cursor, call_token, state_bytes))
 }
 
 /// Like [`build_continuation_token`] but takes the already-serialized schema
@@ -4442,12 +4642,15 @@ fn build_init_tokens(
 /// token, so re-serializing the `SchemaRef`s (a decode→re-encode round trip,
 /// plus two `empty_batch` builds) on every turn is pure waste — thread the
 /// bytes straight through instead.
+///
+/// Returns the sealed cursor and the plaintext it seals — see
+/// [`build_init_tokens`] for why the plaintext comes back out.
 fn build_cursor_token(
     state: &Arc<HttpState>,
     auth: &crate::auth::AuthContext,
     ss: &StreamStateKind,
     call_id: &[u8; CALL_ID_LEN],
-) -> Result<String> {
+) -> Result<(String, Vec<u8>)> {
     let state_bytes = dispatch_sync(|| {
         crate::server::call_guard(|| match ss {
             StreamStateKind::Producer(p) => p.encode_state(),
@@ -4455,7 +4658,8 @@ fn build_cursor_token(
         })
         .and_then(|result| result)
     })?;
-    Ok(state.pack_cursor_token(auth, &state_bytes, call_id))
+    let token = state.pack_cursor_token(auth, &state_bytes, call_id);
+    Ok((token, state_bytes))
 }
 
 /// What the HTTP stream paths should do with one output batch after the
@@ -4555,8 +4759,14 @@ fn externalize_stream_batch(
 struct ProducerTurn {
     /// The stream is over — no continuation token should be minted.
     finished: bool,
-    /// The turn wrote an EXCEPTION envelope rather than data.
-    errored: bool,
+    /// The failure the turn wrote as an EXCEPTION envelope, if any. Carried
+    /// rather than reduced to a flag because the access record files the turn
+    /// under its `error_type` and message, and a stream's error records are
+    /// the ones an operator actually reads.
+    error: Option<RpcError>,
+    /// Data batches and rows this turn wrote, for the record's call statistics.
+    output_batches: u64,
+    output_rows: u64,
 }
 
 /// Metadata keys the HTTP transport itself puts on a stream continuation
@@ -4637,11 +4847,15 @@ fn run_producer<W: std::io::Write>(
         let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
         return ProducerTurn {
             finished: true,
-            errored: true,
+            error: Some(err),
+            output_batches: 0,
+            output_rows: 0,
         };
     }
     let finished = out.finished();
     let mut emitted_data = false;
+    let mut output_batches = 0u64;
+    let mut output_rows = 0u64;
     for item in out.items.drain(..) {
         match item {
             Emitted::Log(log) => {
@@ -4673,10 +4887,14 @@ fn run_producer<W: std::io::Write>(
                         let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                         return ProducerTurn {
                             finished: true,
-                            errored: true,
+                            error: Some(err),
+                            output_batches,
+                            output_rows,
                         };
                     }
                 }
+                output_batches += 1;
+                output_rows += batch.num_rows() as u64;
                 emitted_data = true;
             }
         }
@@ -4684,7 +4902,9 @@ fn run_producer<W: std::io::Write>(
     ProducerTurn {
         // Guard against degenerate producers that neither emit nor finish.
         finished: finished || !emitted_data,
-        errored: false,
+        error: None,
+        output_batches,
+        output_rows,
     }
 }
 
@@ -4696,6 +4916,29 @@ async fn handle_stream_exchange(
     State(state): State<Arc<HttpState>>,
     connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     Path(method): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    stream_exchange_dispatch(state, connect_info, None, method, headers, body).await
+}
+
+/// `POST {prefix}/{protocol}/{method}/exchange` — the same continuation,
+/// addressed by the protocol that owns the method.
+async fn handle_protocol_stream_exchange(
+    State(state): State<Arc<HttpState>>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    Path((protocol, method)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    stream_exchange_dispatch(state, connect_info, Some(protocol), method, headers, body).await
+}
+
+async fn stream_exchange_dispatch(
+    state: Arc<HttpState>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    path_protocol: Option<String>,
+    method: String,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -4728,6 +4971,8 @@ async fn handle_stream_exchange(
     };
 
     let server = state.server.clone();
+    // Measured before decompression, like every other request-bytes figure.
+    let request_wire_bytes = body.len() as u64;
     let body = match maybe_decompress(&headers, &body, request_decode_limit(&state)) {
         Ok(b) => b,
         Err(e) => return request_decode_error(&state, &e),
@@ -4823,7 +5068,7 @@ async fn handle_stream_exchange(
         Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
     };
 
-    let req = Request {
+    let mut req = Request {
         method: method.clone(),
         protocol: md_get(&metadata, crate::metadata::PROTOCOL_KEY)
             .unwrap_or("")
@@ -4832,6 +5077,31 @@ async fn handle_stream_exchange(
         batch: empty_batch(&Schema::empty()).unwrap(),
         metadata: Arc::new(metadata.clone()),
     };
+    if let Err(err) = adopt_path_protocol(&mut req, path_protocol.as_deref()) {
+        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+    }
+    // The stream id comes back out of the call token, so every continuation
+    // files under the id `/init` minted -- including one that lands on a
+    // different worker than the one that opened the stream, which is the whole
+    // point of a stateless continuation. `request_data` is deliberately not
+    // set: the spec puts the call's arguments on the init record alone.
+    let mut record = StreamAccessRecord::begin(
+        &server,
+        &req,
+        &auth,
+        &headers,
+        &call.stream_id,
+        request_wire_bytes,
+        None,
+    );
+    if let Some(record) = record.as_mut() {
+        record.set_cancelled(cancelled);
+        record.stats.input_batches = 1;
+        record.stats.input_rows = batch.num_rows() as u64;
+    }
+    // Externalised uploads never reach the HTTP body; count them where they
+    // happen. No `.await` runs between here and the response below.
+    let externalized = crate::external::ExternalizedScope::new();
     let mut ctx = CallContext::with_auth_cookies(
         &server,
         &req,
@@ -4869,6 +5139,9 @@ async fn handle_stream_exchange(
             }
             let _ = sw.finish();
         }
+        if let Some(record) = record.as_mut() {
+            record.set_externalized_bytes(externalized.finish());
+        }
         let mut resp = enforce_response_body_cap(
             response_limit,
             output_schema.as_ref(),
@@ -4883,12 +5156,17 @@ async fn handle_stream_exchange(
         if let Some(s) = sticky_sink.as_ref() {
             stamp_session_headers(&mut resp, &state, s);
         }
+        // A cancel turn is terminal, so it hands back no cursor and carries no
+        // `response_state`.
+        finish_stream_record(record, cancel_result.as_ref().err(), &mut resp);
         return resp;
     }
 
     if matches!(ss, StreamStateKind::Producer(_)) {
         // Producer continuation.
         let mut wrote_error = false;
+        // Assigned unconditionally from the turn below, before any read.
+        let mut turn_error: Option<RpcError>;
         {
             let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
             // The continuation request's custom metadata is this turn's tick
@@ -4916,21 +5194,33 @@ async fn handle_stream_exchange(
                 response_limit,
                 preferred_response,
             );
-            wrote_error |= turn.errored;
+            if let Some(record) = record.as_mut() {
+                record.stats.output_batches = turn.output_batches;
+                record.stats.output_rows = turn.output_rows;
+            }
+            turn_error = turn.error;
+            wrote_error |= turn_error.is_some();
             if !turn.finished {
                 match build_cursor_token(&state, &auth, &ss, &unpacked.call_id) {
-                    Ok(new_token) => {
+                    Ok((new_token, state_bytes)) => {
                         let md = Metadata::from([(STATE_KEY.to_string(), new_token)]);
                         let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                        if let Some(record) = record.as_mut() {
+                            record.set_response_state(state_bytes);
+                        }
                     }
                     Err(err) => {
                         let md = build_error_metadata(&err, &server.server_id, &req.request_id);
                         let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                         wrote_error = true;
+                        turn_error = Some(err);
                     }
                 }
             }
             let _ = sw.finish();
+        }
+        if let Some(record) = record.as_mut() {
+            record.set_externalized_bytes(externalized.finish());
         }
         let mut resp = enforce_response_body_cap(
             response_limit,
@@ -4946,6 +5236,7 @@ async fn handle_stream_exchange(
         if let Some(s) = sticky_sink.as_ref() {
             stamp_session_headers(&mut resp, &state, s);
         }
+        finish_stream_record(record, turn_error.as_ref(), &mut resp);
         return resp;
     }
 
@@ -4961,6 +5252,7 @@ async fn handle_stream_exchange(
                 drop(sw);
                 let mut resp = arrow_response(StatusCode::OK, body_buf);
                 stamp_rpc_error(&mut resp);
+                finish_stream_record(record, Some(&e), &mut resp);
                 return resp;
             }
         },
@@ -4992,6 +5284,7 @@ async fn handle_stream_exchange(
     });
 
     let mut wrote_error = false;
+    let mut turn_error: Option<RpcError> = None;
     {
         let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
         for log in ctx.drain_logs() {
@@ -5002,9 +5295,15 @@ async fn handle_stream_exchange(
             let md = build_error_metadata(&err, &server.server_id, &req.request_id);
             let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
             wrote_error = true;
+            turn_error = Some(err);
         } else {
             let new_token = match build_cursor_token(&state, &auth, &ss, &unpacked.call_id) {
-                Ok(t) => t,
+                Ok((token, state_bytes)) => {
+                    if let Some(record) = record.as_mut() {
+                        record.set_response_state(state_bytes);
+                    }
+                    token
+                }
                 Err(err) => {
                     let md = build_error_metadata(&err, &server.server_id, &req.request_id);
                     let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
@@ -5012,6 +5311,7 @@ async fn handle_stream_exchange(
                     drop(sw);
                     let mut resp = arrow_response(StatusCode::OK, body_buf);
                     stamp_rpc_error(&mut resp);
+                    finish_stream_record(record, Some(&err), &mut resp);
                     return resp;
                 }
             };
@@ -5019,6 +5319,8 @@ async fn handle_stream_exchange(
             // Per-response external budget, same units and same hard
             // semantics as the producer path.
             let mut cumulative_external = 0usize;
+            let mut output_batches = 0u64;
+            let mut output_rows = 0u64;
             for item in out.items.drain(..) {
                 match item {
                     Emitted::Log(log) => {
@@ -5055,9 +5357,12 @@ async fn handle_stream_exchange(
                                     Some(&emd),
                                 );
                                 wrote_error = true;
+                                turn_error = Some(err);
                                 break;
                             }
                         }
+                        output_batches += 1;
+                        output_rows += batch.num_rows() as u64;
                         wrote_data = true;
                     }
                 }
@@ -5069,8 +5374,21 @@ async fn handle_stream_exchange(
                 let md = Metadata::from([(STATE_KEY.to_string(), new_token)]);
                 let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
             }
+            if let Some(record) = record.as_mut() {
+                record.stats.output_batches = output_batches;
+                record.stats.output_rows = output_rows;
+            }
         }
         let _ = sw.finish();
+    }
+
+    if let Some(record) = record.as_mut() {
+        record.set_externalized_bytes(externalized.finish());
+        // A turn that ended in an EXCEPTION envelope hands back no usable
+        // cursor, so it must not advertise one.
+        if wrote_error {
+            record.set_response_state(Vec::new());
+        }
     }
 
     let mut resp = enforce_response_body_cap(
@@ -5089,6 +5407,7 @@ async fn handle_stream_exchange(
     if let Some(s) = sticky_sink.as_ref() {
         stamp_session_headers(&mut resp, &state, s);
     }
+    finish_stream_record(record, turn_error.as_ref(), &mut resp);
     resp
 }
 

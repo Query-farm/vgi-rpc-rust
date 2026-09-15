@@ -196,7 +196,7 @@ pub fn build_protocol_list(
             // StructBuilder::from_fields boxes its child builders, so the list
             // child is ListBuilder<Box<dyn ArrayBuilder>> -- downcasting to the
             // concrete element builder returns None and panics.
-            sb.field_builder::<ListBuilder<Box<dyn arrow_array::builder::ArrayBuilder>>>(5)
+            sb.field_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(5)
                 .unwrap()
                 .append(true);
             sb.append(true);

@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vgi_rpc::metadata::{
-    PROTOCOL_VERSION_KEY, REQUEST_ID_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY,
+    PROTOCOL_KEY, PROTOCOL_VERSION_KEY, REQUEST_ID_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY,
+    RPC_METHOD_KEY,
 };
 use vgi_rpc::wire::Metadata;
 
@@ -23,11 +24,18 @@ pub fn generate_request_id() -> String {
     format!("{mixed:016x}")
 }
 
-/// Build the request batch metadata: method, mandatory request version,
-/// request id, optional protocol version, plus any caller-supplied extras.
+/// Build the request batch metadata: method, routing key, mandatory request
+/// version, request id, optional protocol version, plus caller-supplied extras.
+///
+/// `protocol` is the routing key -- which protocol the method belongs to. The
+/// wire protocol requires it on every request, including against a server
+/// hosting exactly one protocol, so omitting it produces a request the server
+/// refuses with `protocol_not_specified`. That is the intended outcome for a
+/// caller that genuinely does not know which protocol it is addressing.
 pub fn build_request_metadata(
     method: &str,
     request_id: &str,
+    protocol: Option<&str>,
     protocol_version: Option<&str>,
     extra: Option<&Metadata>,
 ) -> Metadata {
@@ -36,6 +44,9 @@ pub fn build_request_metadata(
         md.extend(e.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
     md.insert(RPC_METHOD_KEY.to_string(), method.to_string());
+    if let Some(p) = protocol.filter(|s| !s.is_empty()) {
+        md.insert(PROTOCOL_KEY.to_string(), p.to_string());
+    }
     md.insert(REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string());
     md.insert(REQUEST_ID_KEY.to_string(), request_id.to_string());
     if let Some(pv) = protocol_version.filter(|s| !s.is_empty()) {

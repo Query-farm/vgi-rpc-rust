@@ -13,9 +13,9 @@ use crate::log::{LogLevel, LogMessage};
 #[cfg(feature = "shm")]
 use crate::metadata::SHM_SEGMENT_SIZE_KEY;
 use crate::metadata::{
-    CANCEL_KEY, LOCATION_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY, PROTOCOL_VERSION_KEY,
-    REQUEST_ID_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY, SERVER_ID_KEY,
-    SHM_OFFSET_KEY, SHM_SEGMENT_NAME_KEY,
+    CANCEL_KEY, LOCATION_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY, PROTOCOL_KEY,
+    PROTOCOL_VERSION_KEY, REQUEST_ID_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY,
+    SERVER_ID_KEY, SHM_OFFSET_KEY, SHM_SEGMENT_NAME_KEY,
 };
 #[cfg(feature = "shm")]
 use crate::shm::{is_shm_pointer_batch, maybe_write_to_shm, resolve_shm_batch, ShmSegment};
@@ -416,6 +416,9 @@ impl CallContext {
 /// A request batch parsed from the wire.
 pub struct Request {
     pub method: String,
+    /// The protocol the method belongs to -- the routing key. Empty only for a
+    /// request that carried none, which the dispatcher refuses.
+    pub protocol: String,
     pub request_id: String,
     pub batch: RecordBatch,
     /// Request-level custom metadata. Held behind an `Arc` so the dispatch
@@ -484,6 +487,7 @@ impl Request {
         let request_id = md_get(&metadata, REQUEST_ID_KEY).unwrap_or("").to_string();
         Ok(Request {
             method,
+            protocol: md_get(&metadata, PROTOCOL_KEY).unwrap_or("").to_string(),
             request_id,
             batch,
             metadata: Arc::new(metadata),
@@ -605,7 +609,14 @@ impl RpcServerBuilder {
             methods: HashMap::new(),
             server_id: self.server_id.unwrap_or_else(crate::util::short_random_id),
             server_version: self.server_version.unwrap_or_default(),
-            protocol_name: self.protocol_name.unwrap_or_default(),
+            // A server with no declared name is still addressable: the
+            // routing key is required on every request, so an empty name would
+            // make the server unreachable rather than permissive. "Service"
+            // matches the other ports' default.
+            protocol_name: self
+                .protocol_name
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "Service".to_string()),
             protocol_version: self.protocol_version.unwrap_or_default(),
             protocol_hash: std::sync::OnceLock::new(),
             describe_enabled: self.enable_describe,
@@ -1155,11 +1166,47 @@ impl RpcServer {
             return Ok(true);
         }
 
+        // Resolve (protocol, method). Method names may collide across
+        // protocols, so the routing key is part of the lookup rather than a
+        // label on it. The routing key is required even against a server
+        // hosting exactly one protocol: an exemption would let an intermediary
+        // that rebuilds a request and drops the field land silently on
+        // whichever protocol happened to be first, rather than being told.
+        let hosted = [self.protocol_name.as_str()];
+        if req.protocol.is_empty() {
+            write_error_stream(
+                w,
+                &empty_schema(),
+                &crate::binding::protocol_not_specified(&hosted),
+                &self.server_id,
+                &req.request_id,
+            )?;
+            return Ok(true);
+        }
+        // Checked before the lookup so an arbitrary request-supplied string
+        // never reaches an error message, a log field or a metric label.
+        if crate::binding::validate_protocol_name(&req.protocol, true).is_err()
+            || req.protocol != self.protocol_name
+        {
+            write_error_stream(
+                w,
+                &empty_schema(),
+                &crate::binding::protocol_not_supported(&req.protocol, &hosted),
+                &self.server_id,
+                &req.request_id,
+            )?;
+            return Ok(true);
+        }
+
         let Some(info) = self.methods.get(&req.method) else {
             let names = self.sorted_method_names();
+            // "The protocol is hosted but has no such method" -- deliberately a
+            // different answer from "this server does not host that protocol",
+            // because a client probing for an optional method depends on the
+            // difference.
             let msg = format!(
-                "Unknown method: '{}'. Available methods: {:?}",
-                req.method, names
+                "Protocol '{}' has no method '{}'. Available: {:?}",
+                req.protocol, req.method, names
             );
             write_error_stream(
                 w,
@@ -1836,6 +1883,9 @@ mod tests {
             let mut w = StreamWriter::new(&mut buf, &schema).unwrap();
             let mut md = Metadata::new();
             md.insert(RPC_METHOD_KEY.into(), method.into());
+            // The routing key is required on every request, including against a
+            // server hosting exactly one protocol.
+            md.insert(crate::metadata::PROTOCOL_KEY.into(), "Service".into());
             md.insert(REQUEST_VERSION_KEY.into(), REQUEST_VERSION.into());
             md.insert(REQUEST_ID_KEY.into(), format!("req-{method}"));
             w.write(&batch, Some(&md)).unwrap();
@@ -1955,6 +2005,7 @@ mod tests {
         fn dispatch_md(seg: Option<&ShmSegment>) -> Metadata {
             let mut md = Metadata::new();
             md.insert(RPC_METHOD_KEY.into(), "do_thing".into());
+            md.insert(crate::metadata::PROTOCOL_KEY.into(), "Service".into());
             md.insert(REQUEST_VERSION_KEY.into(), REQUEST_VERSION.into());
             if let Some(seg) = seg {
                 md.insert(SHM_SEGMENT_NAME_KEY.into(), seg.name().to_string());
@@ -2080,6 +2131,7 @@ mod tests {
             let (ptr, mut ptr_md) =
                 make_shm_pointer_batch(params_schema().as_ref(), off, len).unwrap();
             ptr_md.insert(RPC_METHOD_KEY.into(), "do_thing".into());
+            ptr_md.insert(crate::metadata::PROTOCOL_KEY.into(), "Service".into());
             ptr_md.insert(REQUEST_VERSION_KEY.into(), REQUEST_VERSION.into());
             {
                 let mut w = StreamWriter::new(&mut input, ptr.schema().as_ref()).unwrap();

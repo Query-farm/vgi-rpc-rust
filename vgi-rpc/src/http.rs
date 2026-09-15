@@ -4715,6 +4715,9 @@ async fn handle_stream_exchange(
 
     let req = Request {
         method: method.clone(),
+        protocol: md_get(&metadata, crate::metadata::PROTOCOL_KEY)
+            .unwrap_or("")
+            .to_string(),
         request_id: md_get(&metadata, REQUEST_ID_KEY).unwrap_or("").to_string(),
         batch: empty_batch(&Schema::empty()).unwrap(),
         metadata: Arc::new(metadata.clone()),

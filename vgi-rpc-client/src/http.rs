@@ -452,6 +452,8 @@ pub struct HttpClientBuilder {
     headers: HeaderMap,
     on_log: Option<OnLog>,
     relax_nullability: bool,
+    /// The routing key stamped on every request.
+    protocol: Option<String>,
     protocol_version: Option<String>,
     inner: Option<ReqwestClient>,
     timeout: Option<Duration>,
@@ -495,6 +497,14 @@ impl HttpClientBuilder {
 
     pub fn relax_nullability(mut self, yes: bool) -> Self {
         self.relax_nullability = yes;
+        self
+    }
+
+    /// Send `vgi_rpc.protocol` on every request -- the routing key.
+    ///
+    /// Required by the wire protocol even against a single-protocol server.
+    pub fn protocol(mut self, v: impl Into<String>) -> Self {
+        self.protocol = Some(v.into());
         self
     }
 
@@ -646,6 +656,7 @@ impl HttpClientBuilder {
             external_client,
             on_log: self.on_log,
             relax_nullability: self.relax_nullability,
+            protocol: self.protocol,
             protocol_version: self.protocol_version,
             retry: self.retry,
             compression_level: self.compression_level,
@@ -690,6 +701,8 @@ pub struct HttpClient {
     external_client: ReqwestClient,
     on_log: Option<OnLog>,
     relax_nullability: bool,
+    /// The routing key stamped on every request.
+    protocol: Option<String>,
     protocol_version: Option<String>,
     retry: RetryConfig,
     compression_level: Option<i32>,
@@ -716,6 +729,7 @@ impl HttpClient {
             headers: HeaderMap::new(),
             on_log: None,
             relax_nullability: false,
+            protocol: None,
             protocol_version: None,
             inner: None,
             timeout: Some(DEFAULT_TIMEOUT),
@@ -1028,7 +1042,13 @@ impl HttpClient {
 
     fn req_md(&self, method: &str, extra: Option<&Metadata>) -> (String, Metadata) {
         let id = generate_request_id();
-        let md = build_request_metadata(method, &id, self.protocol_version.as_deref(), extra);
+        let md = build_request_metadata(
+            method,
+            &id,
+            self.protocol.as_deref(),
+            self.protocol_version.as_deref(),
+            extra,
+        );
         (id, md)
     }
 

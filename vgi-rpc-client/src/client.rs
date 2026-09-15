@@ -119,6 +119,11 @@ pub struct ClientTransportOptions {
 pub struct RpcClient {
     transport: Box<dyn Transport>,
     on_log: Option<OnLog>,
+    /// The routing key stamped on every request. Required by the wire protocol
+    /// even against a single-protocol server, so a client that leaves it unset
+    /// is refused rather than silently landing on whichever protocol the server
+    /// registered first.
+    protocol: Option<String>,
     protocol_version: Option<String>,
     relax_nullability: bool,
     shm: ShmHandle,
@@ -130,6 +135,7 @@ impl RpcClient {
         Self {
             transport,
             on_log: None,
+            protocol: None,
             protocol_version: None,
             relax_nullability: false,
             shm: None,
@@ -247,6 +253,14 @@ impl RpcClient {
         self
     }
 
+    /// Send `vgi_rpc.protocol` on every request -- the routing key.
+    ///
+    /// Required by the wire protocol even against a single-protocol server.
+    pub fn protocol(mut self, v: impl Into<String>) -> Self {
+        self.protocol = Some(v.into());
+        self
+    }
+
     /// Send `vgi_rpc.protocol_version` on every request.
     pub fn protocol_version(mut self, v: impl Into<String>) -> Self {
         self.protocol_version = Some(v.into());
@@ -287,6 +301,7 @@ impl RpcClient {
         let req_md = build_request_metadata(
             method,
             &req_id,
+            self.protocol.as_deref(),
             self.protocol_version.as_deref(),
             shm_md.as_ref().or(metadata),
         );
@@ -364,6 +379,7 @@ impl RpcClient {
         let req_md = build_request_metadata(
             method,
             &req_id,
+            self.protocol.as_deref(),
             self.protocol_version.as_deref(),
             shm_md.as_ref().or(metadata),
         );

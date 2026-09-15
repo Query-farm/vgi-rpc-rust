@@ -278,7 +278,16 @@ impl TokenIntrospector {
         // Every diagnostic below names the digest, never the credential.
         let digest = token_digest(&token);
 
-        if is_jws_shaped(&token) {
+        // The shape test runs on the *trimmed* credential while the resolver
+        // still receives what the caller sent -- the same rule
+        // `vgi_rpc.Identity.v1` follows, and for the same reason: without it
+        // `"a.b.c\n"` is not JWS-shaped to a strict matcher and gets routed
+        // onward, which is precisely what this guard exists to stop. Trimming
+        // can only add refusals, never remove one. See
+        // [`crate::token_identity::reject_jws_shaped`] for the full reasoning
+        // and the enumerated trim floor.
+        let candidate = token.trim();
+        if candidate.is_empty() || is_jws_shaped(candidate) {
             // Refused without ever reaching the resolver. A JWS is validated
             // locally against a key set; one arriving here is either a caller
             // bug or an attempt to have this worker vouch for a token its asker
@@ -287,7 +296,7 @@ impl TokenIntrospector {
                 target: "vgi_rpc.http.introspect",
                 principal = %auth.principal,
                 token_digest = %digest,
-                "introspection refused: JWS-shaped subject"
+                "introspection refused: JWS-shaped or blank subject"
             );
             return IntrospectOutcome::Unresolved;
         }
@@ -444,6 +453,71 @@ mod tests {
             !resolver_ran.load(std::sync::atomic::Ordering::SeqCst),
             "the resolver was handed a JWS"
         );
+    }
+
+    /// The same padding hole `vgi_rpc.Identity.v1` closed: this matcher is
+    /// hand-rolled, so a trailing newline makes the third segment
+    /// non-base64url and the credential is not "JWS-shaped" unless the guard
+    /// trims first. The resolver here resolves everything, so a missing trim
+    /// shows up as a resolution rather than as a rejection for the wrong
+    /// reason.
+    #[test]
+    fn a_padded_jws_never_reaches_the_resolver() {
+        let jws = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl";
+        let resolver_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = resolver_ran.clone();
+        let it = TokenIntrospector::new(
+            Arc::new(move |_: &str| {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(TokenIdentity::new("subject@example")))
+            }),
+            ["proxy"],
+            DEFAULT_INTROSPECT_TTL_SECONDS,
+            DEFAULT_INTROSPECT_RATE_LIMIT,
+        );
+        for padded in [
+            format!("{jws}\n"),
+            format!("{jws}\n\n"),
+            format!("  {jws}  "),
+            format!("\t{jws}\r\n"),
+            format!("{jws}\u{00A0}"),
+            format!("{jws}\u{0085}"),
+        ] {
+            assert!(
+                matches!(
+                    it.introspect(&caller("proxy"), &body(&padded)),
+                    IntrospectOutcome::Unresolved
+                ),
+                "a padded JWS was not refused: {padded:?}"
+            );
+        }
+        assert!(
+            !resolver_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the resolver was handed a padded JWS"
+        );
+    }
+
+    /// Whitespace-only is not a credential, and must not reach a resolver.
+    #[test]
+    fn a_blank_subject_never_reaches_the_resolver() {
+        let resolver_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = resolver_ran.clone();
+        let it = TokenIntrospector::new(
+            Arc::new(move |_: &str| {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(TokenIdentity::new("subject@example")))
+            }),
+            ["proxy"],
+            DEFAULT_INTROSPECT_TTL_SECONDS,
+            DEFAULT_INTROSPECT_RATE_LIMIT,
+        );
+        for blank in ["   ", "\n", "\t\r\n", "\u{00A0}\u{0085}"] {
+            assert!(matches!(
+                it.introspect(&caller("proxy"), &body(blank)),
+                IntrospectOutcome::Unresolved
+            ));
+        }
+        assert!(!resolver_ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

@@ -368,6 +368,74 @@ fn error_kind_rides_on_the_wire() {
     );
 }
 
+/// A newline-padded JWS is refused on the wire, not routed onward.
+///
+/// This port's shape matcher is hand-rolled, so `"aaa.bbb.ccc\n"` has a
+/// non-base64url third segment and is not JWS-shaped unless the guard trims
+/// first -- which meant the one credential this guard exists to stop reached
+/// the resolver. The resolver here resolves everything, so a missing trim
+/// surfaces as a resolution rather than as a rejection for the wrong reason.
+#[test]
+fn a_padded_jws_is_refused_on_the_wire() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let spy = seen.clone();
+    let server = server_with(
+        IdentityImpl::builder()
+            .resolve_token(Arc::new(move |token: &str| {
+                spy.lock().unwrap().push(token.to_string());
+                Ok(Some(TokenIdentity::new("anyone@example")))
+            }))
+            .introspect_principals([INTROSPECTOR])
+            .build(),
+    );
+    for padded in ["aaa.bbb.ccc\n", "  aaa.bbb.ccc  ", "aaa.bbb.ccc\u{00A0}"] {
+        let frames = call(
+            &server,
+            AuthContext::for_principal("test", INTROSPECTOR),
+            IDENTITY_PROTOCOL_NAME,
+            INTROSPECT_TOKEN_METHOD,
+            &token_batch(padded),
+        );
+        let md = error_metadata(&frames).unwrap_or_else(|| panic!("{padded:?} was resolved"));
+        assert_eq!(
+            md.get(ERROR_KIND_KEY).map(String::as_str),
+            Some("token_unresolved")
+        );
+    }
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the resolver was handed a padded JWS: {:?}",
+        seen.lock().unwrap()
+    );
+}
+
+/// Trimming is for the shape test only: the hook is handed the credential
+/// exactly as it arrived, because rewriting it would make the worker answer
+/// about a string the caller never sent.
+#[test]
+fn the_resolver_receives_the_credential_unmodified_on_the_wire() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let spy = seen.clone();
+    let server = server_with(
+        IdentityImpl::builder()
+            .resolve_token(Arc::new(move |token: &str| {
+                spy.lock().unwrap().push(token.to_string());
+                Ok(Some(TokenIdentity::new("subject@example")))
+            }))
+            .introspect_principals([INTROSPECTOR])
+            .build(),
+    );
+    let frames = call(
+        &server,
+        AuthContext::for_principal("test", INTROSPECTOR),
+        IDENTITY_PROTOCOL_NAME,
+        INTROSPECT_TOKEN_METHOD,
+        &token_batch("  padded-opaque-token  "),
+    );
+    assert!(error_metadata(&frames).is_none(), "{frames:?}");
+    assert_eq!(*seen.lock().unwrap(), vec!["  padded-opaque-token  "]);
+}
+
 /// A method whose hook the deployment did not configure is *absent*, not
 /// routed-and-refusing -- so a caller gets the "no such method" answer it would
 /// get for any method this protocol does not have here.

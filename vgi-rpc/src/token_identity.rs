@@ -332,18 +332,72 @@ pub fn check_introspector<'a>(
     Ok(&auth.principal)
 }
 
-/// Refuse a JWS-shaped, empty or over-long subject before it reaches a
+/// Refuse a JWS-shaped, blank or over-long subject before it reaches a
 /// resolver.
 ///
 /// A JWS is validated locally against a key set; forwarding one -- which the
 /// asker may itself have rejected as expired or wrong-audience -- to a third
 /// party that might accept it turns this method into a laundering step.
+///
+/// **The shape test runs against the whitespace-trimmed credential, while the
+/// resolver still receives exactly what the caller sent.** Anchor semantics
+/// are the least portable corner of seven regex dialects and the ports split
+/// three ways on `"a.b.c\n"`: the Python reference's `$` matched before a
+/// single trailing newline and refused it, while Go's `\A..\z` and
+/// JavaScript's unflagged `$` matched strictly and routed the same credential
+/// *to the resolver* -- the one outcome this guard exists to prevent. Python
+/// was not self-consistent either, refusing one trailing newline and admitting
+/// two. This port's matcher is hand-rolled rather than a regex (see
+/// [`is_jws_shaped`]) and leaked every padded form.
+///
+/// So the rule does not depend on any dialect: trim, then test. Trimming
+/// first can only add refusals, never remove one.
+///
+/// Trimming is for the shape test **only**. Rewriting a credential before
+/// resolving it would make the worker answer about a string the caller never
+/// sent, so the original goes to the hook.
+///
+/// A whitespace-only credential is refused: it is not a credential.
+///
+/// The length cap is measured on the **original**, not the trimmed form --
+/// splitting "trim for the shape test" from "measure what arrived" is a new
+/// way to get this wrong, and padding must not be a way to talk an over-long
+/// credential down under the cap. It counts codepoints rather than bytes,
+/// which is what `MAX_TOKEN_CHARS` says.
+///
+/// The trim set is an enumerated floor every port must cover -- `U+0009`,
+/// `U+000A`, `U+000B`, `U+000C`, `U+000D`, `U+0020`, `U+0085` (NEL) and
+/// `U+00A0` (NBSP) -- because "whitespace" is itself a divergence one layer
+/// down: JavaScript's `trim()` and Java's `Character.isWhitespace` both
+/// exclude NEL, and an ASCII literal misses NEL and NBSP both. A port
+/// trimming a narrower set routes a padded JWS that another port refuses,
+/// which is the same hole one level down. Rust's [`str::trim`] uses the
+/// Unicode `White_Space` property, a superset of the floor, so it is
+/// sufficient -- but the floor is pinned by a test rather than assumed from
+/// what the standard library happens to do today.
 pub fn reject_jws_shaped(token: &str) -> Result<()> {
-    if token.is_empty() || token.chars().count() > MAX_TOKEN_CHARS || is_jws_shaped(token) {
+    let candidate = token.trim();
+    if candidate.is_empty() || token.chars().count() > MAX_TOKEN_CHARS || is_jws_shaped(candidate) {
         return Err(token_unresolved());
     }
     Ok(())
 }
+
+/// The whitespace codepoints every port MUST trim before the JWS shape test.
+///
+/// A floor, not a definition: a port may trim more (Rust does, via the full
+/// Unicode `White_Space` property), because trimming wider can only add
+/// refusals. Trimming narrower is a leak.
+pub const REQUIRED_TRIM_CODEPOINTS: [char; 8] = [
+    '\u{0009}', // tab
+    '\u{000A}', // line feed
+    '\u{000B}', // vertical tab
+    '\u{000C}', // form feed
+    '\u{000D}', // carriage return
+    '\u{0020}', // space
+    '\u{0085}', // next line (NEL)
+    '\u{00A0}', // no-break space (NBSP)
+];
 
 /// Seconds since the Unix epoch, for the freshness comparison.
 fn now_unix() -> f64 {
@@ -581,7 +635,10 @@ impl IdentityImpl {
             return Err(introspection_refused("introspection rate limit exceeded"));
         }
 
-        // 4. Only now does the subject credential get looked at.
+        // 4. Only now does the subject credential get looked at. The shape
+        //    test runs on the trimmed form; the hook -- and the digest that
+        //    correlates its failures -- gets the credential exactly as it
+        //    arrived.
         reject_jws_shaped(token)?;
 
         // Every diagnostic below names the digest, never the credential.
@@ -1485,6 +1542,152 @@ mod tests {
             .introspect_token("super-secret-credential", &auth("proxy"))
             .unwrap_err();
         assert!(!err.message.contains("super-secret-credential"));
+    }
+
+    // -- The JWS shape test survives translation ---------------------------
+    //
+    // Whitespace must not be a way to walk a JWS past the guard. The shape
+    // test runs against the trimmed credential while the resolver still
+    // receives what the caller sent, so trimming can only add refusals.
+    //
+    // These exist because the ports diverged here and every one of them leaked
+    // some subset. This port's matcher is hand-rolled rather than a regex and
+    // leaked *every* padded form: a trailing newline makes the third segment
+    // non-base64url, so `"aaa.bbb.ccc\n"` was not JWS-shaped and went straight
+    // to the resolver.
+
+    /// No amount of surrounding whitespace makes a JWS resolvable.
+    #[test]
+    fn padding_does_not_smuggle_a_jws_past_the_guard() {
+        for token in [
+            "aaa.bbb.ccc",
+            "aaa.bbb.ccc\n",
+            // Two newlines: the Python reference admitted this one, which is
+            // how the whole divergence was found.
+            "aaa.bbb.ccc\n\n",
+            "  aaa.bbb.ccc  ",
+            "\taaa.bbb.ccc\r\n",
+        ] {
+            assert!(
+                reject_jws_shaped(token).is_err(),
+                "a padded JWS reached the resolver: {token:?}"
+            );
+        }
+    }
+
+    /// Every port must trim at least these eight, so pin them here.
+    ///
+    /// "Whitespace" is itself a divergence one layer down: JavaScript's
+    /// `trim()` and Java's `Character.isWhitespace` both exclude `U+0085`, and
+    /// an ASCII-only literal misses `U+0085` and `U+00A0` both, so a port
+    /// delegating to the language routes a padded JWS that another port
+    /// refuses. Rust's `str::trim` uses the full Unicode `White_Space`
+    /// property, a superset -- this pins the agreed floor rather than what
+    /// `trim` happens to do today.
+    #[test]
+    fn the_enumerated_trim_set_is_covered() {
+        for c in REQUIRED_TRIM_CODEPOINTS {
+            assert!(
+                reject_jws_shaped(&format!("aaa.bbb.ccc{c}")).is_err(),
+                "U+{:04X} is not trimmed before the shape test",
+                c as u32
+            );
+            assert!(
+                reject_jws_shaped(&format!("{c}aaa.bbb.ccc")).is_err(),
+                "U+{:04X} is not trimmed from the front",
+                c as u32
+            );
+        }
+    }
+
+    /// Whitespace-only never reaches a resolver either: it is not a credential.
+    #[test]
+    fn a_blank_credential_is_not_a_credential() {
+        for token in ["", "   ", "\n", "\t\r\n", "\u{00A0}\u{0085}"] {
+            assert!(
+                reject_jws_shaped(token).is_err(),
+                "a blank credential reached the resolver: {token:?}"
+            );
+        }
+    }
+
+    /// Trimming tightens the JWS test; it must not refuse ordinary tokens.
+    #[test]
+    fn an_opaque_credential_still_reaches_the_resolver() {
+        for token in ["opaque-token", "a.b.c.d", "two.segments", "sk_live_abc123"] {
+            assert!(reject_jws_shaped(token).is_ok(), "{token:?}");
+        }
+    }
+
+    /// Padding must not be talked down into the allowance.
+    ///
+    /// Splitting "trim for the shape test" from "measure the original" creates
+    /// a new way to get this wrong, and nothing else would catch it: what
+    /// arrived is what a resolver would have to handle, so that is what the cap
+    /// applies to.
+    #[test]
+    fn the_length_check_runs_on_the_untrimmed_credential() {
+        let padded = format!("x{}", " ".repeat(MAX_TOKEN_CHARS * 2));
+        assert!(padded.trim().chars().count() < MAX_TOKEN_CHARS);
+        assert!(padded.chars().count() > MAX_TOKEN_CHARS);
+        assert!(reject_jws_shaped(&padded).is_err());
+    }
+
+    /// The cap counts codepoints, not bytes -- `MAX_TOKEN_CHARS` says so, and
+    /// a port measuring bytes refuses a non-ASCII credential another port
+    /// accepts.
+    #[test]
+    fn the_length_cap_counts_codepoints_not_bytes() {
+        // Four bytes per char, so a byte-counting port refuses this.
+        let wide = "\u{1F510}".repeat(MAX_TOKEN_CHARS / 2);
+        assert!(wide.len() > MAX_TOKEN_CHARS);
+        assert!(wide.chars().count() <= MAX_TOKEN_CHARS);
+        assert!(reject_jws_shaped(&wide).is_ok());
+    }
+
+    /// Trimming is for the shape test only -- never for what is resolved.
+    ///
+    /// Rewriting a credential before resolving it would make the worker answer
+    /// about a string the caller never sent.
+    #[test]
+    fn the_resolver_receives_the_credential_unmodified() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let spy = seen.clone();
+        let impl_ = IdentityImpl::builder()
+            .resolve_token(Arc::new(move |token: &str| {
+                spy.lock().unwrap().push(token.to_string());
+                Ok(Some(TokenIdentity::new("p")))
+            }))
+            .introspect_principals(["proxy"])
+            .build();
+        impl_
+            .introspect_token("  padded-opaque-token  ", &auth("proxy"))
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec!["  padded-opaque-token  "]);
+    }
+
+    /// And a padded JWS never reaches it at all -- the spy resolves
+    /// everything, so a missing trim shows up as a resolution rather than as a
+    /// rejection that happens to be right for the wrong reason.
+    #[test]
+    fn a_padded_jws_never_reaches_the_resolver() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let spy = seen.clone();
+        let impl_ = IdentityImpl::builder()
+            .resolve_token(Arc::new(move |token: &str| {
+                spy.lock().unwrap().push(token.to_string());
+                Ok(Some(TokenIdentity::new("bob")))
+            }))
+            .introspect_principals(["proxy"])
+            .build();
+        let err = impl_
+            .introspect_token("aaa.bbb.ccc\n", &auth("proxy"))
+            .unwrap_err();
+        assert_eq!(err.error_kind.as_deref(), Some(ERROR_KIND_TOKEN_UNRESOLVED));
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the resolver was handed a newline-padded JWS"
+        );
     }
 
     // -- The rate limiter --------------------------------------------------

@@ -135,15 +135,18 @@ fn unary_has_return(info: &MethodInfo) -> bool {
 }
 
 /// The stream kind, or `""` for a unary method.
-fn stream_kind_for(info: &MethodInfo) -> &'static str {
+fn stream_kind_for(info: &MethodInfo) -> String {
     match info.method_type {
-        MethodType::Unary => "",
-        MethodType::Producer => "producer",
-        MethodType::Exchange => "exchange",
-        // The state type is decided at runtime by the handler, so the protocol
-        // definition genuinely cannot say -- and "unknown" is sayable, which is
-        // why this is a string rather than a nullable bool.
-        MethodType::Dynamic => "unknown",
+        MethodType::Unary => String::new(),
+        MethodType::Producer => "producer".to_string(),
+        MethodType::Exchange => "exchange".to_string(),
+        // A runtime output schema does not make the kind unknowable: the
+        // declaration states it separately. "unknown" remains sayable for a
+        // registration that genuinely does not.
+        MethodType::Dynamic if !info.declared_stream_kind.is_empty() => {
+            info.declared_stream_kind.clone()
+        }
+        MethodType::Dynamic => "unknown".to_string(),
     }
 }
 
@@ -244,7 +247,7 @@ pub fn build_service_description(
             sb.field_builder::<BooleanBuilder>(3)
                 .unwrap()
                 .append_value(info.header_schema.is_some());
-            append_string(sb, 4, stream_kind_for(info));
+            append_string(sb, 4, &stream_kind_for(info));
             append_binary(sb, 5, &schema_to_ipc(&info.params_schema)?);
             // Empty rather than null when absent: a nullable column costs every
             // port a null check on a value it will only ever treat as absent.

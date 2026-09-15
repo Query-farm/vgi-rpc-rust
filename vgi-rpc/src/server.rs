@@ -664,6 +664,16 @@ pub struct MethodInfo {
     /// stateless-worker model); `None` for unary methods and for streams
     /// that will only ever run over pipe/unix.
     pub state_decoder: Option<StateDecoder>,
+    /// "producer" or "exchange" when the declaration stated it, "" otherwise.
+    ///
+    /// Separate from `method_type` because the two are independent axes the
+    /// macro used to conflate: a method whose *output schema* is decided at
+    /// runtime registers as `MethodType::Dynamic`, which says nothing about
+    /// whether it is a producer or an exchange -- and `stream_kind` is the only
+    /// field in a description that tells a client whether a stream accepts
+    /// input. A dynamic schema should not make the kind undiscoverable, and the
+    /// macro knows the shape either way.
+    pub declared_stream_kind: String,
 }
 
 /// Decoder that reconstructs a concrete streaming state from its
@@ -693,6 +703,7 @@ impl MethodInfo {
             unary: Some(Arc::new(handler)),
             stream: None,
             state_decoder: None,
+            declared_stream_kind: String::new(),
         }
     }
 
@@ -732,7 +743,14 @@ impl MethodInfo {
             unary: None,
             stream: Some(Arc::new(handler)),
             state_decoder: None,
+            declared_stream_kind: String::new(),
         }
+    }
+
+    /// Declare the stream kind, for a method whose `method_type` cannot carry it.
+    pub fn with_stream_kind(mut self, kind: impl Into<String>) -> Self {
+        self.declared_stream_kind = kind.into();
+        self
     }
 
     /// Attach a state decoder function. See [`StateDecoder`].

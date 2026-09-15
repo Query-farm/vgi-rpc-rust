@@ -913,6 +913,14 @@ fn build_stream(
     };
 
     // Init closure body and StreamResult constructor.
+    // The shape is known here even when `meta.dynamic` forces the method type to
+    // Dynamic: a runtime output schema is a separate question from
+    // producer-vs-exchange. Emitting it keeps `stream_kind` answerable.
+    let declared_kind = match shape {
+        StreamShape::Producer => "producer",
+        StreamShape::Exchange => "exchange",
+    };
+
     let (method_type_variant, stream_result_ctor, decoder_helper) = match shape {
         StreamShape::Producer => {
             let mt = if meta.dynamic {
@@ -1023,7 +1031,8 @@ fn build_stream(
                 #(#param_doc_calls)*
                 #(#param_default_calls)*
                 #header_schema_call
-                .with_state_decoder(#decoder_helper),
+                .with_state_decoder(#decoder_helper)
+                .with_stream_kind(#declared_kind),
             );
         }
     };

@@ -99,6 +99,22 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
   the existing identity guard, which scans for *assignments* and so cannot see
   an emit site that sets the identity fields to nothing at all. Outside
   `hooks.rs`, a `DispatchInfo` may only come from `from_request`.
+- The two `vgi_rpc.Identity.v1` conformance fixtures, so the shared cross-port
+  group runs instead of skipping: `--identity both` and `--identity
+  introspect-only` on the conformance worker, exposed to the harness as
+  `conformance_http_identity_port` and
+  `conformance_http_identity_introspect_only_port`. Policy — allowlist,
+  `max_auth_age`, rate limit, and the two hooks — is pinned by
+  `IDENTITY_CONFORMANCE_FIXTURE.md` and transcribed in the worker's
+  `identity_fixture` module; the plain worker deliberately configures no hook,
+  because the group asserts against *it* that a deployment configuring none
+  hosts no identity protocol at all. Authentication is two request headers
+  (`X-Conformance-Principal`, `X-Conformance-Auth-Time`, the latter verbatim
+  into `claims["auth_time"]`) — trivially spoofable, a test fixture, never to
+  be deployed. All 77 cases pass, including the byte-measured credential cap
+  the group expects codepoint- and UTF-16-measuring ports to fail. Mutation-
+  checked against all twenty breakages the contract's §8 lists: twenty killed,
+  none survived.
 
 ## [0.24.4] — 2026-09-11
 

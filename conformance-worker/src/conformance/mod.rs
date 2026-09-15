@@ -44,7 +44,7 @@ pub fn build_server() -> RpcServer {
 /// asserts anything else — otherwise a token that supposedly "belongs to the
 /// other worker" belongs to this one, and the test proves nothing.
 pub fn build_server_with_id(server_id: Option<&str>) -> RpcServer {
-    build_server_with_external_and_hook(None, server_id, None)
+    build_server_with_external_and_hook(None, server_id, None, None)
 }
 
 /// Build a conformance server with an explicit transport-start hook.
@@ -52,7 +52,21 @@ pub fn build_server_with_id_and_hook(
     server_id: Option<&str>,
     hook: vgi_rpc::ServeStartHook,
 ) -> RpcServer {
-    build_server_with_external_and_hook(None, server_id, Some(hook))
+    build_server_with_external_and_hook(None, server_id, Some(hook), None)
+}
+
+/// Build a conformance server that also co-hosts `vgi_rpc.Identity.v1`.
+///
+/// Backs the two identity fixtures the shared group needs. Deliberately a
+/// separate entry point rather than a default: the group asserts against the
+/// *plain* worker that a deployment configuring no hook hosts no identity
+/// protocol at all, which is the property that keeps a dependency upgrade from
+/// growing a credential-to-identity oracle on every existing worker.
+pub fn build_server_with_identity(
+    server_id: Option<&str>,
+    identity: vgi_rpc::token_identity::IdentityImpl,
+) -> RpcServer {
+    build_server_with_external_and_hook(None, server_id, None, Some(identity))
 }
 
 /// Build an `RpcServer` with all conformance methods registered, optionally
@@ -62,13 +76,14 @@ pub fn build_server_with_external(
     external: Option<vgi_rpc::external::ExternalLocationConfig>,
     server_id: Option<&str>,
 ) -> RpcServer {
-    build_server_with_external_and_hook(external, server_id, None)
+    build_server_with_external_and_hook(external, server_id, None, None)
 }
 
 fn build_server_with_external_and_hook(
     external: Option<vgi_rpc::external::ExternalLocationConfig>,
     server_id: Option<&str>,
     serve_start_hook: Option<vgi_rpc::ServeStartHook>,
+    identity: Option<vgi_rpc::token_identity::IdentityImpl>,
 ) -> RpcServer {
     let mut builder = RpcServer::builder()
         .server_id(server_id.unwrap_or("rust-conf-0001"))
@@ -81,6 +96,9 @@ fn build_server_with_external_and_hook(
     }
     if let Some(hook) = serve_start_hook {
         builder = builder.on_serve_start(hook);
+    }
+    if let Some(identity) = identity {
+        builder = builder.identity(identity);
     }
 
     // When VGI_ACCESS_LOG is set, emit JSON-per-call access records to that

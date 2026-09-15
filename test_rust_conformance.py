@@ -178,7 +178,7 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
 
     variant ∈ {plain, no_compression, storage, zstd_storage, externalize_always,
     strict, small_request_cap, auth, sticky_short_ttl, sticky_peer_a, sticky_peer_b, sticky_auth,
-    cors, introspect}.
+    cors, introspect, identity, identity_introspect_only}.
     Raises ``pytest.skip`` for (server, variant) combinations not wired here
     (the Go conformance binary doesn't expose the storage/strict/auth modes).
 
@@ -224,6 +224,9 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
             )
         if variant == "introspect":
             return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--introspect"])
+        if variant in ("identity", "identity_introspect_only"):
+            mode = "both" if variant == "identity" else "introspect-only"
+            return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--identity", mode])
         if variant in ("storage", "zstd_storage", "externalize_always", "external_security"):
             port = _free_port()
             args = [_VENV_PY, _PY_SERVE_HTTP, "--port", str(port), "--fake-storage", storage_url or ""]
@@ -352,6 +355,12 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
             )
         if variant == "introspect":
             return _spawn_read_port([RUST_WORKER, "--http", "--introspect"])
+        if variant in ("identity", "identity_introspect_only"):
+            # Same binary, different flag — which is the point: the narrowing
+            # under test is a *configuration* difference, so two binaries
+            # could not show it.
+            mode = "both" if variant == "identity" else "introspect-only"
+            return _spawn_read_port([RUST_WORKER, "--http", "--identity", mode])
     else:  # go
         if variant == "plain":
             return _spawn_read_port(_worker_cmd("http"))
@@ -732,6 +741,36 @@ def conformance_http_introspect_port() -> Iterator[int]:
     ``_JWS_TRAP_TOKEN``); see ``introspect_fixture`` in the Rust worker.
     """
     yield from _http_variant_fixture("introspect")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_identity_port() -> Iterator[int]:
+    """HTTP worker co-hosting ``vgi_rpc.Identity.v1`` with both hooks.
+
+    Backs the shared identity group, whose every assertion reads deployment
+    policy — who may introspect, what a credential resolves to, whether a
+    grant is minted, how recently the caller authenticated. Against a worker
+    whose allowlist and hooks are unknown no cross-port assertion exists, so
+    the policy is pinned by ``IDENTITY_CONFORMANCE_FIXTURE.md`` and configured
+    in the worker's ``identity_fixture`` module. The fixture name is
+    load-bearing: the shared suite looks it up with ``getfixturevalue`` and
+    skips the whole group, naming this fixture, if it is missing.
+
+    Not the plain worker: the group asserts against *that* one that a
+    deployment configuring no hook hosts no identity protocol at all.
+    """
+    yield from _http_variant_fixture("identity")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_identity_introspect_only_port() -> Iterator[int]:
+    """The same binary with the mint hook left out.
+
+    Method-level narrowing — that an unconfigured hook makes its method absent
+    rather than hosted-and-refusing, and shrinks the ``protocol_hash`` with it
+    — is only observable against a *second* worker configured with one hook.
+    """
+    yield from _http_variant_fixture("identity_introspect_only")
 
 
 def _short_unix_path(name: str) -> str:

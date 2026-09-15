@@ -19,6 +19,7 @@
 
 mod conformance;
 mod fake_storage;
+mod identity_fixture;
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -45,6 +46,14 @@ fn build_plain_server(args: &[String]) -> vgi_rpc::RpcServer {
     }
 
     let server_id = parse_str_flag(args, "--server-id");
+    // `--identity {off,both,introspect-only}` co-hosts `vgi_rpc.Identity.v1`
+    // under the fixed policy in `identity_fixture`. Off by default and read
+    // here rather than defaulted in the builder: the shared group asserts
+    // against the *plain* worker that a deployment configuring no hook hosts
+    // no identity protocol at all.
+    if let Some(identity) = identity_fixture::IdentityMode::from_args(args).build() {
+        return conformance::build_server_with_identity(server_id.as_deref(), identity);
+    }
     if args.iter().any(|arg| arg == "--fail-serve-start-once") {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let hook_attempts = attempts.clone();
@@ -152,11 +161,29 @@ fn conformance_resolve_token(
 /// cheapest thing every port can implement identically, and the cases that use
 /// it only need two identities to be distinguishable. Requests without the
 /// header stay anonymous rather than being rejected: the suite probes /health
-/// and the capability endpoint before it authenticates anything.
+/// and the capability endpoint before it authenticates anything, and the
+/// identity group relies on the absence to test fail-closed behaviour.
+///
+/// `X-Conformance-Auth-Time` rides along as the `auth_time` claim, which is
+/// what `vgi_rpc.Identity.v1`'s freshness guard reads. The value is placed in
+/// the claim map **verbatim and unparsed**: parsing it here and dropping what
+/// will not parse would collapse "carries an unusable auth_time" into "carries
+/// no auth_time", and the guard would then be refusing for a reason the test
+/// did not ask for. Nothing else goes in the claim map.
+///
+/// # Warning
+///
+/// Trivially spoofable by anyone who can reach the port. It exists so six
+/// language ports can produce a deterministic authenticated caller without an
+/// identity provider, and must never be deployed.
 fn principal_from_header(req: &vgi_rpc::auth::AuthRequest) -> vgi_rpc::auth::AuthResult {
-    Ok(match req.header("x-conformance-principal") {
+    Ok(match req.header(identity_fixture::PRINCIPAL_HEADER) {
         Some(principal) if !principal.is_empty() => {
-            vgi_rpc::auth::AuthContext::for_principal("conformance", principal)
+            let ctx = vgi_rpc::auth::AuthContext::for_principal("conformance", principal);
+            match req.header(identity_fixture::AUTH_TIME_HEADER) {
+                Some(auth_time) => ctx.with_claim("auth_time", auth_time),
+                None => ctx,
+            }
         }
         _ => vgi_rpc::auth::AuthContext::anonymous(),
     })
@@ -702,7 +729,13 @@ fn run_http(
         // observe the refusal. Read from argv here rather than threaded through
         // this function's parameter list, same as the two options above.
         let introspect = std::env::args().any(|a| a == "--introspect");
-        if sticky.principal_auth || introspect {
+        // `--identity` implies principal-header auth for the same reason:
+        // both identity methods guard on an authenticated caller, so without
+        // one the group could only ever observe the refusal.
+        let identity =
+            identity_fixture::IdentityMode::from_args(&std::env::args().collect::<Vec<_>>())
+                != identity_fixture::IdentityMode::Off;
+        if sticky.principal_auth || introspect || identity {
             // Unlike the reject-all mode above, this deliberately leaves the
             // prefix at the root — the suite connects to this worker exactly as
             // to the plain one.

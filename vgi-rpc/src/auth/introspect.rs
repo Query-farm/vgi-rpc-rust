@@ -42,10 +42,12 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::AuthContext;
 use crate::errors::RpcError;
-// One implementation of the fixed-window limiter, shared with
-// `vgi_rpc.Identity.v1`. Two copies of a security-relevant primitive is how
-// two deployments of the same guard end up behaving differently.
-use crate::token_identity::RateLimiter;
+// One implementation of the fixed-window limiter, and one credential cap,
+// shared with `vgi_rpc.Identity.v1`. Two copies of a security-relevant
+// primitive is how two deployments of the same guard end up behaving
+// differently -- and the cap in particular is a constant whose *unit* the
+// ports already diverged on once, so it gets exactly one definition here.
+use crate::token_identity::{RateLimiter, MAX_TOKEN_BYTES};
 
 /// Endpoint path, appended to the app's prefix. Matches the de-facto contract
 /// the existing proxy client already speaks; changing it would cost a lockstep
@@ -61,10 +63,6 @@ pub const INTROSPECT_ENABLED_HEADER: &str = "vgi-token-introspection";
 /// megabytes into a JSON parse for a body whose only legitimate content is one
 /// credential.
 pub const MAX_INTROSPECT_BODY_BYTES: usize = 8192;
-
-/// Cap on a credential we will even attempt to resolve. Anything longer is not
-/// a bearer token; refusing early keeps a resolver from being handed megabytes.
-const MAX_TOKEN_CHARS: usize = 4096;
 
 /// Cache window handed to the caller when a resolver does not choose one.
 pub const DEFAULT_INTROSPECT_TTL_SECONDS: u64 = 300;
@@ -357,7 +355,10 @@ fn parse_token(body: &[u8]) -> Option<String> {
     }
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let token = value.get("token")?.as_str()?;
-    if token.is_empty() || token.len() > MAX_TOKEN_CHARS {
+    // `str::len` is UTF-8 bytes, which is the unit `MAX_TOKEN_BYTES` is
+    // defined in -- see its docs for why bytes and not one of the other two
+    // units the ports reached for.
+    if token.is_empty() || token.len() > MAX_TOKEN_BYTES {
         return None;
     }
     Some(token.to_string())
@@ -543,7 +544,7 @@ mod tests {
             b"not json at all".to_vec(),
             b"{}".to_vec(),
             serde_json::json!({ "token": 7 }).to_string().into_bytes(),
-            serde_json::json!({ "token": "x".repeat(MAX_TOKEN_CHARS + 1) })
+            serde_json::json!({ "token": "x".repeat(MAX_TOKEN_BYTES + 1) })
                 .to_string()
                 .into_bytes(),
         ] {
@@ -552,6 +553,55 @@ mod tests {
                 IntrospectOutcome::Unresolved
             ));
         }
+    }
+
+    /// The credential cap is UTF-8 bytes here too, because it is literally the
+    /// same constant -- the two surfaces share [`MAX_TOKEN_BYTES`] rather than
+    /// each carrying a copy, so they cannot drift on either the value or the
+    /// unit. `str::len` was already bytes on this route; what changed is that
+    /// the name now says so.
+    ///
+    /// The oversize credential is made **resolvable**, for the same reason the
+    /// JWS trap is: every rejection on this route is the uniform
+    /// `Unresolved`, so against a credential the resolver does not know, a
+    /// port measuring the wrong unit still "passes" -- the cap lets it
+    /// through and the resolver rejects it, and the test cannot tell the two
+    /// apart. Resolvable, the cap is the only thing that can produce a
+    /// rejection.
+    #[test]
+    fn the_credential_cap_is_measured_in_utf8_bytes() {
+        // Two bytes each: under the cap in codepoints, over it in bytes. Well
+        // inside MAX_INTROSPECT_BODY_BYTES, so it is the credential cap being
+        // exercised and not the body cap.
+        let multibyte = "\u{00E9}".repeat(MAX_TOKEN_BYTES / 2 + 1);
+        assert!(multibyte.chars().count() < MAX_TOKEN_BYTES);
+        assert!(multibyte.len() > MAX_TOKEN_BYTES);
+        let probe = body(&multibyte);
+        assert!(probe.len() < MAX_INTROSPECT_BODY_BYTES);
+
+        let resolvable = multibyte.clone();
+        let resolver_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = resolver_ran.clone();
+        let it = TokenIntrospector::new(
+            Arc::new(move |token: &str| {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok((token == resolvable).then(|| TokenIdentity::new("subject@example")))
+            }),
+            ["proxy"],
+            DEFAULT_INTROSPECT_TTL_SECONDS,
+            DEFAULT_INTROSPECT_RATE_LIMIT,
+        );
+        assert!(
+            matches!(
+                it.introspect(&caller("proxy"), &probe),
+                IntrospectOutcome::Unresolved
+            ),
+            "the cap is being measured in something other than UTF-8 bytes"
+        );
+        assert!(
+            !resolver_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "an over-long credential reached the resolver"
+        );
     }
 
     #[test]

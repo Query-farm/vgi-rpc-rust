@@ -63,7 +63,21 @@ pub const IDENTITY_PROTOCOL_NAME: &str = "vgi_rpc.Identity.v1";
 
 /// Cap on a credential we will even attempt to resolve. Anything longer is not
 /// a bearer token; refusing early keeps a resolver from being handed megabytes.
-pub const MAX_TOKEN_CHARS: usize = 4096;
+///
+/// Measured in **UTF-8 bytes**, which is the unit the purpose implies: what is
+/// being bounded is what a resolver would have to handle, and megabytes are
+/// bytes. Spelled out in the name because the ports reached for three
+/// different units -- codepoints (the Python reference, and this port),
+/// UTF-16 code units (Java, C#, TypeScript), and bytes (Go, C++). All three
+/// agree for an ASCII credential, which every real bearer token is, so this
+/// only bites on a multibyte one -- but "approximately the same limit" is how
+/// the rest of this module's divergences started, and each turned out to be a
+/// hole once somebody measured it. Bytes is also the most conservative of the
+/// three, so standardising on it can only refuse earlier.
+///
+/// Rust's [`str::len`] is already UTF-8 bytes, so measuring is the simple
+/// thing here rather than the careful one.
+pub const MAX_TOKEN_BYTES: usize = 4096;
 
 /// How recently a caller must have authenticated to mint a grant.
 pub const DEFAULT_MAX_AUTH_AGE_SECONDS: f64 = 900.0;
@@ -362,8 +376,9 @@ pub fn check_introspector<'a>(
 /// The length cap is measured on the **original**, not the trimmed form --
 /// splitting "trim for the shape test" from "measure what arrived" is a new
 /// way to get this wrong, and padding must not be a way to talk an over-long
-/// credential down under the cap. It counts codepoints rather than bytes,
-/// which is what `MAX_TOKEN_CHARS` says.
+/// credential down under the cap. It counts UTF-8 bytes; see
+/// [`MAX_TOKEN_BYTES`] for why that unit and not one of the other two the
+/// ports reached for.
 ///
 /// The trim set is an enumerated floor every port must cover -- `U+0009`,
 /// `U+000A`, `U+000B`, `U+000C`, `U+000D`, `U+0020`, `U+0085` (NEL) and
@@ -377,7 +392,7 @@ pub fn check_introspector<'a>(
 /// what the standard library happens to do today.
 pub fn reject_jws_shaped(token: &str) -> Result<()> {
     let candidate = token.trim();
-    if candidate.is_empty() || token.chars().count() > MAX_TOKEN_CHARS || is_jws_shaped(candidate) {
+    if candidate.is_empty() || token.len() > MAX_TOKEN_BYTES || is_jws_shaped(candidate) {
         return Err(token_unresolved());
     }
     Ok(())
@@ -1204,7 +1219,7 @@ mod tests {
     fn authorization_precedes_every_look_at_the_subject() {
         let impl_ = introspecting();
         for probe in [
-            "x".repeat(MAX_TOKEN_CHARS + 1),
+            "x".repeat(MAX_TOKEN_BYTES + 1),
             "aaa.bbb.ccc".to_string(),
             String::new(),
         ] {
@@ -1244,7 +1259,7 @@ mod tests {
     #[test]
     fn rejections_are_uniform() {
         let impl_ = introspecting();
-        for probe in ["", "unknown", &"x".repeat(MAX_TOKEN_CHARS + 1)] {
+        for probe in ["", "unknown", &"x".repeat(MAX_TOKEN_BYTES + 1)] {
             let err = impl_.introspect_token(probe, &auth("proxy")).unwrap_err();
             assert_eq!(
                 err.error_kind.as_deref(),
@@ -1627,22 +1642,33 @@ mod tests {
     /// applies to.
     #[test]
     fn the_length_check_runs_on_the_untrimmed_credential() {
-        let padded = format!("x{}", " ".repeat(MAX_TOKEN_CHARS * 2));
-        assert!(padded.trim().chars().count() < MAX_TOKEN_CHARS);
-        assert!(padded.chars().count() > MAX_TOKEN_CHARS);
+        let padded = format!("x{}", " ".repeat(MAX_TOKEN_BYTES * 2));
+        assert!(padded.trim().len() < MAX_TOKEN_BYTES);
+        assert!(padded.len() > MAX_TOKEN_BYTES);
         assert!(reject_jws_shaped(&padded).is_err());
     }
 
-    /// The cap counts codepoints, not bytes -- `MAX_TOKEN_CHARS` says so, and
-    /// a port measuring bytes refuses a non-ASCII credential another port
-    /// accepts.
+    /// A multibyte credential is bounded by what a resolver would have to
+    /// handle, not by how many characters a human would count.
+    ///
+    /// The ports reached for three different units -- codepoints, UTF-16 code
+    /// units, and bytes -- which agree for an ASCII credential and diverge for
+    /// anything else. Bytes is the unit the purpose implies, and the most
+    /// conservative of the three. This port measured codepoints until the
+    /// reference standardised, so the test is here to stop it drifting back:
+    /// a credential that is comfortably under the cap in characters and over
+    /// it in bytes must be refused.
     #[test]
-    fn the_length_cap_counts_codepoints_not_bytes() {
-        // Four bytes per char, so a byte-counting port refuses this.
-        let wide = "\u{1F510}".repeat(MAX_TOKEN_CHARS / 2);
-        assert!(wide.len() > MAX_TOKEN_CHARS);
-        assert!(wide.chars().count() <= MAX_TOKEN_CHARS);
-        assert!(reject_jws_shaped(&wide).is_ok());
+    fn the_cap_is_measured_in_utf8_bytes() {
+        // Two bytes each, so this is half the cap in codepoints and just over
+        // it in bytes -- the exact case the three units disagree on.
+        let multibyte = "\u{00E9}".repeat(MAX_TOKEN_BYTES / 2 + 1);
+        assert!(multibyte.chars().count() < MAX_TOKEN_BYTES);
+        assert!(multibyte.len() > MAX_TOKEN_BYTES);
+        assert!(
+            reject_jws_shaped(&multibyte).is_err(),
+            "the cap is being measured in something other than UTF-8 bytes"
+        );
     }
 
     /// Trimming is for the shape test only -- never for what is resolved.

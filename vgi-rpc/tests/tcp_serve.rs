@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
-use vgi_rpc::metadata::{REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY};
+use vgi_rpc::metadata::{PROTOCOL_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY};
 use vgi_rpc::tcp::TcpIdentityOptions;
 use vgi_rpc::wire::{Metadata, StreamWriter};
 use vgi_rpc::{peer_identity_primary, IdentityAssurance, MethodInfo, RpcServer, SubjectKind};
@@ -28,6 +28,11 @@ fn empty_body(method: &str) -> Vec<u8> {
     .unwrap();
     let mut md = Metadata::new();
     md.insert(RPC_METHOD_KEY.into(), method.into());
+    // The routing key is required even against a single-protocol server: a
+    // request without it is refused before dispatch. Omitting it here did not
+    // read as a routing failure -- the identity assertions below simply timed
+    // out waiting for a handler that was never reached.
+    md.insert(PROTOCOL_KEY.into(), "Service".into());
     md.insert(REQUEST_VERSION_KEY.into(), REQUEST_VERSION.into());
     let mut buf = Vec::new();
     {

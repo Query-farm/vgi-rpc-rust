@@ -176,7 +176,10 @@ fn connect() -> (
     let client_read = client_sock.try_clone().unwrap();
     let transport = PipeTransport::new(Box::new(client_read), Box::new(client_sock));
     (
-        RpcClient::from_transport(Box::new(transport)),
+        // `.protocol(..)` is not optional: an unset routing key is refused
+        // rather than silently landing on whichever protocol the server
+        // happens to host. The server here keeps the default name.
+        RpcClient::from_transport(Box::new(transport)).protocol("Service"),
         handle,
         cancel_flag,
     )

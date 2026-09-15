@@ -299,11 +299,11 @@ impl AllTypes {
         // list_of_nested
         arrs.push(Arc::new(list_of_points(&self.list_of_nested)?));
 
-        // annotated_int32 / annotated_float32
-        arrs.push(Arc::new(Int32Array::from(vec![self.annotated_int32])));
-        arrs.push(Arc::new(Float32Array::from(vec![self.annotated_float32])));
-
-        // nested_list
+        // nested_list -- built HERE, at column 14, because that is where
+        // `all_types_schema()` declares it. The schema's order was corrected to
+        // match the reference; this builder was not, so every column from 14 on
+        // was one position out and `RecordBatch::try_new` rejected the batch.
+        // The reader is name-keyed and so never noticed.
         let mut lb = ListBuilder::new(ListBuilder::new(Int64Builder::new()));
         for inner in &self.nested_list {
             {
@@ -316,6 +316,10 @@ impl AllTypes {
         }
         lb.append(true);
         arrs.push(Arc::new(lb.finish()));
+
+        // annotated_int32 / annotated_float32
+        arrs.push(Arc::new(Int32Array::from(vec![self.annotated_int32])));
+        arrs.push(Arc::new(Float32Array::from(vec![self.annotated_float32])));
 
         // dict_str_str
         let mut mb = MapBuilder::new(

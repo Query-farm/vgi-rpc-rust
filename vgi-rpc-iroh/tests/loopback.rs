@@ -159,7 +159,7 @@ async fn one_connection_multiplexes_stateful_transports_with_one_identity_snapsh
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let first = tokio::task::spawn_blocking(move || {
-        let mut client = RpcClient::from_transport(Box::new(first_transport));
+        let mut client = RpcClient::from_transport(Box::new(first_transport)).protocol("Service");
         let params = RecordBatch::new_empty(Arc::new(Schema::empty()));
 
         let (first, _) = client.call_unary("identity", &params, None).unwrap();
@@ -181,7 +181,7 @@ async fn one_connection_multiplexes_stateful_transports_with_one_identity_snapsh
         first
     });
     let second = tokio::task::spawn_blocking(move || {
-        let mut client = RpcClient::from_transport(Box::new(second_transport));
+        let mut client = RpcClient::from_transport(Box::new(second_transport)).protocol("Service");
         let params = RecordBatch::new_empty(Arc::new(Schema::empty()));
         let (identity, _) = client.call_unary("identity", &params, None).unwrap();
         identity.column(0).as_string::<i32>().value(0).to_owned()
@@ -268,7 +268,7 @@ async fn drip_fed_stream_is_terminated_without_poisoning_its_connection() {
     // connection remains usable and inherits the same connection identity.
     let healthy = connection.open_transport().await.unwrap();
     tokio::task::spawn_blocking(move || {
-        let mut client = RpcClient::from_transport(Box::new(healthy));
+        let mut client = RpcClient::from_transport(Box::new(healthy)).protocol("Service");
         let params = RecordBatch::new_empty(Arc::new(Schema::empty()));
         client.call_unary("identity", &params, None).unwrap();
     })

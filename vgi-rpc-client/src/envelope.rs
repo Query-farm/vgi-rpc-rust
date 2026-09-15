@@ -40,8 +40,8 @@ pub fn classify(batch: &RecordBatch, md: &Metadata) -> BatchKind {
     if level_str == "EXCEPTION" {
         let (etype, traceback) = parse_exception_extra(extra_json);
         let mut err = RpcError::new(etype, message);
-        err.traceback = traceback;
-        err.request_id = request_id;
+        err.traceback = traceback.into_boxed_str();
+        err.request_id = request_id.into_boxed_str();
         return BatchKind::Exception(err);
     }
 

@@ -13,9 +13,9 @@ use crate::log::{LogLevel, LogMessage};
 #[cfg(feature = "shm")]
 use crate::metadata::SHM_SEGMENT_SIZE_KEY;
 use crate::metadata::{
-    CANCEL_KEY, LOCATION_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY, PROTOCOL_KEY,
-    PROTOCOL_VERSION_KEY, REQUEST_ID_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY,
-    SERVER_ID_KEY, SHM_OFFSET_KEY, SHM_SEGMENT_NAME_KEY,
+    CANCEL_KEY, ERROR_KIND_KEY, LOCATION_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY,
+    PROTOCOL_KEY, PROTOCOL_VERSION_KEY, REQUEST_ID_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY,
+    RPC_METHOD_KEY, SERVER_ID_KEY, SHM_OFFSET_KEY, SHM_SEGMENT_NAME_KEY,
 };
 #[cfg(feature = "shm")]
 use crate::shm::{is_shm_pointer_batch, maybe_write_to_shm, resolve_shm_batch, ShmSegment};
@@ -541,6 +541,7 @@ pub struct RpcServerBuilder {
     protocol_name: Option<String>,
     protocol_version: Option<String>,
     enable_describe: bool,
+    identity: Option<Arc<crate::token_identity::IdentityImpl>>,
     dispatch_hook: Option<Arc<dyn crate::hooks::DispatchHook>>,
     on_serve_start: Option<crate::transport::ServeStartHook>,
     #[cfg(feature = "http")]
@@ -573,6 +574,21 @@ impl RpcServerBuilder {
 
     pub fn enable_describe(mut self, enabled: bool) -> Self {
         self.enable_describe = enabled;
+        self
+    }
+
+    /// Co-host [`vgi_rpc.Identity.v1`](crate::token_identity), which resolves
+    /// an opaque credential to a principal and mints standing grants.
+    ///
+    /// Absent by default, and absent rather than routed-and-refusing when
+    /// omitted: that is what keeps a dependency upgrade from growing a
+    /// credential-to-identity oracle on every existing worker. Only the
+    /// methods whose hooks the deployment configured are hosted, and the
+    /// protocol's hash narrows with them -- a client discovers what this
+    /// worker can answer from reflection rather than by calling and reading an
+    /// error.
+    pub fn identity(mut self, identity: crate::token_identity::IdentityImpl) -> Self {
+        self.identity = Some(Arc::new(identity));
         self
     }
 
@@ -620,6 +636,14 @@ impl RpcServerBuilder {
             protocol_version: self.protocol_version.unwrap_or_default(),
             protocol_hash: std::sync::OnceLock::new(),
             describe_enabled: self.enable_describe,
+            // Built after everything else so the binding -- and therefore its
+            // hash -- reflects only the hooks the deployment actually
+            // supplied. `None` when neither hook exists: with nothing to
+            // answer, the protocol is not registered at all.
+            identity: self
+                .identity
+                .and_then(crate::token_identity::IdentityBinding::new)
+                .map(Arc::new),
             dispatch_hook: self.dispatch_hook,
             on_serve_start: self.on_serve_start,
             transport_notify: Mutex::new(()),
@@ -794,6 +818,9 @@ pub struct RpcServer {
     pub(crate) protocol_version: String,
     pub(crate) protocol_hash: std::sync::OnceLock<String>,
     pub(crate) describe_enabled: bool,
+    /// `vgi_rpc.Identity.v1`, when the deployment configured at least one of
+    /// its hooks. See [`RpcServerBuilder::identity`].
+    pub(crate) identity: Option<Arc<crate::token_identity::IdentityBinding>>,
     pub(crate) dispatch_hook: Option<Arc<dyn crate::hooks::DispatchHook>>,
     /// Optional one-shot lifecycle hook fired on the first
     /// [`notify_transport`](Self::notify_transport) per (kind, caps).
@@ -827,6 +854,30 @@ impl RpcServer {
 
     pub fn protocol_name(&self) -> &str {
         &self.protocol_name
+    }
+
+    /// Every protocol this server routes, application first.
+    ///
+    /// Named in the "not specified" / "not supported" diagnostics, so a client
+    /// that guessed wrong is told what *is* here rather than only that its
+    /// guess was not. The framework-owned protocols come after the
+    /// application's: reflection always, identity only when the deployment
+    /// configured it -- a name that appears here is a name this server will
+    /// actually answer on.
+    pub fn hosted_protocol_names(&self) -> Vec<&str> {
+        let mut hosted = vec![
+            self.protocol_name.as_str(),
+            crate::reflection::REFLECTION_PROTOCOL_NAME,
+        ];
+        if self.identity.is_some() {
+            hosted.push(crate::token_identity::IDENTITY_PROTOCOL_NAME);
+        }
+        hosted
+    }
+
+    /// The `vgi_rpc.Identity.v1` binding, when hosted.
+    pub(crate) fn identity_binding(&self) -> Option<&crate::token_identity::IdentityBinding> {
+        self.identity.as_deref()
     }
 
     pub fn describe_enabled(&self) -> bool {
@@ -1158,11 +1209,27 @@ impl RpcServer {
             return self.serve_reflection(w, &req);
         }
 
+        // Which protocol's method table this request resolves against. The
+        // routing key is part of the lookup rather than a label on it:
+        // method names may collide across protocols, which is what makes
+        // protocols independently authorable.
+        let identity_call = self
+            .identity_binding()
+            .filter(|_| req.protocol == crate::token_identity::IDENTITY_PROTOCOL_NAME);
+
         // Enforce application protocol-version compatibility (the transport
         // capability handshake above remains available for negotiation).
-        if let Err(err) = validate_protocol_version(&self.protocol_version, &req.metadata) {
-            write_error_stream(w, &empty_schema(), &err, &self.server_id, &req.request_id)?;
-            return Ok(true);
+        //
+        // Skipped for the framework's own identity protocol, which declares no
+        // version of its own: gating it on the *application's* version would
+        // refuse a credential resolution that has nothing to do with the
+        // application surface, and identity is exactly what a fronting proxy
+        // needs to work even when it and the worker disagree about the app.
+        if identity_call.is_none() {
+            if let Err(err) = validate_protocol_version(&self.protocol_version, &req.metadata) {
+                write_error_stream(w, &empty_schema(), &err, &self.server_id, &req.request_id)?;
+                return Ok(true);
+            }
         }
 
         let ctx = CallContext::for_request_on_connection(self, &req, connection);
@@ -1193,16 +1260,12 @@ impl RpcServer {
             return Ok(true);
         }
 
-        // Resolve (protocol, method). Method names may collide across
-        // protocols, so the routing key is part of the lookup rather than a
-        // label on it. The routing key is required even against a server
-        // hosting exactly one protocol: an exemption would let an intermediary
-        // that rebuilds a request and drops the field land silently on
-        // whichever protocol happened to be first, rather than being told.
-        let hosted = [
-            self.protocol_name.as_str(),
-            crate::reflection::REFLECTION_PROTOCOL_NAME,
-        ];
+        // Resolve (protocol, method). The routing key is required even
+        // against a server hosting exactly one protocol: an exemption would
+        // let an intermediary that rebuilds a request and drops the field land
+        // silently on whichever protocol happened to be first, rather than
+        // being told.
+        let hosted = self.hosted_protocol_names();
         if req.protocol.is_empty() {
             write_error_stream(
                 w,
@@ -1216,7 +1279,7 @@ impl RpcServer {
         // Checked before the lookup so an arbitrary request-supplied string
         // never reaches an error message, a log field or a metric label.
         if crate::binding::validate_protocol_name(&req.protocol, true).is_err()
-            || req.protocol != self.protocol_name
+            || (req.protocol != self.protocol_name && identity_call.is_none())
         {
             write_error_stream(
                 w,
@@ -1228,8 +1291,15 @@ impl RpcServer {
             return Ok(true);
         }
 
-        let Some(info) = self.methods.get(&req.method) else {
-            let names = self.sorted_method_names();
+        let table = match identity_call {
+            Some(binding) => &binding.methods,
+            None => &self.methods,
+        };
+        let Some(info) = table.get(&req.method) else {
+            let names: Vec<&str> = match identity_call {
+                Some(binding) => binding.sorted_method_names(),
+                None => self.sorted_method_names(),
+            };
             // "The protocol is hosted but has no such method" -- deliberately a
             // different answer from "this server does not host that protocol",
             // because a client probing for an optional method depends on the
@@ -1280,6 +1350,15 @@ impl RpcServer {
             }
             if method_type == "stream" {
                 di.stream_id = crate::access_log::random_stream_id();
+            }
+            // A co-hosted protocol's calls must not be logged under the
+            // application's identity: an access log that attributes a
+            // credential resolution to the app protocol cannot be filtered on
+            // the surface that actually served it.
+            if let Some(binding) = identity_call {
+                di.protocol = crate::token_identity::IDENTITY_PROTOCOL_NAME.to_string();
+                di.protocol_hash = binding.protocol_hash.clone();
+                di.protocol_version = String::new();
             }
             di
         });
@@ -1853,15 +1932,34 @@ impl<'a> EnvelopeMeta<'a> {
 
     /// Populate for an error (EXCEPTION level) and return the reused map.
     pub(crate) fn error(&mut self, err: &RpcError) -> &Metadata {
-        let extra = serde_json::json!({
-            "exception_type": err.error_type,
-            "exception_message": err.message,
-            "traceback": err.traceback,
-        })
+        let extra = match &err.error_kind {
+            Some(kind) => serde_json::json!({
+                "exception_type": err.error_type,
+                "exception_message": err.message,
+                "traceback": err.traceback,
+                "error_kind": kind,
+            }),
+            None => serde_json::json!({
+                "exception_type": err.error_type,
+                "exception_message": err.message,
+                "traceback": err.traceback,
+            }),
+        }
         .to_string();
         self.set(LOG_LEVEL_KEY, "EXCEPTION".to_string());
         self.set(LOG_MESSAGE_KEY, err.message.clone());
         self.set(LOG_EXTRA_KEY, extra);
+        // Hoisted to a top-level key as well as living in the extra blob: a
+        // caller deciding whether to retry should not have to parse JSON to
+        // find out, and an intermediary that forwards metadata but not bodies
+        // can still route on it.
+        match &err.error_kind {
+            Some(kind) => self.set(ERROR_KIND_KEY, kind.to_string()),
+            // Clear any kind left by a previous error on this reused envelope.
+            None => {
+                self.map().remove(ERROR_KIND_KEY);
+            }
+        }
         self.md.as_ref().unwrap()
     }
 }

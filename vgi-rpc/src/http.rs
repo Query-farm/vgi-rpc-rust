@@ -3776,8 +3776,22 @@ async fn handle_unary(
         ));
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
-    if let Err(err) = validate_protocol_version(server.protocol_version(), &req.metadata) {
-        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+    // `vgi_rpc.Identity.v1` is co-hosted, and -- unlike the application
+    // surface, which HTTP addresses by URL path -- resolved through the
+    // request's routing key. A deployment that configured no hook has no
+    // binding, so the name resolves to nothing and the caller gets the
+    // ordinary "unknown method" rather than a route that exists and refuses.
+    let identity_call = server
+        .identity_binding()
+        .filter(|_| req.protocol == crate::token_identity::IDENTITY_PROTOCOL_NAME);
+    // The identity protocol declares no version of its own, so the
+    // application's version gate does not apply to it: a fronting proxy must
+    // still be able to resolve a credential against a worker whose
+    // application protocol it is out of step with.
+    if identity_call.is_none() {
+        if let Err(err) = validate_protocol_version(server.protocol_version(), &req.metadata) {
+            return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+        }
     }
 
     // If the request batch is an external-location pointer (zero rows +
@@ -3837,10 +3851,11 @@ async fn handle_unary(
         );
     }
 
-    let Some(info) = server
-        .method(&method)
-        .filter(|m| m.method_type == MethodType::Unary)
-    else {
+    let Some(info) = (match identity_call {
+        Some(binding) => binding.methods.get(&method),
+        None => server.method(&method),
+    })
+    .filter(|m| m.method_type == MethodType::Unary) else {
         let err = RpcError::attribute_error(format!("Unknown method: '{}'", method));
         return arrow_error(&state, StatusCode::NOT_FOUND, &err, &req.request_id);
     };
@@ -3854,6 +3869,14 @@ async fn handle_unary(
         ctx.set_sticky(s);
     }
     let mut dispatch_info = crate::hooks::DispatchInfo::from_request(&server, &req, "unary", &auth);
+    // A co-hosted protocol's calls must not be logged under the application's
+    // identity: an access log that attributes a credential resolution to the
+    // app protocol cannot be filtered on the surface that actually served it.
+    if let Some(binding) = identity_call {
+        dispatch_info.protocol = crate::token_identity::IDENTITY_PROTOCOL_NAME.to_string();
+        dispatch_info.protocol_hash = binding.protocol_hash.clone();
+        dispatch_info.protocol_version = String::new();
+    }
     // Log the HTTP correlation id, not the Arrow-level one. `X-Request-ID`
     // on the response and `request_id` in the record have to name the same
     // request or the trail cannot be joined; `postprocess_middleware`

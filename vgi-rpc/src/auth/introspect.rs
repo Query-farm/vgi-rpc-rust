@@ -36,13 +36,16 @@
 //! the route is absent — a fixed `404 not_enabled` — until it is.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
 use crate::auth::AuthContext;
 use crate::errors::RpcError;
+// One implementation of the fixed-window limiter, shared with
+// `vgi_rpc.Identity.v1`. Two copies of a security-relevant primitive is how
+// two deployments of the same guard end up behaving differently.
+use crate::token_identity::RateLimiter;
 
 /// Endpoint path, appended to the app's prefix. Matches the de-facto contract
 /// the existing proxy client already speaks; changing it would cost a lockstep
@@ -173,50 +176,6 @@ pub enum IntrospectOutcome {
     /// `503` + `Retry-After` — could not determine. The caller must retry
     /// rather than cache.
     Unavailable { retry_after_seconds: u32 },
-}
-
-/// Fixed-window request limiter, keyed by caller.
-///
-/// Present because the endpoint is a credential→identity oracle even when
-/// correctly restricted: an allowlisted caller whose own credential leaks can
-/// still test guesses. Rate limiting does not close that, it bounds it — a
-/// lower ceiling on how fast an attacker converts guesses to answers.
-///
-/// Fixed-window rather than a token bucket: a window admits at most twice the
-/// rate across a boundary, which is a rounding error here, and the state is one
-/// integer per caller rather than a float that has to be aged.
-struct RateLimiter {
-    per_window: u32,
-    window: std::time::Duration,
-    state: Mutex<(Instant, std::collections::HashMap<String, u32>)>,
-}
-
-impl RateLimiter {
-    fn new(per_window: u32) -> Self {
-        Self {
-            per_window,
-            window: std::time::Duration::from_secs(1),
-            state: Mutex::new((Instant::now(), std::collections::HashMap::new())),
-        }
-    }
-
-    fn allow(&self, key: &str) -> bool {
-        let now = Instant::now();
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, counts) = &mut *guard;
-        if now.duration_since(*start) >= self.window {
-            // Whole-map reset rather than per-key ageing: a caller cycling keys
-            // cannot grow the map beyond one window's worth.
-            counts.clear();
-            *start = now;
-        }
-        let count = counts.entry(key.to_string()).or_insert(0);
-        if *count >= self.per_window {
-            return false;
-        }
-        *count += 1;
-        true
-    }
 }
 
 /// The configured endpoint: an allowlist, a resolver, and a rate limiter.

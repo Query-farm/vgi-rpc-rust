@@ -150,9 +150,14 @@ fn stream_kind_for(info: &MethodInfo) -> String {
     }
 }
 
-/// One protocol's canonical fingerprint.
-pub fn binding_hash(name: &str, methods: &HashMap<String, MethodInfo>) -> Result<String> {
-    let entries: Vec<HashMethod<'_>> = methods
+/// The hash inputs for one method table.
+///
+/// Split out from [`binding_hash`] so a failing digest can be diffed rather
+/// than guessed at: feed these to
+/// [`canonical_description`](crate::protocol_hash::canonical_description) and
+/// compare the JSON against the reference's.
+pub fn hash_methods(methods: &HashMap<String, MethodInfo>) -> Vec<HashMethod<'_>> {
+    methods
         .values()
         .map(|info| HashMethod {
             name: &info.name,
@@ -166,7 +171,12 @@ pub fn binding_hash(name: &str, methods: &HashMap<String, MethodInfo>) -> Result
             result_schema: Some(info.result_schema.as_ref()),
             header_schema: info.header_schema.as_deref(),
         })
-        .collect();
+        .collect()
+}
+
+/// One protocol's canonical fingerprint.
+pub fn binding_hash(name: &str, methods: &HashMap<String, MethodInfo>) -> Result<String> {
+    let entries = hash_methods(methods);
     compute_protocol_hash(name, &entries)
         .map_err(|e| RpcError::protocol_error(format!("computing protocol hash for {name:?}: {e}")))
 }
@@ -324,13 +334,16 @@ impl crate::server::RpcServer {
         // is over an empty method set.
         let refl_methods: HashMap<String, MethodInfo> = HashMap::new();
         let refl_hash = binding_hash(REFLECTION_PROTOCOL_NAME, &refl_methods)?;
+        // Identity is registered *after* reflection, so it appears in
+        // reflection's output -- which is the whole point of hosting it as an
+        // ordinary protocol: a client learns which of its methods this
+        // deployment can answer by looking, rather than by calling and reading
+        // an error.
+        let identity = self.identity_binding();
 
         let batch = match req.method.as_str() {
-            "list_protocols" => build_protocol_list(
-                &self.server_id,
-                "",
-                crate::metadata::REQUEST_VERSION,
-                &[
+            "list_protocols" => {
+                let mut protocols = vec![
                     (
                         self.protocol_name.clone(),
                         self.protocol_version.clone(),
@@ -341,8 +354,21 @@ impl crate::server::RpcServer {
                         String::new(),
                         refl_hash,
                     ),
-                ],
-            )?,
+                ];
+                if let Some(binding) = identity {
+                    protocols.push((
+                        crate::token_identity::IDENTITY_PROTOCOL_NAME.to_string(),
+                        String::new(),
+                        binding.protocol_hash.clone(),
+                    ));
+                }
+                build_protocol_list(
+                    &self.server_id,
+                    "",
+                    crate::metadata::REQUEST_VERSION,
+                    &protocols,
+                )?
+            }
             "describe" => {
                 let requested = reflection_describe_argument(&req.batch);
                 if requested == self.protocol_name {
@@ -359,10 +385,22 @@ impl crate::server::RpcServer {
                         &refl_hash,
                         &refl_methods,
                     )?
+                } else if let Some(binding) =
+                    identity.filter(|_| requested == crate::token_identity::IDENTITY_PROTOCOL_NAME)
+                {
+                    // Only the methods whose hooks the deployment supplied: a
+                    // description that listed `issue_grant` on a worker that
+                    // cannot mint would be a promise the worker does not keep.
+                    build_service_description(
+                        crate::token_identity::IDENTITY_PROTOCOL_NAME,
+                        "",
+                        &binding.protocol_hash,
+                        &binding.methods,
+                    )?
                 } else {
                     // Named, not silently empty: an empty description reads as
                     // "this protocol has no methods".
-                    let hosted = [self.protocol_name.as_str(), REFLECTION_PROTOCOL_NAME];
+                    let hosted = self.hosted_protocol_names();
                     crate::server::write_error_stream(
                         w,
                         &empty_schema(),

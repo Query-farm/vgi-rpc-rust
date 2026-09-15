@@ -11,9 +11,19 @@ pub struct RpcError {
     /// Human-readable error message.
     pub message: String,
     /// Optional stack trace or remote traceback string.
-    pub traceback: String,
+    ///
+    /// A `Box<str>` rather than a `String`: this is written once and never
+    /// grown, and `RpcError` is returned by value from every `Result` in the
+    /// framework, so eight bytes of unused capacity ride along on every call
+    /// that can fail. Keeping the whole error under clippy's
+    /// `result_large_err` threshold is the point -- an error type that is
+    /// expensive to return gets returned less carefully.
+    pub traceback: Box<str>,
     /// Optional request ID attached when the error was produced.
-    pub request_id: String,
+    ///
+    /// `Box<str>` for the same reason as [`Self::traceback`]: written once,
+    /// never grown, and carried by value on every fallible return.
+    pub request_id: Box<str>,
     /// Machine-readable reason when this error is an authentication
     /// rejection. `None` means unclassified, which renders as
     /// [`crate::unauthorized::AuthReason::Unauthorized`] — guessing a finer
@@ -23,6 +33,19 @@ pub struct RpcError {
     /// `Retry-After` hint, in seconds, carried by a *transient* failure —
     /// see [`RpcError::auth_unavailable`]. `None` on every other error.
     pub retry_after_seconds: Option<u32>,
+    /// Stable, machine-readable classification, surfaced on the wire as
+    /// `vgi_rpc.error_kind` (see [`crate::metadata::ERROR_KIND_KEY`]).
+    ///
+    /// An open enum, and deliberately separate from [`Self::error_type`]:
+    /// `error_type` names the *language* exception a port happened to raise,
+    /// which differs across ports, while `error_kind` is the contract. It
+    /// exists because some errors used to be distinguishable only by HTTP
+    /// status — `vgi_rpc.Identity.v1` was an HTTP route whose callers read
+    /// definitive-vs-transient off `404` versus `503`. As protocol methods
+    /// every handler failure surfaces the same way, so without this a caller
+    /// would have to substring-match a message to know whether retrying is
+    /// correct or abusive.
+    pub error_kind: Option<Box<str>>,
 }
 
 /// [`RpcError::error_type`] marking "I could not determine whether the
@@ -43,10 +66,11 @@ impl RpcError {
         Self {
             error_type: error_type.into(),
             message: message.into(),
-            traceback: String::new(),
-            request_id: String::new(),
+            traceback: String::new().into_boxed_str(),
+            request_id: String::new().into_boxed_str(),
             auth_reason: None,
             retry_after_seconds: None,
+            error_kind: None,
         }
     }
 
@@ -76,6 +100,12 @@ impl RpcError {
     /// Override the `Retry-After` hint on a transient failure.
     pub fn with_retry_after(mut self, seconds: u32) -> Self {
         self.retry_after_seconds = Some(seconds);
+        self
+    }
+
+    /// Attach the stable machine-readable [`Self::error_kind`].
+    pub fn with_error_kind(mut self, kind: impl Into<String>) -> Self {
+        self.error_kind = Some(kind.into().into_boxed_str());
         self
     }
 

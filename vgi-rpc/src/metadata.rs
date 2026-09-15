@@ -21,6 +21,14 @@ pub const REQUEST_VERSION_KEY: &str = "vgi_rpc.request_version";
 pub const REQUEST_VERSION: &str = "1";
 pub const REQUEST_ID_KEY: &str = "vgi_rpc.request_id";
 
+/// Typed error classification on EXCEPTION-level batches. An open enum —
+/// values beyond the well-known tokens are valid and should be treated as
+/// unknown kinds by clients. Lets a caller pattern-match on a stable
+/// identifier instead of substring-searching the exception message, which is
+/// the only way to tell a *definitive* rejection from a *transient* one once
+/// every handler failure surfaces through the same envelope.
+pub const ERROR_KIND_KEY: &str = "vgi_rpc.error_kind";
+
 pub const LOG_LEVEL_KEY: &str = "vgi_rpc.log_level";
 pub const LOG_MESSAGE_KEY: &str = "vgi_rpc.log_message";
 pub const LOG_EXTRA_KEY: &str = "vgi_rpc.log_extra";

@@ -43,6 +43,9 @@ pub mod reflection;
 #[cfg(feature = "stream-codec")]
 pub mod stream_codec;
 pub mod tcp;
+/// `vgi_rpc.Identity.v1` -- resolving an opaque credential to a principal, and
+/// minting standing grants. Framework-owned and off unless configured.
+pub mod token_identity;
 pub mod transport;
 pub mod transport_options;
 pub mod type_tokens;
@@ -115,6 +118,9 @@ pub use server::{
 #[cfg(feature = "http")]
 pub use sticky::{DrainHandle, SessionRegistry};
 pub use stream::{ExchangeState, OutputCollector, ProducerState, StreamResult};
+pub use token_identity::{
+    GrantMinter, IdentityImpl, IdentityImplBuilder, IssuedGrant, IDENTITY_PROTOCOL_NAME,
+};
 pub use transport::{ServeStartHook, TransportCapabilities, TransportKind};
 
 #[cfg(feature = "otel")]

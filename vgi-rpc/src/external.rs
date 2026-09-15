@@ -170,7 +170,7 @@ pub fn validate_external_url(validator: &UrlValidator, raw: &str) -> Result<()> 
     validator(raw).map_err(|mut err| {
         let redacted = redact_external_url(raw);
         err.message = err.message.replace(raw, &redacted);
-        err.traceback = err.traceback.replace(raw, &redacted);
+        err.traceback = err.traceback.replace(raw, &redacted).into_boxed_str();
         err
     })
 }

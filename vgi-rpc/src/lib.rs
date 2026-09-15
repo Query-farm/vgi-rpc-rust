@@ -22,7 +22,6 @@ pub mod hooks;
 /// Wire-framing helpers for proxies, routers, and gateways. Unfeatured, so an
 /// intermediary needn't pull the server or HTTP stack.
 pub mod intermediary;
-pub mod introspect;
 pub mod log;
 pub mod metadata;
 pub mod proxy_protocol;
@@ -103,7 +102,6 @@ pub use intermediary::{
     build_error_stream, find_protocol_version, find_state_token, read_request, read_unary_result,
     write_request, write_unary_result,
 };
-pub use introspect::{DESCRIBE_METHOD_NAME, DESCRIBE_VERSION};
 pub use log::{LogLevel, LogMessage};
 pub use proxy_protocol::{
     parse_proxy_protocol_v2, parse_proxy_protocol_v2_with_options, read_proxy_protocol_v2,

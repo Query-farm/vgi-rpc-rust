@@ -7,8 +7,9 @@
 A blocking, synchronous client for the [`vgi-rpc`](https://crates.io/crates/vgi-rpc)
 Arrow-IPC RPC framework. It speaks the canonical `vgi_rpc` wire protocol and is
 validated against the Python reference implementation's full conformance suite
-(unary, producer/exchange streaming, cancellation, logs, errors, `__describe__`,
-and `__transport_options__`) across every transport, driving the Rust, Python,
+(unary, producer/exchange streaming, cancellation, logs, errors,
+`vgi_rpc.Reflection.v1` introspection, and `__transport_options__`) across every
+transport, driving the Rust, Python,
 and Go conformance servers.
 
 The client is **dynamic and schema-first**, mirroring the server's model and the

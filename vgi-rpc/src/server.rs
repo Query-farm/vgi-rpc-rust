@@ -540,7 +540,6 @@ pub struct RpcServerBuilder {
     server_version: Option<String>,
     protocol_name: Option<String>,
     protocol_version: Option<String>,
-    enable_describe: bool,
     identity: Option<Arc<crate::token_identity::IdentityImpl>>,
     dispatch_hook: Option<Arc<dyn crate::hooks::DispatchHook>>,
     on_serve_start: Option<crate::transport::ServeStartHook>,
@@ -569,11 +568,6 @@ impl RpcServerBuilder {
     /// (build) ``server_version``.
     pub fn protocol_version(mut self, v: impl Into<String>) -> Self {
         self.protocol_version = Some(v.into());
-        self
-    }
-
-    pub fn enable_describe(mut self, enabled: bool) -> Self {
-        self.enable_describe = enabled;
         self
     }
 
@@ -635,7 +629,7 @@ impl RpcServerBuilder {
                 .unwrap_or_else(|| "Service".to_string()),
             protocol_version: self.protocol_version.unwrap_or_default(),
             protocol_hash: std::sync::OnceLock::new(),
-            describe_enabled: self.enable_describe,
+            reflection_hash: std::sync::OnceLock::new(),
             // Built after everything else so the binding -- and therefore its
             // hash -- reflects only the hooks the deployment actually
             // supplied. `None` when neither hook exists: with nothing to
@@ -655,10 +649,10 @@ impl RpcServerBuilder {
 }
 
 /// Describes one RPC method — the metadata required both for dispatch and
-/// introspection via `__describe__`.
+/// for the description `vgi_rpc.Reflection.v1` generates from it.
 ///
 /// Build via [`MethodInfo::unary`] / [`MethodInfo::stream`] and attach
-/// additional describe-time metadata through the builder helpers
+/// additional description-time metadata through the builder helpers
 /// (`.doc`, `.param_type`, `.param_default`, `.param_doc`, `.header_schema`).
 pub struct MethodInfo {
     pub name: String,
@@ -809,6 +803,23 @@ impl MethodInfo {
     }
 }
 
+/// The wire identity of one hosted protocol, as an access record must carry it.
+///
+/// Name and hash travel together deliberately. They were separable while a
+/// server hosted exactly one protocol; they are not now, and a site that reads
+/// one from the binding and the other from the server produces the one failure
+/// in this area that is silent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProtocolIdentity<'a> {
+    /// The protocol's wire name.
+    pub name: &'a str,
+    /// Its canonical protocol hash.
+    pub hash: &'a str,
+    /// Its operator-declared contract version; empty for the framework's own
+    /// protocols, which declare none.
+    pub version: &'a str,
+}
+
 /// The RPC server — holds method registrations and dispatches requests.
 pub struct RpcServer {
     pub(crate) methods: HashMap<String, MethodInfo>,
@@ -817,7 +828,8 @@ pub struct RpcServer {
     pub(crate) protocol_name: String,
     pub(crate) protocol_version: String,
     pub(crate) protocol_hash: std::sync::OnceLock<String>,
-    pub(crate) describe_enabled: bool,
+    /// Cache for [`RpcServer::reflection_protocol_hash`].
+    reflection_hash: std::sync::OnceLock<String>,
     /// `vgi_rpc.Identity.v1`, when the deployment configured at least one of
     /// its hooks. See [`RpcServerBuilder::identity`].
     pub(crate) identity: Option<Arc<crate::token_identity::IdentityBinding>>,
@@ -880,10 +892,6 @@ impl RpcServer {
         self.identity.as_deref()
     }
 
-    pub fn describe_enabled(&self) -> bool {
-        self.describe_enabled
-    }
-
     pub fn server_version(&self) -> &str {
         &self.server_version
     }
@@ -892,23 +900,76 @@ impl RpcServer {
         &self.protocol_version
     }
 
-    /// SHA-256 hex digest of the canonical __describe__ payload. Computed
-    /// lazily on first call and cached.
+    /// The application protocol's canonical hash. Computed lazily and cached.
+    ///
+    /// Canonical, not the digest `__describe__` used to carry: that one hashed
+    /// serialized Arrow IPC bytes, which each language may legitimately spell
+    /// differently for the same logical schema, so it was only ever comparable
+    /// against itself. This is the digest every port agrees on
+    /// ([`protocol_hash`](crate::protocol_hash)), and the one the access log
+    /// publishes as its registry key -- a record keyed on a port-local digest
+    /// cannot be decoded by a consumer holding any other port's description.
     pub fn protocol_hash(&self) -> &str {
         self.protocol_hash.get_or_init(|| {
-            match crate::introspect::build_describe(
-                &self.protocol_name,
-                &self.methods,
-                &self.server_id,
-                &self.protocol_version,
-            ) {
-                Ok((_, md)) => md
-                    .get(crate::metadata::PROTOCOL_HASH_KEY)
-                    .cloned()
-                    .unwrap_or_default(),
-                Err(_) => String::new(),
-            }
+            crate::reflection::binding_hash(&self.protocol_name, &self.methods).unwrap_or_default()
         })
+    }
+
+    /// The reflection protocol's canonical hash. Computed lazily and cached.
+    ///
+    /// Over an empty method set: reflection's two methods are framework-owned
+    /// rather than registered, so an empty table is the honest input.
+    pub(crate) fn reflection_protocol_hash(&self) -> &str {
+        self.reflection_hash.get_or_init(|| {
+            crate::reflection::binding_hash(
+                crate::reflection::REFLECTION_PROTOCOL_NAME,
+                &HashMap::new(),
+            )
+            .unwrap_or_default()
+        })
+    }
+
+    /// The wire identity of the protocol that owns a dispatched method.
+    ///
+    /// `access-log-spec.md` §3 makes `protocol` "the wire name of the protocol
+    /// that owns the dispatched method … not a server-wide default", and
+    /// `protocol_hash` that protocol's canonical digest -- "the registry key
+    /// when decoding archived records". So both have to be read from the
+    /// resolved binding, and read *together*: a record naming one protocol and
+    /// carrying another's digest is worse than either field being wrong alone,
+    /// because it is well-formed, passes the schema, and decodes against the
+    /// wrong description with nothing about it looking wrong.
+    ///
+    /// Capturing the identity per binding rather than per server is what keeps
+    /// this correct for a protocol co-hosted later: every emit site reads it
+    /// here instead of spelling out its own special case.
+    ///
+    /// An unrecognised name -- a framework endpoint owned by no protocol, or a
+    /// routing key dispatch has already refused -- yields the server's primary,
+    /// which is what the spec prescribes for `__transport_options__` and
+    /// `__upload_url__`.
+    pub fn protocol_identity(&self, protocol: &str) -> ProtocolIdentity<'_> {
+        if protocol == crate::reflection::REFLECTION_PROTOCOL_NAME {
+            return ProtocolIdentity {
+                name: crate::reflection::REFLECTION_PROTOCOL_NAME,
+                hash: self.reflection_protocol_hash(),
+                version: "",
+            };
+        }
+        if protocol == crate::token_identity::IDENTITY_PROTOCOL_NAME {
+            if let Some(binding) = self.identity_binding() {
+                return ProtocolIdentity {
+                    name: crate::token_identity::IDENTITY_PROTOCOL_NAME,
+                    hash: &binding.protocol_hash,
+                    version: "",
+                };
+            }
+        }
+        ProtocolIdentity {
+            name: &self.protocol_name,
+            hash: self.protocol_hash(),
+            version: &self.protocol_version,
+        }
     }
 
     #[cfg(feature = "http")]
@@ -1184,7 +1245,7 @@ impl RpcServer {
 
         // __transport_options__ — framework transport-capability handshake,
         // handled before method dispatch (not a registered method, so it never
-        // appears in `methods` / `__describe__`, and doesn't perturb the
+        // appears in the protocol's description, and doesn't perturb the
         // protocol hash). Capabilities ride as response metadata; the response
         // batch is empty. Always available, including to version-mismatched
         // clients, since it is the negotiation they perform before `init`.
@@ -1200,13 +1261,31 @@ impl RpcServer {
             return Ok(true);
         }
 
+        // `__describe__` is retired, and is answered here rather than left to
+        // fall through to "no such method" -- which is true, useless, and
+        // indistinguishable from "this server was built without
+        // introspection". Answered before routing because a stale client
+        // predates the routing key and would otherwise be told only that it
+        // failed to name a protocol, which is not its problem.
+        if req.method == crate::reflection::RETIRED_DESCRIBE_METHOD {
+            write_error_stream(
+                w,
+                &empty_schema(),
+                &crate::reflection::describe_retired(),
+                &self.server_id,
+                &req.request_id,
+            )?;
+            return Ok(true);
+        }
+
         // Reflection is a co-hosted protocol, routed by the same key as
         // everything else and appearing in its own output. Handled *before* the
         // version gate because it is exempt from it: this is what a
         // version-mismatched client calls to learn what mismatched, and gating
         // it would deny the client the diagnosis it came for.
         if req.protocol == crate::reflection::REFLECTION_PROTOCOL_NAME {
-            return self.serve_reflection(w, &req);
+            let ctx = CallContext::for_request_on_connection(self, &req, connection);
+            return self.serve_reflection_logged(w, &req, &ctx);
         }
 
         // Which protocol's method table this request resolves against. The
@@ -1240,24 +1319,6 @@ impl RpcServer {
             let mut s = lock_ok(&stats);
             s.input_batches = 1;
             s.input_rows = req.batch.num_rows() as u64;
-        }
-
-        // Built-in __describe__ introspection.
-        if self.describe_enabled && req.method == crate::introspect::DESCRIBE_METHOD_NAME {
-            match crate::introspect::build_describe(
-                &self.protocol_name,
-                &self.methods,
-                &self.server_id,
-                &self.protocol_version,
-            ) {
-                Ok((batch, md)) => {
-                    crate::introspect::write_describe_response(w, &batch, &md)?;
-                }
-                Err(err) => {
-                    write_error_stream(w, &empty_schema(), &err, &self.server_id, &req.request_id)?;
-                }
-            }
-            return Ok(true);
         }
 
         // Resolve (protocol, method). The routing key is required even
@@ -1350,15 +1411,6 @@ impl RpcServer {
             }
             if method_type == "stream" {
                 di.stream_id = crate::access_log::random_stream_id();
-            }
-            // A co-hosted protocol's calls must not be logged under the
-            // application's identity: an access log that attributes a
-            // credential resolution to the app protocol cannot be filtered on
-            // the surface that actually served it.
-            if let Some(binding) = identity_call {
-                di.protocol = crate::token_identity::IDENTITY_PROTOCOL_NAME.to_string();
-                di.protocol_hash = binding.protocol_hash.clone();
-                di.protocol_version = String::new();
             }
             di
         });

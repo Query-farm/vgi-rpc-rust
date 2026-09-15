@@ -5,7 +5,7 @@
 //! (`Point`, `BoundingBox`, `AllTypes`) round-trip through Arrow
 //! `Binary` IPC bytes (matches Python's `ArrowSerializableDataclass`
 //! wire convention) — those use `Bytes` + `param_type = "..."` to
-//! preserve the `__describe__` type names.
+//! preserve the type names a description reports.
 
 use std::sync::Arc;
 

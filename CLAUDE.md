@@ -92,18 +92,23 @@ dispatch flow:
 2. Handle `__transport_options__` inline — a pre-dispatch capability
    handshake (see `transport_options.rs`), answered before everything
    below so even a version-mismatched client can negotiate.
-3. Enforce application protocol-version compatibility: if the server has
+3. Refuse `__describe__` with a message naming `vgi_rpc.Reflection.v1`
+   and its two entry points. Retired, and answered before routing
+   because a client stale enough to call it predates the routing key.
+4. Serve `vgi_rpc.Reflection.v1` when the routing key names it — a
+   co-hosted protocol, exempt from the version gate below because it is
+   what a version-mismatched client calls to learn *what* mismatched.
+5. Enforce application protocol-version compatibility: if the server has
    an enforced `protocol_version`, reject a request whose
    `vgi_rpc.protocol_version` MAJOR differs (mirrors the Python gate).
-4. Handle `__describe__` inline if enabled.
-5. Build `CallContext` (with `auth`, `cookies`, `transport_metadata`).
-6. Fire `on_dispatch_start`.
-7. Call `serve_unary` or `serve_stream`. Both take `&mut Option<RpcError>`
+6. Build `CallContext` (with `auth`, `cookies`, `transport_metadata`).
+7. Fire `on_dispatch_start`.
+8. Call `serve_unary` or `serve_stream`. Both take `&mut Option<RpcError>`
    (`app_err`) so they can record a handler error without killing the
    serve loop.
-8. On unary success, optionally externalize the result batch before
+9. On unary success, optionally externalize the result batch before
    writing it to the IPC writer.
-9. Fire `on_dispatch_end` with the final `CallStatistics`.
+10. Fire `on_dispatch_end` with the final `CallStatistics`.
 
 Stream dispatch writes the output IPC stream's schema **before** opening
 the input reader so the client can decode the schema without first sending
@@ -114,11 +119,11 @@ so handlers can pick up per-tick signals like dynamic pushdown filters.
 
 ### Transport-capability handshake — `vgi-rpc/src/transport_options.rs`
 
-`__transport_options__` is a framework method (parallel to `__describe__`)
-that a client calls once, before `init`, to learn which transport features
-the worker supports. It is **not** a registered method — `server.rs`
-intercepts it pre-dispatch — so it never appears in `methods` /
-`__describe__` and does not perturb the protocol hash. Capabilities ride
+`__transport_options__` is a framework method that a client calls once,
+before `init`, to learn which transport features the worker supports. It is
+server-level rather than owned by any protocol, and **not** a registered
+method — `server.rs` intercepts it pre-dispatch — so it never appears in a
+protocol's description and does not perturb the protocol hash. Capabilities ride
 as `vgi_rpc.transport.*` response metadata on an empty batch; today the
 only key is `vgi_rpc.transport.shm` (`metadata::TRANSPORT_SHM_KEY`),
 `"true"` on POSIX builds with the `shm` feature. Mirrors Python
@@ -339,9 +344,10 @@ keeping in mind when extending):
 - **Cast input schemas** — use `arrow_cast::cast_with_options` plus an
   explicit field-name check so the existing "column-name mismatch is a
   TypeError" conformance test stays green.
-- **__describe__ method_type**. Python's `MethodType` has only `unary`
+- **Description `method_type`**. Python's `MethodType` has only `unary`
   and `stream`; collapse `Producer | Exchange | Dynamic` → `"stream"` in
-  the describe response.
+  a reflection description. The producer/exchange split rides separately
+  on `stream_kind`, where `"unknown"` is a sayable answer.
 - **Error envelopes** are zero-row batches whose custom metadata carries
   `vgi_rpc.log_level = "EXCEPTION"`, `vgi_rpc.log_message`, and a JSON
   `vgi_rpc.log_extra` with at least `exception_type`.

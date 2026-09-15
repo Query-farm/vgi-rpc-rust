@@ -34,14 +34,16 @@ use vgi_rpc::external::{
     any_url_validator, validate_external_url, Compression, ExternalLocationConfig, ExternalStorage,
     FetchedPayload, Fetcher, UploadResult, UrlValidator,
 };
-use vgi_rpc::introspect::DESCRIBE_METHOD_NAME;
 use vgi_rpc::metadata::{CALL_STATE_KEY, CANCEL_KEY, LOCATION_KEY, REQUEST_ID_KEY, STATE_KEY};
 use vgi_rpc::retry::RetryConfig;
 use vgi_rpc::wire::{empty_batch, write_one_batch, Metadata, StreamReader};
 
 use crate::client::OnLog;
 use crate::envelope::{classify, BatchKind};
-use crate::introspect::{empty_schema, parse_describe_batch, ServiceDescription};
+use crate::introspect::{
+    describe_params, empty_schema, no_application_protocol, parse_protocol_list,
+    parse_service_description, reflection_payload, ProtocolList, ServiceDescription,
+};
 use crate::request::{build_request_metadata, generate_request_id};
 
 /// Apache Arrow IPC stream content type (matches `vgi_rpc::http::ARROW_CONTENT_TYPE`).
@@ -1041,11 +1043,23 @@ impl HttpClient {
     }
 
     fn req_md(&self, method: &str, extra: Option<&Metadata>) -> (String, Metadata) {
+        self.req_md_on(self.protocol.as_deref(), method, extra)
+    }
+
+    /// [`req_md`](Self::req_md) with an explicit routing key, for a call
+    /// addressed to a co-hosted framework protocol rather than to the one this
+    /// client is bound to.
+    fn req_md_on(
+        &self,
+        protocol: Option<&str>,
+        method: &str,
+        extra: Option<&Metadata>,
+    ) -> (String, Metadata) {
         let id = generate_request_id();
         let md = build_request_metadata(
             method,
             &id,
-            self.protocol.as_deref(),
+            protocol,
             self.protocol_version.as_deref(),
             extra,
         );
@@ -1067,11 +1081,56 @@ impl HttpClient {
         read_unary(&resp, &mut self.on_log, relax, external.as_ref())
     }
 
-    /// Fetch the service description via `__describe__`.
-    pub fn describe(&mut self) -> Result<ServiceDescription> {
+    /// One unary call to `vgi_rpc.Reflection.v1`.
+    ///
+    /// HTTP addresses the application surface by URL path; a co-hosted
+    /// framework protocol is reached the same way identity is, by naming
+    /// itself in the request's routing key.
+    fn reflection_call(&mut self, method: &str, params: &RecordBatch) -> Result<RecordBatch> {
+        let (_id, md) = self.req_md_on(
+            Some(vgi_rpc::reflection::REFLECTION_PROTOCOL_NAME),
+            method,
+            None,
+        );
+        let body = write_one_batch(params, Some(&md))?;
+        // Protocol-qualified: reflection's `describe` collides with the
+        // human-facing describe page on the bare `/{method}` route, which
+        // answers GET and 405s a POST with an empty body.
+        let path = format!("{}/{method}", vgi_rpc::reflection::REFLECTION_PROTOCOL_NAME);
+        let resp = self.post(&path, body, true)?;
+        let relax = self.relax_nullability;
+        let external = self.external.clone();
+        let (batch, _md) = read_unary(&resp, &mut self.on_log, relax, external.as_ref())?;
+        reflection_payload(&batch)
+    }
+
+    /// What protocols this server hosts, via `vgi_rpc.Reflection.v1`.
+    pub fn list_protocols(&mut self) -> Result<ProtocolList> {
         let params = empty_batch(empty_schema().as_ref())?;
-        let (batch, md) = self.call_unary(DESCRIBE_METHOD_NAME, &params, None)?;
-        parse_describe_batch(&batch, &md)
+        parse_protocol_list(&self.reflection_call("list_protocols", &params)?)
+    }
+
+    /// Describe one named protocol, in a single round trip.
+    ///
+    /// `server_id` and `request_version` come back empty; see
+    /// [`RpcClient::describe_protocol`](crate::RpcClient::describe_protocol).
+    pub fn describe_protocol(&mut self, protocol: &str) -> Result<ServiceDescription> {
+        let params = describe_params(protocol)?;
+        parse_service_description(&self.reflection_call("describe", &params)?, None)
+    }
+
+    /// Describe the server's application protocol: `list_protocols`, then
+    /// `describe`. Name one with
+    /// [`describe_protocol`](Self::describe_protocol) to skip the first hop.
+    pub fn describe(&mut self) -> Result<ServiceDescription> {
+        let listing = self.list_protocols()?;
+        let protocol = listing
+            .primary()
+            .ok_or_else(|| no_application_protocol(&listing))?
+            .protocol
+            .clone();
+        let params = describe_params(&protocol)?;
+        parse_service_description(&self.reflection_call("describe", &params)?, Some(&listing))
     }
 
     /// Open a producer stream over HTTP.

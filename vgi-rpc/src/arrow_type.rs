@@ -44,7 +44,7 @@ pub trait VgiArrow: Sized {
         false
     }
 
-    /// Wire-format type name surfaced via `__describe__` metadata.
+    /// Wire-format type name surfaced in a protocol's description.
     /// Mirrors Python: `"str"`, `"int"`, `"list[int]"`, `"int | None"`.
     fn describe_name() -> String;
 

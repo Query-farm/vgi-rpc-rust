@@ -87,7 +87,6 @@ async fn main() -> std::io::Result<()> {
     let mut server = RpcServer::builder()
         .server_id("hello-stream")
         .protocol_name("StreamingSvc")
-        .enable_describe(true)
         .build();
     StreamingSvc::register_with(&mut server, Arc::new(StreamingSvc));
 

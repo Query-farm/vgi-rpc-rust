@@ -165,7 +165,6 @@ fn build_app() -> axum::Router {
     let mut srv = RpcServer::builder()
         .server_id("test")
         .protocol_name("Calc")
-        .enable_describe(true)
         .build();
     Calc::register_with(&mut srv, Arc::new(Calc));
     let state = HttpState::builder()

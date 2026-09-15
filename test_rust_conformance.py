@@ -1165,7 +1165,7 @@ class TestLargeData(TestLargeData):  # type: ignore[no-redef]  # noqa: F811
 # -----------------------------------------------------------------------------
 
 from vgi_rpc.conformance import run_describe_conformance  # noqa: E402
-from vgi_rpc.introspect import introspect, DESCRIBE_METHOD_NAME, DESCRIBE_VERSION  # noqa: E402
+from vgi_rpc.introspect import introspect, DESCRIBE_VERSION  # noqa: E402
 from vgi_rpc.http import http_introspect  # noqa: E402
 
 
@@ -1173,9 +1173,16 @@ from vgi_rpc.http import http_introspect  # noqa: E402
     params=[t for t in _TRANSPORTS if t in ("pipe", "subprocess", "http", "unix", "tcp")]
 )
 def conformance_describe(request: pytest.FixtureRequest):  # type: ignore[no-untyped-def]
-    """Return a ``ServiceDescription`` from a real ``__describe__`` call to the
-    Rust worker under test — the fixture the upstream ``TestDescribeConformance``
-    relies on. Parallels ``conformance_conn``'s transport matrix.
+    """Return a ``ServiceDescription`` from a real introspection round trip
+    against the Rust worker under test — the fixture the upstream
+    ``TestDescribeConformance`` relies on. Parallels ``conformance_conn``'s
+    transport matrix.
+
+    Introspection is ``vgi_rpc.Reflection.v1`` (``list_protocols``, then
+    ``describe``), which is what ``introspect`` / ``http_introspect`` speak.
+    ``__describe__`` is retired: the worker refuses it with a message naming
+    the replacement, so a harness still calling it would fail loudly rather
+    than silently describe nothing.
 
     Both ``pipe`` and ``subprocess`` use a stdio subprocess (the Rust worker has
     no in-process server); a dedicated child is spawned so the shared transport

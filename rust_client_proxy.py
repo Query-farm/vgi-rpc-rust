@@ -201,15 +201,57 @@ class RustClientProxy:
         return caller
 
     def describe(self) -> Any:
-        from vgi_rpc.introspect import parse_describe_batch
+        """The Rust client's own introspection, relayed as JSON.
+
+        Introspection is ``vgi_rpc.Reflection.v1`` now, whose reply is two
+        nested payloads rather than one flat batch. Relaying raw Arrow the way
+        every other op does would make this shim re-implement the reflection
+        schema; the Rust client already decoded it, so the driver hands over
+        what it got and this rebuilds the client-side view.
+        """
+        import pyarrow as pa
+        from pyarrow import ipc
+
+        from vgi_rpc.introspect import MethodDescription, ServiceDescription
+        from vgi_rpc.rpc import MethodType
 
         self._send({"op": "describe"})
         resp = self._recv()
         if not resp.get("ok"):
             raise RpcError("TransportError", str(resp.get("error")), "")
-        reader = _reader(_b64d(resp["result_b64"]))
-        batch, cm = reader.read_next_batch_with_custom_metadata()
-        return parse_describe_batch(batch, cm)
+        if resp.get("error"):
+            err = resp["error"]
+            raise RpcError(
+                err.get("error_type", "RpcError"), err.get("message", ""), err.get("traceback", "")
+            )
+        d = resp["describe"]
+
+        def _schema(b64: str | None) -> Any:
+            if not b64:
+                return pa.schema([])
+            return ipc.open_stream(pa.py_buffer(_b64d(b64))).schema
+
+        methods = {}
+        for m in d["methods"]:
+            methods[m["name"]] = MethodDescription(
+                name=m["name"],
+                method_type=MethodType(m["method_type"]),
+                has_return=m["has_return"],
+                params_schema=_schema(m["params_schema_b64"]),
+                result_schema=_schema(m["result_schema_b64"]),
+                has_header=m["has_header"],
+                header_schema=_schema(m["header_schema_b64"]) if m["has_header"] else None,
+                is_exchange=m["is_exchange"],
+            )
+        return ServiceDescription(
+            protocol_name=d["protocol_name"],
+            request_version=d["request_version"],
+            describe_version=d["describe_version"],
+            protocol_hash=d["protocol_hash"],
+            server_id=d["server_id"],
+            methods=methods,
+            protocol_version=d["protocol_version"],
+        )
 
     def with_session_token(self, token: Any = None) -> Any:
         """Sticky-session scope: subsequent calls on the returned view carry

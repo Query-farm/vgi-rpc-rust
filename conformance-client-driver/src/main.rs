@@ -12,7 +12,7 @@
 //!   {"op":"connect","transport":"stdio|unix|tcp|http","target":<argv|path|host:port|url>}
 //!        http may also carry {"headers":{name:value}} — default request headers
 //!   {"op":"unary","request_b64":...}            -> {ok,result_b64,logs,error}
-//!   {"op":"describe"}                            -> {ok,result_b64}
+//!   {"op":"describe"}                            -> {ok,describe:{...}}
 //!   {"op":"stream_open","request_b64":...,"is_exchange":bool,"has_header":bool}
 //!        -> {ok,header_b64,logs}  then a sub-loop of:
 //!   {"op":"tick"}                                -> {ok,done,batch_b64,logs,error}
@@ -214,12 +214,20 @@ fn main() {
                 }
                 Err(e) => write_response(&mut out, &json!({"ok": false, "error": e})),
             },
-            "unary" | "describe" => {
+            "unary" => {
                 let Some(c) = conn.as_mut() else {
                     write_response(&mut out, &json!({"ok": false, "error": "not connected"}));
                     continue;
                 };
-                let resp = handle_unary(c, op, &req, &log_buf);
+                let resp = handle_unary(c, &req, &log_buf);
+                write_response(&mut out, &resp);
+            }
+            "describe" => {
+                let Some(c) = conn.as_mut() else {
+                    write_response(&mut out, &json!({"ok": false, "error": "not connected"}));
+                    continue;
+                };
+                let resp = handle_describe(c, &log_buf);
                 write_response(&mut out, &resp);
             }
             "stream_open" => {
@@ -432,19 +440,70 @@ fn handle_http_admin(c: &mut HttpClient, op: &str, req: &Value) -> Value {
     }
 }
 
-fn handle_unary(conn: &mut Conn, op: &str, req: &Value, log_buf: &LogBuf) -> Value {
+/// Render a `ServiceDescription` as JSON.
+///
+/// Introspection is `vgi_rpc.Reflection.v1` now, whose reply is two nested
+/// payloads rather than one flat batch, so relaying raw Arrow the way every
+/// other op does would make the shim re-implement the reflection schema on the
+/// Python side. The client already decoded it; this hands over what it got.
+fn describe_to_json(desc: &vgi_rpc_client::ServiceDescription) -> Value {
+    let schema_b64 = |schema: &arrow_schema::Schema| -> Value {
+        match vgi_rpc::wire::write_one_batch(
+            &match empty_batch(schema) {
+                Ok(b) => b,
+                Err(_) => return Value::Null,
+            },
+            None,
+        ) {
+            Ok(bytes) => Value::String(b64_encode(&bytes)),
+            Err(_) => Value::Null,
+        }
+    };
+    let mut methods: Vec<&vgi_rpc_client::MethodDescription> = desc.methods.values().collect();
+    methods.sort_by(|a, b| a.name.cmp(&b.name));
+    let methods: Vec<Value> = methods
+        .into_iter()
+        .map(|m| {
+            json!({
+                "name": m.name,
+                "method_type": m.method_type,
+                "has_return": m.has_return,
+                "has_header": m.has_header,
+                "is_exchange": m.is_exchange,
+                "params_schema_b64": schema_b64(&m.params_schema),
+                "result_schema_b64": schema_b64(&m.result_schema),
+                "header_schema_b64": m.header_schema.as_ref().map(|h| schema_b64(h)),
+            })
+        })
+        .collect();
+    json!({
+        "protocol_name": desc.protocol_name,
+        "request_version": desc.request_version,
+        "describe_version": desc.describe_version,
+        "protocol_hash": desc.protocol_hash,
+        "server_id": desc.server_id,
+        "protocol_version": desc.protocol_version,
+        "methods": methods,
+    })
+}
+
+fn handle_describe(conn: &mut Conn, log_buf: &LogBuf) -> Value {
+    let result = match conn {
+        Conn::ByteStream(c) => c.describe(),
+        Conn::Http(c) => c.describe(),
+    };
+    let logs = drain_logs(log_buf);
+    match result {
+        Ok(desc) => json!({"ok": true, "describe": describe_to_json(&desc), "logs": logs,
+                           "error": Value::Null}),
+        Err(e) => json!({"ok": true, "describe": Value::Null, "logs": logs,
+                         "error": error_to_json(&e)}),
+    }
+}
+
+fn handle_unary(conn: &mut Conn, req: &Value, log_buf: &LogBuf) -> Value {
     // Build (method, batch, md) for the call.
-    let (method, batch, md): (String, RecordBatch, Metadata) = if op == "describe" {
-        let b = match empty_batch(&arrow_schema::Schema::empty()) {
-            Ok(b) => b,
-            Err(e) => return json!({"ok": false, "error": e.to_string()}),
-        };
-        (
-            vgi_rpc::introspect::DESCRIBE_METHOD_NAME.to_string(),
-            b,
-            Metadata::new(),
-        )
-    } else {
+    let (method, batch, md): (String, RecordBatch, Metadata) = {
         let b64 = req.get("request_b64").and_then(Value::as_str).unwrap_or("");
         let bytes = match b64_decode(b64) {
             Ok(b) => b,
@@ -454,10 +513,10 @@ fn handle_unary(conn: &mut Conn, op: &str, req: &Value, log_buf: &LogBuf) -> Val
             Ok(x) => x,
             Err(e) => return json!({"ok": false, "error": e}),
         };
-        let method = md_get(&md, vgi_rpc::metadata::RPC_METHOD_KEY)
-            .unwrap_or(vgi_rpc::introspect::DESCRIBE_METHOD_NAME)
-            .to_string();
-        (method, batch, md)
+        let Some(method) = md_get(&md, vgi_rpc::metadata::RPC_METHOD_KEY) else {
+            return json!({"ok": false, "error": "request metadata names no method"});
+        };
+        (method.to_string(), batch, md)
     };
 
     let extra = if md.is_empty() { None } else { Some(&md) };

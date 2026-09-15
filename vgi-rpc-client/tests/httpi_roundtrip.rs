@@ -31,7 +31,7 @@ fn utf8_schema(name: &str) -> SchemaRef {
 }
 
 fn server(external: Option<ExternalLocationConfig>) -> RpcServer {
-    let builder = RpcServer::builder().enable_describe(true);
+    let builder = RpcServer::builder();
     let builder = match external {
         Some(config) => builder.with_external_location(config),
         None => builder,

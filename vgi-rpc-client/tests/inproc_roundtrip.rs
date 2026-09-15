@@ -84,7 +84,7 @@ impl ExchangeState for Double {
 }
 
 fn build_server(cancel_flag: Arc<std::sync::atomic::AtomicBool>) -> RpcServer {
-    let mut srv = RpcServer::builder().enable_describe(true).build();
+    let mut srv = RpcServer::builder().build();
 
     let p = utf8_schema("value");
     let r = utf8_schema("result");
@@ -264,7 +264,7 @@ fn cancel_producer() {
 fn describe_and_transport_options() {
     let (mut client, handle, _) = connect();
     let desc = client.describe().unwrap();
-    assert_eq!(desc.describe_version, "4");
+    assert_eq!(desc.describe_version, "5");
     assert!(desc.methods.contains_key("echo_string"));
     assert_eq!(desc.method("count_to").unwrap().method_type, "stream");
     let opts = client.transport_options().unwrap();

@@ -2252,6 +2252,22 @@ fn build_router_inner(state: Arc<HttpState>) -> Router {
         .route(
             "/:method/exchange",
             post(handle_stream_exchange).options(handle_preflight),
+        )
+        // A unary method addressed as `{protocol}/{method}`.
+        //
+        // The bare `/:method` route above cannot reach a co-hosted protocol
+        // whose method name collides with something already mounted -- and
+        // reflection's `describe` collides with the human-facing describe
+        // *page*, so on the bare route it resolves to an HTML document that
+        // answers GET and 405s a POST. A protocol-qualified path has no such
+        // collision, and it is the shape the rest of the fleet routes on.
+        //
+        // Static segments still win at each position, so `/:method/init` and
+        // `/:method/exchange` keep their traffic: streams are not addressable
+        // this way yet, which is why this is one route and not three.
+        .route(
+            "/:protocol/:method",
+            post(handle_protocol_unary).options(handle_preflight),
         );
 
     let api = if state.upload_url_provider.is_some() {
@@ -3723,6 +3739,34 @@ async fn handle_unary(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    unary_dispatch(state, connect_info, None, method, headers, body).await
+}
+
+/// `POST {prefix}/{protocol}/{method}` — the same unary dispatch, addressed by
+/// the protocol that owns the method.
+///
+/// The path segment is checked against the request's routing key rather than
+/// substituted for it: two carriers naming different protocols is a caller
+/// error, and silently preferring one would let an intermediary that rewrites
+/// a path land a call on a protocol the request never named.
+async fn handle_protocol_unary(
+    State(state): State<Arc<HttpState>>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    Path((protocol, method)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    unary_dispatch(state, connect_info, Some(protocol), method, headers, body).await
+}
+
+async fn unary_dispatch(
+    state: Arc<HttpState>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    path_protocol: Option<String>,
+    method: String,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     // Authenticate before any other rejection: an unauthenticated
     // caller should always see 401, regardless of whether they sent
     // the right content type or anything else.
@@ -3776,6 +3820,17 @@ async fn handle_unary(
         ));
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
+    if let Some(path_protocol) = path_protocol.as_deref() {
+        if req.protocol.is_empty() {
+            req.protocol = path_protocol.to_string();
+        } else if req.protocol != path_protocol {
+            let err = RpcError::protocol_error(format!(
+                "Protocol mismatch: route names '{path_protocol}', request metadata names '{}'",
+                req.protocol
+            ));
+            return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
+        }
+    }
     // `vgi_rpc.Identity.v1` is co-hosted, and -- unlike the application
     // surface, which HTTP addresses by URL path -- resolved through the
     // request's routing key. A deployment that configured no hook has no
@@ -3784,6 +3839,57 @@ async fn handle_unary(
     let identity_call = server
         .identity_binding()
         .filter(|_| req.protocol == crate::token_identity::IDENTITY_PROTOCOL_NAME);
+
+    // `__describe__` is retired, and says so rather than falling through to
+    // the generic "Unknown method" below -- which is true, useless, and
+    // indistinguishable from "this server was built without introspection".
+    // Only `__describe__` is special-cased; every other unknown reserved name
+    // keeps the plain capability answer a client probing for an optional
+    // method depends on.
+    if method == crate::reflection::RETIRED_DESCRIBE_METHOD {
+        return arrow_error(
+            &state,
+            StatusCode::NOT_FOUND,
+            &crate::reflection::describe_retired(),
+            &req.request_id,
+        );
+    }
+
+    // Reflection, like identity, is resolved through the request's routing key
+    // rather than by URL path: HTTP addresses the application surface by
+    // method name, so a co-hosted protocol reaches its own methods by naming
+    // itself in `vgi_rpc.protocol`. Handled before the method-table lookup --
+    // `list_protocols` is not a registered method and never will be -- and
+    // before the version gate, which it is exempt from for the same reason the
+    // raw transports exempt it: this is what a version-mismatched client calls
+    // to learn what mismatched.
+    if req.protocol == crate::reflection::REFLECTION_PROTOCOL_NAME {
+        let ctx = CallContext::with_auth_cookies(
+            &server,
+            &req,
+            auth.clone(),
+            evidence.clone(),
+            cookies.clone(),
+        );
+        let mut buf = Vec::new();
+        if let Err(err) = server.serve_reflection_logged(&mut buf, &req, &ctx) {
+            return arrow_error(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &err,
+                &req.request_id,
+            );
+        }
+        return enforce_response_body_cap(
+            response_limit,
+            &Schema::empty(),
+            buf,
+            &method,
+            &server.server_id,
+            &req.request_id,
+        );
+    }
+
     // The identity protocol declares no version of its own, so the
     // application's version gate does not apply to it: a fronting proxy must
     // still be able to resolve a credential against a worker whose
@@ -3821,36 +3927,6 @@ async fn handle_unary(
         }
     }
 
-    // __describe__ introspection — served as a unary call.
-    if server.describe_enabled() && method == crate::introspect::DESCRIBE_METHOD_NAME {
-        let (batch, md) = match crate::introspect::build_describe(
-            server.protocol_name(),
-            server.methods(),
-            &server.server_id,
-            server.protocol_version(),
-        ) {
-            Ok(x) => x,
-            Err(err) => {
-                return arrow_error(
-                    &state,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &err,
-                    &req.request_id,
-                );
-            }
-        };
-        let mut buf = Vec::new();
-        let _ = crate::introspect::write_describe_response(&mut buf, &batch, &md);
-        return enforce_response_body_cap(
-            response_limit,
-            batch.schema().as_ref(),
-            buf,
-            &method,
-            &server.server_id,
-            &req.request_id,
-        );
-    }
-
     let Some(info) = (match identity_call {
         Some(binding) => binding.methods.get(&method),
         None => server.method(&method),
@@ -3869,14 +3945,6 @@ async fn handle_unary(
         ctx.set_sticky(s);
     }
     let mut dispatch_info = crate::hooks::DispatchInfo::from_request(&server, &req, "unary", &auth);
-    // A co-hosted protocol's calls must not be logged under the application's
-    // identity: an access log that attributes a credential resolution to the
-    // app protocol cannot be filtered on the surface that actually served it.
-    if let Some(binding) = identity_call {
-        dispatch_info.protocol = crate::token_identity::IDENTITY_PROTOCOL_NAME.to_string();
-        dispatch_info.protocol_hash = binding.protocol_hash.clone();
-        dispatch_info.protocol_version = String::new();
-    }
     // Log the HTTP correlation id, not the Arrow-level one. `X-Request-ID`
     // on the response and `request_id` in the record have to name the same
     // request or the trail cannot be joined; `postprocess_middleware`

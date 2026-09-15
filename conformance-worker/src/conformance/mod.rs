@@ -74,8 +74,7 @@ fn build_server_with_external_and_hook(
         .server_id(server_id.unwrap_or("rust-conf-0001"))
         .protocol_name("ConformanceService")
         .protocol_version("2.0.0")
-        .server_version("rust-conformance-0.2.0")
-        .enable_describe(true);
+        .server_version("rust-conformance-0.2.0");
 
     if let Some(cfg) = external {
         builder = builder.with_external_location(cfg);
@@ -188,4 +187,32 @@ pub(crate) fn read_cancel_probe() -> [i64; 3] {
 }
 pub(crate) fn reset_cancel_probe() {
     *CANCEL_PROBE.lock() = [0, 0, 0];
+}
+
+#[cfg(test)]
+mod hash_tests {
+    /// The `ConformanceService` digest every port agrees on.
+    ///
+    /// Pinned here because it is what the access log publishes as
+    /// `protocol_hash` -- `access-log-spec.md` §3 calls that "the registry key
+    /// when decoding archived records", and a record keyed on a port-local
+    /// digest cannot be decoded against any other port's description. The
+    /// failure is silent: such a record is well-formed and passes the schema.
+    ///
+    /// The digest this worker used to publish was not this one. It was taken
+    /// over serialized Arrow IPC bytes of the retired `__describe__` payload,
+    /// and each language may legitimately spell those differently for the same
+    /// logical schema -- so it was only ever comparable against itself.
+    const CANONICAL: &str = "5cc768771c2e8a54e19ebb7546c97c119823eb13e20a5ff62ca5ce7ed2a1334e";
+
+    #[test]
+    fn the_access_log_publishes_the_canonical_digest() {
+        let srv = super::build_server();
+        assert_eq!(srv.protocol_hash(), CANONICAL);
+        assert_eq!(
+            srv.protocol_identity(srv.protocol_name()).hash,
+            CANONICAL,
+            "the accessor every emit site reads must return the same digest"
+        );
+    }
 }

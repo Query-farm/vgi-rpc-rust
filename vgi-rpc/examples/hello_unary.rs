@@ -41,7 +41,6 @@ async fn main() -> std::io::Result<()> {
         .server_id("hello-unary")
         .protocol_name("Echo")
         .server_version("0.1.0")
-        .enable_describe(true)
         .build();
     Echo::register_with(&mut server, Arc::new(Echo));
 

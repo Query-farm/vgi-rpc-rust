@@ -22,8 +22,9 @@ Stock `arrow-rs` 59.x dependency tree, MSRV 1.97, no
 
 - **Server-side dispatch** for unary, producer, and exchange stream
   methods over stdio / Unix socket / HTTP / shared memory.
-- **Introspection** via the built-in `__describe__` method
-  (`DESCRIBE_VERSION = "4"`, slim wire format plus `protocol_hash`).
+- **Introspection** via the co-hosted `vgi_rpc.Reflection.v1` protocol
+  (`list_protocols`, then `describe`), which reports each hosted
+  protocol's canonical `protocol_hash`.
 - **HTTP surface** — axum-backed server with HMAC-signed stateless
   stream-state tokens, CORS + preflight, zstd request/response
   compression, configurable URL prefix, landing / describe / health
@@ -140,7 +141,6 @@ use vgi_rpc::{
     DispatchHook, DispatchInfo, CallStatistics, ChainHook, SharedHook,
     AccessLogHook, RetryConfig,
     LogLevel, LogMessage, RpcError, Result,
-    DESCRIBE_METHOD_NAME, DESCRIBE_VERSION,
     // Transport lifecycle
     TransportKind, TransportCapabilities, ServeStartHook,
     // Stream state (for hand-written stream handlers; macros generate these for you)
@@ -193,10 +193,14 @@ auto-impls `StreamStateCodec` (bincode) on stream-state types.
 The wire protocol matches Python's `vgi_rpc` canonical:
 
 - Pointer-batch schema is empty; location metadata is the payload.
-- `__describe__` version is `"4"`; `method_type` collapses Producer /
-  Exchange / Dynamic into `"stream"`. The describe response carries a
-  `protocol_hash` SHA-256 digest computed identically to Python's
-  algorithm.
+- Introspection is `vgi_rpc.Reflection.v1`, not a `__describe__`
+  method: `list_protocols` reports what a server hosts, `describe`
+  reports one protocol's methods. `__describe__` is refused with a
+  message naming the replacement, so a stale client is fixable from the
+  error text. `method_type` collapses Producer / Exchange / Dynamic into
+  `"stream"`; `stream_kind` carries the producer/exchange split
+  separately. `protocol_hash` is the canonical digest of
+  `WIRE_PROTOCOL.md §14`, identical in every port.
 - Access log records carry `logger: "vgi_rpc.access"` and validate
   cleanly against Python's `vgi_rpc.access_log_conformance` JSON
   Schema. `request_data` is truncated at INFO level (replaced with

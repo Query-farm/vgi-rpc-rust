@@ -1,7 +1,8 @@
 //! The `__transport_options__` RPC method — transport capability negotiation.
 //!
-//! A framework-level handshake, parallel to `__describe__` (see
-//! [`crate::introspect`]). The client calls it once per worker, before `init`,
+//! A framework-level handshake: server-level rather than owned by any
+//! protocol, so it is answered before routing. The client calls it once per
+//! worker, before `init`,
 //! to discover which transport features the worker supports; the shared-memory
 //! side-channel (and, later, compression / AEAD) is used only when both peers
 //! advertise support.

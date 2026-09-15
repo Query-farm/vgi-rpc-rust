@@ -7,14 +7,16 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 
 use vgi_rpc::errors::{Result, RpcError};
-use vgi_rpc::introspect::DESCRIBE_METHOD_NAME;
 use vgi_rpc::log::LogMessage;
 use vgi_rpc::metadata::{CANCEL_KEY, TRANSPORT_SHM_KEY};
 use vgi_rpc::transport_options::TRANSPORT_OPTIONS_METHOD_NAME;
 use vgi_rpc::wire::{empty_batch, md_get, Metadata, StreamReader, StreamWriter};
 
 use crate::envelope::{classify, BatchKind};
-use crate::introspect::{empty_schema, parse_describe_batch, ServiceDescription};
+use crate::introspect::{
+    describe_params, empty_schema, no_application_protocol, parse_protocol_list,
+    parse_service_description, reflection_payload, ProtocolList, ServiceDescription,
+};
 use crate::request::{build_request_metadata, generate_request_id};
 use crate::transport::{RpcDeadline, Transport};
 
@@ -291,6 +293,23 @@ impl RpcClient {
         params: &RecordBatch,
         metadata: Option<&Metadata>,
     ) -> Result<(RecordBatch, Metadata)> {
+        let protocol = self.protocol.clone();
+        self.call_unary_on(protocol.as_deref(), method, params, metadata)
+    }
+
+    /// [`call_unary`](Self::call_unary) against an explicitly named protocol.
+    ///
+    /// The routing key on the wire is `protocol`, not the client's configured
+    /// one. That is what lets a client bound to an application protocol reach
+    /// a co-hosted framework protocol -- reflection above all, which a caller
+    /// asks *before* it has a client bound to anything.
+    pub fn call_unary_on(
+        &mut self,
+        protocol: Option<&str>,
+        method: &str,
+        params: &RecordBatch,
+        metadata: Option<&Metadata>,
+    ) -> Result<(RecordBatch, Metadata)> {
         let _deadline = DeadlineTurn::start(self.transport.rpc_deadline())?;
         let req_id = generate_request_id();
         // Advertise the shm segment (when present) so the server may return
@@ -301,7 +320,7 @@ impl RpcClient {
         let req_md = build_request_metadata(
             method,
             &req_id,
-            self.protocol.as_deref(),
+            protocol,
             self.protocol_version.as_deref(),
             shm_md.as_ref().or(metadata),
         );
@@ -432,11 +451,62 @@ impl RpcClient {
         })
     }
 
-    /// Fetch the service description via `__describe__`.
-    pub fn describe(&mut self) -> Result<ServiceDescription> {
+    /// What protocols this server hosts, via `vgi_rpc.Reflection.v1`.
+    ///
+    /// The cheap question -- what is here, and has it changed -- and the only
+    /// one a warm client needs, because each entry's `protocol_hash` answers
+    /// "has it changed" without transferring a single schema.
+    pub fn list_protocols(&mut self) -> Result<ProtocolList> {
         let params = empty_batch(empty_schema().as_ref())?;
-        let (batch, md) = self.call_unary(DESCRIBE_METHOD_NAME, &params, None)?;
-        parse_describe_batch(&batch, &md)
+        let (batch, _md) = self.call_unary_on(
+            Some(vgi_rpc::reflection::REFLECTION_PROTOCOL_NAME),
+            "list_protocols",
+            &params,
+            None,
+        )?;
+        parse_protocol_list(&reflection_payload(&batch)?)
+    }
+
+    /// Describe one named protocol, in a single round trip.
+    ///
+    /// `server_id` and `request_version` come back empty: they are properties
+    /// of the *server*, carried by [`list_protocols`](Self::list_protocols),
+    /// and a description deliberately carries no server identity -- two
+    /// processes serving the same protocol must describe it identically or the
+    /// description is not a property of the protocol. Use
+    /// [`describe`](Self::describe) when those fields are wanted.
+    pub fn describe_protocol(&mut self, protocol: &str) -> Result<ServiceDescription> {
+        let params = describe_params(protocol)?;
+        let (batch, _md) = self.call_unary_on(
+            Some(vgi_rpc::reflection::REFLECTION_PROTOCOL_NAME),
+            "describe",
+            &params,
+            None,
+        )?;
+        parse_service_description(&reflection_payload(&batch)?, None)
+    }
+
+    /// Describe the server's application protocol.
+    ///
+    /// Two round trips -- `list_protocols`, then `describe` -- because a server
+    /// may host several protocols, so there is no longer a single "the"
+    /// protocol to ask about without asking. Name one with
+    /// [`describe_protocol`](Self::describe_protocol) to skip the first hop.
+    pub fn describe(&mut self) -> Result<ServiceDescription> {
+        let listing = self.list_protocols()?;
+        let protocol = listing
+            .primary()
+            .ok_or_else(|| no_application_protocol(&listing))?
+            .protocol
+            .clone();
+        let params = describe_params(&protocol)?;
+        let (batch, _md) = self.call_unary_on(
+            Some(vgi_rpc::reflection::REFLECTION_PROTOCOL_NAME),
+            "describe",
+            &params,
+            None,
+        )?;
+        parse_service_description(&reflection_payload(&batch)?, Some(&listing))
     }
 
     /// Perform the `__transport_options__` capability handshake.

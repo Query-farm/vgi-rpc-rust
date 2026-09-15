@@ -61,7 +61,7 @@ impl Calc {
         Ok(format!("echo: {value}"))
     }
 
-    /// Add two integers, with default values surfaced via __describe__.
+    /// Add two integers, with default values surfaced in the description.
     #[unary]
     #[param(name = "a", default = 0)]
     #[param(name = "b", default = 0)]

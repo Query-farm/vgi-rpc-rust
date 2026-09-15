@@ -67,7 +67,7 @@ impl ProducerState for CountTo {
 }
 
 fn build_server() -> RpcServer {
-    let mut srv = RpcServer::builder().enable_describe(true).build();
+    let mut srv = RpcServer::builder().build();
     let r = utf8_schema("result");
     let r2 = r.clone();
     srv.register(MethodInfo::unary(
@@ -152,7 +152,7 @@ fn http_unary_describe_capabilities() {
     assert_eq!(batch.column(0).as_string::<i32>().value(0), "echo: hi");
 
     let desc = c.describe().unwrap();
-    assert_eq!(desc.describe_version, "4");
+    assert_eq!(desc.describe_version, "5");
     assert!(desc.methods.contains_key("echo_string"));
 
     // Capabilities probe should succeed (sticky disabled here).

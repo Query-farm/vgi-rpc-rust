@@ -4,6 +4,42 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## Unreleased
 
+### Removed
+
+- **`__describe__` is retired.** No server answers it, and
+  `RpcServerBuilder::enable_describe` is gone along with the
+  `vgi_rpc::introspect` module. Introspection is `vgi_rpc.Reflection.v1`:
+  `list_protocols` for what a server hosts, then `describe` for one protocol's
+  methods. A `__describe__` request is now refused with a message naming that
+  protocol and both of its entry points, rather than a generic "unknown
+  method" — the generic answer is indistinguishable from "this server was
+  built without introspection", and the two need opposite fixes.
+
+### Fixed
+
+- **Access records carry the owning binding's protocol *and* hash.** Both
+  fields now come from `RpcServer::protocol_identity`, read off the binding a
+  request routes to, so a co-hosted protocol's calls are no longer filed under
+  the application's identity. This failed silently: a mislabelled record is
+  well-formed, passes the schema, and feeds a plausible dashboard while a
+  consumer keying on `protocol_hash` decodes it against the wrong description.
+- **`protocol_hash` is the canonical digest.** The access log published the
+  digest the retired `__describe__` payload carried, which hashed serialized
+  Arrow IPC bytes — bytes each language may legitimately spell differently for
+  the same logical schema, so an archived record could not be keyed against the
+  canonical registry at all.
+- Reflection calls now produce access records; previously they produced none,
+  on any transport.
+
+### Added
+
+- `RpcClient::list_protocols` / `describe_protocol`, and their `HttpClient`
+  counterparts. `describe()` is two round trips (`list_protocols`, then
+  `describe`); name a protocol to skip the first.
+- `POST {prefix}/{protocol}/{method}` addresses a unary method by the protocol
+  that owns it. The bare `/{method}` route cannot reach reflection's `describe`,
+  which collides with the human-facing describe *page*.
+
 ## [0.24.4] — 2026-09-11
 
 ### Added

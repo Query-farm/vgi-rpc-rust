@@ -117,7 +117,10 @@ pub struct DispatchInfo {
     pub server_id: String,
     /// Logical service / protocol name.
     pub protocol: String,
-    /// SHA-256 hex of the canonical __describe__ payload (always required in access log).
+    /// The owning protocol's canonical hash (always required in the access
+    /// log). `access-log-spec.md` §3 makes this "the registry key when
+    /// decoding archived records", so it must be the digest of the protocol
+    /// `protocol` names and not the server's primary.
     pub protocol_hash: String,
     /// Operator-supplied free-form protocol-contract version label (optional).
     pub protocol_version: String,
@@ -175,13 +178,25 @@ impl DispatchInfo {
         method_type: &'static str,
         auth: &crate::auth::AuthContext,
     ) -> Self {
+        // Read from the binding the request routes to, not from the server.
+        // A co-hosted protocol's calls must not be logged under the
+        // application's identity: an access log that files a credential
+        // resolution or a reflection call under the app protocol cannot be
+        // filtered on the surface that actually served it -- and a consumer
+        // keying on `protocol_hash` decodes the record against the wrong
+        // description while nothing about it looks wrong.
+        //
+        // Doing it here rather than at each emit site is the point: a site
+        // added later inherits the correct labelling instead of having to
+        // remember to special-case every co-hosted protocol.
+        let identity = server.protocol_identity(&req.protocol);
         Self {
             method: req.method.clone(),
             method_type,
             server_id: server.server_id.clone(),
-            protocol: server.protocol_name().to_string(),
-            protocol_hash: server.protocol_hash().to_string(),
-            protocol_version: server.protocol_version().to_string(),
+            protocol: identity.name.to_string(),
+            protocol_hash: identity.hash.to_string(),
+            protocol_version: identity.version.to_string(),
             request_id: req.request_id.clone(),
             transport_metadata: req.metadata.clone(),
             principal: auth.principal.clone(),

@@ -59,7 +59,6 @@ fn stock_builder() -> vgi_rpc::http::HttpStateBuilder {
     let mut srv = RpcServer::builder()
         .server_id("it")
         .protocol_name("Test")
-        .enable_describe(true)
         .build();
     srv.register(
         MethodInfo::unary(

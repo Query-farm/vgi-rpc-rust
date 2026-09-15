@@ -25,7 +25,6 @@ use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Fields, Schema};
 
 use crate::errors::{Result, RpcError};
-use crate::introspect::schema_to_ipc;
 use crate::protocol_hash::{compute_protocol_hash, HashMethod};
 use crate::server::{MethodInfo, MethodType};
 use crate::stream::empty_schema;
@@ -35,6 +34,34 @@ use crate::stream::empty_schema;
 /// Fixed, and the one protocol name a client may know a priori: it is the
 /// bootstrap, so there is nothing to discover it with.
 pub const REFLECTION_PROTOCOL_NAME: &str = "vgi_rpc.Reflection.v1";
+
+/// The method introspection used to be, kept only so the refusal can name its
+/// replacement.
+///
+/// No server answers it. It is spelled here because "retired" and "this server
+/// was built without introspection" are indistinguishable from the caller's
+/// side, and they need opposite fixes: one is a client to update, the other a
+/// server to reconfigure. A stale caller told merely "no such method" reads the
+/// second while suffering the first.
+pub const RETIRED_DESCRIBE_METHOD: &str = "__describe__";
+
+/// The answer to a stale `__describe__` caller: where introspection went.
+///
+/// Only `__describe__` is special-cased. Every other reserved name keeps the
+/// plain "no such method" answer, which is what a client probing for an
+/// optional method needs.
+///
+/// Unlike the Python reference -- where `_reflection` imports the server module,
+/// so the protocol name has to be spelled a second time and pinned by a test --
+/// the name is used directly here and cannot drift from the protocol it points
+/// at.
+pub fn describe_retired() -> RpcError {
+    RpcError::attribute_error(format!(
+        "'{RETIRED_DESCRIBE_METHOD}' was retired. Introspection is now the \
+         '{REFLECTION_PROTOCOL_NAME}' protocol: call 'list_protocols' for what this \
+         server hosts, then 'describe' for one protocol's methods."
+    ))
+}
 
 /// Values a method's `idempotency` may take, borrowed from gRPC.
 ///
@@ -323,6 +350,44 @@ impl crate::server::RpcServer {
     /// Self-description is not special-cased: reflection appears in its own
     /// output, so a client discovers it the same way it discovers everything
     /// else rather than having to know a priori what to ask.
+    /// [`serve_reflection`](Self::serve_reflection) with an access record
+    /// around it.
+    ///
+    /// Reflection is dispatched outside the registered method table, so it
+    /// would otherwise produce no record at all -- and "no record" is how a
+    /// port ends up unable to tell whether its labelling is right, because the
+    /// one call that can prove it never reaches the log. The record's
+    /// `protocol` and `protocol_hash` come from
+    /// [`protocol_identity`](crate::server::RpcServer::protocol_identity) like
+    /// every other site's, so reflection is labelled as itself rather than as
+    /// the application.
+    pub(crate) fn serve_reflection_logged<W: std::io::Write>(
+        &self,
+        w: &mut W,
+        req: &crate::server::Request,
+        ctx: &crate::server::CallContext,
+    ) -> Result<bool> {
+        let Some(hook) = self.dispatch_hook.as_ref() else {
+            return self.serve_reflection(w, req);
+        };
+        let mut info = crate::hooks::DispatchInfo::from_request(self, req, "unary", &ctx.auth);
+        if let Ok(bytes) = crate::server::serialize_request_batch(&req.batch) {
+            info.request_data = bytes;
+        }
+        let token = hook.on_dispatch_start(&info);
+        let outcome = self.serve_reflection(w, req);
+        let stats = crate::hooks::CallStatistics {
+            input_batches: 1,
+            input_rows: req.batch.num_rows() as u64,
+            output_batches: 1,
+            output_rows: 1,
+            ..Default::default()
+        };
+        let err = outcome.as_ref().err().cloned();
+        hook.on_dispatch_end(token, &info, err.as_ref(), &stats);
+        outcome
+    }
+
     pub(crate) fn serve_reflection<W: std::io::Write>(
         &self,
         w: &mut W,
@@ -438,7 +503,7 @@ impl crate::server::RpcServer {
         )
         .map_err(|e| RpcError::protocol_error(format!("building reflection result: {e}")))?;
         let md = crate::server::build_envelope_metadata(&self.server_id, &req.request_id);
-        crate::introspect::write_describe_response(w, &out, &md)?;
+        write_unary_response(w, &out, &md)?;
         Ok(true)
     }
 }
@@ -469,4 +534,35 @@ pub(crate) fn batch_to_ipc(batch: &RecordBatch) -> Result<Vec<u8>> {
             .map_err(|e| RpcError::protocol_error(format!("finishing IPC stream: {e}")))?;
     }
     Ok(buf)
+}
+
+/// Serialize a `Schema` as an IPC stream (schema-only, empty body) — matches
+/// pyarrow's `Schema.serialize()`, which is how every port carries a schema
+/// inside a description.
+pub(crate) fn schema_to_ipc(schema: &Schema) -> Result<Vec<u8>> {
+    // An IPC stream with just the schema message followed by the EOS marker.
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut w = arrow_ipc::writer::StreamWriter::try_new(&mut buf, schema)
+            .map_err(|e| RpcError::protocol_error(format!("opening IPC writer: {e}")))?;
+        w.finish()
+            .map_err(|e| RpcError::protocol_error(format!("finishing IPC stream: {e}")))?;
+    }
+    Ok(buf)
+}
+
+/// Write one batch as a complete unary response stream.
+///
+/// Outlived `__describe__`, which is what it was written for: reflection and
+/// `vgi_rpc.Identity.v1` are ordinary unary methods served outside the
+/// registered method table, and both frame their replies this way.
+pub fn write_unary_response<W: std::io::Write>(
+    w: &mut W,
+    batch: &RecordBatch,
+    metadata: &crate::wire::Metadata,
+) -> Result<()> {
+    let mut sw = crate::wire::StreamWriter::new(w, batch.schema().as_ref())?;
+    sw.write(batch, Some(metadata))?;
+    sw.finish()?;
+    Ok(())
 }

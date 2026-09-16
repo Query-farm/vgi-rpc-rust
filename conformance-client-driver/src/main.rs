@@ -274,6 +274,10 @@ fn do_connect(req: &Value, log_buf: &LogBuf) -> Result<Conn, String> {
         .get("relax_nullability")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // The routing key the shim's proxy is bound to. Every request names the
+    // protocol it addresses, and over HTTP the URL names it a second time, so
+    // the client wants it at connect rather than per call.
+    let protocol = req.get("protocol").and_then(Value::as_str).unwrap_or("");
     match transport {
         "stdio" => {
             let argv: Vec<String> = target
@@ -285,6 +289,7 @@ fn do_connect(req: &Value, log_buf: &LogBuf) -> Result<Conn, String> {
             let client = RpcClient::connect(&argv)
                 .map_err(|e| e.to_string())?
                 .relax_nullability(relax)
+                .protocol(protocol)
                 .on_log(make_log_sink(log_buf));
             Ok(Conn::ByteStream(client))
         }
@@ -302,6 +307,7 @@ fn do_connect(req: &Value, log_buf: &LogBuf) -> Result<Conn, String> {
             let client = RpcClient::shm_connect(&argv, size)
                 .map_err(|e| e.to_string())?
                 .relax_nullability(relax)
+                .protocol(protocol)
                 .on_log(make_log_sink(log_buf));
             Ok(Conn::ByteStream(client))
         }
@@ -312,6 +318,7 @@ fn do_connect(req: &Value, log_buf: &LogBuf) -> Result<Conn, String> {
                 let client = RpcClient::unix_connect(path)
                     .map_err(|e| e.to_string())?
                     .relax_nullability(relax)
+                    .protocol(protocol)
                     .on_log(make_log_sink(log_buf));
                 Ok(Conn::ByteStream(client))
             }
@@ -343,6 +350,7 @@ fn do_connect(req: &Value, log_buf: &LogBuf) -> Result<Conn, String> {
             let client = RpcClient::tcp_connect(&host, port)
                 .map_err(|e| e.to_string())?
                 .relax_nullability(relax)
+                .protocol(protocol)
                 .on_log(make_log_sink(log_buf));
             Ok(Conn::ByteStream(client))
         }
@@ -350,6 +358,7 @@ fn do_connect(req: &Value, log_buf: &LogBuf) -> Result<Conn, String> {
             let url = target.as_str().ok_or("http target must be a url string")?;
             let mut builder = HttpClient::connect(url)
                 .relax_nullability(relax)
+                .protocol(protocol)
                 .on_log(make_log_sink(log_buf));
             // compression_level: absent => default; null => disabled; int => level.
             match req.get("compression_level") {

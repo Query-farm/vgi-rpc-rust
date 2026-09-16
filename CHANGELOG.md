@@ -17,6 +17,17 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ### Fixed
 
+- **The HTTP client addresses methods on the protocol-qualified path.**
+  `HttpClient` posted every call to a bare `/{method}`, which the reference
+  Python server does not route -- it serves only `{protocol}/{method}`, so
+  every unary, `/init` and `/exchange` came back `404 {"title": "404 Not
+  Found"}` and surfaced as an IPC framing error when the JSON body was read
+  as Arrow. The path now carries the bound protocol as its first segment
+  (`HttpClientBuilder::protocol`); a client with no protocol bound still
+  sends the bare path, which is all it can do. Rust servers route both
+  shapes, which is why the Rust-to-Rust matrix never saw this and only the
+  cross-language client leg did.
+
 - **`vgi_rpc.Reflection.v1` describes its own two methods.** The binding was
   registered without them, so `describe("vgi_rpc.Reflection.v1")` returned an
   empty method list and the protocol hashed to `fafffd66…` instead of the

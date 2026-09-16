@@ -26,7 +26,7 @@ from pyarrow import ipc
 from vgi_rpc.conformance import ConformanceService
 from vgi_rpc.log import Level, Message
 from vgi_rpc.rpc import AnnotatedBatch, RpcError
-from vgi_rpc.rpc._types import rpc_methods
+from vgi_rpc.rpc._types import _protocol_wire_name, rpc_methods
 from vgi_rpc.rpc._wire import _read_stream_header, _read_unary_response, _send_request
 from vgi_rpc.rpc._types import MethodType
 from vgi_rpc.utils import IpcValidation, ValidatedReader
@@ -80,6 +80,12 @@ class RustClientProxy:
         # mask the Rust client). compression_level threads to the Rust client.
         self._external = external_config is not None
         self._compression_level = compression_level
+        # The routing key. Every request must name the protocol it addresses
+        # -- a single-protocol server is not an exemption, it refuses an
+        # unrouted call like any other. `_send_request` only stamps it when
+        # handed `protocol=`, so deriving it here is what keeps this shim
+        # speaking the same wire as the canonical `_RpcProxy`.
+        self._protocol = _protocol_wire_name(ConformanceService)
         self._protocol_version = vars(ConformanceService).get("protocol_version")
         self._headers = headers or {}
         self._proc = subprocess.Popen(
@@ -109,6 +115,10 @@ class RustClientProxy:
                 "op": "connect",
                 "transport": transport,
                 "target": target,
+                # The routing key, bound once. Over HTTP the reference server
+                # routes only `{protocol}/{method}`, so the Rust client needs
+                # this to build a path that exists, not just a metadata key.
+                "protocol": self._protocol,
                 "external": self._external,
                 "compression_level": self._compression_level,
                 # Default request headers, e.g. the identity the upstream
@@ -148,7 +158,13 @@ class RustClientProxy:
 
     def _request_bytes(self, info: Any, kwargs: dict) -> bytes:
         buf = io.BytesIO()
-        _send_request(buf, info, kwargs, protocol_version=self._protocol_version)
+        _send_request(
+            buf,
+            info,
+            kwargs,
+            protocol=self._protocol,
+            protocol_version=self._protocol_version,
+        )
         return buf.getvalue()
 
     def _make_unary(self, info: Any) -> Callable[..., object]:

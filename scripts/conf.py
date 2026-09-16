@@ -7,7 +7,8 @@ Writes artifacts to .test-run/ so subsequent queries don't re-run tests:
   .test-run/args.txt     — the command line used, for reproducibility
 
 Usage:
-  conf.py run [--transport {pipe,subprocess,http,unix,all}] [-k PATTERN] [--release|--debug] [-- pytest_args...]
+  conf.py run [--transport {pipe,subprocess,http,unix,tcp,http_externalize_always,shm_pipe,all}]
+              [-k PATTERN] [--release|--debug] [-- pytest_args...]
   conf.py summary                 Show pass/fail/error/skip counts
   conf.py failures                List failing tests with 1-line summaries
   conf.py show PATTERN            Show failure/error detail for tests matching PATTERN
@@ -194,7 +195,7 @@ def _run(args: argparse.Namespace, extras: list[str]) -> int:
         env["VGI_CLIENT_DRIVER"] = str(driver)
 
     transports = (
-        ["pipe", "subprocess", "http", "unix", "http_externalize_always", "shm_pipe"]
+        ["pipe", "subprocess", "http", "unix", "tcp", "http_externalize_always", "shm_pipe"]
         if args.transport == "all"
         else [args.transport]
     )
@@ -384,7 +385,8 @@ def main() -> int:
 
     pr = sub.add_parser("run")
     pr.add_argument("--transport", default="pipe",
-                    choices=["pipe", "subprocess", "http", "unix", "http_externalize_always", "shm_pipe", "all"])
+                    choices=["pipe", "subprocess", "http", "unix", "tcp",
+                             "http_externalize_always", "shm_pipe", "all"])
     pr.add_argument("--role", default="server", choices=["server", "client"],
                     help="server: Python client drives the worker (default); "
                          "client: the Rust vgi-rpc-client drives the server")

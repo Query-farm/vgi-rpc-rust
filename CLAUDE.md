@@ -92,6 +92,21 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ./scripts/conf.py run --transport all --timeout 900 --per-test-timeout 30
 
+# Conformance is THREE legs, not one. The line above is only the default
+# (role=server, server=rust) -- the Python client driving the Rust worker.
+# CI also runs both client legs, and they exercise entirely different code:
+# `vgi-rpc-client` and the driver, which the server leg never loads at all.
+# A client-side wire break is invisible to the default run by construction --
+# that is how a client that sent no routing key and posted to bare
+# `/{method}` paths sat at "1203/1203 green" while CI was 730 red.
+./scripts/conf.py run --role client --server rust   --transport all --timeout 1800 --per-test-timeout 30
+./scripts/conf.py run --role client --server python --transport all --timeout 1800 --per-test-timeout 30
+
+# The native typed client against the reference worker. `#[ignore]`d, so
+# `cargo test` above does not run it; CI does, in the client/python leg.
+VGI_RPC_PYTHON=~/Development/vgi-rpc-python/.venv/bin/python \
+  cargo test -p vgi-rpc-client --test python_native_client -- --ignored
+
 # Narrow feature sets. `--all-features` makes every optional dependency
 # present no matter which feature pulled it in, so it cannot catch a feature
 # that fails to declare its own crates — and `--all-targets` here is what
@@ -494,8 +509,14 @@ version — you cannot overwrite an existing one.
    crate depends on one published earlier.
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, cargo doc, an
-MSRV (1.97) build, and the Python-driven conformance job (full six-
-transport matrix) on every push.
+MSRV (1.97) build, the narrow-feature matrix, and the conformance job on
+every push. Conformance is a three-leg matrix over seven transports
+(`pipe,subprocess,http,unix,tcp,http_externalize_always,shm_pipe`):
+`server/rust` (Python client drives the Rust worker), `client/rust` and
+`client/python` (the Rust client drives each server). The `client/python`
+leg checks out `Query-farm/vgi-rpc-python` at its default branch and
+installs it with `pip install -e`, so it measures this port against the
+reference's `main` -- not against whatever is in a local checkout.
 
 ## Defining a service with the macro
 

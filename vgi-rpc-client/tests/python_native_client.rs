@@ -183,7 +183,13 @@ fn assert_echo(session: &mut HttpStreamSession<'_>, expected: &RecordBatch) {
 #[ignore = "requires the Python vgi-rpc reference worker"]
 fn python_worker_preserves_declared_typed_exchange_schema() {
     let worker = PythonWorker::start();
+    // The worker hosts `ClientConformanceService`. Binding it is not
+    // decoration: it is the routing key on every request *and* the first
+    // path segment of every URL, and the reference server routes only the
+    // qualified shape -- unbound, `/typed_exchange/init` reads as protocol
+    // `typed_exchange`, method `init`, which it does not host.
     let mut client = HttpClient::connect(format!("http://127.0.0.1:{}", worker.port))
+        .protocol("ClientConformanceService")
         .build()
         .expect("build Rust HTTP client");
     let params = RecordBatch::new_empty(Arc::new(Schema::empty()));

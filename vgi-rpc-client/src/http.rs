@@ -502,9 +502,15 @@ impl HttpClientBuilder {
         self
     }
 
-    /// Send `vgi_rpc.protocol` on every request -- the routing key.
+    /// Bind this client to a protocol: `vgi_rpc.protocol` on every request,
+    /// and the first segment of every request path.
     ///
-    /// Required by the wire protocol even against a single-protocol server.
+    /// Required by the wire protocol even against a single-protocol server,
+    /// and over HTTP it is required twice -- the routing key and the URL
+    /// both name the protocol, and a server may insist they agree. The
+    /// reference Python server routes *only* `{protocol}/{method}`, so an
+    /// unbound client posting a bare `/{method}` gets a 404 from it however
+    /// correct its metadata is.
     pub fn protocol(mut self, v: impl Into<String>) -> Self {
         self.protocol = Some(v.into());
         self
@@ -762,6 +768,21 @@ impl HttpClient {
 
     fn target(&self, path: &str) -> String {
         self.backend.target(&self.base_url, &self.prefix, path)
+    }
+
+    /// The URL path segment(s) addressing `method` on the bound protocol.
+    ///
+    /// HTTP carries the routing key twice -- in the request metadata and in
+    /// the URL -- and a server is entitled to require both and to require
+    /// that they agree. The reference Python server routes *only* the
+    /// qualified shape, so a bare `/{method}` is a 404 there however correct
+    /// the metadata is. With no protocol bound there is nothing to qualify
+    /// with, and the bare path is the only thing left to send.
+    fn route(&self, method: &str) -> String {
+        match self.protocol.as_deref().filter(|p| !p.is_empty()) {
+            Some(p) => format!("{p}/{method}"),
+            None => method.to_string(),
+        }
     }
 
     /// Build per-request headers: content type, codec advertisement, and
@@ -1075,7 +1096,7 @@ impl HttpClient {
     ) -> Result<(RecordBatch, Metadata)> {
         let (_id, md) = self.req_md(method, metadata);
         let body = write_one_batch(params, Some(&md))?;
-        let resp = self.post(method, body, true)?;
+        let resp = self.post(&self.route(method), body, true)?;
         let relax = self.relax_nullability;
         let external = self.external.clone();
         read_unary(&resp, &mut self.on_log, relax, external.as_ref())
@@ -1165,7 +1186,7 @@ impl HttpClient {
     ) -> Result<HttpStreamSession<'_>> {
         let (_id, md) = self.req_md(method, metadata);
         let body = write_one_batch(params, Some(&md))?;
-        let resp = self.post(&format!("{method}/init"), body, true)?;
+        let resp = self.post(&format!("{}/init", self.route(method)), body, true)?;
 
         let relax = self.relax_nullability;
         let external = self.external.clone();
@@ -1184,8 +1205,8 @@ impl HttpClient {
         )?;
 
         Ok(HttpStreamSession {
+            route: self.route(method),
             client: self,
-            method: method.to_string(),
             header,
             pending: parsed.batches.into(),
             finished: parsed.finished,
@@ -1223,8 +1244,8 @@ impl HttpClient {
     ) -> HttpStreamSession<'_> {
         let (cursor, call_token) = unpack_resume_token(&token.into());
         HttpStreamSession {
+            route: self.route(method),
             client: self,
-            method: method.to_string(),
             header: None,
             pending: VecDeque::new(),
             token: Some(cursor),
@@ -1552,7 +1573,11 @@ fn unpack_resume_token(token: &str) -> (String, Option<String>) {
 /// One stateless HTTP stream session.
 pub struct HttpStreamSession<'c> {
     client: &'c mut HttpClient,
-    method: String,
+    /// The already-qualified path this stream's continuations post to --
+    /// `{protocol}/{method}` when the client is bound to a protocol. Frozen
+    /// at open so a continuation cannot drift onto a different route than
+    /// the `/init` that minted its token.
+    route: String,
     header: Option<(RecordBatch, Metadata)>,
     pending: VecDeque<(RecordBatch, Metadata)>,
     token: Option<String>,
@@ -1600,7 +1625,7 @@ impl HttpStreamSession<'_> {
             // Producer continuation is idempotent (token-addressed) → retryable.
             let resp = self
                 .client
-                .post(&format!("{}/exchange", self.method), body, true)?;
+                .post(&format!("{}/exchange", self.route), body, true)?;
             let relax = self.client.relax_nullability;
             let external = self.client.external.clone();
             let mut cursor = Cursor::new(resp);
@@ -1661,7 +1686,7 @@ impl HttpStreamSession<'_> {
         // Producer continuation is idempotent (token-addressed) → retryable.
         let resp = self
             .client
-            .post(&format!("{}/exchange", self.method), body, true)?;
+            .post(&format!("{}/exchange", self.route), body, true)?;
         let relax = self.client.relax_nullability;
         let external = self.client.external.clone();
         let mut cursor = Cursor::new(resp);
@@ -1724,7 +1749,7 @@ impl HttpStreamSession<'_> {
         // Exchange is NEVER retried (process() may have side effects).
         let resp = self
             .client
-            .post(&format!("{}/exchange", self.method), body, false)?;
+            .post(&format!("{}/exchange", self.route), body, false)?;
         let relax = self.client.relax_nullability;
         let external = self.client.external.clone();
         let mut cursor = Cursor::new(resp);
@@ -1748,7 +1773,7 @@ impl HttpStreamSession<'_> {
             let body = self.continuation_body(&token, true, None)?;
             let _ = self
                 .client
-                .post(&format!("{}/exchange", self.method), body, false);
+                .post(&format!("{}/exchange", self.route), body, false);
         }
         self.cancelled = true;
         self.finished = true;

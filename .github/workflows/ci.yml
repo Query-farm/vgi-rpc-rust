@@ -346,6 +346,109 @@ jobs:
             --require-request-data \
             --filter '!large_payload'
 
+  # Everything above compares this port to *itself*: our tests, our fixtures,
+  # our idea of the protocol. The conformance job goes one better and drives
+  # the wire between Rust and Python — but a wire that both sides encode and
+  # decode the same wrong way is still green. This job asks a different
+  # question: does this port *describe* the protocol the way the reference
+  # describes it, field for field, hash for hash. Run by hand, that comparison
+  # found four ports advertising `vgi_rpc.Reflection.v1` as having zero methods
+  # and six ports logging six different wrong `protocol_hash` values — none of
+  # it visible from inside any single port.
+  #
+  # The reference is checked out at `main` and deliberately NOT pinned. A pin
+  # is how the Java port's Iroh lane reported green for eleven days against a
+  # reference that had moved underneath it. The intended behaviour is that a
+  # reference change which breaks this port turns this port red the same day.
+  cross-port-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check out the Python reference (main, unpinned — see above)
+        uses: actions/checkout@v5
+        with:
+          repository: Query-farm/vgi-rpc-python
+          path: vgi-python
+
+      - uses: dtolnay/rust-toolchain@1.97.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      # describe_diff stands the reference server up in-process, so it needs
+      # `vgi_rpc.conformance` and `vgi_rpc.rpc._reflection` — both in the base
+      # install. The extras are here to match the conformance job exactly: two
+      # reference installs that differ in ways nobody tracks cost debugging
+      # time and buy nothing.
+      - name: Install the reference from the Python checkout
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "./vgi-python[http,cli,external,conformance]"
+
+      # describe_diff's SUBPROCESS_WORKERS["rust"] entry spawns
+      # `./target/release/vgi-rpc-conformance-rust` and will build it itself if
+      # missing. Building here instead puts the compile in its own step (so a
+      # build break reads as a build break, not as "reflection failed"), lets
+      # rust-cache carry it between runs, and adds the `--locked` the tool's
+      # own build command does not pass.
+      - name: Build the release conformance worker
+        run: cargo build --release --bin vgi-rpc-conformance-rust --locked
+
+      # Both tools resolve a port as `$VGI_RPC_REPOS/vgi-rpc-<name>`, so the
+      # two checkouts have to look like siblings. actions/checkout refuses to
+      # write outside the workspace and names the reference `vgi-python`, so
+      # the sibling layout is built out of symlinks rather than by moving
+      # anything — nothing downstream cares, and the real checkouts stay where
+      # every other job expects to find them.
+      - name: Arrange the two checkouts as siblings
+        run: |
+          mkdir -p "$RUNNER_TEMP/repos"
+          ln -sfn "$GITHUB_WORKSPACE" "$RUNNER_TEMP/repos/vgi-rpc-rust"
+          ln -sfn "$GITHUB_WORKSPACE/vgi-python" "$RUNNER_TEMP/repos/vgi-rpc-python"
+          ls -l "$RUNNER_TEMP/repos"
+
+      # Exits non-zero on drift, and also when the worker cannot be reached at
+      # all — "not checked" and "checked and agrees" are different outcomes to
+      # this tool, which is the whole reason it is worth running unattended.
+      - name: Compare every hosted protocol against the reference
+        working-directory: vgi-python
+        env:
+          VGI_RPC_REPOS: ${{ runner.temp }}/repos
+        run: python tools/cross-port/describe_diff.py --only rust
+
+      # Identity's security properties — guard order, rate-limit window,
+      # allowlist-by-omission, transient-vs-definitive — live in code the
+      # protocol hash does not cover, so describe_diff cannot see any of them.
+      # This is a source-level grep over both checkouts instead.
+      #
+      # Being a grep, it has an empty-corpus failure mode: until
+      # vgi-rpc-python 1eedad2 a missing checkout printed `ABSENT: rust` and
+      # exited *0*, so a job whose sibling layout was slightly wrong went
+      # green having read nothing. The tool now exits 1 for a port it could
+      # not find or could not audit. An exit code still does not say how much
+      # was read, so `--verbose` is not decoration: the assertion below keeps
+      # "this step passed" and "this step examined something" the same claim.
+      - name: Audit vgi_rpc.Identity.v1 invariants against the reference
+        working-directory: vgi-python
+        env:
+          VGI_RPC_REPOS: ${{ runner.temp }}/repos
+        run: |
+          set -euo pipefail
+          python tools/cross-port/identity_consistency.py --only rust --verbose \
+            | tee "$RUNNER_TEMP/identity.txt"
+          files=$(sed -n 's/^=== rust: \([0-9][0-9]*\) identity file(s)$/\1/p' \
+            "$RUNNER_TEMP/identity.txt")
+          if [ -z "$files" ] || [ "$files" -lt 1 ]; then
+            echo "::error::identity_consistency named no Rust identity sources — it audited nothing"
+            exit 1
+          fi
+          echo "audited $files Rust identity source file(s) against the reference"
+
   msrv:
     runs-on: ubuntu-latest
     steps:

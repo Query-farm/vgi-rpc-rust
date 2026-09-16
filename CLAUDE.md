@@ -121,7 +121,24 @@ done
 # Docs and MSRV — both fail the build in CI.
 cargo doc --workspace --no-deps --all-features
 cargo +1.97.0 build --workspace --all-features
+
+# Cross-port drift. Everything above compares this port to itself; conformance
+# compares the wire, which both sides can encode the same wrong way. These two
+# compare what this port *says about the protocol* to what the reference says.
+# Run from the Python checkout, with both checkouts as siblings under
+# VGI_RPC_REPOS. CI runs them in the `cross-port-drift` job.
+cargo build --release --bin vgi-rpc-conformance-rust   # describe_diff spawns this exact path
+cd ~/Development/vgi-rpc-python
+VGI_RPC_REPOS=~/Development .venv/bin/python tools/cross-port/describe_diff.py --only rust
+VGI_RPC_REPOS=~/Development .venv/bin/python tools/cross-port/identity_consistency.py --only rust --verbose
 ```
+
+`identity_consistency` is a grep, so an empty corpus is its failure mode. It
+used to print `ABSENT: rust` and exit **0** when `VGI_RPC_REPOS` pointed
+somewhere the Rust checkout was not — green for a port it never opened; since
+vgi-rpc-python `1eedad2` that exits 1. Read the matrix anyway: `--verbose`
+prints `=== rust: N identity file(s)`, and N is the only number that says how
+much was actually examined. CI asserts N ≥ 1.
 
 CI additionally passes `--locked` everywhere; run it locally too if you have
 touched `Cargo.toml`.

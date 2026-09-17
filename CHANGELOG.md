@@ -2,18 +2,70 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
-## Unreleased
+## [0.25.0] — 2026-09-16
 
-### Removed
+This is the multi-protocol (VGI 2.0) round. Three changes break the wire;
+each is listed with what to do about it. Rust now produces byte-identical
+protocol hashes to the Python reference, to Go, and to TypeScript, for all
+88 conformance methods.
 
-- **`__describe__` is retired.** No server answers it, and
-  `RpcServerBuilder::enable_describe` is gone along with the
-  `vgi_rpc::introspect` module. Introspection is `vgi_rpc.Reflection.v1`:
-  `list_protocols` for what a server hosts, then `describe` for one protocol's
-  methods. A `__describe__` request is now refused with a message naming that
-  protocol and both of its entry points, rather than a generic "unknown
-  method" — the generic answer is indistinguishable from "this server was
-  built without introspection", and the two need opposite fixes.
+### Breaking
+
+- **`vgi_rpc.protocol` is the routing key, and it is required.** A server
+  resolves the pair `(protocol, method)`; method names may collide across
+  co-hosted protocols, which is what makes protocols independently
+  authorable. The key is required even against a server hosting exactly one
+  protocol — an exemption would let an intermediary that rebuilds a request
+  and drops the field land silently on whichever protocol the server
+  registered first, rather than being told.
+
+  *Migration:* raw transports (pipe, subprocess, unix, tcp) must stamp it on
+  every request — `RpcClientBuilder::protocol` / `HttpClientBuilder::protocol`
+  do this for you. Over HTTP it is optional when the path carries the
+  protocol, but the path segment is checked against the routing key when both
+  are present, never substituted for it. Three routing failures stay
+  distinct because clients depend on the difference:
+  `protocol_not_specified`, `protocol_not_supported`, and the method-absent
+  case, which is the documented capability-probe signal. A server built with
+  no explicit `protocol_name` now defaults to `"Service"` (it previously
+  carried an empty one, which under a required routing key would make it
+  unreachable) — set one explicitly if you rely on the name.
+
+- **`__describe__` is retired; introspection is `vgi_rpc.Reflection.v1`.** No
+  server answers `__describe__`, and `RpcServerBuilder::enable_describe` is
+  gone along with the `vgi_rpc::introspect` module. A `__describe__` request
+  is refused with a message naming the replacement protocol and both of its
+  entry points, rather than a generic "unknown method" — the generic answer is
+  indistinguishable from "this server was built without introspection", and
+  the two need opposite fixes.
+
+  *Migration:* call `list_protocols` for what a server hosts, then `describe`
+  for one protocol's methods — `RpcClient::list_protocols` /
+  `describe_protocol` and their `HttpClient` counterparts. `describe()` is two
+  round trips; name a protocol to skip the first. Reflection is handled
+  *before* the version gate, because it is what a version-mismatched client
+  calls to learn what mismatched.
+
+- **The protocol hash is redefined; every pinned digest moves.** It used to be
+  taken over serialized Arrow IPC bytes, which are not stable across Arrow
+  implementations — so `protocol_hash` was advisory and comparable only against
+  itself. The preimage is now canonical JSON (RFC 8785 / JCS) of the decoded
+  description:
+  `sha256("vgi_rpc.protocol_hash.v1|" + canonical_json(description))`. Every
+  number folds into a type token (`decimal128(38,9)`), so JCS's number rule —
+  the likeliest place for six ports to diverge — never applies. Not in the
+  preimage: server identity, docstrings, parameter defaults, language-specific
+  type names, framework request/describe versions, and `stream_kind`.
+
+  *Migration:* re-read any digest you have pinned; none of the old values
+  survive. `type_token` is total — an unrecognised Arrow type is an error, not
+  a fallback to `DataType`'s `Display`, whose output is an arrow-rs
+  implementation detail no other port shares. Two consequences worth knowing:
+  arrow-rs's `Decimal32`/`Decimal64` are spelled following the same pattern but
+  cannot be expressed in ports whose Arrow lacks them, and arrow-rs carries no
+  `ordered` flag on `Dictionary`, so an ordered dictionary from another port
+  decodes as unordered here and the hashes differ — visibly, which is the
+  correct outcome.
 
 ### Fixed
 
@@ -128,6 +180,36 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
   `OVERALL TIMEOUT`.
 
 ### Added
+
+- **`vgi_rpc.Reflection.v1`**, a co-hosted protocol with `list_protocols` and
+  `describe`, routed by the same key as everything else and appearing in its
+  own output. Payloads are generated schemas mirroring the reference field for
+  field, returned as a nested IPC stream in the framework's ordinary `result`
+  binary column. Reaching cross-port agreement on the digest exposed four real
+  defects nothing could have detected before: `echo_enum` accepted a dictionary
+  and answered a plain string; the rich header schema declared `nested_list` in
+  the wrong position; `MethodEntry` declared its fields in a plausible rather
+  than sorted key order, putting every digest off by a constant; and a
+  `ListBuilder` inside a `StructBuilder` was downcast to its concrete element
+  type, panicking mid-response and reaching the client as a truncated stream.
+
+- **`vgi_rpc.Identity.v1`** — resolving an opaque credential to a principal
+  (`introspect_token`) and minting a standing grant (`issue_grant`), as a
+  framework-owned protocol rather than an HTTP route. The route form (`POST
+  {prefix}/__introspect_token__`) is still served, but it existed on one
+  transport only and had to be hand-written in every port; as a protocol it
+  routes, reflects and hashes like everything else. The two methods are guarded
+  deliberately differently: `introspect_token` answers a question about
+  *somebody else's* credential, so it takes an allowlist with no permissive
+  default, uniform rejections, a JWS-shaped subject refused before the resolver
+  runs, and a rate limit — with the guard order load-bearing, authorization and
+  rate limit preceding any look at the subject, including how long looking
+  took. `issue_grant` mints for the *calling* user, so it has no allowlist, no
+  rate limit, actionable rejections, and no subject parameter at all —
+  cross-subject minting is closed by construction. Requiring an `auth_time`
+  claim stops a grant minting another grant, and makes subprocess/unix fail
+  closed for free. The credential cap is measured in UTF-8 bytes.
+
 
 - `produce_annotated_batches` on the conformance worker — a producer emitting
   `count` batches that carry a varying `conformance.batch_index`, a constant

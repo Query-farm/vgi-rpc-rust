@@ -302,6 +302,29 @@ struct ClientHttpFetcher {
     client: ReqwestClient,
 }
 
+/// Build the resolver every transport in this crate uses.
+///
+/// Its own redirect-free, timed reqwest client (SSRF-safer), so a byte-stream
+/// client resolving a pointer gets the same fetch policy an HTTP one does
+/// rather than a second, weaker implementation.
+pub(crate) fn build_client_external_config(
+    validator: UrlValidator,
+) -> Result<ExternalLocationConfig> {
+    let fetch_client = ReqwestClient::builder()
+        .timeout(DEFAULT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| RpcError::new("TransportError", format!("build fetch client: {e}")))?;
+    let mut cfg = ExternalLocationConfig::new(
+        Arc::new(NoopStorage),
+        Arc::new(ClientHttpFetcher {
+            client: fetch_client,
+        }),
+    );
+    cfg.url_validator = validator;
+    Ok(cfg)
+}
+
 fn redact_external_url(url: &str) -> String {
     let Ok(mut parsed) = reqwest::Url::parse(url) else {
         return "<invalid external URL>".to_string();
@@ -1923,41 +1946,65 @@ fn process_frame(
             Ok(())
         }
         BatchKind::Exception(e) => Err(e),
-        BatchKind::Data => {
-            if allow_external {
-                if let Some(cfg) = external {
-                    if vgi_rpc::wire::md_get(&md, LOCATION_KEY).is_some() {
-                        // The token may ride on the outer pointer (Rust) — keep it.
-                        if let Some(tok) = md.remove(STATE_KEY) {
-                            out.token = Some(tok);
-                        }
-                        if let Some(call) = md.remove(CALL_STATE_KEY) {
-                            out.call_token = Some(call);
-                        }
-                        if let Some(inner) = vgi_rpc::external::fetch_external_ipc_bytes(&md, cfg)?
-                        {
-                            let mut ir = StreamReader::new(&inner[..])?;
-                            if relax {
-                                ir = ir.relax_nullability();
-                            }
-                            while let Some((ib, imd)) = ir.read_next()? {
-                                // No nested external (loop guard).
-                                process_frame(
-                                    ib,
-                                    imd,
-                                    on_log,
-                                    relax,
-                                    treat_state_frame_as_data,
-                                    external,
-                                    out,
-                                    false,
-                                )?;
-                            }
-                        }
-                        return Ok(());
-                    }
+        BatchKind::Pointer => {
+            let Some(cfg) = external.filter(|_| allow_external) else {
+                // `allow_external == false` means we are already inside a
+                // fetched payload: a pointer there is a redirect loop, not a
+                // second hop. No resolver at all is the other way to arrive
+                // with a pointer and nothing to do with it. Either way the
+                // payload is unreachable, and saying so beats handing the
+                // caller a zero-row batch.
+                return Err(crate::pointer::unresolved_pointer_error(&md));
+            };
+            // The token may ride on the outer pointer (Rust) — keep it.
+            if let Some(tok) = md.remove(STATE_KEY) {
+                out.token = Some(tok);
+            }
+            if let Some(call) = md.remove(CALL_STATE_KEY) {
+                out.call_token = Some(call);
+            }
+            let url = vgi_rpc::wire::md_get(&md, LOCATION_KEY)
+                .unwrap_or_default()
+                .to_string();
+            let first_new = out.batches.len();
+            let started = std::time::Instant::now();
+            if let Some(inner) = vgi_rpc::external::fetch_external_ipc_bytes(&md, cfg)? {
+                let fetch_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let mut ir = StreamReader::new(&inner[..])?;
+                if relax {
+                    ir = ir.relax_nullability();
+                }
+                while let Some((ib, imd)) = ir.read_next()? {
+                    // No nested external (loop guard).
+                    process_frame(
+                        ib,
+                        imd,
+                        on_log,
+                        relax,
+                        treat_state_frame_as_data,
+                        external,
+                        out,
+                        false,
+                    )?;
+                }
+                // Provenance is the reader's to stamp, on every batch this
+                // pointer produced (WIRE_PROTOCOL.md §12). Stamped here rather
+                // than inside the recursion so an inline frame never acquires
+                // keys no fetch stands behind.
+                for (_, bmd) in out.batches.iter_mut().skip(first_new) {
+                    bmd.insert(
+                        vgi_rpc::metadata::LOCATION_FETCH_MS_KEY.to_string(),
+                        format!("{:.2}", fetch_ms),
+                    );
+                    bmd.insert(
+                        vgi_rpc::metadata::LOCATION_SOURCE_KEY.to_string(),
+                        url.clone(),
+                    );
                 }
             }
+            Ok(())
+        }
+        BatchKind::Data => {
             // `/init` pairs the call token with the cursor on the same frame;
             // strip it either way so it never leaks into user metadata.
             let call = md.remove(CALL_STATE_KEY);
@@ -2010,6 +2057,14 @@ fn parse_upload_urls(bytes: &[u8], on_log: &mut Option<OnLog>) -> Result<Vec<Upl
             BatchKind::Exception(e) => {
                 let _ = reader.drain();
                 return Err(e);
+            }
+            // The upload-URL bootstrap is the one response that must not be
+            // externalized: resolving it would need an upload URL. A server
+            // that externalized it has broken the bootstrap, and saying so is
+            // better than reporting "upload_url missing" from a zero-row batch.
+            BatchKind::Pointer => {
+                let _ = reader.drain();
+                return Err(crate::pointer::unresolved_pointer_error(&md));
             }
             BatchKind::Data => {
                 let up = batch

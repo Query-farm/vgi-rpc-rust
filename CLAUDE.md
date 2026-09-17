@@ -395,10 +395,33 @@ with no row is the case a row-demanding validator gets wrong.
 
 `ExternalStorage` trait (upload) + `Fetcher` trait (download) +
 `ExternalLocationConfig` (threshold, compression, URL validator).
-`maybe_externalize_batch` returns a zero-row empty-schema pointer batch
-with metadata keys `vgi_rpc.location`, `vgi_rpc.location.sha256`;
-`resolve_external_location` reverses it and appends
-`vgi_rpc.location.fetch_ms` to the user-visible metadata.
+`maybe_externalize_batch` returns a zero-row pointer batch carrying the
+enclosing stream's schema and exactly two metadata keys —
+`vgi_rpc.location`, `vgi_rpc.location.sha256`. Those two are all a
+pointer ever carries on the wire.
+
+**Provenance belongs to the reader, and both keys go on together.**
+`resolved_metadata` (one definition, called by
+`resolve_external_location` and by both clients) stamps
+`vgi_rpc.location.fetch_ms` *and* `vgi_rpc.location.source` — the URL
+actually fetched, in full, since the redaction rules govern rendering a
+URL for a human rather than this key. WIRE_PROTOCOL.md §12 records that
+seven ports produced four different answers here; stamping only
+`fetch_ms` was this port's. A batch carrying neither is
+indistinguishable from one whose resolver never ran.
+
+**Every transport resolves, not just HTTP.** `vgi-rpc-client`'s
+`pointer.rs` is the byte-stream half: `classify` tests for
+`vgi_rpc.location` *before* the zero-row/log test and returns
+`BatchKind::Pointer`, which the compiler then forces every reader to
+handle. That ordering is load-bearing for the **stream header**, which
+§1.5 makes externalizable: its pointer is zero-row, so a reader that
+reaches the log test first discards the header and reports it absent.
+This server does not externalize headers (it writes the header batch
+directly), so that path is exercised by
+`vgi-rpc-client/tests/inproc_external.rs` against a hand-rolled peer and
+by the `role=client server=python` conformance leg against the
+reference, which does.
 
 Integration into `RpcServer` is transparent for unary results and stream
 output batches: set `RpcServer::builder().with_external_location(cfg)`.

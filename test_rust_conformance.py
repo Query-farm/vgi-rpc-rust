@@ -554,6 +554,111 @@ def conformance_fake_storage() -> Iterator[str]:
         shutdown()
 
 
+def _bytestream_external_cmd(storage_url: str) -> list[str]:
+    """Argv for a byte-stream conformance server that externalises everything.
+
+    ``_worker_cmd`` is handed the transport by name rather than left to infer
+    it from which flags are present. That inference is the trap the shared docs
+    call out: a ``_worker()`` that spells "byte stream" as *the absence of every
+    flag* reroutes to an HTTP server the moment this fixture adds
+    ``--fake-storage``, the fixture then speaks stdio to a server listening on a
+    TCP port nobody dialled, and every test in the group times out in a read
+    with no error text at all.
+
+    One byte as the threshold, matching the reference: every data-bearing batch
+    in the group must reach storage, or its upload assertions pass vacuously on
+    batches that quietly stayed inline.
+    """
+    return [
+        *_worker_cmd("stdio"),
+        "--fake-storage",
+        storage_url,
+        "--externalize-threshold",
+        "1",
+    ]
+
+
+@pytest.fixture(scope="session")
+def conformance_bytestream_external_target(
+    conformance_fake_storage: str,
+) -> Iterator[Any]:
+    """Supply an externalising byte-stream connection for ``TestExternalByteStream``.
+
+    External-location pointers are not an HTTP feature — WIRE_PROTOCOL.md §12
+    says so, and every transport that carries record batches carries pointer
+    batches. This port has exactly one pointer resolver and its byte-stream
+    client calls it, so the group *fails* rather than skips when this fixture is
+    withheld: withholding is how that half stayed untested in the first place.
+
+    Both ends are wired to the same fake storage, over a pipe:
+
+    * ``role=server`` puts the reference Python client on the reading end of
+      this port's writer, so it pins where per-emit metadata meets
+      externalisation;
+    * ``role=client`` puts this port's ``vgi-rpc-client`` on the reading end.
+      With ``server=python`` the peer is the reference, which is the whole value
+      of the leg — the reference externalises a stream *header*, and this port's
+      server (like most) externalises only in the data path, so a port talking
+      to itself never produces the pointer its own header reader must resolve.
+    """
+    from vgi_rpc.conformance._external_bytestream_pytest import ByteStreamExternalTarget
+    from vgi_rpc.external import ExternalLocationConfig
+
+    argv = _bytestream_external_cmd(conformance_fake_storage)
+    # Fake storage vends `http://127.0.0.1` URLs that the default HTTPS-only
+    # policy correctly refuses. Disabled here, in one fixture, rather than
+    # loosened anywhere a production client could inherit it.
+    external_config = ExternalLocationConfig(url_validator=None)
+
+    def connect(
+        on_log: Callable[[Message], None] | None = None,
+    ) -> contextlib.AbstractContextManager[Any]:
+        if ROLE == "client":
+            from rust_client_proxy import RustClientProxy
+
+            @contextlib.contextmanager
+            def _driver_conn() -> Iterator[Any]:
+                proxy = RustClientProxy(
+                    "stdio", argv, on_log, external_config=external_config
+                )
+                try:
+                    yield proxy
+                finally:
+                    proxy.close()
+
+            return _driver_conn()
+
+        @contextlib.contextmanager
+        def _pipe_conn() -> Iterator[_RpcProxy]:
+            transport = SubprocessTransport(argv)
+            try:
+                yield _RpcProxy(
+                    ConformanceService,
+                    transport,
+                    on_log,
+                    external_config=external_config,
+                )
+            finally:
+                transport.close()
+
+        return _pipe_conn()
+
+    def uploaded_objects() -> int:
+        response = httpx.get(f"{conformance_fake_storage}/_stats", timeout=5.0)
+        response.raise_for_status()
+        return int(response.json()["object_count"])
+
+    try:
+        yield ByteStreamExternalTarget(
+            name=f"rust-{ROLE}-{SERVER}-pipe",
+            connect=connect,
+            uploaded_objects=uploaded_objects,
+        )
+    finally:
+        # Releases whatever session the resolver kept for pointer fetches.
+        external_config.fetch_config.close()
+
+
 @pytest.fixture(scope="session")
 def conformance_http_with_storage_port(conformance_fake_storage: str) -> Iterator[int]:
     """HTTP server wired to fake storage (no compression)."""
@@ -1331,7 +1436,7 @@ class TestRustDescribeConformance:
 def _assert_describe(desc) -> None:  # type: ignore[no-untyped-def]
     assert desc.protocol_name == "ConformanceService"
     assert desc.describe_version == DESCRIBE_VERSION
-    assert len(desc.methods) == 87, sorted(desc.methods.keys())
+    assert len(desc.methods) == 88, sorted(desc.methods.keys())
     suite = run_describe_conformance(desc)
     if not suite.success:
         failures = [r for r in suite.results if not r.passed]

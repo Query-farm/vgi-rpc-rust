@@ -46,9 +46,18 @@ pub const STATE_KEY: &str = "vgi_rpc.stream_state#b64";
 pub const CALL_STATE_KEY: &str = "vgi_rpc.call_state#b64";
 pub const CANCEL_KEY: &str = "vgi_rpc.cancel";
 
+/// Pointer-batch keys — the only two an external-location pointer carries on
+/// the wire (WIRE_PROTOCOL.md §12).
 pub const LOCATION_KEY: &str = "vgi_rpc.location";
 pub const LOCATION_SHA256_KEY: &str = "vgi_rpc.location.sha256";
+
+/// Provenance keys, stamped by the **reader** at resolve time and never
+/// written by a producer. [`LOCATION_FETCH_MS_KEY`] is the elapsed fetch time
+/// and [`LOCATION_SOURCE_KEY`] the URL that was actually fetched; a pointer on
+/// the wire MUST NOT carry either, because a writer's guess at the source is
+/// not a URL anyone fetched.
 pub const LOCATION_FETCH_MS_KEY: &str = "vgi_rpc.location.fetch_ms";
+pub const LOCATION_SOURCE_KEY: &str = "vgi_rpc.location.source";
 
 pub const PROTOCOL_NAME_KEY: &str = "vgi_rpc.protocol_name";
 pub const DESCRIBE_VERSION_KEY: &str = "vgi_rpc.describe_version";

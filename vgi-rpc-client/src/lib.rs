@@ -22,6 +22,7 @@
 pub mod client;
 pub mod envelope;
 pub mod introspect;
+mod pointer;
 pub mod request;
 pub mod transport;
 

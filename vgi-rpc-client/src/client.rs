@@ -17,6 +17,7 @@ use crate::introspect::{
     describe_params, empty_schema, no_application_protocol, parse_protocol_list,
     parse_service_description, reflection_payload, ProtocolList, ServiceDescription,
 };
+use crate::pointer::{resolve_with, ExternalHandle};
 use crate::request::{build_request_metadata, generate_request_id};
 use crate::transport::{RpcDeadline, Transport};
 
@@ -129,6 +130,9 @@ pub struct RpcClient {
     protocol_version: Option<String>,
     relax_nullability: bool,
     shm: ShmHandle,
+    /// External-location resolver. `None` means a pointer batch is an error
+    /// rather than a zero-row batch handed to the caller.
+    external: ExternalHandle,
 }
 
 impl RpcClient {
@@ -141,6 +145,7 @@ impl RpcClient {
             protocol_version: None,
             relax_nullability: false,
             shm: None,
+            external: None,
         }
     }
 
@@ -269,6 +274,35 @@ impl RpcClient {
         self
     }
 
+    /// Resolve external-location pointer batches, validating storage URLs with
+    /// `validator`.
+    ///
+    /// Externalization is not an HTTP feature: a server configured with a
+    /// storage backend externalizes over pipe, subprocess, unix and tcp too,
+    /// and without a resolver those payloads arrive as zero-row pointer
+    /// batches. Use [`vgi_rpc::external::safe_https_validator`] against real
+    /// storage; [`Self::external_resolution_any`] is the local-test opt-out.
+    #[cfg(feature = "http")]
+    pub fn external_resolution(self, validator: vgi_rpc::external::UrlValidator) -> Result<Self> {
+        let cfg = crate::http::build_client_external_config(validator)?;
+        Ok(self.external_config(cfg))
+    }
+
+    /// Resolve pointers accepting any storage URL (trusted / test storage,
+    /// which vends `http://127.0.0.1` URLs the HTTPS-only default refuses).
+    #[cfg(feature = "http")]
+    pub fn external_resolution_any(self) -> Result<Self> {
+        self.external_resolution(vgi_rpc::external::any_url_validator())
+    }
+
+    /// Resolve pointers with a fully-specified configuration (custom fetcher,
+    /// caps, compression).
+    #[cfg(feature = "http")]
+    pub fn external_config(mut self, cfg: vgi_rpc::external::ExternalLocationConfig) -> Self {
+        self.external = Some(cfg);
+        self
+    }
+
     /// Promote response schemas to fully-nullable on read (needed for Python
     /// servers that declare non-nullable fields but legitimately send nulls).
     pub fn relax_nullability(mut self, yes: bool) -> Self {
@@ -327,6 +361,7 @@ impl RpcClient {
         let relax = self.relax_nullability;
         let on_log = &mut self.on_log;
         let shm = &self.shm;
+        let external = &self.external;
         let (r, w) = self.transport.split();
 
         // Phase 1: write the request as one complete IPC stream.
@@ -349,6 +384,23 @@ impl RpcClient {
                 BatchKind::Exception(e) => {
                     let _ = reader.drain();
                     return Err(e);
+                }
+                // An externalized unary result. Resolved here rather than left
+                // to the caller: on a byte-stream transport this is the only
+                // place that sees the pointer at all.
+                BatchKind::Pointer => {
+                    let resolved = resolve_with(external, &md, on_log, relax);
+                    match resolved {
+                        Ok(pair) => {
+                            if result.is_none() {
+                                result = Some(pair);
+                            }
+                        }
+                        Err(e) => {
+                            let _ = reader.drain();
+                            return Err(e);
+                        }
+                    }
                 }
                 BatchKind::Data => {
                     if result.is_none() {
@@ -407,6 +459,10 @@ impl RpcClient {
         let shm = self.shm.clone();
         #[cfg(not(feature = "shm"))]
         let shm = self.shm;
+        #[cfg(feature = "http")]
+        let external = self.external.clone();
+        #[cfg(not(feature = "http"))]
+        let external = self.external;
         let on_log = &mut self.on_log;
         let (r, w) = self.transport.split();
 
@@ -420,7 +476,7 @@ impl RpcClient {
         // Phase 2a: read the header sub-stream first when the method declares
         // one (the server writes it before the output schema).
         let header = if has_header {
-            match read_substream(&mut *r, on_log, relax)? {
+            match read_substream(&mut *r, on_log, relax, &external)? {
                 Some((b, m)) => Some(shm_resolve_inbound(b, m, &shm)?),
                 None => None,
             }
@@ -444,6 +500,7 @@ impl RpcClient {
             kind,
             relax,
             shm,
+            external,
             cancelled: false,
             finished: false,
             closed: false,
@@ -533,6 +590,7 @@ fn read_substream(
     r: &mut dyn std::io::Read,
     on_log: &mut Option<OnLog>,
     relax: bool,
+    external: &ExternalHandle,
 ) -> Result<Option<(RecordBatch, Metadata)>> {
     let mut reader = StreamReader::new(r)?;
     if relax {
@@ -546,6 +604,22 @@ fn read_substream(
                 let _ = reader.drain();
                 return Err(e);
             }
+            // A stream header is externalizable like any other batch
+            // (WIRE_PROTOCOL.md §1.5). It then arrives here as a zero-row
+            // pointer, and a reader that skipped it would report the header
+            // absent rather than malformed -- which is why `classify` tests
+            // for the pointer before it tests for zero rows.
+            BatchKind::Pointer => match resolve_with(external, &md, on_log, relax) {
+                Ok(pair) => {
+                    if data.is_none() {
+                        data = Some(pair);
+                    }
+                }
+                Err(e) => {
+                    let _ = reader.drain();
+                    return Err(e);
+                }
+            },
             BatchKind::Data => {
                 if data.is_none() {
                     data = Some((batch, md));
@@ -570,6 +644,7 @@ pub struct StreamSession<'c> {
     kind: StreamKind,
     relax: bool,
     shm: ShmHandle,
+    external: ExternalHandle,
     cancelled: bool,
     finished: bool,
     closed: bool,
@@ -692,6 +767,20 @@ impl StreamSession<'_> {
                         self.finished = true;
                         let _ = reader.drain();
                         return Err(e);
+                    }
+                    // An externalized output cycle: this turn's logs and its
+                    // one data batch, uploaded as a single IPC stream. The
+                    // resolver dispatches those logs, so a turn's logs survive
+                    // externalization the same way they survive inline.
+                    BatchKind::Pointer => {
+                        match resolve_with(&self.external, &md, self.on_log, self.relax) {
+                            Ok(pair) => return Ok(Some(pair)),
+                            Err(e) => {
+                                self.finished = true;
+                                let _ = reader.drain();
+                                return Err(e);
+                            }
+                        }
                     }
                     // Resolve a shm pointer (no-op when not shm).
                     BatchKind::Data => return shm_resolve_inbound(batch, md, &self.shm).map(Some),

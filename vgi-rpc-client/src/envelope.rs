@@ -8,13 +8,21 @@ use serde_json::Value;
 
 use vgi_rpc::errors::RpcError;
 use vgi_rpc::log::{LogLevel, LogMessage};
-use vgi_rpc::metadata::{LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY, REQUEST_ID_KEY};
+use vgi_rpc::metadata::{
+    LOCATION_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY, REQUEST_ID_KEY,
+};
 use vgi_rpc::wire::{md_get, Metadata};
 
 /// What a received frame represents.
 pub enum BatchKind {
     /// A user-visible data batch.
     Data,
+    /// An external-location pointer standing in for a batch (or, on a stream,
+    /// for a whole output cycle) that lives in storage. Zero-row by
+    /// construction, which is why it is tested for *first*: a reader that
+    /// classified it as a log would skip it, and the payload would be missing
+    /// rather than malformed.
+    Pointer,
     /// An out-of-band log message (zero-row, non-EXCEPTION level).
     Log(LogMessage),
     /// An error envelope (zero-row, EXCEPTION level).
@@ -23,10 +31,19 @@ pub enum BatchKind {
 
 /// Classify a received `(batch, metadata)` frame.
 ///
-/// A frame is data unless it is a **zero-row** batch carrying a
+/// `vgi_rpc.location` is tested **before** anything else, including the
+/// zero-row shortcut. A pointer batch is zero-row by construction, so a
+/// classifier that reached the log test first would report the frame as a log
+/// and drop it — the failure mode WIRE_PROTOCOL.md §1.5 describes for stream
+/// headers, where the header then "does not fail to parse, it fails to exist".
+///
+/// Otherwise a frame is data unless it is a **zero-row** batch carrying a
 /// `vgi_rpc.log_level` key — then it is a log (or, at `EXCEPTION` level, an
 /// error envelope).
 pub fn classify(batch: &RecordBatch, md: &Metadata) -> BatchKind {
+    if md_get(md, LOCATION_KEY).is_some() {
+        return BatchKind::Pointer;
+    }
     if batch.num_rows() != 0 {
         return BatchKind::Data;
     }

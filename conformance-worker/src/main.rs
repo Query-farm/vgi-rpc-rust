@@ -46,6 +46,28 @@ fn build_plain_server(args: &[String]) -> vgi_rpc::RpcServer {
     }
 
     let server_id = parse_str_flag(args, "--server-id");
+    // `--fake-storage <base_url> [--externalize-threshold N]` wires
+    // externalization onto the **byte-stream** transports (stdio, unix, tcp).
+    // Externalization is not an HTTP feature: WIRE_PROTOCOL.md §12 says so, and
+    // the shared `TestExternalByteStream` group drives a port's pointer
+    // resolver over a pipe precisely because a resolver reachable only from the
+    // HTTP client is an untested half.
+    if let Some(storage_url) = parse_str_flag(args, "--fake-storage") {
+        use std::sync::Arc as StdArc;
+        use vgi_rpc::external::ExternalLocationConfig;
+        // One byte: every data-bearing batch in the group must reach storage,
+        // or the group passes vacuously on batches that stayed inline.
+        let threshold = parse_usize_flag(args, "--externalize-threshold").unwrap_or(4096);
+        let cfg = ExternalLocationConfig::new(
+            StdArc::new(fake_storage::FakeStorage::new(&storage_url)),
+            StdArc::new(vgi_rpc_s3::HttpFetcher::new()),
+        )
+        .with_threshold_bytes(threshold)
+        // Fake storage vends `http://127.0.0.1` URLs the default HTTPS-only
+        // policy correctly refuses.
+        .with_url_validator(vgi_rpc::external::any_url_validator());
+        return conformance::build_server_with_external(Some(cfg), server_id.as_deref());
+    }
     // `--identity {off,both,introspect-only}` co-hosts `vgi_rpc.Identity.v1`
     // under the fixed policy in `identity_fixture`. Off by default and read
     // here rather than defaulted in the builder: the shared group asserts

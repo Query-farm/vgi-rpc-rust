@@ -17,6 +17,41 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ### Fixed
 
+- **The byte-stream client resolved no external-location pointers at all.**
+  `read_substream` and the stream session matched three envelope kinds — log,
+  exception, data — with no pointer arm, so an externalized batch classified as
+  data and reached the caller as a zero-row batch. Silent row loss on every
+  externalized batch over pipe, subprocess, unix and tcp, and an empty result
+  is not an error anywhere. Externalization is not an HTTP feature
+  (WIRE_PROTOCOL.md §12): resolution now happens on the unary result, the
+  stream header, and every stream turn, through one path that also dispatches
+  the log batches bundled into an externalized cycle. `RpcClient` gains
+  `external_resolution`, `external_resolution_any` and `external_config`; a
+  pointer arriving at a client with no resolver is now a named error rather
+  than an empty batch, which is the failure a caller can act on.
+
+- **A stream header is externalizable, and its pointer is zero-row.** Four of
+  seven ports classified that zero-row batch as a log *before* testing for
+  `vgi_rpc.location`, skipped it, and then reported the header absent — it does
+  not fail to parse, it fails to exist. `classify` now tests for the pointer
+  first, and `BatchKind` carries a `Pointer` variant so every reader in this
+  crate has to decide what to do with one rather than fall through to `Data`.
+  This is the one resolution path a port cannot exercise against itself: this
+  crate's server writes its header batch directly and externalizes only in the
+  data path, so the guard test drives a hand-rolled peer that externalizes a
+  header, and the cross-language client leg drives the reference, which does.
+
+- **The resolver stamps both provenance keys, not one.** §12 makes
+  `vgi_rpc.location.source` — the URL that was actually fetched — as much the
+  reader's responsibility as `vgi_rpc.location.fetch_ms`, and this port stamped
+  only the latter: what you get from implementing the first of the pseudocode's
+  two adjacent assignments. A resolved batch carrying neither key is
+  indistinguishable, to a correct peer, from one whose resolver silently did
+  not run. Both are now stamped in one place,
+  `vgi_rpc::external::resolved_metadata`, which every reader here calls; a
+  pointer on the wire carries neither, and a writer that supplies either has it
+  stripped rather than propagated as a URL nobody fetched.
+
 - **The HTTP client addresses methods on the protocol-qualified path.**
   `HttpClient` posted every call to a bare `/{method}`, which the reference
   Python server does not route -- it serves only `{protocol}/{method}`, so
@@ -94,6 +129,19 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ### Added
 
+- `produce_annotated_batches` on the conformance worker — a producer emitting
+  `count` batches that carry a varying `conformance.batch_index`, a constant
+  `conformance.batch_total`, and a deliberately non-ASCII
+  `conformance.emit_label`. It pins the one point where per-emit metadata meets
+  externalization, which no conformance method reached before because none
+  emitted per-batch custom metadata. Moves the conformance protocol hash to
+  `7713e810…` and the method count to 88.
+- `conformance_bytestream_external_target`, the fixture backing the shared
+  `TestExternalByteStream` group, plus `--fake-storage <url>` /
+  `--externalize-threshold <n>` on the conformance worker's byte-stream
+  transports. The group *fails* rather than skips for a runner that supplies
+  external storage and withholds this fixture, because withholding is how the
+  byte-stream half of a pointer resolver stays untested.
 - `RpcClient::list_protocols` / `describe_protocol`, and their `HttpClient`
   counterparts. `describe()` is two round trips (`list_protocols`, then
   `describe`); name a protocol to skip the first.

@@ -25,7 +25,9 @@ use arrow_schema::{Schema, SchemaRef};
 use sha2::{Digest, Sha256};
 
 use crate::errors::{Result, RpcError};
-use crate::metadata::{LOCATION_FETCH_MS_KEY, LOCATION_KEY, LOCATION_SHA256_KEY};
+use crate::metadata::{
+    LOCATION_FETCH_MS_KEY, LOCATION_KEY, LOCATION_SHA256_KEY, LOCATION_SOURCE_KEY,
+};
 use crate::wire::{bytes_to_hex, empty_batch, md_get, write_one_batch_as, Metadata, StreamReader};
 
 thread_local! {
@@ -442,6 +444,20 @@ impl ExternalLocationConfig {
 // Serialize a batch as an IPC stream with no custom metadata.
 // ---------------------------------------------------------------------------
 
+/// Whether `key` is one of the four location keys the resolver owns.
+///
+/// Two of them ([`LOCATION_KEY`], [`LOCATION_SHA256_KEY`]) ride on the pointer
+/// and must not survive resolution; the other two ([`LOCATION_FETCH_MS_KEY`],
+/// [`LOCATION_SOURCE_KEY`]) are provenance the reader stamps and a writer must
+/// never emit. Either way no inbound copy is ever trusted — a stale value from
+/// the wire would name a URL nobody fetched.
+fn is_location_key(key: &str) -> bool {
+    key == LOCATION_KEY
+        || key == LOCATION_SHA256_KEY
+        || key == LOCATION_FETCH_MS_KEY
+        || key == LOCATION_SOURCE_KEY
+}
+
 /// Serialize one record batch as a complete IPC stream (schema + batch + EOS).
 pub fn serialize_batch_to_ipc(batch: &RecordBatch) -> Result<Vec<u8>> {
     // External payloads carry the raw data only; the pointer batch on
@@ -692,9 +708,7 @@ fn prepare_externalize_batch_inner(
     // The location keys are added by `upload_prepared`, which is the only
     // place that knows the URL.
     let mut md: Metadata = inline_metadata.cloned().unwrap_or_default();
-    md.remove(LOCATION_KEY);
-    md.remove(LOCATION_SHA256_KEY);
-    md.remove(LOCATION_FETCH_MS_KEY);
+    md.retain(|k, _| !is_location_key(k));
 
     // The caller's metadata is written on BOTH sides of the indirection:
     // inside the uploaded stream and on the pointer batch. Ports disagree
@@ -786,14 +800,58 @@ pub fn maybe_externalize_batch(
 // Client-side: resolve pointer batches
 // ---------------------------------------------------------------------------
 
+/// Assemble the metadata a resolved batch carries.
+///
+/// One definition for every reader in this workspace -- the byte-stream and
+/// HTTP clients call it too -- because WIRE_PROTOCOL.md §12 records that seven
+/// independent implementations produced four different answers here, and two
+/// call sites in one crate are enough to reproduce that locally.
+///
+/// * The inner (fetched) batch's metadata is authoritative; the pointer's
+///   non-location keys are merged underneath it, because this crate's server
+///   stamps per-batch keys such as the stream cursor on the *outer* pointer
+///   while the reference stamps them on the inner payload. Writing both and
+///   merging recovers the cursor from either peer.
+/// * No location key survives from the wire, in either direction.
+/// * Both provenance keys are stamped here and nowhere else: `fetch_ms` is the
+///   reader's measured elapsed time and `source` is the URL the reader
+///   actually fetched -- in full, since the redaction rules govern *rendering*
+///   a URL for a human, not this key.
+pub fn resolved_metadata(
+    pointer_md: &Metadata,
+    inner_md: Metadata,
+    url: &str,
+    fetch_ms: f64,
+) -> Metadata {
+    let mut user_md: Metadata = pointer_md
+        .iter()
+        .filter(|(k, _)| !is_location_key(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (k, v) in inner_md {
+        if !is_location_key(&k) {
+            user_md.insert(k, v);
+        }
+    }
+    user_md.insert(
+        LOCATION_FETCH_MS_KEY.to_string(),
+        format!("{:.2}", fetch_ms),
+    );
+    user_md.insert(LOCATION_SOURCE_KEY.to_string(), url.to_string());
+    user_md
+}
+
 /// Resolve a pointer batch (zero-row batch with `vgi_rpc.location`
 /// metadata) back into the original record batch. Non-pointer batches
 /// are returned untouched.
 ///
-/// Returns `(resolved_batch, user_metadata)` where the location keys
-/// have been stripped from the metadata visible to the caller. A
-/// `vgi_rpc.location.fetch_ms` claim is appended so callers / access
-/// logs can observe the fetch latency.
+/// Returns `(resolved_batch, user_metadata)` where the pointer's own location
+/// keys have been stripped from the metadata visible to the caller, and the
+/// two provenance keys WIRE_PROTOCOL.md §12 makes the *reader's*
+/// responsibility are stamped on: `vgi_rpc.location.fetch_ms` (elapsed fetch
+/// time) and `vgi_rpc.location.source` (the URL that was fetched). Stamping
+/// neither is indistinguishable, to a correct peer, from a resolver that
+/// silently did not run.
 pub fn resolve_external_location(
     batch: &RecordBatch,
     metadata: &Metadata,
@@ -828,29 +886,10 @@ pub fn resolve_external_location(
     let (resolved, inner_md) = deserialize_single_batch_with_metadata(&ipc_bytes)?;
     let fetch_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    // Start from the outer pointer's non-location keys, then overlay the inner
-    // (externalized) batch's metadata. Implementations differ on where they
-    // carry per-batch keys like `vgi_rpc.stream_state#b64`: the Rust server
-    // stamps them on the outer pointer, the Python server on the inner payload
-    // batch. Merging both (inner wins) recovers the token either way and
-    // matches Python's resolver, which uses the inner batch's metadata.
-    let mut user_md: Metadata = metadata
-        .iter()
-        .filter(|(k, _)| {
-            *k != LOCATION_KEY && *k != LOCATION_SHA256_KEY && *k != LOCATION_FETCH_MS_KEY
-        })
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    for (k, v) in inner_md {
-        if k != LOCATION_KEY && k != LOCATION_SHA256_KEY && k != LOCATION_FETCH_MS_KEY {
-            user_md.insert(k, v);
-        }
-    }
-    user_md.insert(
-        LOCATION_FETCH_MS_KEY.to_string(),
-        format!("{:.2}", fetch_ms),
-    );
-    Ok((resolved, user_md))
+    Ok((
+        resolved,
+        resolved_metadata(metadata, inner_md, url, fetch_ms),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -987,10 +1026,51 @@ mod tests {
         assert!(md_get(&md, LOCATION_KEY).unwrap().starts_with("https://"));
         assert_eq!(storage.len(), 1);
 
+        // Provenance is the reader's, so the pointer on the wire carries
+        // neither key: a writer's `location.source` names whatever the writer
+        // chose rather than a URL anyone fetched.
+        assert!(md_get(&md, LOCATION_FETCH_MS_KEY).is_none());
+        assert!(md_get(&md, LOCATION_SOURCE_KEY).is_none());
+
+        let url = md_get(&md, LOCATION_KEY).unwrap().to_string();
         let (resolved, user_md) = resolve_external_location(&ptr, &md, &cfg).unwrap();
         assert_eq!(resolved.num_rows(), batch.num_rows());
         assert!(md_get(&user_md, LOCATION_KEY).is_none());
+        assert!(md_get(&user_md, LOCATION_SHA256_KEY).is_none());
         assert!(md_get(&user_md, LOCATION_FETCH_MS_KEY).is_some());
+        // The URL that was fetched, in full -- not a redacted rendering, and
+        // not absent, which against a correct peer is indistinguishable from a
+        // resolver that never ran.
+        assert_eq!(md_get(&user_md, LOCATION_SOURCE_KEY), Some(url.as_str()));
+    }
+
+    /// A writer that stamps provenance onto its own batch must not have it
+    /// reach the wire: the pointer is built from the caller's metadata, and a
+    /// stale `location.source` copied through would survive resolution and name
+    /// a URL nobody fetched.
+    #[test]
+    fn writer_supplied_provenance_never_reaches_the_pointer() {
+        let storage = InMemoryStorage::new();
+        let cfg = cfg_with(storage.clone(), 1024);
+        let batch = big_batch(20_000);
+        let mut inline = Metadata::new();
+        inline.insert(LOCATION_SOURCE_KEY.to_string(), "https://lies".to_string());
+        inline.insert(LOCATION_FETCH_MS_KEY.to_string(), "0.01".to_string());
+        inline.insert("app.key".to_string(), "kept".to_string());
+        let (ptr, md) =
+            maybe_externalize_batch(&batch, batch.schema().as_ref(), Some(&inline), &cfg)
+                .unwrap()
+                .unwrap();
+        assert!(md_get(&md, LOCATION_SOURCE_KEY).is_none());
+        assert!(md_get(&md, LOCATION_FETCH_MS_KEY).is_none());
+        assert_eq!(md_get(&md, "app.key"), Some("kept"));
+
+        let (_, user_md) = resolve_external_location(&ptr, &md, &cfg).unwrap();
+        assert_eq!(
+            md_get(&user_md, LOCATION_SOURCE_KEY),
+            md_get(&md, LOCATION_KEY)
+        );
+        assert_eq!(md_get(&user_md, "app.key"), Some("kept"));
     }
 
     #[test]

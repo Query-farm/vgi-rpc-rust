@@ -86,6 +86,23 @@ fn counter_batch_range(start: i64, count: i64) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(counter_schema(), arrs)?)
 }
 
+/// Output schema for `produce_annotated_batches`: one **nullable** int64
+/// column. Nullable because the reference declares `pa.field("value",
+/// pa.int64())`, whose pyarrow default is `nullable=True`, and the field's
+/// nullability is hashed into the protocol description.
+fn annotated_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        true,
+    )]))
+}
+
+/// Deliberately non-ASCII: a port that round-trips per-emit metadata through a
+/// latin-1 or C-string path fails the conformance assertion here rather than in
+/// someone's production data.
+const ANNOTATED_EMIT_LABEL: &str = "ünïcode-λ";
+
 // ---------------------------------------------------------------------------
 // Producer states
 // ---------------------------------------------------------------------------
@@ -233,6 +250,52 @@ impl ProducerState for Large {
         }
         let offset = self.cur * self.rows;
         out.emit(counter_batch_range(offset, self.rows)?)?;
+        self.cur += 1;
+        Ok(())
+    }
+    fn encode_state(&self) -> Result<Vec<u8>> {
+        StreamStateCodec::encode(self)
+    }
+}
+
+/// Emit `count` batches, each carrying distinct per-emit custom metadata.
+///
+/// Exists to pin the one place per-batch metadata and externalization meet.
+/// Two ports shipped opposite defects there: one refused to externalize any
+/// batch carrying metadata (treating "has metadata" as "is a control batch"),
+/// the other externalized and then *replaced* the pointer's metadata, erasing
+/// `vgi_rpc.location`. `batch_index` varies per batch and the shared tests
+/// check which batch carried which value, so a port that caches the first
+/// turn's metadata and reuses it fails here rather than passing on a constant
+/// label.
+#[derive(Serialize, Deserialize)]
+struct Annotated {
+    count: i64,
+    rows: i64,
+    cur: i64,
+}
+impl_bincode_codec!(Annotated);
+impl ProducerState for Annotated {
+    fn produce(&mut self, out: &mut OutputCollector, _ctx: &CallContext) -> Result<()> {
+        if self.cur >= self.count {
+            out.finish();
+            return Ok(());
+        }
+        let base = self.cur * 1_000_000;
+        let values: Vec<i64> = (0..self.rows).map(|row| base + row).collect();
+        let arrs: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(values))];
+        let batch = RecordBatch::try_new(annotated_schema(), arrs)?;
+        let mut md = vgi_rpc::wire::Metadata::new();
+        md.insert("conformance.batch_index".to_string(), self.cur.to_string());
+        md.insert(
+            "conformance.batch_total".to_string(),
+            self.count.to_string(),
+        );
+        md.insert(
+            "conformance.emit_label".to_string(),
+            ANNOTATED_EMIT_LABEL.to_string(),
+        );
+        out.emit_with_metadata(batch, md)?;
         self.cur += 1;
         Ok(())
     }
@@ -609,6 +672,10 @@ fn counter_schema_fn() -> SchemaRef {
     counter_schema()
 }
 
+fn annotated_schema_fn() -> SchemaRef {
+    annotated_schema()
+}
+
 fn tick_metadata_schema_fn() -> SchemaRef {
     tick_metadata_schema()
 }
@@ -690,6 +757,16 @@ impl StreamSvc {
         Ok(Large {
             rows: rows_per_batch,
             batches: batch_count,
+            cur: 0,
+        })
+    }
+
+    /// Produce count batches, each carrying distinct per-emit metadata.
+    #[producer(state = Annotated, output_schema = annotated_schema_fn)]
+    fn produce_annotated_batches(&self, count: i64, rows_per_batch: i64) -> Result<Annotated> {
+        Ok(Annotated {
+            count,
+            rows: rows_per_batch,
             cur: 0,
         })
     }

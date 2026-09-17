@@ -278,6 +278,24 @@ fn do_connect(req: &Value, log_buf: &LogBuf) -> Result<Conn, String> {
     // protocol it addresses, and over HTTP the URL names it a second time, so
     // the client wants it at connect rather than per call.
     let protocol = req.get("protocol").and_then(Value::as_str).unwrap_or("");
+    // Presence of external resolution is the only thing that crosses the
+    // control protocol. It applies to every transport, not just HTTP:
+    // externalization is not an HTTP feature, and the byte-stream leg of the
+    // shared conformance suite drives exactly that.
+    let external = req
+        .get("external")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    /// Enable pointer resolution on a byte-stream client when the harness
+    /// asked for it. Fake storage vends `http://127.0.0.1` URLs, so the
+    /// permissive validator is the one the fixture needs.
+    fn with_external(client: RpcClient, external: bool) -> Result<RpcClient, String> {
+        if external {
+            client.external_resolution_any().map_err(|e| e.to_string())
+        } else {
+            Ok(client)
+        }
+    }
     match transport {
         "stdio" => {
             let argv: Vec<String> = target
@@ -291,7 +309,7 @@ fn do_connect(req: &Value, log_buf: &LogBuf) -> Result<Conn, String> {
                 .relax_nullability(relax)
                 .protocol(protocol)
                 .on_log(make_log_sink(log_buf));
-            Ok(Conn::ByteStream(client))
+            Ok(Conn::ByteStream(with_external(client, external)?))
         }
         "shm" => {
             let argv: Vec<String> = target
@@ -309,7 +327,7 @@ fn do_connect(req: &Value, log_buf: &LogBuf) -> Result<Conn, String> {
                 .relax_nullability(relax)
                 .protocol(protocol)
                 .on_log(make_log_sink(log_buf));
-            Ok(Conn::ByteStream(client))
+            Ok(Conn::ByteStream(with_external(client, external)?))
         }
         "unix" => {
             let path = target.as_str().ok_or("unix target must be a path string")?;
@@ -320,7 +338,7 @@ fn do_connect(req: &Value, log_buf: &LogBuf) -> Result<Conn, String> {
                     .relax_nullability(relax)
                     .protocol(protocol)
                     .on_log(make_log_sink(log_buf));
-                Ok(Conn::ByteStream(client))
+                Ok(Conn::ByteStream(with_external(client, external)?))
             }
             #[cfg(not(unix))]
             {
@@ -352,7 +370,7 @@ fn do_connect(req: &Value, log_buf: &LogBuf) -> Result<Conn, String> {
                 .relax_nullability(relax)
                 .protocol(protocol)
                 .on_log(make_log_sink(log_buf));
-            Ok(Conn::ByteStream(client))
+            Ok(Conn::ByteStream(with_external(client, external)?))
         }
         "http" => {
             let url = target.as_str().ok_or("http target must be a url string")?;
@@ -378,11 +396,7 @@ fn do_connect(req: &Value, log_buf: &LogBuf) -> Result<Conn, String> {
                     }
                 }
             }
-            if req
-                .get("external")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
+            if external {
                 builder = builder.external_resolution_any();
             }
             let client = builder.build().map_err(|e| e.to_string())?;

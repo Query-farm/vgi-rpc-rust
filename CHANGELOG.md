@@ -9,6 +9,58 @@ each is listed with what to do about it. Rust now produces byte-identical
 protocol hashes to the Python reference, to Go, and to TypeScript, for all
 88 conformance methods.
 
+### Upgrade note — this port's tokens are *not* rotated, and that is the divergence
+
+**Short version: upgrading a Rust-only deployment breaks no tokens.** Cursor,
+call and sticky-session tokens minted by 0.24.4 all still open on 0.25.0, so a
+rolling upgrade needs no draining of open HTTP streams or sticky sessions. Read
+on only if you run a mixed-language fleet.
+
+This is worth spelling out because the sibling ports went the other way. The
+Python reference and the TypeScript port rotated their AEAD associated data in
+this same window — prefixes bumped (`vgi_rpc.state.v4/v5` → `v6/v7`,
+`vgi_rpc.call.v1/v2` → `v3/v4`, and sticky sessions along with them) *and* a
+trailing protocol scope appended, so the break there is over-determined and
+every token class is a casualty. **This port made neither change.** Verified in
+source rather than assumed; all three AAD builders here are unchanged:
+
+| Token | Builder | Prefixes (unchanged) |
+|---|---|---|
+| Stream cursor | `compute_aad`, `vgi-rpc/src/http.rs` | `vgi_rpc.state.v5\x00` / `vgi_rpc.state.v4\x00` |
+| Call token | `compute_call_aad`, `vgi-rpc/src/http.rs` | `vgi_rpc.call.v2\x00` / `vgi_rpc.call.v1\x00` |
+| Sticky session | `compute_session_aad`, `vgi-rpc/src/sticky.rs` | `vgi_rpc.session.v2\x00` / `vgi_rpc.session.v1\x00` |
+
+(The `v5`/`v2`/`v2` spellings are the peer-evidence-bound variants; the lower
+number is used otherwise.) Note that sticky sessions do **not** share an AAD
+builder with the cursor and call tokens in this port — `sticky.rs` defines its
+own, structurally identical but separately maintained. A port-to-port
+comparison that assumes one shared builder will mis-describe this one.
+
+No builder appends a protocol scope. `compute_aad_with` is prefix, then either
+the authenticated domain and principal or the anonymous marker, then an
+optional peer-evidence binding — and `compute_session_aad` mirrors it. So in
+this port the separation between co-hosted protocols is enforced by the path
+and the routing key, not by the AEAD tag: it is not the cryptography that
+refuses a cursor replayed onto another protocol's `/exchange`. That is
+unchanged from 0.24.4 rather than new, but multi-protocol hosting is what makes
+it reachable, and it is the gap the reference closed by binding the protocol
+into the AAD.
+
+Two practical consequences:
+
+- **A mixed-language fleet sharing a `token_key` can no longer resume across
+  the language boundary.** A cursor, call or session token minted by a
+  reference Python or TypeScript worker on the rotated AAD fails this port's
+  tag check, and vice versa. It surfaces as `Malformed state token` (or
+  `session_lost_error`) with nothing naming the version skew as the cause — so
+  drain before mixing, or accept that in-flight continuations and sticky
+  sessions restart.
+- **The byte-for-byte compatibility claim in `sticky.rs`'s module docs is now
+  stale.** It states that the session token format matches Python's so the two
+  could validate each other's tokens given a shared key. With the reference's
+  session prefixes moved, that no longer holds. The comment is unchanged in
+  this release; treat it as describing 0.24.4-era Python.
+
 ### Breaking
 
 - **`vgi_rpc.protocol` is the routing key, and it is required.** A server

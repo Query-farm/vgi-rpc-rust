@@ -15,11 +15,19 @@
 //! multiplex correctly (each call carries its own header, not an ambient
 //! jar entry).
 //!
-//! Mirrors Python's `vgi_rpc/http/server/_sticky.py`. The token wire
-//! format (version `0x01`, the plaintext framing, the AAD prefix) matches
-//! the Python module byte-for-byte so a Rust worker and a Python worker
-//! sharing a `token_key` could in principle validate each other's session
-//! tokens (cross-worker resume is still gated on matching `server_id`).
+//! Mirrors Python's `vgi_rpc/http/server/_sticky.py` in structure. The
+//! plaintext framing and version byte follow it; the **AAD does not, and is
+//! not required to**. Associated data never crosses the wire and a sealed
+//! token is only ever opened by the implementation that minted it, so the
+//! AAD prefix and its numbering are internal to this worker framework
+//! (WIRE_PROTOCOL.md §5c). This module still stamps `vgi_rpc.session.v1/v2`
+//! where the reference has moved on, which is fine and deliberate.
+//!
+//! An earlier version of this comment claimed the two were byte-for-byte
+//! compatible so a Rust and a Python worker sharing a `token_key` could
+//! validate each other's session tokens. That is no longer true, and it was
+//! never a supported deployment -- do not build anything that depends on
+//! opening another implementation's tokens.
 
 use std::any::Any;
 use std::collections::HashMap;

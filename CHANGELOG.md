@@ -2,7 +2,7 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
-## [Unreleased]
+## [0.26.0] — 2026-09-18
 
 Tracks the reference's identity revision of 2026-09-18
 (`IDENTITY_V1_SPEC.md`: §4 "No rate limiter", §8 "Retired").

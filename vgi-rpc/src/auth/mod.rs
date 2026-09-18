@@ -15,13 +15,13 @@
 //!   - [`jwt::jwt_authenticate`] (feature `jwt`)
 //!   - [`pkce`] (feature `oauth-pkce`)
 //!
-//! [`introspect`] is the inverse direction: resolving an opaque credential to a
-//! principal *on behalf of a fronting proxy*, which is a distinct capability
-//! from authenticating a request and is off unless explicitly enabled.
+//! The inverse direction -- resolving an opaque credential to a principal *on
+//! behalf of a fronting proxy* -- is not authentication and does not live here:
+//! it is the co-hosted `vgi_rpc.Identity.v1` protocol, in
+//! [`crate::token_identity`].
 
 pub mod bearer;
 pub mod identity;
-pub mod introspect;
 pub mod iroh;
 pub mod mtls;
 pub mod oauth;

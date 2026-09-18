@@ -6,7 +6,9 @@
 //! `identity_protocol.rs`; what is asserted here is that the same binding is
 //! reachable over HTTP, that it is addressed by the *routing key* rather than
 //! by the URL path (so an application method named `introspect_token` is a
-//! different method), and that a worker that configured no hook grows no route.
+//! different method), that a worker that configured no hook grows no route, and
+//! that the retired `__introspect_token__` JSON route is gone -- `Identity.v1`
+//! is the only introspection surface (cross-port spec §8).
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -17,13 +19,14 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use tower::ServiceExt; // for oneshot
 
-use vgi_rpc::auth::introspect::TokenIdentity;
 use vgi_rpc::http::HttpState;
 use vgi_rpc::metadata::{
     ERROR_KIND_KEY, LOG_LEVEL_KEY, PROTOCOL_KEY, REQUEST_ID_KEY, REQUEST_VERSION,
     REQUEST_VERSION_KEY, RPC_METHOD_KEY,
 };
-use vgi_rpc::token_identity::{IdentityImpl, IDENTITY_PROTOCOL_NAME, INTROSPECT_TOKEN_METHOD};
+use vgi_rpc::token_identity::{
+    IdentityImpl, TokenIdentity, IDENTITY_PROTOCOL_NAME, INTROSPECT_TOKEN_METHOD,
+};
 use vgi_rpc::wire::{Metadata, StreamReader, StreamWriter};
 use vgi_rpc::{AuthContext, RpcServer};
 
@@ -206,4 +209,111 @@ async fn the_routing_key_selects_the_protocol_not_the_path() {
 async fn an_unconfigured_worker_hosts_nothing() {
     let (status, _frames) = post(state(None), Some(INTROSPECTOR), IDENTITY_PROTOCOL_NAME).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The pre-0.46 JSON route is retired, not merely unadvertised: a worker that
+/// *does* resolve credentials must not answer it, and must not consult its
+/// resolver for it. Two surfaces meant two sets of guards to keep identical,
+/// and the second had already drifted -- it kept a rate limiter after the
+/// protocol dropped one.
+///
+/// The resolver here resolves everything and counts its calls, so a route that
+/// quietly survived would show up as a resolution or as a call, not hide
+/// behind a rejection that reads the same either way.
+#[tokio::test]
+async fn the_retired_json_route_is_not_served() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let state = state(Some(
+        IdentityImpl::builder()
+            .resolve_token(Arc::new(move |_: &str| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(TokenIdentity::new("subject@example")))
+            }))
+            .introspect_principals([INTROSPECTOR])
+            .build(),
+    ));
+    let resp = vgi_rpc::http::build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/__introspect_token__")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(PRINCIPAL_HEADER, INTROSPECTOR)
+                .body(Body::from(
+                    serde_json::json!({ "token": SUBJECT }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(
+        status.is_client_error(),
+        "POST /__introspect_token__ answered {status}: {body}"
+    );
+    assert!(
+        !body.contains("subject@example") && !body.contains("ttl_seconds"),
+        "the retired route answered with an identity: {body}"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the retired route consulted the resolver"
+    );
+}
+
+/// Its capability header went with it. A client learns whether a worker
+/// introspects from reflection (`vgi_rpc.Identity.v1` hosted), which is what
+/// the reference and the conformance group use; a stale advert would send a
+/// proxy's preflight to a route that no longer exists.
+#[tokio::test]
+async fn health_does_not_advertise_the_retired_route() {
+    let state = HttpState::builder()
+        .server(Arc::new(
+            RpcServer::builder()
+                .server_id("it")
+                .protocol_name("Test")
+                .identity(
+                    IdentityImpl::builder()
+                        .resolve_token(resolver())
+                        .introspect_principals([INTROSPECTOR])
+                        .build(),
+                )
+                .build(),
+        ))
+        .authenticate(Arc::new(principal_from_header))
+        .cors_origins("https://proxy.example")
+        .build();
+    for method in ["OPTIONS", "GET"] {
+        let resp = vgi_rpc::http::build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/health")
+                    .header(header::ORIGIN, "https://proxy.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.headers().get("vgi-token-introspection").is_none(),
+            "{method} /health still advertises the retired route"
+        );
+        let exposed = resp
+            .headers()
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            !exposed.contains("vgi-token-introspection"),
+            "{method} /health still exposes the retired header: {exposed}"
+        );
+    }
 }

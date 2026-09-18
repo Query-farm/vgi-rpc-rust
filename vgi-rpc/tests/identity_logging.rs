@@ -11,17 +11,15 @@
 
 use std::sync::{Arc, Mutex};
 
-use vgi_rpc::auth::introspect::{
-    token_digest, TokenIdentity, TokenIntrospector, DEFAULT_INTROSPECT_RATE_LIMIT,
-    DEFAULT_INTROSPECT_TTL_SECONDS,
-};
+use vgi_rpc::token_identity::{token_digest, IdentityImpl, TokenIdentity};
 use vgi_rpc::AuthContext;
 
 const SUBJECT: &str = "opaque-subject-token";
 const UNKNOWN: &str = "no-such-credential";
-/// JWS-shaped *and* resolvable, so the shape guard is what refuses it — and so
-/// the refusal's log line is one that has seen the credential.
-const JWS: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl";
+/// Resolvable only by a resolver that is down, so the outage path's log line —
+/// the one written at `error`, and so the likeliest to be shipped — is one that
+/// has seen the credential.
+const OUTAGE: &str = "credential-during-an-outage";
 
 /// Collects a subscriber's formatted output so the test can assert on what was
 /// — and was not — written.
@@ -53,25 +51,27 @@ fn the_credential_never_reaches_a_log_record() {
         .with_max_level(tracing::Level::TRACE)
         .finish();
     tracing::subscriber::with_default(subscriber, || {
-        let it = TokenIntrospector::new(
-            Arc::new(|token: &str| {
-                Ok((token == SUBJECT || token == JWS)
-                    .then(|| TokenIdentity::new("subject@example")))
-            }),
-            ["proxy"],
-            DEFAULT_INTROSPECT_TTL_SECONDS,
-            DEFAULT_INTROSPECT_RATE_LIMIT,
-        );
+        let identity = IdentityImpl::builder()
+            .resolve_token(Arc::new(|token: &str| {
+                if token == OUTAGE {
+                    return Err(vgi_rpc::token_identity::identity_unavailable(
+                        "token store unreachable",
+                    ));
+                }
+                Ok((token == SUBJECT).then(|| TokenIdentity::new("subject@example")))
+            }))
+            .introspect_principals(["proxy"])
+            .build();
         let caller = AuthContext::for_principal("test", "proxy");
-        // Every path that touches the token, because each has its own log call.
-        for token in [SUBJECT, UNKNOWN, JWS] {
-            let body = serde_json::json!({ "token": token }).to_string();
-            it.introspect(&caller, body.as_bytes());
+        // Every path that reaches the resolver, because each has its own log
+        // call: resolved, did not resolve, and could not find out.
+        for token in [SUBJECT, UNKNOWN, OUTAGE] {
+            let _ = identity.introspect_token(token, &caller);
         }
     });
     let log = String::from_utf8(buf.lock().unwrap().clone()).expect("utf-8 log");
 
-    for secret in [SUBJECT, UNKNOWN, JWS] {
+    for secret in [SUBJECT, UNKNOWN, OUTAGE] {
         assert!(
             !log.contains(secret),
             "the credential reached the log: {log}"
@@ -79,7 +79,7 @@ fn the_credential_never_reaches_a_log_record() {
     }
     // Digested rather than dropped: a diagnostic that cannot correlate one
     // credential's failures across records is not worth emitting.
-    for secret in [SUBJECT, UNKNOWN, JWS] {
+    for secret in [SUBJECT, UNKNOWN, OUTAGE] {
         assert!(
             log.contains(&token_digest(secret)),
             "no digest for {secret} in: {log}"

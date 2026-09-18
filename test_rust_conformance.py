@@ -178,7 +178,7 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
 
     variant ∈ {plain, no_compression, storage, zstd_storage, externalize_always,
     strict, small_request_cap, auth, sticky_short_ttl, sticky_peer_a, sticky_peer_b, sticky_auth,
-    cors, introspect, identity, identity_introspect_only}.
+    cors, identity, identity_introspect_only}.
     Raises ``pytest.skip`` for (server, variant) combinations not wired here
     (the Go conformance binary doesn't expose the storage/strict/auth modes).
 
@@ -222,8 +222,6 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
                 ],
                 expect_port=port,
             )
-        if variant == "introspect":
-            return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--introspect"])
         if variant in ("identity", "identity_introspect_only"):
             mode = "both" if variant == "identity" else "introspect-only"
             return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--identity", mode])
@@ -353,8 +351,6 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
                     _CORS_ORIGIN,
                 ]
             )
-        if variant == "introspect":
-            return _spawn_read_port([RUST_WORKER, "--http", "--introspect"])
         if variant in ("identity", "identity_introspect_only"):
             # Same binary, different flag — which is the point: the narrowing
             # under test is a *configuration* difference, so two binaries
@@ -829,23 +825,6 @@ def conformance_http_cors_port(conformance_fake_storage: str) -> Iterator[int]:
     exposures a port is most likely to miss.
     """
     yield from _http_variant_fixture("cors", conformance_fake_storage)
-
-
-@pytest.fixture(scope="session")
-def conformance_http_introspect_port() -> Iterator[int]:
-    """HTTP worker with token introspection enabled.
-
-    Backs the shared ``TestTokenIntrospection`` group. It needs its own worker
-    because the endpoint is absent unless explicitly enabled — which
-    ``TestTokenIntrospectionOffMode`` asserts against the plain worker, and
-    which is the guard that stops a worker growing a credential-to-identity
-    oracle by upgrading a dependency.
-
-    The worker is configured with the exact constants the shared suite posts
-    (``_INTROSPECTOR`` / ``_SUBJECT_TOKEN`` / ``_SUBJECT_PRINCIPAL`` /
-    ``_JWS_TRAP_TOKEN``); see ``introspect_fixture`` in the Rust worker.
-    """
-    yield from _http_variant_fixture("introspect")
 
 
 @pytest.fixture(scope="session")

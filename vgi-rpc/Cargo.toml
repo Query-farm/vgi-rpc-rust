@@ -115,10 +115,6 @@ name = "http_init_metadata"
 required-features = ["http"]
 
 [[test]]
-name = "http_introspect"
-required-features = ["http"]
-
-[[test]]
 name = "http_load_balance"
 required-features = ["http"]
 

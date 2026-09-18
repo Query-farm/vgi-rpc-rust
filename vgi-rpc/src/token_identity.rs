@@ -4,9 +4,12 @@
 //! protocol: a bearer token is not an application concept, the auth primitives
 //! it builds on ([`AuthContext`], [`RpcError::auth_unavailable`]) are already
 //! here, and implementing it once is the whole point. It was previously an
-//! HTTP JSON route, `POST {prefix}/__introspect_token__` (still served by
-//! [`crate::auth::introspect`] for callers that speak it), which meant it
+//! HTTP JSON route, `POST {prefix}/__introspect_token__`, which meant it
 //! existed on one transport only and had to be hand-written in every port.
+//! That route is **retired** and this port no longer serves it (cross-port
+//! spec §8): two introspection surfaces meant two sets of guards to keep
+//! identical, and the second had already drifted -- it kept a rate limiter
+//! after the protocol dropped one.
 //!
 //! Two methods share this module's guards, and they are guarded *differently*
 //! on purpose.
@@ -18,13 +21,23 @@
 //! entitlement lookups, policy-tier selection. "Trust it as much as you trust
 //! the worker" is the wrong frame: it must be trusted *more*. So every
 //! rejection is uniform, the caller must be on an allowlist with no permissive
-//! default, a JWS-shaped subject never reaches the resolver, and the whole
-//! thing is rate limited.
+//! default, and a JWS-shaped subject never reaches the resolver.
+//!
+//! It is deliberately **not rate limited**. The allowlist is the control: the
+//! only callers are trusted askers, in practice a proxy. A per-caller limit
+//! there bounds only guessing, which is hopeless against a random credential
+//! at any rate, and not the real harm of a leaked introspector credential --
+//! resolving a *stolen* credential to its owner takes one call. What it did do
+//! was harm: the asker calls on behalf of everyone who presents a bearer, so a
+//! per-caller budget is one budget for every user's login, drainable by
+//! unauthenticated junk credentials. Throttling untrusted traffic belongs where
+//! it arrives -- at the asker, per client -- and a throttled answer is never
+//! `introspection_refused`, which a caller may cache as definitive.
 //!
 //! `issue_grant` mints a credential for the *calling* user, so it is not an
-//! oracle about anybody else. It therefore needs no allowlist and no rate
-//! limit, and its rejections are deliberately *actionable*: a console that
-//! cannot tell "your login is too old" from "no" cannot know to re-prompt.
+//! oracle about anybody else. It therefore needs no allowlist, and its
+//! rejections are deliberately *actionable*: a console that cannot tell "your
+//! login is too old" from "no" cannot know to re-prompt.
 //!
 //! Errors carry a stable [`RpcError::error_kind`]. That is load-bearing rather
 //! than decorative: these used to be a bespoke HTTP route whose callers
@@ -35,24 +48,16 @@
 //! a definitive rejection hammers the worker.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use sha2::{Digest, Sha256};
 
 use crate::auth::AuthContext;
 use crate::errors::{Result, RpcError};
 use crate::server::{CallContext, MethodInfo, Request};
-
-// Re-exported so a caller wiring this protocol needs one import, and so the
-// *same* resolver backs both this protocol and the legacy HTTP route -- two
-// copies of "what does this credential resolve to" is exactly how two answers
-// for one credential appear.
-pub use crate::auth::introspect::{
-    is_jws_shaped, token_digest, TokenIdentity, TokenResolver, DEFAULT_INTROSPECT_RATE_LIMIT,
-    DEFAULT_INTROSPECT_TTL_SECONDS,
-};
 
 /// The wire name of the identity protocol.
 ///
@@ -85,6 +90,104 @@ pub const DEFAULT_MAX_AUTH_AGE_SECONDS: f64 = 900.0;
 /// `Retry-After` carried by [`identity_unavailable`]. Short on purpose: it is
 /// a hint to retry, not a backoff schedule.
 pub const DEFAULT_IDENTITY_RETRY_AFTER_SECONDS: u32 = 5;
+
+/// Cache window advertised for a resolution that does not name its own.
+pub const DEFAULT_INTROSPECT_TTL_SECONDS: u64 = 300;
+
+// ---------------------------------------------------------------------------
+// What a resolver answers
+// ---------------------------------------------------------------------------
+
+/// The identity an opaque credential authenticates as.
+///
+/// **It never carries claims.** A pass-through claims field would let a worker
+/// choose its caller's tenant routing, its row scope, and its policy branch --
+/// the single most dangerous thing this protocol could grow. The asker derives
+/// what it needs from the principal alone.
+#[derive(Clone, Debug)]
+pub struct TokenIdentity {
+    /// The canonical principal. Return it in the exact form the worker itself
+    /// would derive, so an asker that normalises differently does not authorize
+    /// as one identity while the worker serves another.
+    pub principal: String,
+    /// Human-readable name for the credential, for audit trails. Never the
+    /// credential.
+    pub token_name: String,
+    /// How long the answer may be cached. `None` takes the configured default.
+    /// The *caller* does the caching; the worker holds none of its own. Treat
+    /// it as an authorization window, because for any path the asker serves
+    /// without re-presenting the credential it is exactly that.
+    pub ttl_seconds: Option<u64>,
+}
+
+impl TokenIdentity {
+    /// Identity with no display name and the configured default TTL.
+    pub fn new(principal: impl Into<String>) -> Self {
+        Self {
+            principal: principal.into(),
+            token_name: String::new(),
+            ttl_seconds: None,
+        }
+    }
+
+    /// Attach the credential's display name (never the credential).
+    pub fn with_token_name(mut self, name: impl Into<String>) -> Self {
+        self.token_name = name.into();
+        self
+    }
+
+    /// Override the configured default cache window for this credential.
+    pub fn with_ttl_seconds(mut self, ttl: u64) -> Self {
+        self.ttl_seconds = Some(ttl);
+        self
+    }
+}
+
+/// Resolves an opaque credential.
+///
+/// `Ok(None)` means "did not resolve" -- unknown, expired and malformed are one
+/// answer, because reporting which would confirm that a guessed credential
+/// exists. `Err(`[`identity_unavailable`]`)` (or any other `Err`) means the
+/// answer is not *knowable*: a backing store that is down is not a credential
+/// that is unknown, and a caller that negative-caches the second must not cache
+/// the first.
+pub type TokenResolver = Arc<dyn Fn(&str) -> Result<Option<TokenIdentity>> + Send + Sync>;
+
+/// Return a SHA-256 hex digest of `token`, for diagnostics.
+///
+/// The credential itself must never reach a log, a span, or an error message. A
+/// digest is stable enough to correlate one credential's failures across
+/// records without being the credential.
+pub fn token_digest(token: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(token.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// Three dot-separated base64url segments -- a JWS.
+///
+/// Such a credential is validated locally against a key set and MUST NOT be
+/// routed to a resolver: doing so sends a bearer token the asker may itself
+/// have rejected (expired, wrong audience) to a third party that might accept
+/// it. The trailing segment may be empty (an unsecured JWS still has the
+/// shape).
+///
+/// Hand-rolled rather than a regex, deliberately: a backtracking engine on
+/// attacker-controlled input is its own hazard. Callers test the *trimmed*
+/// credential -- see [`reject_jws_shaped`].
+pub fn is_jws_shaped(token: &str) -> bool {
+    let mut parts = token.split('.');
+    let (Some(a), Some(b), Some(c), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let b64url = |s: &str| {
+        s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    };
+    !a.is_empty() && !b.is_empty() && b64url(a) && b64url(b) && b64url(c)
+}
 
 // ---------------------------------------------------------------------------
 // Error taxonomy
@@ -175,73 +278,6 @@ fn as_unavailable(err: RpcError) -> RpcError {
 }
 
 // ---------------------------------------------------------------------------
-// Rate limiting
-// ---------------------------------------------------------------------------
-
-/// Fixed-window request limiter, keyed by caller.
-///
-/// Present because introspection is a credential-to-identity oracle even when
-/// correctly restricted: an allowlisted caller whose own credential leaks can
-/// still test guesses. Rate limiting does not close that, it bounds it.
-///
-/// Fixed-window rather than a token bucket: a window admits at most twice the
-/// rate across a boundary, which is a rounding error here, and the state is one
-/// integer per caller rather than a float that has to be aged.
-///
-/// One `Mutex` around the whole `(window_start, counts)` pair, because the two
-/// are only meaningful together -- a reader that saw a rolled window and a
-/// stale count would admit a caller that is over budget.
-pub struct RateLimiter {
-    per_window: u32,
-    window: Duration,
-    state: Mutex<(Instant, HashMap<String, u32>)>,
-}
-
-impl RateLimiter {
-    /// Build a limiter admitting `per_window` requests per one-second window.
-    pub fn new(per_window: u32) -> Self {
-        Self {
-            per_window,
-            window: Duration::from_secs(1),
-            state: Mutex::new((Instant::now(), HashMap::new())),
-        }
-    }
-
-    /// Whether `key` may make a request now.
-    pub fn allow(&self, key: &str) -> bool {
-        self.allow_at(key, Instant::now())
-    }
-
-    /// Whether `key` may make a request at `now`.
-    ///
-    /// The clock is a parameter so the window-roll behaviour is testable
-    /// without sleeping -- a limiter verified by `sleep` is a limiter verified
-    /// flakily.
-    pub fn allow_at(&self, key: &str, now: Instant) -> bool {
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, counts) = &mut *guard;
-        if now.saturating_duration_since(*start) >= self.window {
-            // Whole-map reset rather than per-key ageing: an attacker cycling
-            // keys cannot grow the map beyond one window's worth.
-            counts.clear();
-            *start = now;
-        }
-        let count = counts.entry(key.to_string()).or_insert(0);
-        if *count >= self.per_window {
-            return false;
-        }
-        *count += 1;
-        true
-    }
-
-    /// Number of keys currently tracked. Exposed for the test that pins the
-    /// whole-map reset; a growing map is the failure mode it guards.
-    pub fn tracked_keys(&self) -> usize {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).1.len()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Payloads
 // ---------------------------------------------------------------------------
 
@@ -310,9 +346,7 @@ pub type GrantMinter = Arc<dyn Fn(&str, &str, &[String], i64) -> Result<IssuedGr
 /// introspection into an open oracle, so it must not be reachable by omission.
 /// A panic rather than a returned error because this is a *construction*
 /// check -- a worker that would refuse every introspection should fail to
-/// start rather than serve traffic until someone tries. It matches
-/// [`crate::auth::introspect::TokenIntrospector::new`], which guards the same
-/// configuration on the HTTP route.
+/// start rather than serve traffic until someone tries.
 pub fn normalise_principals<I, S>(principals: I) -> BTreeSet<String>
 where
     I: IntoIterator<Item = S>,
@@ -476,7 +510,7 @@ pub fn check_freshness_at(auth: &AuthContext, max_auth_age: f64, now: f64) -> Re
 /// Applies this module's guards, then delegates to worker-supplied hooks.
 ///
 /// The framework owns the guards and owns none of the policy. It decides who
-/// may ask, how often, and what shape of credential is refused outright; the
+/// may ask and what shape of credential is refused outright; the
 /// worker decides what a credential resolves to and whether a grant is minted.
 /// That split is deliberate -- the guards are the part that is identical in
 /// every deployment and catastrophic to get wrong, and the policy is the part
@@ -495,7 +529,6 @@ pub struct IdentityImpl {
     principals: BTreeSet<String>,
     default_ttl_seconds: u64,
     max_auth_age: f64,
-    limiter: RateLimiter,
 }
 
 impl std::fmt::Debug for IdentityImpl {
@@ -515,7 +548,6 @@ pub struct IdentityImplBuilder {
     mint_grant: Option<GrantMinter>,
     principals: Vec<String>,
     default_ttl_seconds: Option<u64>,
-    rate_limit: Option<u32>,
     max_auth_age: Option<f64>,
 }
 
@@ -547,12 +579,6 @@ impl IdentityImplBuilder {
         S: Into<String>,
     {
         self.principals = principals.into_iter().map(Into::into).collect();
-        self
-    }
-
-    /// Introspections allowed per caller per second (default 20).
-    pub fn introspect_rate_limit(mut self, per_second: u32) -> Self {
-        self.rate_limit = Some(per_second);
         self
     }
 
@@ -594,7 +620,6 @@ impl IdentityImplBuilder {
                 .default_ttl_seconds
                 .unwrap_or(DEFAULT_INTROSPECT_TTL_SECONDS),
             max_auth_age: self.max_auth_age.unwrap_or(DEFAULT_MAX_AUTH_AGE_SECONDS),
-            limiter: RateLimiter::new(self.rate_limit.unwrap_or(DEFAULT_INTROSPECT_RATE_LIMIT)),
         }
     }
 }
@@ -624,10 +649,13 @@ impl IdentityImpl {
     /// Resolve `token`, after checking the caller may ask.
     ///
     /// The guard order is load-bearing and must not be tidied: authorization
-    /// and rate limiting come *before* anything looks at the subject
-    /// credential -- before its length is measured, before its shape is
-    /// tested. An unauthorized caller must learn nothing about the subject,
-    /// including how long looking at it took.
+    /// comes *before* anything looks at the subject credential -- before its
+    /// length is measured, before its shape is tested. An unauthorized caller
+    /// must learn nothing about the subject, including how long looking at it
+    /// took.
+    ///
+    /// There is deliberately no rate limit between the two (see the module
+    /// docs): an allowlisted asker is answered however often it asks.
     pub fn introspect_token(&self, token: &str, auth: &AuthContext) -> Result<TokenIdentity> {
         // 1. The hook is absent. Belt to the braces of not registering the
         //    method at all, for a caller that reached it anyway.
@@ -640,17 +668,7 @@ impl IdentityImpl {
         // 2. Authorization.
         let caller = check_introspector(auth, &self.principals)?;
 
-        // 3. Rate limit, keyed by caller.
-        if !self.limiter.allow(caller) {
-            tracing::warn!(
-                target: "vgi_rpc.identity",
-                principal = %caller,
-                "introspection rate limit exceeded"
-            );
-            return Err(introspection_refused("introspection rate limit exceeded"));
-        }
-
-        // 4. Only now does the subject credential get looked at. The shape
+        // 3. Only now does the subject credential get looked at. The shape
         //    test runs on the trimmed form; the hook -- and the digest that
         //    correlates its failures -- gets the credential exactly as it
         //    arrived.
@@ -669,7 +687,7 @@ impl IdentityImpl {
                 );
                 Ok(identity)
             }
-            // 5. Uniform with malformed and expired: reporting which would
+            // 4. Uniform with malformed and expired: reporting which would
             //    confirm that a guessed credential exists.
             Ok(None) => {
                 tracing::info!(
@@ -956,6 +974,7 @@ impl IdentityBinding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     const GOOD: &str = "good";
 
@@ -1234,26 +1253,6 @@ mod tests {
         }
     }
 
-    /// Rate limiting also precedes the subject: an allowlisted caller that has
-    /// exhausted its budget is refused before the credential is inspected.
-    #[test]
-    fn the_rate_limit_precedes_every_look_at_the_subject() {
-        let impl_ = IdentityImpl::builder()
-            .resolve_token(resolver())
-            .introspect_principals(["proxy"])
-            .introspect_rate_limit(1)
-            .build();
-        assert!(impl_.introspect_token(GOOD, &auth("proxy")).is_ok());
-        let err = impl_
-            .introspect_token("aaa.bbb.ccc", &auth("proxy"))
-            .unwrap_err();
-        assert_eq!(
-            err.error_kind.as_deref(),
-            Some(ERROR_KIND_INTROSPECTION_REFUSED)
-        );
-        assert!(err.message.contains("rate limit"));
-    }
-
     /// Unknown, malformed and over-long are one answer. Distinguishing them
     /// would confirm that a guessed credential exists.
     #[test]
@@ -1321,14 +1320,34 @@ mod tests {
         assert_ne!(err.error_type, token_unresolved().error_type);
     }
 
-    /// Bounds, rather than closes, the oracle an allowlisted caller still has.
+    /// The allowlisted caller is answered however often it asks.
+    ///
+    /// The caller is the asker -- a proxy -- introspecting on behalf of every
+    /// client that presents a bearer, so a per-caller limit was one budget for
+    /// every user's login, drainable by unauthenticated junk credentials. 500
+    /// is 25 times the retired default of 20 per second, all inside one second.
     #[test]
-    fn rate_limited() {
-        let impl_ = IdentityImpl::builder()
-            .resolve_token(resolver())
-            .introspect_principals(["proxy"])
-            .introspect_rate_limit(2)
-            .build();
+    fn introspection_is_not_rate_limited() {
+        let impl_ = introspecting();
+        for i in 0..500 {
+            let resolved = impl_
+                .introspect_token(GOOD, &auth("proxy"))
+                .unwrap_or_else(|e| panic!("introspection {i} was refused: {e:?}"));
+            assert_eq!(resolved.principal, "bob");
+        }
+    }
+
+    /// Nor does a burst of junk credentials -- the drain that made the retired
+    /// limiter a lockout -- cost the next valid credential its answer.
+    #[test]
+    fn junk_credentials_do_not_starve_a_valid_one() {
+        let impl_ = introspecting();
+        for i in 0..100 {
+            let err = impl_
+                .introspect_token(&format!("junk-{i}"), &auth("proxy"))
+                .unwrap_err();
+            assert_eq!(err.error_kind.as_deref(), Some(ERROR_KIND_TOKEN_UNRESOLVED));
+        }
         assert_eq!(
             impl_
                 .introspect_token(GOOD, &auth("proxy"))
@@ -1336,15 +1355,26 @@ mod tests {
                 .principal,
             "bob"
         );
-        assert_eq!(
-            impl_
-                .introspect_token(GOOD, &auth("proxy"))
-                .unwrap()
-                .principal,
-            "bob"
-        );
-        let err = impl_.introspect_token(GOOD, &auth("proxy")).unwrap_err();
-        assert!(err.message.contains("rate limit"));
+    }
+
+    /// Concurrent, so the burst lands inside one window however the threads
+    /// are scheduled -- the shape `TestIntrospectionIsNotThrottled` sends over
+    /// the wire.
+    #[test]
+    fn a_concurrent_burst_is_answered_in_full() {
+        let impl_ = Arc::new(introspecting());
+        let handles: Vec<_> = (0..12)
+            .map(|_| {
+                let impl_ = impl_.clone();
+                std::thread::spawn(move || {
+                    (0..20)
+                        .filter(|_| impl_.introspect_token(GOOD, &auth("proxy")).is_err())
+                        .count()
+                })
+            })
+            .collect();
+        let refused: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(refused, 0, "{refused} of 240 introspections were refused");
     }
 
     /// There is no permissive default, so it cannot be reached by omission.
@@ -1523,6 +1553,24 @@ mod tests {
         assert_eq!(token_digest("secret"), token_digest("secret"));
         assert_ne!(token_digest("secret"), token_digest("other"));
         assert_eq!(token_digest("secret").len(), 64);
+    }
+
+    /// The shape matcher refuses a JWS and nothing that merely resembles one:
+    /// an opaque credential with dots in it must still reach the resolver.
+    #[test]
+    fn the_jws_matcher_does_not_catch_opaque_credentials() {
+        assert!(is_jws_shaped(
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl"
+        ));
+        assert!(
+            is_jws_shaped("a.b."),
+            "an unsecured JWS still has the shape"
+        );
+        assert!(!is_jws_shaped("conformance-opaque-subject-token"));
+        assert!(!is_jws_shaped("a.b"));
+        assert!(!is_jws_shaped("a.b.c.d"));
+        assert!(!is_jws_shaped("a.b.c!"));
+        assert!(!is_jws_shaped(".b.c"));
     }
 
     /// The `error_kind` strings are the only definitive/transient signal a
@@ -1714,52 +1762,6 @@ mod tests {
             seen.lock().unwrap().is_empty(),
             "the resolver was handed a newline-padded JWS"
         );
-    }
-
-    // -- The rate limiter --------------------------------------------------
-
-    /// Within a window.
-    #[test]
-    fn admits_up_to_the_limit() {
-        let limiter = RateLimiter::new(3);
-        let t = Instant::now();
-        assert_eq!(
-            (0..4).map(|_| limiter.allow_at("a", t)).collect::<Vec<_>>(),
-            vec![true, true, true, false]
-        );
-    }
-
-    /// A new window resets the count.
-    #[test]
-    fn window_rolls() {
-        let limiter = RateLimiter::new(1);
-        let t = Instant::now();
-        assert!(limiter.allow_at("a", t));
-        assert!(!limiter.allow_at("a", t + Duration::from_millis(500)));
-        assert!(limiter.allow_at("a", t + Duration::from_millis(1500)));
-    }
-
-    /// One caller exhausting its budget must not refuse another.
-    #[test]
-    fn callers_are_independent() {
-        let limiter = RateLimiter::new(1);
-        let t = Instant::now();
-        assert!(limiter.allow_at("a", t));
-        assert!(limiter.allow_at("b", t));
-        assert!(!limiter.allow_at("a", t));
-    }
-
-    /// Whole-map reset rather than per-key ageing, so an attacker cycling keys
-    /// cannot grow the map without bound between sweeps.
-    #[test]
-    fn cycling_keys_cannot_grow_the_map() {
-        let limiter = RateLimiter::new(1);
-        let t = Instant::now();
-        for i in 0..1000 {
-            limiter.allow_at(&format!("k{i}"), t);
-        }
-        limiter.allow_at("fresh", t + Duration::from_secs(100));
-        assert_eq!(limiter.tracked_keys(), 1);
     }
 
     // -- Payload shapes ----------------------------------------------------

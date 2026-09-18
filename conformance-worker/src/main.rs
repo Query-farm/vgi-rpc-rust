@@ -132,51 +132,6 @@ fn reject_all(req: &vgi_rpc::auth::AuthRequest) -> vgi_rpc::auth::AuthResult {
     }
 }
 
-/// Fixed conformance values for the token-introspection group, mirroring the
-/// module constants in the shared `_pytest_suite.py`. A port supplying
-/// `conformance_http_introspect_port` MUST configure exactly these: the shared
-/// tests post the subject credential and assert the principal, so they are part
-/// of the fixture's contract rather than decoration.
-mod introspect_fixture {
-    pub const INTROSPECTOR: &str = "conformance-introspector";
-    pub const SUBJECT_TOKEN: &str = "conformance-opaque-subject-token";
-    pub const SUBJECT_PRINCIPAL: &str = "subject@conformance.example";
-    pub const SUBJECT_TOKEN_NAME: &str = "conformance-subject";
-    /// A JWS-shaped credential the resolver *would* resolve. Deliberately
-    /// resolvable: against an unknown JWS a port with no shape guard rejects it
-    /// as unknown and passes the test for the wrong reason. Made resolvable,
-    /// the guard is the only thing that can produce a rejection.
-    pub const JWS_TRAP_TOKEN: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl";
-    /// The credential whose resolution is *unknowable* rather than unknown. The
-    /// shared suite posts it to check that a backing-store outage surfaces as a
-    /// transient `503` and not as the endpoint's own definitive `404` — which a
-    /// caller may negative-cache, so a briefly unreachable store would be
-    /// remembered as a bad credential for the cache's lifetime.
-    pub const UNAVAILABLE_TOKEN: &str = "conformance-unavailable-token";
-}
-
-/// Resolve the fixed credentials the shared tests post.
-///
-/// Three answers, deliberately: an identity, `Ok(None)` for "does not resolve",
-/// and `Err` for "I could not find out". The third is not a flavour of the
-/// second — `Ok(None)` becomes the definitive `404` a caller may negative-cache.
-fn conformance_resolve_token(
-    token: &str,
-) -> Result<Option<vgi_rpc::auth::introspect::TokenIdentity>, vgi_rpc::RpcError> {
-    use introspect_fixture::*;
-    if token == UNAVAILABLE_TOKEN {
-        return Err(vgi_rpc::RpcError::auth_unavailable(
-            "conformance: mapping store unreachable",
-        ));
-    }
-    Ok(
-        (token == SUBJECT_TOKEN || token == JWS_TRAP_TOKEN).then(|| {
-            vgi_rpc::auth::introspect::TokenIdentity::new(SUBJECT_PRINCIPAL)
-                .with_token_name(SUBJECT_TOKEN_NAME)
-        }),
-    )
-}
-
 /// Resolve the principal named in `X-Conformance-Principal`, or stay anonymous.
 ///
 /// Naming yourself in a header is obviously not authentication — it is the
@@ -744,29 +699,19 @@ fn run_http(
         if let Some(hex) = sticky.token_key_hex.as_deref() {
             builder = builder.token_key_hex(hex);
         }
-        // `--introspect` backs the shared TestTokenIntrospection group: the
-        // endpoint plus a single-principal allowlist. It implies principal-
-        // header auth so the allowlist has something to check — without an
-        // identity every caller is anonymous and the group could only ever
-        // observe the refusal. Read from argv here rather than threaded through
-        // this function's parameter list, same as the two options above.
-        let introspect = std::env::args().any(|a| a == "--introspect");
-        // `--identity` implies principal-header auth for the same reason:
-        // both identity methods guard on an authenticated caller, so without
-        // one the group could only ever observe the refusal.
+        // `--identity` implies principal-header auth: both identity methods
+        // guard on an authenticated caller, so without one the group could
+        // only ever observe the refusal. Read from argv here rather than
+        // threaded through this function's parameter list, same as the two
+        // options above.
         let identity =
             identity_fixture::IdentityMode::from_args(&std::env::args().collect::<Vec<_>>())
                 != identity_fixture::IdentityMode::Off;
-        if sticky.principal_auth || introspect || identity {
+        if sticky.principal_auth || identity {
             // Unlike the reject-all mode above, this deliberately leaves the
             // prefix at the root — the suite connects to this worker exactly as
             // to the plain one.
             builder = builder.authenticate(std::sync::Arc::new(principal_from_header));
-        }
-        if introspect {
-            builder = builder
-                .introspect_resolver(std::sync::Arc::new(conformance_resolve_token))
-                .introspect_principals([introspect_fixture::INTROSPECTOR]);
         }
         if no_compression {
             builder = builder.disable_response_compression();

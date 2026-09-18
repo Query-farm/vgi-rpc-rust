@@ -33,8 +33,9 @@
 //! six language ports a deterministic authenticated caller without an identity
 //! provider. It is a *test fixture* and must never be deployed.
 
-use vgi_rpc::auth::introspect::TokenIdentity;
-use vgi_rpc::token_identity::{grant_refused, identity_unavailable, IdentityImpl, IssuedGrant};
+use vgi_rpc::token_identity::{
+    grant_refused, identity_unavailable, IdentityImpl, IssuedGrant, TokenIdentity,
+};
 use vgi_rpc::RpcError;
 
 // ---------------------------------------------------------------------------
@@ -62,13 +63,9 @@ pub const AUTH_TIME_HEADER: &str = "x-conformance-auth-time";
 /// and "authenticated but not on the list" are both reachable.
 pub const INTROSPECTOR_PRINCIPAL: &str = "conformance-introspector";
 
-/// `introspect_rate_limit` the worker must configure. Deliberately far above
-/// the default: nearly every case in the group is an introspection, and a
-/// limiter tuned for production would fire mid-group with every resulting
-/// failure reading as the wrong guard. The limiter is covered port-locally
-/// instead (`vgi-rpc/src/token_identity.rs`), where its refusal is
-/// distinguishable by message and so cannot be tested vacuously.
-pub const INTROSPECT_RATE_LIMIT: u32 = 100_000;
+// There is no `introspect_rate_limit` to configure: introspection is not rate
+// limited (`TestIntrospectionIsNotThrottled` pins that). The fixture used to
+// set it to 100,000 so a production-tuned limiter could not fire mid-group.
 
 /// `max_auth_age` the worker must configure -- the documented default.
 pub const MAX_AUTH_AGE_SECONDS: u64 = 900;
@@ -254,7 +251,6 @@ impl IdentityMode {
         let mut builder = IdentityImpl::builder()
             .resolve_token(std::sync::Arc::new(conformance_resolve_token))
             .introspect_principals([INTROSPECTOR_PRINCIPAL])
-            .introspect_rate_limit(INTROSPECT_RATE_LIMIT)
             .max_auth_age(std::time::Duration::from_secs(MAX_AUTH_AGE_SECONDS));
         if self == Self::Both {
             builder = builder.mint_grant(std::sync::Arc::new(conformance_mint_grant));

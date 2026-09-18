@@ -126,3 +126,43 @@ async fn oauth_well_known_returns_404_without_metadata() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn a_transient_authenticator_failure_is_not_a_401() {
+    // The failure mode the reference's `AuthUnavailableError` exists to stop:
+    // an authority that is merely down reaching the caller as "your credential
+    // is bad", which makes every client re-authenticate at once. Driven
+    // through the chain combinator, since that is where the reference's
+    // equivalent used to lose the distinction.
+    let down: vgi_rpc::Authenticate =
+        Arc::new(|_| Err(vgi_rpc::RpcError::auth_unavailable("jwks down")));
+    let fallback: vgi_rpc::Authenticate =
+        Arc::new(|_| Ok(AuthContext::for_principal("test", "alice")));
+    let server = Arc::new(
+        RpcServer::builder()
+            .server_id("it")
+            .protocol_name("Test")
+            .build(),
+    );
+    let state = HttpState::builder()
+        .server(server)
+        .authenticate(vgi_rpc::chain_all([down, fallback]).unwrap())
+        .build();
+    let resp = vgi_rpc::http::build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/echo_string")
+                .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
+                .body(Body::from(vec![]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an outage was reported as a credential rejection"
+    );
+    assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "5");
+}

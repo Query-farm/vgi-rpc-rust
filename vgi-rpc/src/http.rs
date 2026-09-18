@@ -394,10 +394,6 @@ pub struct HttpState {
     upload_url_provider: Option<Arc<dyn crate::external::UploadUrlProvider>>,
     /// Sticky-session context, `Some` when the server is sticky-enabled.
     sticky: Option<Arc<crate::sticky::StickyContext>>,
-    /// Token-introspection endpoint, `Some` only when an operator supplied a
-    /// resolver. `None` leaves `{prefix}/__introspect_token__` answering a
-    /// fixed `404 not_enabled` that looks nothing up.
-    introspect: Option<Arc<crate::auth::introspect::TokenIntrospector>>,
     /// Producer for the standardized landing contract (`describe.json` +
     /// lazy columns). `Some` mounts the describe routes; `None` leaves the
     /// server serving only the shared `landing.html` at `GET {prefix}/`.
@@ -459,10 +455,6 @@ pub struct HttpStateBuilder {
     proxy_proof_required: Option<bool>,
     extra_proxy_auth_headers: Vec<String>,
     call_state_cache_entries: Option<usize>,
-    introspect_resolver: Option<crate::auth::introspect::TokenResolver>,
-    introspect_principals: Vec<String>,
-    introspect_default_ttl_seconds: Option<u64>,
-    introspect_rate_limit: Option<u32>,
 }
 
 impl HttpStateBuilder {
@@ -833,57 +825,6 @@ impl HttpStateBuilder {
         self
     }
 
-    /// Enable `POST {prefix}/__introspect_token__`, which resolves an opaque
-    /// bearer credential to a principal for a reverse proxy that must know the
-    /// caller's identity before it can authorize.
-    ///
-    /// Off by default: the route answers a fixed `404 not_enabled` and holds no
-    /// resolver, so no worker grows a credential-to-identity oracle by
-    /// upgrading a dependency. It stays definitive rather than unrouted because
-    /// a caller that classifies `401/403/404` as final and everything else as
-    /// transient would retry a generic `415` forever.
-    ///
-    /// Requires [`introspect_principals`](Self::introspect_principals). See
-    /// [`crate::auth::introspect`] for the guards and why it is deliberately
-    /// *not* a replay through the server's own authenticate chain.
-    pub fn introspect_resolver(mut self, resolver: crate::auth::introspect::TokenResolver) -> Self {
-        self.introspect_resolver = Some(resolver);
-        self
-    }
-
-    /// Principals permitted to introspect.
-    ///
-    /// Required alongside [`introspect_resolver`](Self::introspect_resolver),
-    /// with **no permissive default**: authentication and introspection are
-    /// different capabilities, and a deployment where any valid credential may
-    /// introspect lets any user resolve any other user's credential to its
-    /// owner.
-    pub fn introspect_principals<I, S>(mut self, principals: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.introspect_principals = principals.into_iter().map(Into::into).collect();
-        self
-    }
-
-    /// Cache window advertised as `ttl_seconds` for a resolution that does not
-    /// name its own. Default 300 s. Treat it as an authorization window: for
-    /// any path the asker serves without re-presenting the credential, it is
-    /// exactly that.
-    pub fn introspect_default_ttl(mut self, ttl: std::time::Duration) -> Self {
-        self.introspect_default_ttl_seconds = Some(ttl.as_secs());
-        self
-    }
-
-    /// Introspection requests allowed per caller per second (default 20).
-    /// Bounds, rather than closes, the oracle an allowlisted-but-compromised
-    /// caller still has.
-    pub fn introspect_rate_limit(mut self, per_second: u32) -> Self {
-        self.introspect_rate_limit = Some(per_second);
-        self
-    }
-
     pub fn build(self) -> Arc<HttpState> {
         let server = self.server.expect("HttpStateBuilder::server is required");
         // A wildcard CORS origin combined with a credentialed auth
@@ -926,28 +867,6 @@ impl HttpStateBuilder {
         } else {
             None
         };
-        // Introspection is resolved here, before any route exists, so a
-        // misconfiguration fails at construction rather than at the first proxy
-        // preflight.
-        let introspect = match self.introspect_resolver {
-            Some(resolver) => Some(Arc::new(crate::auth::introspect::TokenIntrospector::new(
-                resolver,
-                self.introspect_principals,
-                self.introspect_default_ttl_seconds
-                    .unwrap_or(crate::auth::introspect::DEFAULT_INTROSPECT_TTL_SECONDS),
-                self.introspect_rate_limit
-                    .unwrap_or(crate::auth::introspect::DEFAULT_INTROSPECT_RATE_LIMIT),
-            ))),
-            None => {
-                assert!(
-                    self.introspect_principals.is_empty(),
-                    "introspect_principals was given without introspect_resolver; the \
-                     route stays disabled, so the allowlist would have no effect. Pass \
-                     both or neither."
-                );
-                None
-            }
-        };
         let cors_allow_origin = self
             .cors_origins
             .as_deref()
@@ -974,7 +893,6 @@ impl HttpStateBuilder {
                 sticky: sticky.as_deref(),
                 response_compression_level,
                 proxy_proof_required: self.proxy_proof_required.unwrap_or(false),
-                introspect_enabled: introspect.is_some(),
             });
         Arc::new(HttpState {
             extra_proxy_auth_headers: self.extra_proxy_auth_headers.clone(),
@@ -1017,7 +935,6 @@ impl HttpStateBuilder {
             max_externalized_response_bytes: self.max_externalized_response_bytes,
             upload_url_provider: self.upload_url_provider,
             sticky,
-            introspect,
             landing_info: self.landing_info,
             capability_headers,
             capability_has_any,
@@ -1039,7 +956,6 @@ struct CapabilityInputs<'a> {
     sticky: Option<&'a crate::sticky::StickyContext>,
     response_compression_level: Option<i32>,
     proxy_proof_required: bool,
-    introspect_enabled: bool,
 }
 
 /// Response headers a browser client must be able to read that are *not*
@@ -1087,7 +1003,6 @@ fn build_capability_headers(inputs: CapabilityInputs<'_>) -> (HeaderMap, bool, H
         sticky,
         response_compression_level,
         proxy_proof_required,
-        introspect_enabled,
     } = inputs;
     let mut out = HeaderMap::new();
     let mut any = false;
@@ -1151,18 +1066,6 @@ fn build_capability_headers(inputs: CapabilityInputs<'_>) -> (HeaderMap, bool, H
     if proxy_proof_required {
         out.insert(
             crate::auth::proof::PROOF_REQUIRED_HEADER,
-            HeaderValue::from_static("true"),
-        );
-        any = true;
-    }
-    // Token introspection. Positive form only — absence is the answer when the
-    // route is disabled, and the point of the advert is that a fronting proxy
-    // preflights at boot rather than discovering at first login that the worker
-    // it depends on cannot resolve credentials. Riding the capability map means
-    // it lands in `Access-Control-Expose-Headers` for free below.
-    if introspect_enabled {
-        out.insert(
-            crate::auth::introspect::INTROSPECT_ENABLED_HEADER,
             HeaderValue::from_static("true"),
         );
         any = true;
@@ -2296,16 +2199,6 @@ fn build_router_inner(state: Arc<HttpState>) -> Router {
         api
     };
 
-    // Always routed, but only ever an oracle when a resolver exists. With
-    // introspection off the handler holds nothing and looks nothing up; it is
-    // there so a caller gets a definitive 404 instead of the 415 the generic
-    // `/:method` route answers a JSON body with — which a caller classifying
-    // 401/403/404 as final reads as "retry later" and spins on forever.
-    let api = api.route(
-        crate::auth::introspect::INTROSPECT_ENDPOINT,
-        post(handle_introspect_token).options(handle_preflight),
-    );
-
     let mut app = if prefix.is_empty() {
         api
     } else {
@@ -2390,108 +2283,6 @@ async fn handle_delete_session(
             (StatusCode::NO_CONTENT, h).into_response()
         }
     }
-}
-
-/// `POST {prefix}/__introspect_token__` — opaque credential to principal.
-///
-/// Two rejection axes, deliberately distinguishable from each other and
-/// deliberately uniform within themselves: `403` says the *caller* may not
-/// introspect, `404` says the *subject* credential did not resolve. Both are
-/// definitive and may be negative-cached; anything transient reaches the caller
-/// as `503` so it is retried instead.
-async fn handle_introspect_token(
-    State(state): State<Arc<HttpState>>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
-    headers: HeaderMap,
-    body: axum::body::Body,
-) -> Response {
-    use crate::auth::introspect::{IntrospectOutcome, MAX_INTROSPECT_BODY_BYTES};
-
-    let Some(introspector) = state.introspect.as_ref() else {
-        // Deliberately no authentication of its own: "this worker does not do
-        // introspection" is not a secret, and a caller needs to learn it at
-        // preflight rather than after arranging credentials.
-        return introspect_refusal(StatusCode::NOT_FOUND, "not_enabled", None);
-    };
-    let identity = match authenticate_request_from_peer(
-        &state,
-        crate::auth::introspect::INTROSPECT_ENDPOINT,
-        &headers,
-        connect_info.map(|info| info.0),
-    )
-    .await
-    {
-        Ok(identity) => identity,
-        Err(resp) => return resp,
-    };
-    let auth = identity.auth;
-    // Bounded here rather than by the global body limit: the only legitimate
-    // content is one credential, and an over-length body collapses onto the
-    // same answer an unknown one gets.
-    let bytes = axum::body::to_bytes(body, MAX_INTROSPECT_BODY_BYTES)
-        .await
-        .unwrap_or_default();
-
-    match introspector.introspect(&auth, &bytes) {
-        IntrospectOutcome::Resolved {
-            principal,
-            token_name,
-            ttl_seconds,
-        } => {
-            // A closed set of three keys. A `claims` field would let this
-            // worker choose its caller's tenant routing, row scope and policy
-            // branch; the asker derives what it needs from the principal alone.
-            let body = serde_json::json!({
-                "principal": principal,
-                "token_name": token_name,
-                "ttl_seconds": ttl_seconds,
-            })
-            .to_string();
-            introspect_json(StatusCode::OK, body, None)
-        }
-        IntrospectOutcome::NotAnIntrospector => {
-            introspect_refusal(StatusCode::FORBIDDEN, "not_an_introspector", None)
-        }
-        IntrospectOutcome::Unresolved => {
-            introspect_refusal(StatusCode::NOT_FOUND, "unresolved", None)
-        }
-        IntrospectOutcome::RateLimited => {
-            introspect_refusal(StatusCode::TOO_MANY_REQUESTS, "rate_limited", Some(1))
-        }
-        IntrospectOutcome::Unavailable {
-            retry_after_seconds,
-        } => introspect_refusal(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-            Some(retry_after_seconds),
-        ),
-    }
-}
-
-/// A rejection carrying no detail about why beyond the coarse code.
-fn introspect_refusal(status: StatusCode, error: &str, retry_after: Option<u32>) -> Response {
-    introspect_json(
-        status,
-        serde_json::json!({ "error": error }).to_string(),
-        retry_after,
-    )
-}
-
-fn introspect_json(status: StatusCode, body: String, retry_after: Option<u32>) -> Response {
-    let mut h = HeaderMap::new();
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    // A credential's resolution can change; nothing here may sit in a shared
-    // cache.
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    if let Some(secs) = retry_after {
-        if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
-            h.insert(header::RETRY_AFTER, v);
-        }
-    }
-    (status, h, body).into_response()
 }
 
 async fn handle_preflight(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> Response {

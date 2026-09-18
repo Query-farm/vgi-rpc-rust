@@ -421,8 +421,8 @@ jobs:
           VGI_RPC_REPOS: ${{ runner.temp }}/repos
         run: python tools/cross-port/describe_diff.py --only rust
 
-      # Identity's security properties — guard order, rate-limit window,
-      # allowlist-by-omission, transient-vs-definitive — live in code the
+      # Identity's security properties — guard order, allowlist-by-omission,
+      # transient-vs-definitive, the absence of a limiter — live in code the
       # protocol hash does not cover, so describe_diff cannot see any of them.
       # This is a source-level grep over both checkouts instead.
       #

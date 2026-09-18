@@ -2,6 +2,43 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased]
+
+Tracks the reference's identity revision of 2026-09-18
+(`IDENTITY_V1_SPEC.md`: §4 "No rate limiter", §8 "Retired").
+
+### Removed — breaking
+
+- **`introspect_token` is no longer rate limited.** `RateLimiter`,
+  `IdentityImplBuilder::introspect_rate_limit` and
+  `DEFAULT_INTROSPECT_RATE_LIMIT` are gone. The limiter capped each caller at
+  20 introspections a second, but the caller is the asker — a proxy
+  introspecting on behalf of every client that presents a bearer — so it was
+  one budget for every user's login, drainable by unauthenticated junk
+  credentials, and it refused with `introspection_refused`, a kind the spec
+  lets a caller negative-cache. It bounded only guessing, which a random
+  credential defeats at any rate. The allowlist is the control; throttle
+  untrusted traffic at the asker, per client. `introspection_refused` now means
+  only "not on the allowlist". Pinned by `TestIntrospectionIsNotThrottled`
+  (the conformance fixture no longer sets a limit) and by
+  `introspection_is_not_rate_limited` / `a_concurrent_burst_is_answered_in_full`.
+  Remove any `.introspect_rate_limit(n)` call; there is no replacement.
+- **The pre-0.46 `POST {prefix}/__introspect_token__` JSON route is retired.**
+  Deleted with its handler, the `vgi_rpc::auth::introspect` module
+  (`TokenIntrospector`, `IntrospectOutcome`, `INTROSPECT_ENDPOINT`,
+  `MAX_INTROSPECT_BODY_BYTES`), its own limiter, the `vgi-token-introspection`
+  capability header, and the `HttpStateBuilder::introspect_resolver` /
+  `introspect_principals` / `introspect_default_ttl` / `introspect_rate_limit`
+  options. `vgi_rpc.Identity.v1` is the only introspection surface: configure
+  it with `RpcServerBuilder::identity(IdentityImpl::builder()...)`, and a
+  client learns whether a worker introspects from reflection. The conformance
+  worker's `--introspect` flag and the harness's
+  `conformance_http_introspect_port` fixture, which backed the reference's
+  since-deleted HTTP-shaped group, are gone too.
+- `TokenIdentity`, `TokenResolver`, `is_jws_shaped`, `token_digest` and
+  `DEFAULT_INTROSPECT_TTL_SECONDS` now live in `vgi_rpc::token_identity`
+  (previously defined in `vgi_rpc::auth::introspect` and re-exported there).
+
 ## [0.25.0] — 2026-09-16
 
 This is the multi-protocol (VGI 2.0) round. Three changes break the wire;

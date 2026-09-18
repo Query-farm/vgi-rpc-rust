@@ -524,6 +524,104 @@ impl ExchangeState for FailOnExchangeN {
     }
 }
 
+/// The application key [`InputMetadata`] reports the value of.
+const INPUT_METADATA_KEY: &str = "vgi.conformance.input";
+
+/// Keys [`InputMetadata`] reports the presence of.
+///
+/// This port hands an exchange handler its input batch's custom metadata only
+/// through `CallContext::tick_metadata(key)` -- a lookup by name, with no way
+/// to enumerate what is there -- so `keys` is the sorted subset of this list
+/// that is present. The list covers every key the shared cases assert on
+/// (application keys, the HTTP cursor / call token / cancel marker, the
+/// pointer and provenance keys) plus every other key `vgi_rpc::metadata`
+/// defines, so a framework key leaking onto an input shows up too. A key
+/// outside this list goes unreported, where the reference, which enumerates
+/// `input.custom_metadata`, would list it.
+const INPUT_METADATA_PROBE_KEYS: &[&str] = &[
+    INPUT_METADATA_KEY,
+    "vgi.conformance.extra",
+    "vgi.cache.if_none_match",
+    "vgi.cache.if_modified_since",
+    "vgi_pushdown_filters",
+    vgi_rpc::metadata::STATE_KEY,
+    vgi_rpc::metadata::CALL_STATE_KEY,
+    vgi_rpc::metadata::CANCEL_KEY,
+    vgi_rpc::metadata::LOCATION_KEY,
+    vgi_rpc::metadata::LOCATION_SHA256_KEY,
+    vgi_rpc::metadata::LOCATION_FETCH_MS_KEY,
+    vgi_rpc::metadata::LOCATION_SOURCE_KEY,
+    vgi_rpc::metadata::RPC_METHOD_KEY,
+    vgi_rpc::metadata::PROTOCOL_KEY,
+    vgi_rpc::metadata::REQUEST_VERSION_KEY,
+    vgi_rpc::metadata::REQUEST_ID_KEY,
+    vgi_rpc::metadata::ERROR_KIND_KEY,
+    vgi_rpc::metadata::LOG_LEVEL_KEY,
+    vgi_rpc::metadata::LOG_MESSAGE_KEY,
+    vgi_rpc::metadata::LOG_EXTRA_KEY,
+    vgi_rpc::metadata::PROTOCOL_NAME_KEY,
+    vgi_rpc::metadata::DESCRIBE_VERSION_KEY,
+    vgi_rpc::metadata::PROTOCOL_HASH_KEY,
+    vgi_rpc::metadata::PROTOCOL_VERSION_KEY,
+    vgi_rpc::metadata::SERVER_ID_KEY,
+    vgi_rpc::metadata::TRANSPORT_SHM_KEY,
+    vgi_rpc::metadata::SHM_OFFSET_KEY,
+    vgi_rpc::metadata::SHM_LENGTH_KEY,
+    vgi_rpc::metadata::SHM_SOURCE_KEY,
+    vgi_rpc::metadata::SHM_SEGMENT_NAME_KEY,
+    vgi_rpc::metadata::SHM_SEGMENT_SIZE_KEY,
+    vgi_rpc::metadata::TRACEPARENT_KEY,
+    vgi_rpc::metadata::TRACESTATE_KEY,
+];
+
+fn input_metadata_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("seen", DataType::Utf8, true),
+        Field::new("keys", DataType::Utf8, true),
+    ]))
+}
+
+/// Input schema for `exchange_input_metadata`: the reference's
+/// `_SCALE_INPUT_SCHEMA`, whose pyarrow default is `nullable=True`.
+fn input_metadata_input_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Float64,
+        true,
+    )]))
+}
+
+/// Report the custom metadata each exchange input batch reached `exchange`
+/// with: one row per input, `seen` the value of [`INPUT_METADATA_KEY`] (empty
+/// when absent) and `keys` every present key, sorted and comma-joined.
+#[derive(Serialize, Deserialize)]
+struct InputMetadata;
+impl_bincode_codec!(InputMetadata);
+impl ExchangeState for InputMetadata {
+    fn exchange(
+        &mut self,
+        _input: &RecordBatch,
+        out: &mut OutputCollector,
+        ctx: &CallContext,
+    ) -> Result<()> {
+        let seen = ctx.tick_metadata(INPUT_METADATA_KEY).unwrap_or_default();
+        let mut keys: Vec<&str> = INPUT_METADATA_PROBE_KEYS
+            .iter()
+            .copied()
+            .filter(|key| ctx.tick_metadata(key).is_some())
+            .collect();
+        keys.sort_unstable();
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![seen])),
+            Arc::new(StringArray::from(vec![keys.join(",")])),
+        ];
+        out.emit(RecordBatch::try_new(out.schema(), arrays)?)
+    }
+    fn encode_state(&self) -> Result<Vec<u8>> {
+        StreamStateCodec::encode(self)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct ZeroColumn;
 impl_bincode_codec!(ZeroColumn);
@@ -962,6 +1060,16 @@ impl StreamSvc {
     )]
     fn exchange_zero_columns(&self) -> Result<ZeroColumn> {
         Ok(ZeroColumn)
+    }
+
+    /// Report the custom metadata each exchange input batch was handed with.
+    #[exchange(
+        state = InputMetadata,
+        input_schema = input_metadata_input_schema,
+        output_schema = input_metadata_output_schema
+    )]
+    fn exchange_input_metadata(&self) -> Result<InputMetadata> {
+        Ok(InputMetadata)
     }
 
     /// Exchange expecting float64 input — tests server-side cast for compatible schemas.

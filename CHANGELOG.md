@@ -39,6 +39,21 @@ Tracks the reference's identity revision of 2026-09-18
   `DEFAULT_INTROSPECT_TTL_SECONDS` now live in `vgi_rpc::token_identity`
   (previously defined in `vgi_rpc::auth::introspect` and re-exported there).
 
+### Added
+
+- `exchange_input_metadata` on the conformance worker, for the reference's
+  exchange-input-metadata cases (`TestExchangeStream::test_input_metadata`,
+  `TestExternalInputRoutes::test_exchange_external_input_carries_the_payloads_metadata`,
+  runner case `exchange_stream.input_metadata`): one row per exchange input,
+  `seen` (the value of `vgi.conformance.input`) and `keys` (the keys present,
+  sorted). The server already met the contract on every transport; only the
+  fixture was missing. `CallContext` offers input metadata only by key
+  (`tick_metadata(key)`), so `keys` reports which of a fixed list of probe keys
+  are present (every key the cases assert on plus every `vgi_rpc::metadata`
+  key) rather than enumerating the batch's metadata as the reference does.
+  Moves the conformance protocol hash to `4b026920…` and the method count to
+  89.
+
 ## [0.25.0] — 2026-09-16
 
 This is the multi-protocol (VGI 2.0) round. Three changes break the wire;

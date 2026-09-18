@@ -221,7 +221,7 @@ mod hash_tests {
     /// over serialized Arrow IPC bytes of the retired `__describe__` payload,
     /// and each language may legitimately spell those differently for the same
     /// logical schema -- so it was only ever comparable against itself.
-    const CANONICAL: &str = "7713e810a0523bddfed4caa692dd218f4cbb09a773d0d94401a90d70ac3b6e54";
+    const CANONICAL: &str = "4b0269208a5a8fdeb7d8fe0f62a352713a3bfc071d7de99e5e12408c5f0b9402";
 
     #[test]
     fn the_access_log_publishes_the_canonical_digest() {

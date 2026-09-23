@@ -50,8 +50,23 @@ are combined into one immutable connection snapshot; another provider named
 `spiffe` is rejected as a duplicate. Network addresses are audit/routing data,
 never principals or state-binding inputs.
 
-The existing blocking raw-TCP client stores independent concrete socket read
-and write halves, while rustls requires shared connection state. This change
-does not silently retrofit that client or invent a new transport abstraction;
-use a TLS-capable custom `Transport` until an explicit client-side API is
-introduced.
+The blocking client provides the matching `tcp-tls` feature. Construct a
+`rustls::ClientConfig` containing the deployment trust roots and client
+certificate, then call `RpcClient::tls_tcp_connect`. The destination host and
+verified TLS server name are separate parameters so an IP address, private
+route, or load balancer does not weaken certificate verification.
+
+```rust,ignore
+use std::{sync::Arc, time::Duration};
+use vgi_rpc_client::RpcClient;
+
+let tls: Arc<rustls::ClientConfig> = build_client_config();
+let client = RpcClient::tls_tcp_connect(
+    "127.0.0.1",
+    9400,
+    "proxy.internal",
+    tls,
+    Duration::from_secs(5),
+    Some(Duration::from_secs(30)),
+)?;
+```

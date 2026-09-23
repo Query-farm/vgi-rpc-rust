@@ -609,6 +609,209 @@ pub struct TcpTransport {
     writer: std::net::TcpStream,
 }
 
+/// A stateful VGI byte stream protected by rustls.
+///
+/// rustls maintains shared connection state across reads and writes, so the
+/// two `Transport` halves synchronize access to one `StreamOwned`. VGI is a
+/// lockstep protocol: a client writes a turn before reading its response, and
+/// therefore does not require simultaneous TLS reads and writes.
+#[cfg(feature = "tcp-tls")]
+pub struct TlsTcpTransport {
+    reader: TlsTcpReader,
+    writer: TlsTcpWriter,
+    reusable: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "tcp-tls")]
+type ClientTlsStream = rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>;
+
+#[cfg(feature = "tcp-tls")]
+struct TlsTcpReader {
+    stream: Arc<Mutex<ClientTlsStream>>,
+    reusable: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "tcp-tls")]
+struct TlsTcpWriter {
+    stream: Arc<Mutex<ClientTlsStream>>,
+    reusable: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "tcp-tls")]
+impl TlsTcpTransport {
+    /// Connect, authenticate the server name, and complete the TLS handshake.
+    ///
+    /// Supplying a client certificate in `tls` enables mutual TLS. A zero
+    /// handshake timeout is rejected, and one monotonic deadline covers the
+    /// complete TLS handshake.
+    pub fn connect(
+        host: &str,
+        port: u16,
+        server_name: &str,
+        tls: Arc<rustls::ClientConfig>,
+        handshake_timeout: Duration,
+        io_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        if handshake_timeout.is_zero() {
+            return Err(RpcError::value_error(
+                "TLS handshake timeout must be positive",
+            ));
+        }
+        if io_timeout.is_some_and(|timeout| timeout.is_zero()) {
+            return Err(RpcError::value_error("TLS I/O timeout must be positive"));
+        }
+
+        let server_name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+            .map_err(|_| RpcError::value_error("invalid TLS server name"))?;
+        let socket = std::net::TcpStream::connect((host, port)).map_err(|error| {
+            RpcError::new("TransportError", format!("connect TLS TCP socket: {error}"))
+        })?;
+        socket.set_nodelay(true).map_err(|error| {
+            RpcError::new(
+                "TransportError",
+                format!("configure TLS TCP socket: {error}"),
+            )
+        })?;
+
+        let connection = rustls::ClientConnection::new(tls, server_name).map_err(|error| {
+            RpcError::new(
+                "TransportError",
+                format!("create TLS client connection: {error}"),
+            )
+        })?;
+        let mut stream = rustls::StreamOwned::new(connection, socket);
+        let deadline = Instant::now()
+            .checked_add(handshake_timeout)
+            .ok_or_else(|| RpcError::value_error("TLS handshake timeout exceeds Instant"))?;
+        while stream.conn.is_handshaking() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(RpcError::new("TransportError", "TLS handshake timed out"));
+            }
+            stream
+                .sock
+                .set_read_timeout(Some(remaining))
+                .map_err(|error| {
+                    RpcError::new(
+                        "TransportError",
+                        format!("set TLS handshake read timeout: {error}"),
+                    )
+                })?;
+            stream
+                .sock
+                .set_write_timeout(Some(remaining))
+                .map_err(|error| {
+                    RpcError::new(
+                        "TransportError",
+                        format!("set TLS handshake write timeout: {error}"),
+                    )
+                })?;
+            stream.conn.complete_io(&mut stream.sock).map_err(|error| {
+                RpcError::new("TransportError", format!("TLS handshake failed: {error}"))
+            })?;
+        }
+        stream.sock.set_read_timeout(io_timeout).map_err(|error| {
+            RpcError::new("TransportError", format!("set TLS read timeout: {error}"))
+        })?;
+        stream.sock.set_write_timeout(io_timeout).map_err(|error| {
+            RpcError::new("TransportError", format!("set TLS write timeout: {error}"))
+        })?;
+
+        let stream = Arc::new(Mutex::new(stream));
+        let reusable = Arc::new(AtomicBool::new(true));
+        Ok(Self {
+            reader: TlsTcpReader {
+                stream: Arc::clone(&stream),
+                reusable: Arc::clone(&reusable),
+            },
+            writer: TlsTcpWriter {
+                stream,
+                reusable: Arc::clone(&reusable),
+            },
+            reusable,
+        })
+    }
+}
+
+#[cfg(feature = "tcp-tls")]
+impl Read for TlsTcpReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self
+            .stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read(buffer)
+        {
+            Ok(read) => Ok(read),
+            Err(error) => {
+                self.reusable.store(false, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tcp-tls")]
+impl Write for TlsTcpWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match self
+            .stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write(buffer)
+        {
+            Ok(written) => Ok(written),
+            Err(error) => {
+                self.reusable.store(false, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self
+            .stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flush()
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.reusable.store(false, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tcp-tls")]
+impl Transport for TlsTcpTransport {
+    fn split(&mut self) -> (&mut dyn Read, &mut dyn Write) {
+        (&mut self.reader, &mut self.writer)
+    }
+
+    fn is_reusable(&self) -> bool {
+        self.reusable.load(Ordering::Acquire)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.reusable.store(false, Ordering::Release);
+        let mut stream = self
+            .writer
+            .stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stream.conn.send_close_notify();
+        let _ = stream.flush();
+        stream
+            .sock
+            .shutdown(std::net::Shutdown::Both)
+            .map_err(|error| {
+                RpcError::new("TransportError", format!("close TLS TCP socket: {error}"))
+            })
+    }
+}
+
 /// A strict SOCKS5h proxy endpoint used to reach a TCP worker.
 ///
 /// The proxy itself must be an IP literal, which keeps proxy connection setup

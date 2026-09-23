@@ -33,6 +33,10 @@ canonical Python client: you build the request parameters as a one-row Arrow
   hostname resolution, one setup deadline, and no direct fallback. The proxy
   URI intentionally requires an IP literal so local proxy DNS cannot escape
   that deadline. Raw TCP provides neither encryption nor authentication.
+- **TLS over TCP** — the same persistent framing through rustls, with normal
+  server-name verification and optional client-certificate identity. Callers
+  supply the `rustls::ClientConfig`; no permissive verifier is installed.
+  *(feature `tcp-tls`)*
 - **HTTP** — `reqwest`-blocking, with the full production surface:
   external-location resolution, sticky sessions, 413 request-externalization,
   415/zstd codec negotiation, a request timeout, and opt-in connection-level
@@ -93,12 +97,31 @@ identity or explicit routing. Construction and calls are blocking; use them on
 a blocking thread rather than a Tokio worker. Externalized payload URLs remain
 ordinary HTTP(S) and use the independently configurable external HTTP client.
 
+For direct mutual TLS, construct a `rustls::ClientConfig` with the deployment
+CA and client certificate, then connect the stateful byte stream explicitly:
+
+```rust,ignore
+use std::{sync::Arc, time::Duration};
+use vgi_rpc_client::RpcClient;
+
+let tls: Arc<rustls::ClientConfig> = build_client_config();
+let mut client = RpcClient::tls_tcp_connect(
+    "proxy.internal",
+    9400,
+    "proxy.internal",
+    tls,
+    Duration::from_secs(5),
+    Some(Duration::from_secs(30)),
+)?;
+```
+
 ## Features
 
 | feature | default | what it adds |
 |---------|:-:|--------------|
 | `http`  | ✅ | `HttpClient` + the HTTP production features above |
 | `iroh`  | — | Native `httpi://` execution through `vgi-iroh-transport`; implies `http` |
+| `tcp-tls` | — | rustls-protected stateful TCP, including mutual TLS |
 | `unix`  | — | AF_UNIX transport |
 | `shm`   | — | POSIX shared-memory side-channel |
 

@@ -390,6 +390,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "aws-lc-rs"
+version = "1.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
+dependencies = [
+ "aws-lc-sys",
+ "untrusted 0.7.1",
+ "zeroize",
+]
+
+[[package]]
+name = "aws-lc-sys"
+version = "0.45.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
+dependencies = [
+ "cc",
+ "cmake",
+ "dunce",
+ "fs_extra",
+ "pkg-config",
+]
+
+[[package]]
 name = "axum"
 version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -703,6 +727,15 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "cmov"
@@ -1137,6 +1170,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
 name = "ed25519"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1144,7 +1183,7 @@ checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
 dependencies = [
  "pkcs8",
  "serdect",
- "signature",
+ "signature 3.0.0",
 ]
 
 [[package]]
@@ -1158,7 +1197,7 @@ dependencies = [
  "rand_core 0.10.1",
  "serde",
  "sha2 0.11.0",
- "signature",
+ "signature 3.0.0",
  "subtle",
  "zeroize",
 ]
@@ -1292,6 +1331,12 @@ checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
 ]
+
+[[package]]
+name = "fs_extra"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "futures"
@@ -2266,17 +2311,18 @@ dependencies = [
 
 [[package]]
 name = "jsonwebtoken"
-version = "9.3.1"
+version = "10.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
+checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
 dependencies = [
+ "aws-lc-rs",
  "base64",
+ "getrandom 0.2.17",
  "js-sys",
- "pem",
- "ring",
  "serde",
  "serde_json",
- "simple_asn1",
+ "signature 2.2.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -3211,16 +3257,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
-name = "pem"
-version = "3.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
-dependencies = [
- "base64",
- "serde_core",
-]
-
-[[package]]
 name = "pem-rfc7468"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3814,7 +3850,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.2.17",
  "libc",
- "untrusted",
+ "untrusted 0.9.0",
  "windows-sys 0.52.0",
 ]
 
@@ -3943,7 +3979,7 @@ checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "ring",
  "rustls-pki-types",
- "untrusted",
+ "untrusted 0.9.0",
 ]
 
 [[package]]
@@ -4272,6 +4308,15 @@ dependencies = [
 
 [[package]]
 name = "signature"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
+dependencies = [
+ "rand_core 0.6.4",
+]
+
+[[package]]
+name = "signature"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
@@ -4308,18 +4353,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b6f884fa9a8d48101774bfbd3aeb81e968dd22cffd19a372da69f183db22c1a"
 dependencies = [
  "bitflags",
-]
-
-[[package]]
-name = "simple_asn1"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "297f631f50729c8c99b84667867963997ec0b50f32b2a7dbcab828ef0541e8bb"
-dependencies = [
- "num-bigint",
- "num-traits",
- "thiserror 2.0.18",
- "time",
 ]
 
 [[package]]
@@ -4980,6 +5013,12 @@ dependencies = [
 
 [[package]]
 name = "untrusted"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
+
+[[package]]
+name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
@@ -5041,7 +5080,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi-iroh-bridge"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5067,7 +5106,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-iroh-cabi"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "bytes",
  "iroh",
@@ -5079,7 +5118,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-iroh-transport"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -5097,7 +5136,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5145,7 +5184,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-benchmark-rust"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5155,7 +5194,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-client"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -5185,7 +5224,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-conformance-client-driver"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -5199,7 +5238,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-conformance-rust"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5224,7 +5263,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-gcs"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "reqwest 0.12.28",
  "uuid",
@@ -5234,7 +5273,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-iroh"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5251,7 +5290,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-iroh-browser"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -5271,7 +5310,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-macros"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5280,7 +5319,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-s3"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "reqwest 0.12.28",
  "tokio",
@@ -5290,7 +5329,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-tailnet-rust"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",

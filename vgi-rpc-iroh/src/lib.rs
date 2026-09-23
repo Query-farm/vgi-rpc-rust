@@ -594,9 +594,14 @@ impl IrohServer {
             (Ok(global), Ok(local)) => (global, local),
             (global, local) => {
                 let error = global.err().or_else(|| local.err()).expect("one error");
+                let operation = match &error {
+                    IrohAdapterError::Saturated { operation } => *operation,
+                    _ => "Iroh stream admission",
+                };
                 tracing::warn!(
                     target: "vgi_rpc_iroh.server",
                     error_class = adapter_error_class(&error),
+                    operation,
                     "Iroh VGI stream rejected at admission boundary"
                 );
                 let _ = send.reset(CLOSE_CODE.into());

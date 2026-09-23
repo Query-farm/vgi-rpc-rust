@@ -2,6 +2,22 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.27.1] — 2026-09-23
+
+### Security
+
+- Upgraded `jsonwebtoken` to 10.4.0 with its AWS-LC backend, resolving the
+  type-confusion vulnerability affecting 9.x JWT verification without pulling
+  in RustCrypto's unresolved RSA timing-side-channel advisory.
+- Reject malformed `nbf` claims in VGI's independent claims-validation layer.
+
+### Fixed
+
+- Use the platform's actual C `char` type in the Iroh C-ABI tests, restoring
+  test portability on AArch64 Linux targets where `char` is unsigned.
+- Include the specific admission boundary in Iroh saturation warnings so
+  operators can distinguish global from per-connection capacity limits.
+
 ## [0.27.0] — 2026-09-23
 
 ### Added

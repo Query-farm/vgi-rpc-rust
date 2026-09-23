@@ -1374,7 +1374,7 @@ mod tests {
             unsafe { vgi_iroh_endpoint_create(&config, &mut endpoint, &mut error) },
             0
         );
-        let mut local_id = [0_i8; 65];
+        let mut local_id = [0 as c_char; 65];
         let mut required = 0;
         assert_eq!(
             unsafe {

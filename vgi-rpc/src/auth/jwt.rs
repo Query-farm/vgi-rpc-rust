@@ -282,8 +282,12 @@ fn validate_token(
     if now - leeway > exp {
         return Err(RpcError::permission_error("JWT expired"));
     }
-    // `nbf` is optional, but enforced when present.
-    if let Some(nbf) = claims.get("nbf").and_then(json_to_i64) {
+    // `nbf` is optional, but must be valid and is enforced when present.
+    // Treating an invalid value as an absent claim would recreate the
+    // type-confusion bypass fixed in jsonwebtoken 10.3.0.
+    if let Some(value) = claims.get("nbf") {
+        let nbf = json_to_i64(value)
+            .ok_or_else(|| RpcError::permission_error("JWT invalid 'nbf' claim"))?;
         if now + leeway < nbf {
             return Err(RpcError::permission_error("JWT not yet valid"));
         }
@@ -807,6 +811,23 @@ mod tests {
         );
         let err = call(&auth, &fake_token_with_kid("k1")).unwrap_err();
         assert!(err.message.contains("expired"), "{}", err.message);
+    }
+
+    #[test]
+    fn malformed_nbf_is_rejected_instead_of_treated_as_absent() {
+        let claims = json!({
+            "iss": "https://iss",
+            "aud": "https://api",
+            "sub": "alice",
+            "exp": future_exp(),
+            "nbf": {"seconds": future_exp()},
+        });
+        let auth = auth_with_claims(
+            JwtConfig::new("https://iss").with_audience("https://api"),
+            claims.as_object().unwrap().clone(),
+        );
+        let err = call(&auth, &fake_token_with_kid("k1")).unwrap_err();
+        assert!(err.message.contains("invalid 'nbf'"), "{}", err.message);
     }
 
     #[test]

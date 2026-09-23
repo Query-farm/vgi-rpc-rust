@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{self, Read, Write};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,6 +34,8 @@ const CLOSE_REASON: &[u8] = b"vgi-rpc transport closed";
 /// Errors produced while establishing or serving an Iroh VGI connection.
 #[derive(Debug, thiserror::Error)]
 pub enum IrohAdapterError {
+    #[error("invalid Iroh target: {message}")]
+    InvalidTarget { message: String },
     #[error("{operation} timed out")]
     Timeout { operation: &'static str },
     #[error("{operation} cancelled")]
@@ -51,6 +54,79 @@ pub enum IrohAdapterError {
 }
 
 pub type Result<T> = std::result::Result<T, IrohAdapterError>;
+
+/// Canonical target for the stateful VGI-over-Iroh transport.
+///
+/// This is intentionally distinct from `httpi://`: an `iroh://` target uses
+/// VGI's long-lived Arrow byte-stream framing directly on an Iroh QUIC stream.
+/// The URI contains only the cryptographic endpoint ID; relay and discovery
+/// configuration belong to the local [`Endpoint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrohTarget {
+    endpoint_id: EndpointId,
+}
+
+impl IrohTarget {
+    pub fn parse(value: &str) -> Result<Self> {
+        if !value.starts_with("iroh://") {
+            return Err(IrohAdapterError::InvalidTarget {
+                message: "target must use the lowercase iroh:// scheme".into(),
+            });
+        }
+        let parsed = url::Url::parse(value).map_err(|_| IrohAdapterError::InvalidTarget {
+            message: "invalid URI".into(),
+        })?;
+        if parsed.scheme() != "iroh"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.port().is_some()
+            || !matches!(parsed.path(), "" | "/")
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(IrohAdapterError::InvalidTarget {
+                message: "expected iroh://<endpoint-id> without credentials, port, path, query, or fragment".into(),
+            });
+        }
+        let endpoint = parsed
+            .host_str()
+            .ok_or_else(|| IrohAdapterError::InvalidTarget {
+                message: "endpoint ID is required".into(),
+            })?;
+        if endpoint.len() != 64
+            || !endpoint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(IrohAdapterError::InvalidTarget {
+                message: "endpoint ID must be 64 lowercase hexadecimal characters".into(),
+            });
+        }
+        let endpoint_id =
+            EndpointId::from_str(endpoint).map_err(|_| IrohAdapterError::InvalidTarget {
+                message: "invalid endpoint ID".into(),
+            })?;
+        Ok(Self { endpoint_id })
+    }
+
+    pub fn endpoint_id(self) -> EndpointId {
+        self.endpoint_id
+    }
+}
+
+impl FromStr for IrohTarget {
+    type Err = IrohAdapterError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Self::parse(value)
+    }
+}
+
+impl std::fmt::Display for IrohTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "iroh://{}", self.endpoint_id)
+    }
+}
 
 fn iroh_error(operation: &'static str, error: impl std::fmt::Display) -> IrohAdapterError {
     IrohAdapterError::Iroh {
@@ -81,6 +157,7 @@ fn endpoint_subject(endpoint: EndpointId) -> String {
 
 fn adapter_error_class(error: &IrohAdapterError) -> &'static str {
     match error {
+        IrohAdapterError::InvalidTarget { .. } => "invalid_target",
         IrohAdapterError::Timeout { .. } => "timeout",
         IrohAdapterError::Cancelled { .. } => "cancelled",
         IrohAdapterError::Saturated { .. } => "saturated",
@@ -812,6 +889,16 @@ impl Drop for IrohConnectionInner {
 }
 
 impl IrohConnection {
+    /// Connect to a canonical `iroh://<endpoint-id>` target using endpoint-ID
+    /// discovery configured on `endpoint`.
+    pub async fn connect_uri(
+        endpoint: Endpoint,
+        target: &str,
+        options: IrohClientOptions,
+    ) -> Result<Self> {
+        Self::connect_id(endpoint, IrohTarget::parse(target)?.endpoint_id(), options).await
+    }
+
     /// Connect using endpoint-ID address lookup configured on `endpoint`.
     pub async fn connect_id(
         endpoint: Endpoint,
@@ -1189,6 +1276,32 @@ async fn timeout_at<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ENDPOINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn canonical_iroh_targets_round_trip() {
+        let target = IrohTarget::parse(&format!("iroh://{ENDPOINT}")).unwrap();
+        assert_eq!(target.to_string(), format!("iroh://{ENDPOINT}"));
+        assert_eq!(target.endpoint_id().to_string(), ENDPOINT);
+        assert!(IrohTarget::parse(&format!("iroh://{ENDPOINT}/")).is_ok());
+    }
+
+    #[test]
+    fn noncanonical_iroh_targets_are_rejected() {
+        for target in [
+            format!("IROH://{ENDPOINT}"),
+            format!("iroh://user@{ENDPOINT}"),
+            format!("iroh://{ENDPOINT}:443"),
+            format!("iroh://{ENDPOINT}/vgi"),
+            format!("iroh://{ENDPOINT}?relay=x"),
+            format!("iroh://{ENDPOINT}#fragment"),
+            format!("iroh://{}", ENDPOINT.to_ascii_uppercase()),
+            "iroh://abcd".to_string(),
+        ] {
+            assert!(IrohTarget::parse(&target).is_err(), "accepted {target}");
+        }
+    }
 
     #[tokio::test]
     async fn handler_shutdown_closes_admission_and_waits_for_active_accepts() {

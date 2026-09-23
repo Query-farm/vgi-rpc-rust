@@ -21,6 +21,7 @@ tokio.workspace = true
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 thiserror.workspace = true
 tracing.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 arrow-array.workspace = true

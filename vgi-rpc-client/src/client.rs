@@ -205,6 +205,32 @@ impl RpcClient {
         Ok(Self::from_transport(Box::new(t)))
     }
 
+    /// Connect to a TCP worker through rustls.
+    ///
+    /// `tls` controls server trust and optional client-certificate identity;
+    /// the transport never installs permissive certificate verification. The
+    /// server name is verified independently from the TCP destination, which
+    /// permits connecting through a load balancer or explicit IP address.
+    #[cfg(feature = "tcp-tls")]
+    pub fn tls_tcp_connect(
+        host: &str,
+        port: u16,
+        server_name: &str,
+        tls: Arc<rustls::ClientConfig>,
+        handshake_timeout: std::time::Duration,
+        io_timeout: Option<std::time::Duration>,
+    ) -> Result<Self> {
+        let transport = crate::transport::TlsTcpTransport::connect(
+            host,
+            port,
+            server_name,
+            tls,
+            handshake_timeout,
+            io_timeout,
+        )?;
+        Ok(Self::from_transport(Box::new(transport)))
+    }
+
     /// Connect to a TCP worker through a strict SOCKS5h proxy. The worker
     /// hostname is resolved by the proxy and proxy failure never falls back
     /// to a direct TCP connection.

@@ -23,11 +23,15 @@ implementation tracks the Python canonical
 the wire, so Python / Go / Rust clients and servers all interoperate.
 
 ```
-┌────────────────────────┐  stdio │ unix │ http                 ┌────────────────────────┐
+┌────────────────────────┐  stdio │ unix │ TCP/mTLS │ HTTP      ┌────────────────────────┐
 │  any vgi-rpc client    │◀───────────────────────────────────▶│  vgi-rpc Rust server   │
 │ (Python / Go / Rust)   │    Arrow IPC + signed state tokens   │   (this repo)          │
 └────────────────────────┘                                      └────────────────────────┘
 ```
+
+The optional `vgi-rpc-iroh` crate carries the raw stateful byte stream over an
+authenticated Iroh QUIC connection; `httpi://` remains a distinct HTTP
+transport.
 
 **Status.** 901 / 901 Python conformance tests pass across pipe,
 subprocess, http, and unix transports. 250 Rust-native unit +

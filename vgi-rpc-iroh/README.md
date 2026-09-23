@@ -113,6 +113,27 @@ let second_client = connection.open_client().await?;
 # Ok(()) }
 ```
 
+Applications accepting configuration strings can use the canonical URI form
+directly. It is deliberately distinct from HTTP-over-Iroh:
+
+```rust,no_run
+# use iroh::{Endpoint, endpoint::presets};
+# use vgi_rpc_iroh::{IrohClientOptions, IrohConnection};
+# async fn connect() -> Result<(), Box<dyn std::error::Error>> {
+let endpoint = Endpoint::bind(presets::N0).await?;
+let connection = IrohConnection::connect_uri(
+    endpoint,
+    "iroh://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    IrohClientOptions::default(),
+).await?;
+# let _ = connection;
+# Ok(()) }
+```
+
+`IrohTarget` parses and formats this strict `iroh://<endpoint-id>` form. It
+rejects credentials, ports, paths, queries, fragments, and non-canonical
+endpoint IDs. `httpi://` remains the separate stateless HTTP transport.
+
 Connecting with only an endpoint ID requires the supplied Iroh endpoint to
 have a suitable address-lookup service. `connect_addr` also accepts an
 `EndpointAddr` containing direct or relay addresses.

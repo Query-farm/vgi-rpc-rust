@@ -2,6 +2,24 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.27.0] — 2026-09-23
+
+### Added
+
+- `vgi-rpc-client` now provides a `tcp-tls` feature and
+  `RpcClient::tls_tcp_connect` for persistent VGI framing over rustls. Callers
+  supply the trust roots and optional client identity; the transport enforces
+  server-name verification plus bounded handshake and I/O timeouts.
+- `vgi-rpc-iroh` now provides strict `IrohTarget` parsing for canonical
+  `iroh://<endpoint-id>` targets and `IrohConnection::connect_uri`. Raw
+  stateful Iroh remains distinct from the `httpi://` HTTP transport.
+
+### Validation
+
+- Added direct mTLS round-trip coverage, including rejection of the wrong
+  server name and clients without a certificate.
+- Added canonical Iroh-target acceptance and rejection coverage.
+
 ## [0.26.0] — 2026-09-18
 
 Tracks the reference's identity revision of 2026-09-18

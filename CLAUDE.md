@@ -513,7 +513,9 @@ is **0.14.x** (the port started at 0.1.0; every release is live on
 crates.io, owned by `rustyconover`). A re-release **must** bump the
 version — you cannot overwrite an existing one.
 
-1. Bump the workspace version in the root `Cargo.toml`, and the internal
+1. Also keep `vgi-rpc-iroh-browser/npm/package.json` and its `package-lock.json`
+   version in sync with the workspace (the release packages both crates and npm).
+   Bump the workspace version in the root `Cargo.toml`, and the internal
    path-dep `version = "..."` pins (`vgi-rpc-macros` in `vgi-rpc`;
    `vgi-rpc` in `vgi-rpc-client`/`vgi-rpc-s3`/`vgi-rpc-gcs`; `vgi-rpc-s3`
    in `vgi-rpc-gcs`). Run `cargo check` to refresh `Cargo.lock`.

@@ -2,6 +2,14 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.27.2] — 2026-09-25
+
+### Fixed
+
+- Refresh the embedded browser client for Reflection.v1 discovery and render
+  hierarchical VGI v2 schema paths throughout the shared catalog landing page.
+- Version the browser bundle URL so existing visitors fetch the corrected client.
+
 ## [0.27.1] — 2026-09-23
 
 ### Security

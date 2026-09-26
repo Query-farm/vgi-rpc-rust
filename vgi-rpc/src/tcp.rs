@@ -29,6 +29,11 @@
 //!
 //! The `shutdown` flag lets a caller's signal handler (SIGTERM/SIGINT) tear the
 //! loop down the same way.
+//!
+//! Native listeners wait for OS readiness rather than sleeping between accepts.
+//! The legacy atomic shutdown flag is checked at most every 50 ms while idle;
+//! incoming connections wake that wait immediately. Wasm retains the std-only
+//! fallback because native readiness backends are unavailable there.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Read};
@@ -44,6 +49,10 @@ use crate::auth::identity::{
 };
 use crate::unauthorized::AuthReason;
 use crate::{AuthContext, ConnectionContext, RpcError, RpcServer};
+
+#[cfg(not(target_family = "wasm"))]
+#[path = "tcp_accept.rs"]
+mod accept;
 
 #[cfg(feature = "tcp-mtls")]
 use crate::auth::identity::{IdentityAssurance, PeerIdentity, SubjectKind, SubjectStability};
@@ -413,7 +422,9 @@ fn serve_tcp_inner<F: FnOnce(&str, u16)>(
     let _ = &connection_options.security;
     let listener = TcpListener::bind((host, port))?;
     let bound_port = listener.local_addr()?.port();
-    listener.set_nonblocking(true).ok();
+    listener.set_nonblocking(true)?;
+    #[cfg(not(target_family = "wasm"))]
+    let mut listener = accept::Listener::new(listener)?;
     on_bound(host, bound_port);
 
     // Startup grace: max(idle_timeout, 60s) before the first client connects,
@@ -433,10 +444,10 @@ fn serve_tcp_inner<F: FnOnce(&str, u16)>(
             maximum: options.identity_resolver_concurrency,
         })
     });
-    loop {
+    let outcome = loop {
         reap_finished(&mut threads);
         if shutdown.load(Ordering::Relaxed) {
-            break;
+            break Ok(());
         }
         // Idle self-termination: only when nothing is in flight and the
         // (startup or re-armed) deadline has elapsed.
@@ -445,7 +456,7 @@ fn serve_tcp_inner<F: FnOnce(&str, u16)>(
             if st.conn_count == 0 {
                 if let Some(dl) = st.deadline {
                     if Instant::now() >= dl {
-                        break;
+                        break Ok(());
                     }
                 }
             }
@@ -453,7 +464,9 @@ fn serve_tcp_inner<F: FnOnce(&str, u16)>(
 
         match listener.accept() {
             Ok((mut conn, peer)) => {
-                conn.set_nonblocking(false).ok();
+                if conn.set_nonblocking(false).is_err() {
+                    continue;
+                }
                 // Disable Nagle so lockstep framing isn't delayed.
                 conn.set_nodelay(true).ok();
                 // Both clones are prerequisites: the worker needs one reader
@@ -529,11 +542,32 @@ fn serve_tcp_inner<F: FnOnce(&str, u16)>(
                 }));
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
+                // AtomicBool has no notification facility. Bound only the
+                // shutdown/idle bookkeeping interval; readiness wakes us as
+                // soon as a connection arrives. Drain accepts to WouldBlock
+                // before waiting again, including on edge-triggered backends.
+                let maximum = Duration::from_millis(50);
+                let timeout = lock(&state)
+                    .deadline
+                    .map(|deadline| {
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(maximum)
+                    })
+                    .unwrap_or(maximum);
+                #[cfg(not(target_family = "wasm"))]
+                if let Err(error) = listener.wait(timeout) {
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        break Err(error);
+                    }
+                }
+                #[cfg(target_family = "wasm")]
+                thread::sleep(timeout);
             }
-            Err(_) => break,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => break Err(error),
         }
-    }
+    };
 
     drop(listener);
     for connection in lock(&active).values() {
@@ -543,7 +577,7 @@ fn serve_tcp_inner<F: FnOnce(&str, u16)>(
     // would make the nominal deadline unbounded.
     let deadline = Instant::now() + Duration::from_secs(2);
     join_until(&mut threads, deadline);
-    Ok(())
+    outcome
 }
 
 fn serve_plain_connection(

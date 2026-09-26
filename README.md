@@ -4,6 +4,11 @@
 
 <h1 align="center">vgi-rpc (Rust)</h1>
 
+Native TCP/mTLS listeners wait on OS readiness, so new connections do not wait
+for a fixed accept-loop sleep. Existing atomic shutdown flags are still checked
+at bounded 50 ms intervals; this compatibility check does not delay connection
+readiness. RPC handlers retain blocking streams and existing identity checks.
+
 <p align="center">
   Transport-agnostic RPC framework built on <a href="https://arrow.apache.org/">Apache Arrow</a> IPC serialization — the Rust port of <a href="https://github.com/Query-farm/vgi-rpc-python">vgi-rpc</a>.<br>
   Built by <a href="https://query.farm">🚜 Query.Farm</a>

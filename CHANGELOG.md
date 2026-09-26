@@ -2,6 +2,17 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## Unreleased
+
+### Fixed
+
+- Wake native TCP/mTLS listeners on OS socket readiness instead of sleeping
+  50 ms after an empty accept. This removes the artificial delay on new
+  connections while retaining existing blocking RPC handlers and wire framing.
+  The legacy atomic shutdown flag still has a bounded 50 ms check interval;
+  shutdown interruption, startup grace and idle self-termination are preserved.
+  Native polling dependencies remain excluded from wasm builds.
+
 ## [0.27.2] — 2026-09-25
 
 ### Fixed

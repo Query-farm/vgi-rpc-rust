@@ -213,6 +213,37 @@ fn tcp_worker_serves_then_idle_exits() {
 }
 
 #[test]
+fn tcp_shutdown_without_a_connection_preserves_startup_grace() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_shutdown = shutdown.clone();
+    let (bound_tx, bound_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = vgi_rpc::tcp::serve_tcp(
+            Arc::new(RpcServer::new("tcp-empty-shutdown")),
+            "127.0.0.1",
+            0,
+            Some(Duration::from_millis(1)),
+            server_shutdown,
+            move |_, _| bound_tx.send(()).unwrap(),
+        );
+        done_tx.send(result).unwrap();
+    });
+    bound_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    // The configured idle timeout must not replace the initial 60-second grace.
+    assert!(matches!(
+        done_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    shutdown.store(true, Ordering::Relaxed);
+    done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    handle.join().unwrap();
+}
+
+#[test]
 fn tcp_shutdown_interrupts_a_stalled_connection() {
     let shutdown = Arc::new(AtomicBool::new(false));
     let (bound_tx, bound_rx) = mpsc::channel();

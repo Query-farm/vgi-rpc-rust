@@ -116,6 +116,25 @@ jobs:
           python3 -m unittest test_launch.py
           node --check verify.mjs
 
+  tcp-readiness:
+    name: TCP readiness (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Readiness and identity regressions
+        run: cargo test -p vgi-rpc --no-default-features --features tcp-mtls --locked --lib tcp::
+      - name: Idle and shutdown lifecycle
+        run: cargo test -p vgi-rpc --no-default-features --features tcp-mtls --locked --test tcp_serve
+      - name: Verified native mTLS client
+        run: cargo test -p vgi-rpc-client --features tcp-tls --locked --test tcp_tls
+
   fmt-clippy-test:
     runs-on: ubuntu-latest
     steps:

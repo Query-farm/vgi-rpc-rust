@@ -327,9 +327,11 @@ fn join_until(threads: &mut Vec<thread::JoinHandle<()>>, deadline: Instant) {
 /// is `Some`, the worker has been idle past its deadline. On exit the listener
 /// is dropped.
 ///
-/// Returns the bind/listen error if the socket cannot be created; the accept
-/// loop itself never returns an error (transient accept failures are retried,
-/// terminal ones end the loop).
+/// Returns bind, readiness registration or terminal accept/wait errors, after
+/// interrupting active sockets and bounding the handler join wait to two seconds.
+/// On Windows, shutdown does not wake an already-blocked socket read; such a
+/// handler may remain until its peer closes. Hard termination requires a process
+/// supervisor. Interrupted waits/accepts and spurious readiness are retried.
 pub fn serve_tcp<F: FnOnce(&str, u16)>(
     server: Arc<RpcServer>,
     host: &str,

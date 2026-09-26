@@ -1239,7 +1239,8 @@ mod identity_tests {
         mut socket: TcpStream,
         proxy: Option<Vec<u8>>,
         with_certificate: bool,
-    ) -> thread::JoinHandle<io::Result<()>> {
+    ) -> thread::JoinHandle<io::Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>>
+    {
         thread::spawn(move || {
             if let Some(proxy) = proxy {
                 socket.write_all(&proxy)?;
@@ -1251,7 +1252,11 @@ mod identity_tests {
                 .map_err(io::Error::other)?;
             let mut stream = rustls::StreamOwned::new(connection, socket);
             stream.write_all(&[0xaa])?;
-            stream.flush()
+            stream.flush()?;
+            // Keep the client socket alive in the join result until the server
+            // has read the application byte. Dropping it here can abort the
+            // connection on Windows with unread TLS session tickets in flight.
+            Ok(stream)
         })
     }
 

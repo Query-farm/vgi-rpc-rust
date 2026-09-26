@@ -129,7 +129,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - name: Readiness and identity regressions
-        run: cargo test -p vgi-rpc --no-default-features --features tcp-mtls --locked --lib tcp::
+        run: "cargo test -p vgi-rpc --no-default-features --features tcp-mtls --locked --lib tcp::"
       - name: Idle and shutdown lifecycle
         run: cargo test -p vgi-rpc --no-default-features --features tcp-mtls --locked --test tcp_serve
       - name: Verified native mTLS client

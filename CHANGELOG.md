@@ -2,6 +2,16 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased]
+
+### Added
+
+- Optional Iroh physical-connection lifecycle callbacks let applications revoke
+  connection-owned resources on disconnect, shutdown, or task cancellation.
+  Logical stream closure leaves the connection lifecycle intact. Cleanup runs
+  before draining handlers, so applications must handle in-flight registration
+  races and perform blocking driver cleanup outside the callback.
+
 ## [0.27.3] — 2026-09-26
 
 ### Fixed

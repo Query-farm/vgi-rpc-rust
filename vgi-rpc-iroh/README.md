@@ -27,6 +27,19 @@ panic hook that also redacts panic payloads.
 
 ## Server
 
+Applications with resources that outlive an individual RPC can install
+`IrohServerOptions::with_lifecycle` with an `IrohConnectionLifecycle` handler.
+`opened` runs after peer policy succeeds, before any request dispatch, and can
+add server-owned claims to the shared `ConnectionContext`. `closed` runs once
+after a successful `opened`, on physical connection loss, listener shutdown,
+first-stream failure, or task drop. It runs before draining active handlers;
+applications must reject late resource creation after revocation. Closing an
+individual logical stream does not trigger it, and two connections from the
+same endpoint have independent lifecycles. Callbacks must not block; schedule
+native cleanup separately and keep any per-connection state bounded by the
+listener's admission limits. When `opened` returns an error, it must undo its
+own partial initialization.
+
 Configure the accepting endpoint with [`VGI_IROH_ALPN`](https://docs.rs/vgi-rpc-iroh/latest/vgi_rpc_iroh/constant.VGI_IROH_ALPN.html):
 
 ```rust,no_run

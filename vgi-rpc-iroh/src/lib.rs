@@ -182,6 +182,51 @@ where
     }
 }
 
+/// Application lifecycle for one accepted physical QUIC connection.
+///
+/// The context is resolved once and shared by all logical streams on that
+/// connection. Implementations may add server-owned claims in `opened` to
+/// associate requests with application resources. They must not perform
+/// blocking work in either callback. No callback runs for rejected peers.
+pub trait IrohConnectionLifecycle: Send + Sync {
+    /// Initialize application state after peer-policy resolution, before dispatch.
+    /// On error, the implementation must undo any partial initialization.
+    fn opened(&self, context: &mut ConnectionContext) -> vgi_rpc::Result<()>;
+
+    /// Revoke application state exactly once after a successful `opened`.
+    ///
+    /// Runs on disconnect, shutdown, early transport error, or task drop.
+    /// In-flight handlers may still be running: implementations must reject
+    /// resources registered after this callback and cancel work separately.
+    fn closed(&self, context: &ConnectionContext);
+}
+
+struct ConnectionLifecycleGuard {
+    lifecycle: Option<Arc<dyn IrohConnectionLifecycle>>,
+    context: ConnectionContext,
+}
+
+impl ConnectionLifecycleGuard {
+    fn close(&mut self) {
+        if let Some(lifecycle) = self.lifecycle.take() {
+            // Never unwind through transport cleanup, including task abort.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                lifecycle.closed(&self.context);
+            }))
+            .is_err()
+            {
+                tracing::error!(target: "vgi_rpc_iroh.server", "connection lifecycle cleanup panicked");
+            }
+        }
+    }
+}
+
+impl Drop for ConnectionLifecycleGuard {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// Server-side connection and identity policy.
 #[derive(Clone)]
 pub struct IrohServerOptions {
@@ -194,6 +239,9 @@ pub struct IrohServerOptions {
     pub policy: Option<PeerAuthenticationPolicy>,
     /// Authentication established outside Iroh, composed by `policy`.
     pub application_auth: AuthContext,
+    /// Optional application resource lifecycle, scoped to a physical QUIC
+    /// connection rather than an endpoint identity or an individual stream.
+    pub lifecycle: Option<Arc<dyn IrohConnectionLifecycle>>,
     /// Maximum time allowed for an incoming cryptographic handshake.
     pub handshake_timeout: Duration,
     /// Maximum time allowed for the client to open its VGI stream.
@@ -226,6 +274,7 @@ impl Default for IrohServerOptions {
             issuer: "iroh".into(),
             policy: None,
             application_auth: AuthContext::anonymous(),
+            lifecycle: None,
             handshake_timeout: Duration::from_secs(15),
             stream_open_timeout: Duration::from_secs(15),
             connection_io_timeout: Duration::from_secs(30),
@@ -241,6 +290,11 @@ impl Default for IrohServerOptions {
 }
 
 impl IrohServerOptions {
+    pub fn with_lifecycle(mut self, lifecycle: Arc<dyn IrohConnectionLifecycle>) -> Self {
+        self.lifecycle = Some(lifecycle);
+        self
+    }
+
     pub fn with_issuer(mut self, issuer: impl Into<String>) -> Self {
         self.issuer = issuer.into();
         self
@@ -507,7 +561,16 @@ impl IrohServer {
         _endpoint: Option<EndpointPermit>,
     ) -> Result<()> {
         let remote_id = connection.remote_id();
-        let context = self.connection_context(remote_id)?;
+        let mut context = self.connection_context(remote_id)?;
+        if let Some(lifecycle) = &self.options.lifecycle {
+            lifecycle
+                .opened(&mut context)
+                .map_err(redacted_policy_error)?;
+        }
+        let mut lifecycle = ConnectionLifecycleGuard {
+            lifecycle: self.options.lifecycle.clone(),
+            context: context.clone(),
+        };
         let per_connection = Arc::new(Semaphore::new(
             self.options.max_active_streams_per_connection,
         ));
@@ -560,6 +623,9 @@ impl IrohServer {
             }
         }
 
+        // Notify the application before waiting for blocking handlers. A
+        // downstream call must not postpone revocation of abandoned state.
+        lifecycle.close();
         let drain = async {
             while let Some(completed) = streams.join_next().await {
                 report_stream_result(Some(completed));

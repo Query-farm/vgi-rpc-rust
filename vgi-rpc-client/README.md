@@ -37,10 +37,12 @@ canonical Python client: you build the request parameters as a one-row Arrow
   server-name verification and optional client-certificate identity. Callers
   supply the `rustls::ClientConfig`; no permissive verifier is installed.
   *(feature `tcp-tls`)*
-- **HTTP** — `reqwest`-blocking, with the full production surface:
+- **HTTP** — blocking, with the full production surface:
   external-location resolution, sticky sessions, 413 request-externalization,
   415/zstd codec negotiation, a request timeout, and opt-in connection-level
-  retries. *(feature `http`, default)*
+  retries. Requests go through `reqwest` by default, or through a
+  caller-supplied `HttpExecutor` (see below). *(features `http` + `reqwest`,
+  default)*
 - **HTTP over Iroh** — the same typed, stateless HTTP state machine carried on
   authenticated `iroh-http/2` streams. A canonical
   `httpi://<endpoint-id>[/base-path]` target selects the peer; direct and relay
@@ -97,6 +99,46 @@ identity or explicit routing. Construction and calls are blocking; use them on
 a blocking thread rather than a Tokio worker. Externalized payload URLs remain
 ordinary HTTP(S) and use the independently configurable external HTTP client.
 
+### Custom HTTP executor
+
+`HttpClientBuilder::executor` routes every HTTP request — RPC calls,
+capability discovery, session teardown, upload-URL `PUT`s and
+external-location `GET`s — through your own synchronous `HttpExecutor`
+instead of reqwest. This needs only the `http` feature, so
+`--no-default-features --features http` builds for targets reqwest does not
+support, such as `wasm32-unknown-emscripten` (e.g. inside DuckDB-WASM, where
+HTTP is a synchronous browser `XMLHttpRequest`).
+
+```rust,ignore
+use std::sync::Arc;
+use vgi_rpc_client::{ExecutorCaps, HttpClient, HttpExecError, HttpExecutor, HttpRequest, HttpResponse};
+
+struct HostHttp;
+impl HttpExecutor for HostHttp {
+    fn execute(&self, req: HttpRequest<'_>) -> Result<HttpResponse, HttpExecError> {
+        host_http_call(req) // status, headers (duplicates kept), body
+    }
+    fn caps(&self) -> ExecutorCaps {
+        // A browser transport: no OPTIONS, decodes Content-Encoding itself.
+        ExecutorCaps { supports_options: false, transparent_decompression: true }
+    }
+}
+
+let mut client = HttpClient::connect("https://rpc.example")
+    .protocol("my.Service.v1")
+    .executor(Arc::new(HostHttp))
+    .build()?;
+```
+
+`ExecutorCaps` adapts the protocol to the transport: without
+`supports_options`, capabilities are discovered with `GET {prefix}/health`;
+with `transparent_decompression`, the client never sends `Accept-Encoding`,
+negotiates with `X-VGI-Accept-Encoding: zstd, gzip`, decodes only bodies the
+server marks with `X-VGI-Content-Encoding`, and treats a standard
+`Content-Encoding` as already decoded by the transport. External-location
+fetches set `follow_redirects: false`; the client validates each redirect hop
+against its URL policy itself.
+
 For direct mutual TLS, construct a `rustls::ClientConfig` with the deployment
 CA and client certificate, then connect the stateful byte stream explicitly:
 
@@ -119,8 +161,9 @@ let mut client = RpcClient::tls_tcp_connect(
 
 | feature | default | what it adds |
 |---------|:-:|--------------|
-| `http`  | ✅ | `HttpClient` + the HTTP production features above |
-| `iroh`  | — | Native `httpi://` execution through `vgi-iroh-transport`; implies `http` |
+| `http`  | ✅ | `HttpClient` + the HTTP production features above, backend-neutral (`HttpExecutor`) |
+| `reqwest` | ✅ | The default blocking reqwest HTTP backend; implies `http` |
+| `iroh`  | — | Native `httpi://` execution through `vgi-iroh-transport`; implies `http` + `reqwest` |
 | `tcp-tls` | — | rustls-protected stateful TCP, including mutual TLS |
 | `unix`  | — | AF_UNIX transport |
 | `shm`   | — | POSIX shared-memory side-channel |

@@ -60,10 +60,16 @@ pub const UNIX_SOCKET_BUFFER_BYTES: usize = 1 << 20;
 ///
 /// Best effort. The kernel clamps the request to its own maximum, and a
 /// refusal is not worth failing a connection over.
+/// A no-op on emscripten, which has no kernel socket buffer to tune.
 pub fn widen_socket_buffers<S: std::os::fd::AsFd>(sock: &S) {
-    let sock = socket2::SockRef::from(sock);
-    let _ = sock.set_send_buffer_size(UNIX_SOCKET_BUFFER_BYTES);
-    let _ = sock.set_recv_buffer_size(UNIX_SOCKET_BUFFER_BYTES);
+    #[cfg(not(target_os = "emscripten"))]
+    {
+        let sock = socket2::SockRef::from(sock);
+        let _ = sock.set_send_buffer_size(UNIX_SOCKET_BUFFER_BYTES);
+        let _ = sock.set_recv_buffer_size(UNIX_SOCKET_BUFFER_BYTES);
+    }
+    #[cfg(target_os = "emscripten")]
+    let _ = sock;
 }
 
 /// Shared idle bookkeeping: how many connections are live, and — when zero —

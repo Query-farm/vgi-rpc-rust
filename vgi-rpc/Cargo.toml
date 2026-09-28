@@ -221,8 +221,10 @@ rust_decimal.workspace = true
 # on unix/wasm the shm code uses the `#[cfg(unix)]` libc path instead.
 # AF_UNIX socket-buffer tuning (see `unix::widen_socket_buffers`).  Unix only,
 # and not optional: the default buffer is small enough to halve throughput, so
-# a build that silently skipped it would be a performance trap.
-[target.'cfg(unix)'.dependencies]
+# a build that silently skipped it would be a performance trap. Emscripten
+# counts as unix but socket2 does not build there (and there is no kernel
+# socket buffer to tune), so it is excluded.
+[target.'cfg(all(unix, not(target_os = "emscripten")))'.dependencies]
 socket2.workspace = true
 
 # Keep the browser/wasm build free of native OS polling backends.

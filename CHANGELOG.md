@@ -11,6 +11,24 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
   Logical stream closure leaves the connection lifecycle intact. Cleanup runs
   before draining handlers, so applications must handle in-flight registration
   races and perform blocking driver cleanup outside the callback.
+- `vgi-rpc-client`: pluggable synchronous HTTP backend. `HttpExecutor`
+  (with `HttpRequest`, `HttpResponse`, `HttpExecError`, `ExecutorCaps`) and
+  `HttpClientBuilder::executor` route every HTTP request — including upload-URL
+  `PUT`s and redirect-validated external-location `GET`s — through
+  caller-supplied code. `ExecutorCaps::supports_options = false` discovers
+  capabilities with `GET /health`; `transparent_decompression = true`
+  negotiates via `X-VGI-Accept-Encoding` / `X-VGI-Content-Encoding` for
+  transports (browsers) that own `Accept-Encoding` / `Content-Encoding`.
+
+### Changed
+
+- `vgi-rpc-client`: the reqwest backend moved behind a new `reqwest` feature
+  (default on; `iroh` implies it). `http` alone now uses the `http` crate's
+  types and builds for `wasm32-unknown-emscripten` with an executor. Without
+  `reqwest`, `HttpClientBuilder::build` requires an executor and
+  `RpcClient::external_resolution` returns an error (use `external_config`).
+- `socket2` is no longer a dependency on emscripten (which counts as unix);
+  `vgi_rpc::unix::widen_socket_buffers` is a no-op there.
 
 ## [0.27.3] — 2026-09-26
 

@@ -23,11 +23,12 @@ use std::io::{Cursor, Read};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use ::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
+#[cfg(feature = "reqwest")]
 use reqwest::blocking::Client as ReqwestClient;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
-use reqwest::{Method, StatusCode};
 
 use vgi_rpc::errors::{Result, RpcError};
 use vgi_rpc::external::{
@@ -40,6 +41,9 @@ use vgi_rpc::wire::{empty_batch, write_one_batch, Metadata, StreamReader};
 
 use crate::client::OnLog;
 use crate::envelope::{classify, BatchKind};
+pub use crate::http_executor::{
+    ExecutorCaps, HttpExecError, HttpExecutor, HttpRequest, HttpResponse,
+};
 use crate::introspect::{
     describe_params, empty_schema, no_application_protocol, parse_protocol_list,
     parse_service_description, reflection_payload, ProtocolList, ServiceDescription,
@@ -66,6 +70,11 @@ const MAX_EXTERNALIZED_RESPONSE_BYTES_HEADER: &str = "VGI-Max-Externalized-Respo
 const EXTERNALIZATION_ENABLED_HEADER: &str = "VGI-Externalization-Enabled";
 const MAX_UPLOAD_BYTES_HEADER: &str = "VGI-Max-Upload-Bytes";
 const UPLOAD_URL_HEADER: &str = "VGI-Upload-URL-Support";
+/// Browser-safe codec negotiation: request/response counterparts of the
+/// standard `Accept-Encoding` / `Content-Encoding`, used when the executor's
+/// transport decodes (and forbids setting) the standard pair.
+const VGI_ACCEPT_ENCODING_HEADER: &str = "X-VGI-Accept-Encoding";
+const VGI_CONTENT_ENCODING_HEADER: &str = "X-VGI-Content-Encoding";
 const SESSION_ENDPOINT: &str = "__session__";
 // The upload-URL method name is a shared public wire contract, not a
 // client-local literal.
@@ -83,10 +92,22 @@ const MAX_SAFE_RESPONSE_BYTES: u64 = (1u64 << 53) - 1;
 const DEFAULT_REQUEST_ENCODING: &str = "zstd";
 
 enum HttpBackend {
+    #[cfg(feature = "reqwest")]
     Reqwest(ReqwestClient),
+    /// A caller-supplied executor; `timeout` is the builder's request timeout.
+    Custom {
+        executor: Arc<dyn HttpExecutor>,
+        timeout: Option<Duration>,
+    },
     #[cfg(feature = "iroh")]
     Iroh(crate::httpi::HttpiExecutor),
 }
+
+/// Capabilities of the built-in native backends (reqwest, Iroh).
+const NATIVE_CAPS: ExecutorCaps = ExecutorCaps {
+    supports_options: true,
+    transparent_decompression: false,
+};
 
 struct BackendResponse {
     status: StatusCode,
@@ -119,6 +140,7 @@ impl HttpBackend {
         body: Vec<u8>,
     ) -> std::result::Result<BackendResponse, BackendRequestError> {
         match self {
+            #[cfg(feature = "reqwest")]
             Self::Reqwest(client) => client
                 .request(method, target)
                 .headers(headers)
@@ -137,6 +159,46 @@ impl HttpBackend {
                     error: RpcError::new("TransportError", error.to_string()),
                     retry_safe: true,
                 }),
+            Self::Custom { executor, timeout } => {
+                let pairs = header_pairs(&headers);
+                let response = executor
+                    .execute(HttpRequest {
+                        method: method.as_str(),
+                        url: &target,
+                        headers: &pairs,
+                        body: &body,
+                        timeout: timeout.unwrap_or(Duration::ZERO),
+                        follow_redirects: true,
+                    })
+                    .map_err(|error| BackendRequestError {
+                        error: RpcError::new("TransportError", error.message),
+                        retry_safe: error.retry_safe,
+                    })?;
+                let transparent = executor.caps().transparent_decompression;
+                let (status, headers) =
+                    convert_executor_response(response.status, response.headers, "executor")
+                        .map_err(|error| BackendRequestError {
+                            error,
+                            retry_safe: false,
+                        })?;
+                // A transport that decodes `Content-Encoding` itself hands
+                // back the decoded body, which `Content-Length` (describing
+                // the encoded one) no longer measures.
+                let content_length = if transparent {
+                    None
+                } else {
+                    parse_content_length(&headers, "HTTP").map_err(|error| BackendRequestError {
+                        error,
+                        retry_safe: false,
+                    })?
+                };
+                Ok(BackendResponse {
+                    status,
+                    headers,
+                    content_length,
+                    body: Box::new(Cursor::new(response.body)),
+                })
+            }
             #[cfg(feature = "iroh")]
             Self::Iroh(client) => {
                 let raw_headers = headers
@@ -187,12 +249,13 @@ impl HttpBackend {
                             })?;
                             headers.append(name, value);
                         }
-                        let content_length = parse_content_length(&headers).map_err(|error| {
-                            BackendRequestError {
-                                error,
-                                retry_safe: false,
-                            }
-                        })?;
+                        let content_length =
+                            parse_content_length(&headers, "Iroh HTTP").map_err(|error| {
+                                BackendRequestError {
+                                    error,
+                                    retry_safe: false,
+                                }
+                            })?;
                         Ok(BackendResponse {
                             status,
                             headers,
@@ -206,19 +269,76 @@ impl HttpBackend {
 
     fn target(&self, base_url: &str, prefix: &str, path: &str) -> String {
         match self {
+            #[cfg(feature = "reqwest")]
             Self::Reqwest(_) => format!("{}{}/{}", base_url, prefix, path),
+            Self::Custom { .. } => format!("{}{}/{}", base_url, prefix, path),
             #[cfg(feature = "iroh")]
             Self::Iroh(_) => format!("{prefix}/{path}"),
+        }
+    }
+
+    fn caps(&self) -> ExecutorCaps {
+        match self {
+            Self::Custom { executor, .. } => executor.caps(),
+            #[allow(unreachable_patterns)]
+            _ => NATIVE_CAPS,
         }
     }
 
     #[cfg(feature = "iroh")]
     fn iroh_endpoint_id(&self) -> Option<String> {
         match self {
-            Self::Reqwest(_) => None,
             Self::Iroh(client) => Some(client.endpoint_id()),
+            _ => None,
         }
     }
+}
+
+/// Flatten a header map into the executor's `(name, value)` list, keeping
+/// repeated names as separate entries.
+fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Convert an executor's status + header list into typed values. Headers are
+/// appended, never inserted, so duplicates survive for the checks that
+/// reject a repeated capability header.
+fn convert_executor_response(
+    status: u16,
+    raw_headers: Vec<(String, String)>,
+    label: &str,
+) -> Result<(StatusCode, HeaderMap)> {
+    let status = StatusCode::from_u16(status).map_err(|error| {
+        RpcError::new(
+            "ProtocolError",
+            format!("invalid {label} HTTP response status: {error}"),
+        )
+    })?;
+    let mut headers = HeaderMap::with_capacity(raw_headers.len());
+    for (name, value) in raw_headers {
+        let name = HeaderName::from_bytes(name.trim().as_bytes()).map_err(|error| {
+            RpcError::new(
+                "ProtocolError",
+                format!("invalid {label} HTTP response header name: {error}"),
+            )
+        })?;
+        let value = HeaderValue::from_str(value.trim()).map_err(|error| {
+            RpcError::new(
+                "ProtocolError",
+                format!("invalid {label} HTTP response header value: {error}"),
+            )
+        })?;
+        headers.append(name, value);
+    }
+    Ok((status, headers))
 }
 
 fn zstd_window_log_for_limit(max_size: usize) -> u32 {
@@ -298,8 +418,48 @@ pub struct UploadUrl {
 
 /// Reqwest-blocking `Fetcher` that returns the still-encoded body under a hard
 /// cap. The shared external-location resolver performs bounded decoding.
+#[cfg(feature = "reqwest")]
 struct ClientHttpFetcher {
     client: ReqwestClient,
+}
+
+/// Egress for ordinary HTTP(S) outside the VGI endpoint: `PUT`s to
+/// server-vended upload URLs. Stays on ordinary HTTP even when VGI requests
+/// themselves use `httpi://`; with an executor it is that executor.
+#[derive(Clone)]
+enum ExternalHttp {
+    #[cfg(feature = "reqwest")]
+    Reqwest(ReqwestClient),
+    Executor {
+        executor: Arc<dyn HttpExecutor>,
+        timeout: Option<Duration>,
+    },
+}
+
+impl ExternalHttp {
+    /// The redirect-free fetcher used to resolve external-location pointers.
+    fn fetcher(&self, timeout: Option<Duration>) -> Result<Arc<dyn Fetcher>> {
+        match self {
+            #[cfg(feature = "reqwest")]
+            Self::Reqwest(_) => {
+                // Its own redirect-free, timed client (SSRF-safer).
+                let fetch_client = ReqwestClient::builder()
+                    .timeout(timeout.unwrap_or(DEFAULT_TIMEOUT))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .map_err(|e| {
+                        RpcError::new("TransportError", format!("build fetch client: {e}"))
+                    })?;
+                Ok(Arc::new(ClientHttpFetcher {
+                    client: fetch_client,
+                }))
+            }
+            Self::Executor { executor, .. } => Ok(Arc::new(ExecutorFetcher {
+                executor: executor.clone(),
+                timeout: timeout.unwrap_or(DEFAULT_TIMEOUT),
+            })),
+        }
+    }
 }
 
 /// Build the resolver every transport in this crate uses.
@@ -307,6 +467,7 @@ struct ClientHttpFetcher {
 /// Its own redirect-free, timed reqwest client (SSRF-safer), so a byte-stream
 /// client resolving a pointer gets the same fetch policy an HTTP one does
 /// rather than a second, weaker implementation.
+#[cfg(feature = "reqwest")]
 pub(crate) fn build_client_external_config(
     validator: UrlValidator,
 ) -> Result<ExternalLocationConfig> {
@@ -325,8 +486,20 @@ pub(crate) fn build_client_external_config(
     Ok(cfg)
 }
 
+/// Without the reqwest backend there is no default fetcher; callers supply
+/// one through `external_config`.
+#[cfg(not(feature = "reqwest"))]
+pub(crate) fn build_client_external_config(
+    _validator: UrlValidator,
+) -> Result<ExternalLocationConfig> {
+    Err(RpcError::new(
+        "TransportError",
+        "external_resolution needs the `reqwest` feature; supply a Fetcher via external_config",
+    ))
+}
+
 fn redact_external_url(url: &str) -> String {
-    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+    let Ok(mut parsed) = url::Url::parse(url) else {
         return "<invalid external URL>".to_string();
     };
     let _ = parsed.set_username("");
@@ -336,6 +509,7 @@ fn redact_external_url(url: &str) -> String {
     parsed.to_string()
 }
 
+#[cfg(feature = "reqwest")]
 impl Fetcher for ClientHttpFetcher {
     fn fetch(&self, url: &str, _compression: Compression, max_bytes: usize) -> Result<Vec<u8>> {
         let mut resp = self.client.get(url).send().map_err(|_| {
@@ -378,10 +552,8 @@ impl Fetcher for ClientHttpFetcher {
         validator: &UrlValidator,
         max_redirects: usize,
     ) -> Result<FetchedPayload> {
-        use reqwest::header::{CONTENT_ENCODING, LOCATION};
-
         validate_external_url(validator, url)?;
-        let mut current = reqwest::Url::parse(url)
+        let mut current = url::Url::parse(url)
             .map_err(|_| RpcError::value_error("URL rejected: invalid external URL"))?;
         let mut redirects = 0usize;
         loop {
@@ -454,6 +626,120 @@ impl Fetcher for ClientHttpFetcher {
     }
 }
 
+/// [`Fetcher`] over a caller-supplied [`HttpExecutor`]. Never lets the
+/// executor follow redirects: each hop is validated against the resolver's
+/// URL policy before it is requested, exactly as the reqwest fetcher does.
+struct ExecutorFetcher {
+    executor: Arc<dyn HttpExecutor>,
+    timeout: Duration,
+}
+
+impl ExecutorFetcher {
+    fn get(&self, url: &str) -> Result<(StatusCode, HeaderMap, Vec<u8>)> {
+        let response = self
+            .executor
+            .execute(HttpRequest {
+                method: "GET",
+                url,
+                headers: &[],
+                body: &[],
+                timeout: self.timeout,
+                follow_redirects: false,
+            })
+            .map_err(|_| {
+                RpcError::runtime_error(format!(
+                    "external GET failed for {}",
+                    redact_external_url(url)
+                ))
+            })?;
+        let (status, headers) =
+            convert_executor_response(response.status, response.headers, "external")?;
+        Ok((status, headers, response.body))
+    }
+}
+
+impl Fetcher for ExecutorFetcher {
+    fn fetch(&self, url: &str, _compression: Compression, max_bytes: usize) -> Result<Vec<u8>> {
+        let (status, _headers, body) = self.get(url)?;
+        if !status.is_success() {
+            return Err(RpcError::runtime_error(format!(
+                "external GET returned {} for {}",
+                status,
+                redact_external_url(url)
+            )));
+        }
+        if body.len() > max_bytes {
+            return Err(RpcError::runtime_error(format!(
+                "external payload exceeds max_bytes={max_bytes}"
+            )));
+        }
+        Ok(body)
+    }
+
+    fn fetch_with_policy(
+        &self,
+        url: &str,
+        _compression: Compression,
+        max_bytes: usize,
+        validator: &UrlValidator,
+        max_redirects: usize,
+    ) -> Result<FetchedPayload> {
+        validate_external_url(validator, url)?;
+        let mut current = url::Url::parse(url)
+            .map_err(|_| RpcError::value_error("URL rejected: invalid external URL"))?;
+        let transparent = self.executor.caps().transparent_decompression;
+        let mut redirects = 0usize;
+        loop {
+            let (status, headers, body) = self.get(current.as_str())?;
+            if status.is_redirection() {
+                if redirects >= max_redirects {
+                    return Err(RpcError::runtime_error(format!(
+                        "external fetch redirect limit ({max_redirects}) exceeded"
+                    )));
+                }
+                let location = headers
+                    .get(LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| RpcError::runtime_error("external redirect missing Location"))?;
+                let next = current.join(location).map_err(|_| {
+                    RpcError::runtime_error("external redirect has invalid Location")
+                })?;
+                validate_external_url(validator, next.as_str())?;
+                current = next;
+                redirects += 1;
+                continue;
+            }
+            if !status.is_success() {
+                return Err(RpcError::runtime_error(format!(
+                    "external GET returned {} for {}",
+                    status,
+                    redact_external_url(current.as_str())
+                )));
+            }
+            if body.len() > max_bytes {
+                return Err(RpcError::runtime_error(format!(
+                    "external payload exceeds max_fetch_bytes={max_bytes}"
+                )));
+            }
+            // A transport that decodes `Content-Encoding` itself has already
+            // undone the storage coding.
+            let compression = if transparent {
+                Compression::None
+            } else {
+                headers
+                    .get(CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| value.eq_ignore_ascii_case("zstd"))
+                    .map_or(Compression::None, |_| Compression::Zstd(0))
+            };
+            return Ok(FetchedPayload {
+                bytes: body,
+                compression,
+            });
+        }
+    }
+}
+
 /// Storage backend that refuses uploads — the client resolves pointers but
 /// never uploads through the `ExternalStorage` path (request externalization
 /// uses the upload-URL flow instead).
@@ -480,7 +766,9 @@ pub struct HttpClientBuilder {
     /// The routing key stamped on every request.
     protocol: Option<String>,
     protocol_version: Option<String>,
+    #[cfg(feature = "reqwest")]
     inner: Option<ReqwestClient>,
+    executor: Option<Arc<dyn HttpExecutor>>,
     timeout: Option<Duration>,
     retry: RetryConfig,
     compression_level: Option<i32>,
@@ -510,8 +798,20 @@ impl HttpClientBuilder {
     }
 
     /// Supply a preconfigured reqwest client (e.g. with custom TLS / auth).
+    #[cfg(feature = "reqwest")]
     pub fn client(mut self, client: ReqwestClient) -> Self {
         self.inner = Some(client);
+        self
+    }
+
+    /// Route every request through a caller-supplied synchronous
+    /// [`HttpExecutor`] instead of reqwest: RPC calls, capability discovery,
+    /// session teardown, upload-URL `PUT`s and external-location `GET`s.
+    /// Takes precedence over a reqwest `client`. Needs only the `http`
+    /// feature. The executor's [`caps`](HttpExecutor::caps) select
+    /// `GET /health` discovery and browser-safe codec negotiation.
+    pub fn executor(mut self, executor: Arc<dyn HttpExecutor>) -> Self {
+        self.executor = Some(executor);
         self
     }
 
@@ -622,69 +922,98 @@ impl HttpClientBuilder {
         self.external_resolution(any_url_validator())
     }
 
+    /// Build the client.
+    ///
+    /// With an [`executor`](Self::executor) every request goes through it.
+    /// Otherwise the reqwest backend is used, which requires the `reqwest`
+    /// feature; without it this returns an error.
     pub fn build(self) -> Result<HttpClient> {
-        let inner = match self.inner {
-            Some(ref c) => c.clone(),
-            None => {
-                let mut b = ReqwestClient::builder();
-                if let Some(t) = self.timeout {
-                    b = b.timeout(t);
+        if let Some(executor) = self.executor.clone() {
+            let timeout = self.timeout;
+            return self.build_with_backend(
+                HttpBackend::Custom {
+                    executor: executor.clone(),
+                    timeout,
+                },
+                ExternalHttp::Executor { executor, timeout },
+            );
+        }
+        #[cfg(feature = "reqwest")]
+        {
+            let inner = match self.inner {
+                Some(ref c) => c.clone(),
+                None => {
+                    let mut b = ReqwestClient::builder();
+                    if let Some(t) = self.timeout {
+                        b = b.timeout(t);
+                    }
+                    b.build().map_err(|e| {
+                        RpcError::new("TransportError", format!("build http client: {e}"))
+                    })?
                 }
-                b.build().map_err(|e| {
-                    RpcError::new("TransportError", format!("build http client: {e}"))
-                })?
-            }
-        };
-        self.build_with_backend(HttpBackend::Reqwest(inner.clone()), inner)
+            };
+            self.build_with_backend(
+                HttpBackend::Reqwest(inner.clone()),
+                ExternalHttp::Reqwest(inner),
+            )
+        }
+        #[cfg(not(feature = "reqwest"))]
+        Err(RpcError::new(
+            "TransportError",
+            "HttpClient has no HTTP backend: enable the `reqwest` feature or supply one \
+             with HttpClientBuilder::executor",
+        ))
     }
 
     #[cfg(feature = "iroh")]
     pub(crate) fn build_httpi(self, executor: crate::httpi::HttpiExecutor) -> Result<HttpClient> {
-        let external_client = match self.inner.as_ref() {
-            Some(client) => client.clone(),
-            None => {
-                let mut builder = ReqwestClient::builder();
-                if let Some(timeout) = self.timeout {
-                    builder = builder.timeout(timeout);
-                }
-                builder.build().map_err(|error| {
-                    RpcError::new(
-                        "TransportError",
-                        format!("build external HTTP client: {error}"),
-                    )
-                })?
+        let external_http = if let Some(custom) = self.executor.clone() {
+            ExternalHttp::Executor {
+                executor: custom,
+                timeout: self.timeout,
             }
+        } else {
+            ExternalHttp::Reqwest(match self.inner.as_ref() {
+                Some(client) => client.clone(),
+                None => {
+                    let mut builder = ReqwestClient::builder();
+                    if let Some(timeout) = self.timeout {
+                        builder = builder.timeout(timeout);
+                    }
+                    builder.build().map_err(|error| {
+                        RpcError::new(
+                            "TransportError",
+                            format!("build external HTTP client: {error}"),
+                        )
+                    })?
+                }
+            })
         };
-        self.build_with_backend(HttpBackend::Iroh(executor), external_client)
+        self.build_with_backend(HttpBackend::Iroh(executor), external_http)
     }
 
     fn build_with_backend(
         self,
         backend: HttpBackend,
-        external_client: ReqwestClient,
+        external_http: ExternalHttp,
     ) -> Result<HttpClient> {
-        // The fetcher uses its own redirect-free, timed client (SSRF-safer).
-        let fetch_client = ReqwestClient::builder()
-            .timeout(self.timeout.unwrap_or(DEFAULT_TIMEOUT))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| RpcError::new("TransportError", format!("build fetch client: {e}")))?;
-        let external = self.external_validator.map(|validator| {
-            let mut cfg = ExternalLocationConfig::new(
-                Arc::new(NoopStorage),
-                Arc::new(ClientHttpFetcher {
-                    client: fetch_client,
-                }),
-            );
-            cfg.url_validator = validator;
-            cfg
-        });
+        let external = match self.external_validator {
+            Some(validator) => {
+                let mut cfg = ExternalLocationConfig::new(
+                    Arc::new(NoopStorage),
+                    external_http.fetcher(self.timeout)?,
+                );
+                cfg.url_validator = validator;
+                Some(cfg)
+            }
+            None => None,
+        };
         Ok(HttpClient {
             base_url: self.base_url.trim_end_matches('/').to_string(),
             prefix: self.prefix,
             headers: self.headers,
             backend,
-            external_client,
+            external_http,
             on_log: self.on_log,
             relax_nullability: self.relax_nullability,
             protocol: self.protocol,
@@ -729,7 +1058,7 @@ pub struct HttpClient {
     backend: HttpBackend,
     /// Ordinary HTTP(S) remains authoritative for external upload URLs even
     /// when VGI requests themselves use `httpi://`.
-    external_client: ReqwestClient,
+    external_http: ExternalHttp,
     on_log: Option<OnLog>,
     relax_nullability: bool,
     /// The routing key stamped on every request.
@@ -762,7 +1091,9 @@ impl HttpClient {
             relax_nullability: false,
             protocol: None,
             protocol_version: None,
+            #[cfg(feature = "reqwest")]
             inner: None,
+            executor: None,
             timeout: Some(DEFAULT_TIMEOUT),
             retry: RetryConfig::default(),
             compression_level: Some(DEFAULT_COMPRESSION_LEVEL),
@@ -820,13 +1151,23 @@ impl HttpClient {
         );
         if let Some(enc) = content_encoding {
             if let Ok(v) = HeaderValue::from_str(enc) {
-                h.insert(reqwest::header::CONTENT_ENCODING, v);
+                h.insert(CONTENT_ENCODING, v);
             }
-            // Advertise the codecs we can decode on responses.
-            h.insert(
-                reqwest::header::ACCEPT_ENCODING,
-                HeaderValue::from_static("zstd, gzip, identity"),
-            );
+            // Advertise the codecs we can decode on responses. A transport
+            // that decodes (and forbids setting) `Accept-Encoding` states
+            // the preference on VGI's own header; the server then answers
+            // with `X-VGI-Content-Encoding`, which it leaves alone.
+            if self.backend.caps().transparent_decompression {
+                h.insert(
+                    VGI_ACCEPT_ENCODING_HEADER,
+                    HeaderValue::from_static("zstd, gzip"),
+                );
+            } else {
+                h.insert(
+                    ACCEPT_ENCODING,
+                    HeaderValue::from_static("zstd, gzip, identity"),
+                );
+            }
         }
         if let Some(s) = self.session.as_ref() {
             h.insert(SESSION_ACCEPT_HEADER, HeaderValue::from_static("true"));
@@ -976,10 +1317,18 @@ impl HttpClient {
                             "server response does not advertise VGI-Accept-Max-Response-Bytes-Support: true",
                         ));
                     }
+                    // With transparent decompression the transport already
+                    // undid any standard `Content-Encoding`; only a coding
+                    // the server declared on VGI's own header remains.
+                    let encoding_header = if self.backend.caps().transparent_decompression {
+                        VGI_CONTENT_ENCODING_HEADER
+                    } else {
+                        CONTENT_ENCODING.as_str()
+                    };
                     let response_encoding = resp_headers
-                        .get(reqwest::header::CONTENT_ENCODING)
+                        .get(encoding_header)
                         .and_then(|v| v.to_str().ok())
-                        .map(str::to_ascii_lowercase);
+                        .map(|v| v.trim().to_ascii_lowercase());
                     let discovered_server_limit = self
                         .caps
                         .borrow()
@@ -1278,7 +1627,8 @@ impl HttpClient {
         }
     }
 
-    /// Query server capabilities via `OPTIONS {prefix}/health` (cached).
+    /// Query server capabilities via `OPTIONS {prefix}/health` (cached), or
+    /// `GET {prefix}/health` when the executor cannot issue `OPTIONS`.
     pub fn capabilities(&self) -> Result<HttpServerCapabilities> {
         if let Some(c) = self.caps.borrow().as_ref() {
             return Ok(c.clone());
@@ -1296,13 +1646,25 @@ impl HttpClient {
             HeaderValue::from_str(&self.accepted_max_response_bytes.to_string())
                 .expect("validated response budget is a valid header"),
         );
+        // The server stamps the same capability headers on `GET /health`,
+        // for transports that cannot issue `OPTIONS` (browser XHR hosts).
+        let method = if self.backend.caps().supports_options {
+            Method::OPTIONS
+        } else {
+            Method::GET
+        };
+        let label = if method == Method::OPTIONS {
+            "options"
+        } else {
+            "get"
+        };
         let resp = self
             .backend
-            .execute(Method::OPTIONS, self.target("health"), headers, Vec::new())
+            .execute(method, self.target("health"), headers, Vec::new())
             .map_err(|error| {
                 RpcError::new(
                     error.error.error_type,
-                    format!("options health: {}", error.error.message),
+                    format!("{label} health: {}", error.error.message),
                 )
             })?;
         require_response_budget_discovery(resp.status(), resp.headers())?;
@@ -1456,7 +1818,7 @@ impl HttpClient {
             .next()
             .ok_or_else(|| RpcError::new("ProtocolError", "server returned no upload URLs"))?;
         // PUT the inline body to the upload URL.
-        put_external_body(&self.external_client, &url.upload_url, body)?;
+        put_external_body(&self.external_http, &url.upload_url, body)?;
         // Build the pointer body: zero-row batch (original schema) + original
         // dispatch metadata + vgi_rpc.location.
         md.insert(LOCATION_KEY.to_string(), url.download_url);
@@ -1465,22 +1827,44 @@ impl HttpClient {
     }
 }
 
-fn put_external_body(client: &ReqwestClient, url: &str, body: &[u8]) -> Result<()> {
-    let response = client
-        .put(url)
-        .header(CONTENT_TYPE, ARROW_CONTENT_TYPE)
-        .body(body.to_vec())
-        .send()
-        .map_err(|_| {
-            RpcError::new(
-                "ExternalUploadFailed",
-                format!("PUT to upload URL failed for {}", redact_external_url(url)),
-            )
-        })?;
-    if !response.status().is_success() {
+fn put_external_body(external: &ExternalHttp, url: &str, body: &[u8]) -> Result<()> {
+    let failed = || {
+        RpcError::new(
+            "ExternalUploadFailed",
+            format!("PUT to upload URL failed for {}", redact_external_url(url)),
+        )
+    };
+    let status = match external {
+        #[cfg(feature = "reqwest")]
+        ExternalHttp::Reqwest(client) => client
+            .put(url)
+            .header(CONTENT_TYPE, ARROW_CONTENT_TYPE)
+            .body(body.to_vec())
+            .send()
+            .map_err(|_| failed())?
+            .status(),
+        ExternalHttp::Executor { executor, timeout } => {
+            let headers = [(
+                CONTENT_TYPE.as_str().to_string(),
+                ARROW_CONTENT_TYPE.to_string(),
+            )];
+            let response = executor
+                .execute(HttpRequest {
+                    method: "PUT",
+                    url,
+                    headers: &headers,
+                    body,
+                    timeout: timeout.unwrap_or(Duration::ZERO),
+                    follow_redirects: true,
+                })
+                .map_err(|_| failed())?;
+            StatusCode::from_u16(response.status).map_err(|_| failed())?
+        }
+    };
+    if !status.is_success() {
         return Err(RpcError::new(
             "ExternalUploadFailed",
-            format!("PUT to upload URL failed: HTTP {}", response.status()),
+            format!("PUT to upload URL failed: HTTP {status}"),
         ));
     }
     Ok(())
@@ -2159,34 +2543,37 @@ fn parse_max_response_bytes(headers: &HeaderMap) -> Result<Option<u64>> {
     Ok(Some(parsed))
 }
 
-#[cfg(feature = "iroh")]
-fn parse_content_length(headers: &HeaderMap) -> Result<Option<u64>> {
-    let mut values = headers.get_all(reqwest::header::CONTENT_LENGTH).iter();
+/// Strict `Content-Length` for backends that hand over raw headers; `label`
+/// names the transport in error messages.
+fn parse_content_length(headers: &HeaderMap, label: &str) -> Result<Option<u64>> {
+    let mut values = headers.get_all(CONTENT_LENGTH).iter();
     let Some(value) = values.next() else {
         return Ok(None);
     };
     if values.next().is_some() {
         return Err(RpcError::new(
             "ProtocolError",
-            "Iroh HTTP Content-Length must occur at most once",
+            format!("{label} Content-Length must occur at most once"),
         ));
     }
     let value = value.to_str().map_err(|_| {
         RpcError::new(
             "ProtocolError",
-            "Iroh HTTP Content-Length must contain ASCII digits",
+            format!("{label} Content-Length must contain ASCII digits"),
         )
     })?;
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(RpcError::new(
             "ProtocolError",
-            "Iroh HTTP Content-Length must contain ASCII digits",
+            format!("{label} Content-Length must contain ASCII digits"),
         ));
     }
-    value
-        .parse()
-        .map(Some)
-        .map_err(|_| RpcError::new("ProtocolError", "Iroh HTTP Content-Length is too large"))
+    value.parse().map(Some).map_err(|_| {
+        RpcError::new(
+            "ProtocolError",
+            format!("{label} Content-Length is too large"),
+        )
+    })
 }
 
 fn parse_caps(h: &HeaderMap) -> HttpServerCapabilities {
@@ -2352,7 +2739,7 @@ mod tests {
 
     #[test]
     fn native_client_sends_and_locally_enforces_the_same_default_budget() {
-        let client = HttpClient::connect("http://127.0.0.1").build().unwrap();
+        let client = offline_builder().build().unwrap();
         assert_eq!(
             client
                 .build_headers(None)
@@ -2365,7 +2752,7 @@ mod tests {
 
     #[test]
     fn decoded_acceptance_does_not_redefine_the_independent_encoded_cap() {
-        let client = HttpClient::connect("http://127.0.0.1")
+        let client = offline_builder()
             .accepted_max_response_bytes(64 * 1024)
             .max_encoded_response_bytes(128 * 1024)
             .build()
@@ -2377,7 +2764,7 @@ mod tests {
     #[test]
     fn advertised_acceptance_matches_the_actual_decoded_ceiling_in_any_option_order() {
         let one_gib = 1024 * 1024 * 1024;
-        let expanded = HttpClient::connect("http://127.0.0.1")
+        let expanded = offline_builder()
             .accepted_max_response_bytes(one_gib)
             .build()
             .unwrap();
@@ -2393,16 +2780,16 @@ mod tests {
         );
 
         for constrained in [
-            HttpClient::connect("http://127.0.0.1")
+            offline_builder()
                 .accepted_max_response_bytes(one_gib)
                 .max_decoded_response_bytes(128 * 1024),
-            HttpClient::connect("http://127.0.0.1")
+            offline_builder()
                 .max_decoded_response_bytes(128 * 1024)
                 .accepted_max_response_bytes(one_gib),
-            HttpClient::connect("http://127.0.0.1")
+            offline_builder()
                 .accepted_max_response_bytes(one_gib)
                 .max_encoded_response_bytes(128 * 1024),
-            HttpClient::connect("http://127.0.0.1")
+            offline_builder()
                 .max_encoded_response_bytes(128 * 1024)
                 .accepted_max_response_bytes(one_gib),
         ] {
@@ -2534,6 +2921,7 @@ mod tests {
         assert!(schema.field(0).is_nullable());
     }
 
+    #[cfg(feature = "reqwest")]
     #[test]
     fn external_upload_connection_error_redacts_signed_query() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2545,12 +2933,229 @@ mod tests {
             .timeout(Duration::from_millis(250))
             .build()
             .unwrap();
-        let error = put_external_body(&client, &url, b"body").unwrap_err();
+        let error = put_external_body(&ExternalHttp::Reqwest(client), &url, b"body").unwrap_err();
         let rendered = format!("{error:?}");
         assert!(
             !rendered.contains(secret),
             "leaked signed query: {rendered}"
         );
         assert!(rendered.contains("/upload"));
+    }
+
+    /// A builder whose backend never touches the network, so builder-level
+    /// tests run with or without the `reqwest` feature.
+    fn offline_builder() -> HttpClientBuilder {
+        HttpClient::connect("http://127.0.0.1").executor(scripted(Vec::new(), false))
+    }
+
+    #[cfg(not(feature = "reqwest"))]
+    #[test]
+    fn build_without_reqwest_or_executor_is_a_clear_error() {
+        let err = HttpClient::connect("http://127.0.0.1")
+            .build()
+            .err()
+            .unwrap();
+        assert!(err.message.contains("executor"), "{}", err.message);
+    }
+
+    /// Scripted executor: answers by URL, records every request.
+    struct ScriptedExecutor {
+        routes: Vec<(&'static str, HttpResponse)>,
+        caps: ExecutorCaps,
+        requests: std::sync::Mutex<Vec<(String, String, bool)>>,
+    }
+
+    impl HttpExecutor for ScriptedExecutor {
+        fn execute(
+            &self,
+            req: HttpRequest<'_>,
+        ) -> std::result::Result<HttpResponse, HttpExecError> {
+            self.requests.lock().unwrap().push((
+                req.method.to_string(),
+                req.url.to_string(),
+                req.follow_redirects,
+            ));
+            self.routes
+                .iter()
+                .find(|(url, _)| *url == req.url)
+                .map(|(_, response)| response.clone())
+                .ok_or_else(|| HttpExecError {
+                    message: format!("no route for {}", req.url),
+                    retry_safe: false,
+                })
+        }
+
+        fn caps(&self) -> ExecutorCaps {
+            self.caps
+        }
+    }
+
+    fn scripted(
+        routes: Vec<(&'static str, HttpResponse)>,
+        transparent: bool,
+    ) -> Arc<ScriptedExecutor> {
+        Arc::new(ScriptedExecutor {
+            routes,
+            caps: ExecutorCaps {
+                supports_options: false,
+                transparent_decompression: transparent,
+            },
+            requests: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn redirect_to(location: &str) -> HttpResponse {
+        HttpResponse {
+            status: 302,
+            headers: vec![("Location".into(), location.into())],
+            body: Vec::new(),
+        }
+    }
+
+    fn zstd_ok(body: &[u8]) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            headers: vec![("Content-Encoding".into(), "zstd".into())],
+            body: body.to_vec(),
+        }
+    }
+
+    fn only_host(host: &'static str) -> UrlValidator {
+        Arc::new(move |raw: &str| {
+            let url = url::Url::parse(raw).map_err(|_| RpcError::value_error("bad url"))?;
+            if url.host_str() == Some(host) {
+                Ok(())
+            } else {
+                Err(RpcError::value_error(format!("URL rejected: {raw}")))
+            }
+        })
+    }
+
+    #[test]
+    fn executor_fetcher_follows_validated_redirects_itself() {
+        let executor = scripted(
+            vec![
+                ("https://store.test/a", redirect_to("/b")),
+                ("https://store.test/b", zstd_ok(b"payload")),
+            ],
+            false,
+        );
+        let fetcher = ExecutorFetcher {
+            executor: executor.clone(),
+            timeout: DEFAULT_TIMEOUT,
+        };
+        let fetched = fetcher
+            .fetch_with_policy(
+                "https://store.test/a",
+                Compression::None,
+                1024,
+                &only_host("store.test"),
+                3,
+            )
+            .unwrap();
+        assert_eq!(fetched.bytes, b"payload");
+        assert!(matches!(fetched.compression, Compression::Zstd(_)));
+        let requests = executor.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|(m, _, follow)| m == "GET" && !follow));
+    }
+
+    #[test]
+    fn executor_fetcher_rejects_redirect_off_policy_and_limits() {
+        let executor = scripted(
+            vec![
+                ("https://store.test/a", redirect_to("https://evil.test/x")),
+                ("https://store.test/loop", redirect_to("/loop")),
+                ("https://store.test/big", zstd_ok(&[0u8; 64])),
+            ],
+            false,
+        );
+        let fetcher = ExecutorFetcher {
+            executor: executor.clone(),
+            timeout: DEFAULT_TIMEOUT,
+        };
+        let policy = only_host("store.test");
+        let fetch = |url| fetcher.fetch_with_policy(url, Compression::None, 16, &policy, 2);
+        assert!(fetch("https://store.test/a").is_err());
+        assert!(!executor
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, url, _)| url.contains("evil")));
+        let err = fetch("https://store.test/loop").err().unwrap();
+        assert!(err.message.contains("redirect limit"), "{}", err.message);
+        let err = fetch("https://store.test/big").err().unwrap();
+        assert!(err.message.contains("max_fetch_bytes"), "{}", err.message);
+    }
+
+    #[test]
+    fn executor_fetcher_trusts_transparent_transport_decoding() {
+        let executor = scripted(vec![("https://store.test/a", zstd_ok(b"plain"))], true);
+        let fetcher = ExecutorFetcher {
+            executor,
+            timeout: DEFAULT_TIMEOUT,
+        };
+        let fetched = fetcher
+            .fetch_with_policy(
+                "https://store.test/a",
+                Compression::None,
+                1024,
+                &any_url_validator(),
+                0,
+            )
+            .unwrap();
+        assert!(matches!(fetched.compression, Compression::None));
+    }
+
+    #[test]
+    fn executor_response_preserves_duplicate_headers() {
+        let (status, headers) = convert_executor_response(
+            200,
+            vec![
+                (
+                    ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER.into(),
+                    "true".into(),
+                ),
+                (
+                    ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER.into(),
+                    "true".into(),
+                ),
+            ],
+            "test",
+        )
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get_all(ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER)
+                .iter()
+                .count(),
+            2
+        );
+        assert!(!has_single_response_budget_support(&headers));
+        assert!(convert_executor_response(1000, Vec::new(), "test").is_err());
+    }
+
+    #[test]
+    fn executor_put_external_body_goes_through_executor() {
+        let executor = scripted(
+            vec![(
+                "https://store.test/up",
+                HttpResponse {
+                    status: 200,
+                    ..Default::default()
+                },
+            )],
+            true,
+        );
+        let external = ExternalHttp::Executor {
+            executor: executor.clone(),
+            timeout: None,
+        };
+        put_external_body(&external, "https://store.test/up", b"body").unwrap();
+        assert!(put_external_body(&external, "https://store.test/missing", b"x").is_err());
+        let requests = executor.requests.lock().unwrap().clone();
+        assert_eq!(requests[0].0, "PUT");
     }
 }

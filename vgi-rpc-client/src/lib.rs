@@ -29,13 +29,16 @@ pub mod transport;
 
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "http")]
+pub mod http_executor;
 
 #[cfg(feature = "iroh")]
 pub mod httpi;
 
 #[cfg(feature = "http")]
-pub use http::{
-    HttpClient, HttpClientBuilder, HttpServerCapabilities, HttpStreamSession, UploadUrl,
+pub use self::http::{
+    ExecutorCaps, HttpClient, HttpClientBuilder, HttpExecError, HttpExecutor, HttpRequest,
+    HttpResponse, HttpServerCapabilities, HttpStreamSession, UploadUrl,
 };
 
 #[cfg(feature = "iroh")]

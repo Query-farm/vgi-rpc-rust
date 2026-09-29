@@ -13,14 +13,19 @@ keywords = ["rpc", "arrow", "ipc", "streaming", "client"]
 categories = ["network-programming", "web-programming::http-client", "data-structures"]
 
 [features]
-default = ["http"]
-# HTTP transport (reqwest blocking + zstd/gzip codec negotiation + external-location
-# resolve/upload via vgi-rpc's external module).
-http = ["dep:reqwest", "dep:zstd", "dep:flate2", "dep:base64", "dep:sha2", "vgi-rpc/external"]
+default = ["http", "reqwest"]
+# HTTP protocol logic (zstd/gzip codec negotiation, capability discovery,
+# sticky sessions, external-location resolve/upload via vgi-rpc's external
+# module). Backend-neutral: requests go through either the `reqwest` backend
+# or a caller-supplied `HttpExecutor` (see `HttpClientBuilder::executor`), so
+# this feature alone builds for targets reqwest cannot (wasm32-unknown-emscripten).
+http = ["dep:http", "dep:zstd", "dep:flate2", "dep:base64", "dep:sha2", "vgi-rpc/external"]
+# The default blocking reqwest HTTP backend.
+reqwest = ["http", "dep:reqwest"]
 # Native authenticated HTTP/1.1 exchanges carried over Iroh's `iroh-http/2`
 # ALPN. This extends the blocking HTTP client without adding Iroh to default
-# builds.
-iroh = ["http", "dep:vgi-iroh-transport", "dep:tokio"]
+# builds. External-location egress stays on ordinary HTTP(S) via reqwest.
+iroh = ["http", "reqwest", "dep:vgi-iroh-transport", "dep:tokio"]
 # AF_UNIX socket transport. Compiles to a no-op on non-unix targets.
 unix = []
 # Stateful VGI framing over TLS-protected TCP. The caller supplies a rustls
@@ -39,6 +44,7 @@ serde_json.workspace = true
 tracing.workspace = true
 url.workspace = true
 
+http = { version = "1", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
 zstd = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
@@ -49,8 +55,11 @@ tokio = { workspace = true, optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring"] }
 
 # See `vgi_rpc::unix::widen_socket_buffers` — the client half of the same fix.
-[target.'cfg(unix)'.dependencies]
+# socket2 does not build for emscripten (which counts as unix).
+[target.'cfg(all(unix, not(target_os = "emscripten")))'.dependencies]
 socket2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

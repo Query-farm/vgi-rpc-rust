@@ -5206,6 +5206,7 @@ dependencies = [
  "base64",
  "bytes",
  "flate2",
+ "http",
  "http-body-util",
  "hyper",
  "libc",

@@ -30,6 +30,14 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 - `socket2` is no longer a dependency on emscripten (which counts as unix);
   `vgi_rpc::unix::widen_socket_buffers` is a no-op there.
 
+### Fixed
+
+- Byte-stream clients (TCP, Unix, pipe, Iroh, SAB) no longer report a stream
+  whose connection closed between batches as complete: EOF without the IPC
+  end-of-stream marker is now a `TransportError` ("connection closed before
+  the end of the stream") instead of a silent, truncated end. New
+  `wire::StreamReader::saw_eos` exposes the distinction.
+
 ## [0.27.3] — 2026-09-26
 
 ### Fixed

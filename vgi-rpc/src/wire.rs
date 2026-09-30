@@ -518,6 +518,9 @@ pub struct StreamReader<R: Read> {
     schema: SchemaRef,
     dictionaries: HashMap<i64, arrow_array::ArrayRef>,
     finished: bool,
+    /// Whether the stream ended with an explicit end-of-stream marker, as
+    /// opposed to the underlying reader reaching EOF at a message boundary.
+    saw_eos: bool,
     /// When `Some`, every read batch is rewrapped with this relaxed
     /// schema before being returned to the caller (used by the
     /// conformance worker to accept Python's nullable-flag-lying
@@ -533,8 +536,12 @@ impl<R: Read> StreamReader<R> {
     /// client cannot trigger a multi-gigabyte alloc by sending a
     /// crafted short payload.
     pub fn new(mut reader: R) -> Result<Self> {
-        let msg = read_message_bytes(&mut reader, MAX_IPC_SCHEMA_BYTES)?
-            .ok_or_else(|| RpcError::new("IPC", "empty IPC stream (no schema)"))?;
+        let msg = match read_message_bytes(&mut reader, MAX_IPC_SCHEMA_BYTES)? {
+            Some(Frame::Message(msg)) => msg,
+            Some(Frame::Eos) | None => {
+                return Err(RpcError::new("IPC", "empty IPC stream (no schema)"));
+            }
+        };
         if msg.had_invalid_utf8 {
             return Err(RpcError::protocol_error(
                 "Invalid UTF-8 in IPC schema metadata",
@@ -570,8 +577,18 @@ impl<R: Read> StreamReader<R> {
             schema: Arc::new(schema),
             dictionaries: HashMap::new(),
             finished: false,
+            saw_eos: false,
             relaxed_schema: None,
         })
+    }
+
+    /// Whether the stream ended with an explicit end-of-stream marker.
+    ///
+    /// [`read_next`](Self::read_next) returns `None` both for the marker and
+    /// for EOF at a message boundary. Over a connection, EOF without the
+    /// marker means the peer or the connection went away mid-stream.
+    pub fn saw_eos(&self) -> bool {
+        self.saw_eos
     }
 
     /// Get the schema of the stream (relaxed schema, if relaxation was
@@ -605,6 +622,14 @@ impl<R: Read> StreamReader<R> {
                 Some(m) => m,
                 None => {
                     self.finished = true;
+                    return Ok(None);
+                }
+            };
+            let msg = match msg {
+                Frame::Message(msg) => msg,
+                Frame::Eos => {
+                    self.finished = true;
+                    self.saw_eos = true;
                     return Ok(None);
                 }
             };
@@ -784,7 +809,15 @@ fn read_exact(r: &mut impl Read, buf: &mut [u8]) -> Result<bool> {
 /// peer actually delivers, so the ceiling can be generous enough for a
 /// legitimate multi-gigabyte batch without a lying `bodyLength` costing
 /// more than [`BODY_PREALLOC_LIMIT`] and an EOF.
-fn read_message_bytes(r: &mut impl Read, max_bytes: usize) -> Result<Option<RawMessage>> {
+/// One framed item of an IPC stream.
+enum Frame {
+    Message(RawMessage),
+    /// The explicit end-of-stream marker (a zero length prefix).
+    Eos,
+}
+
+/// `Ok(None)` is EOF at a message boundary, distinct from [`Frame::Eos`].
+fn read_message_bytes(r: &mut impl Read, max_bytes: usize) -> Result<Option<Frame>> {
     let mut prefix = [0u8; 4];
     if !read_exact(r, &mut prefix)? {
         return Ok(None);
@@ -800,8 +833,7 @@ fn read_message_bytes(r: &mut impl Read, max_bytes: usize) -> Result<Option<RawM
     };
     let size = u32::from_le_bytes(size_bytes) as usize;
     if size == 0 {
-        // EOS
-        return Ok(None);
+        return Ok(Some(Frame::Eos));
     }
     if size > max_bytes {
         return Err(RpcError::new(
@@ -869,11 +901,11 @@ fn read_message_bytes(r: &mut impl Read, max_bytes: usize) -> Result<Option<RawM
             return Err(RpcError::new("IOError", "unexpected EOF in message body"));
         }
     }
-    Ok(Some(RawMessage {
+    Ok(Some(Frame::Message(RawMessage {
         message_bytes,
         body,
         had_invalid_utf8,
-    }))
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,6 +1124,33 @@ mod tests {
         assert_eq!(rb.num_rows(), 3);
         assert_eq!(md_get(&md, "vgi_rpc.method"), Some("echo_string"));
         assert!(r.read_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn eof_at_a_message_boundary_is_distinguished_from_eos() {
+        let schema = Schema::new(vec![Field::new("idx", DataType::Int64, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from(vec![1])) as _],
+        )
+        .unwrap();
+        for finish in [true, false] {
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let mut w = StreamWriter::new(&mut buf, &schema).unwrap();
+                w.write(&batch, None).unwrap();
+                w.finish().unwrap();
+            }
+            if !finish {
+                // Drop the 8-byte EOS marker: the connection closed mid-stream.
+                buf.truncate(buf.len() - 8);
+            }
+            let mut r = StreamReader::new(buf.as_slice()).unwrap();
+            assert!(r.read_next().unwrap().is_some());
+            assert!(!r.saw_eos());
+            assert!(r.read_next().unwrap().is_none());
+            assert_eq!(r.saw_eos(), finish);
+        }
     }
 
     #[test]

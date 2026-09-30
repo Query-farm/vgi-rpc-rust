@@ -783,6 +783,16 @@ impl StreamSession<'_> {
             .ok_or_else(|| RpcError::new("TransportError", "output reader not open"))?;
         loop {
             match reader.read_next()? {
+                None if !reader.saw_eos() => {
+                    // EOF without the end-of-stream marker: the connection
+                    // closed mid-stream. Reporting `None` here would pass a
+                    // truncated result off as complete.
+                    self.finished = true;
+                    return Err(RpcError::new(
+                        "TransportError",
+                        "connection closed before the end of the stream",
+                    ));
+                }
                 None => {
                     self.finished = true;
                     return Ok(None);

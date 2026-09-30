@@ -26,6 +26,24 @@ use axum::{
 use base64::Engine;
 use rand::RngCore;
 
+/// The peer address when the server was started with connect info, as
+/// `Option<ConnectInfo<_>>` extracted before axum 0.8 (where `Option<T>`
+/// requires `OptionalFromRequestParts`, which `ConnectInfo` lacks).
+struct MaybeConnectInfo(Option<ConnectInfo<std::net::SocketAddr>>);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for MaybeConnectInfo {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        Ok(Self(
+            ConnectInfo::from_request_parts(parts, state).await.ok(),
+        ))
+    }
+}
+
 use crate::errors::{Result, RpcError};
 use std::collections::HashMap;
 
@@ -2146,13 +2164,13 @@ fn attach_capability_headers(
 fn build_router_inner(state: Arc<HttpState>) -> Router {
     let prefix = state.prefix.clone();
     let api = Router::new()
-        .route("/:method", post(handle_unary).options(handle_preflight))
+        .route("/{method}", post(handle_unary).options(handle_preflight))
         .route(
-            "/:method/init",
+            "/{method}/init",
             post(handle_stream_init).options(handle_preflight),
         )
         .route(
-            "/:method/exchange",
+            "/{method}/exchange",
             post(handle_stream_exchange).options(handle_preflight),
         )
         // The protocol-qualified shape, `{protocol}/{method}[/init|/exchange]`
@@ -2169,15 +2187,15 @@ fn build_router_inner(state: Arc<HttpState>) -> Router {
         // `/:method/exchange` keep their own traffic; a three-segment path can
         // only ever be the qualified form.
         .route(
-            "/:protocol/:method",
+            "/{protocol}/{method}",
             post(handle_protocol_unary).options(handle_preflight),
         )
         .route(
-            "/:protocol/:method/init",
+            "/{protocol}/{method}/init",
             post(handle_protocol_stream_init).options(handle_preflight),
         )
         .route(
-            "/:protocol/:method/exchange",
+            "/{protocol}/{method}/exchange",
             post(handle_protocol_stream_exchange).options(handle_preflight),
         );
 
@@ -2256,7 +2274,7 @@ fn build_router_inner(state: Arc<HttpState>) -> Router {
 /// a live session ⇒ close it, emit `VGI-Session-Close: true`, 204.
 async fn handle_delete_session(
     State(state): State<Arc<HttpState>>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    MaybeConnectInfo(connect_info): MaybeConnectInfo,
     headers: HeaderMap,
 ) -> Response {
     let identity = match authenticate_request_from_peer(
@@ -3352,7 +3370,7 @@ use crate::external::{
 
 async fn handle_upload_url(
     State(state): State<Arc<HttpState>>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    MaybeConnectInfo(connect_info): MaybeConnectInfo,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -3558,7 +3576,7 @@ fn adopt_path_protocol(req: &mut Request, path_protocol: Option<&str>) -> Result
 
 async fn handle_unary(
     State(state): State<Arc<HttpState>>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    MaybeConnectInfo(connect_info): MaybeConnectInfo,
     Path(method): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -3575,7 +3593,7 @@ async fn handle_unary(
 /// a path land a call on a protocol the request never named.
 async fn handle_protocol_unary(
     State(state): State<Arc<HttpState>>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    MaybeConnectInfo(connect_info): MaybeConnectInfo,
     Path((protocol, method)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -4096,7 +4114,7 @@ fn finish_stream_record(
 
 async fn handle_stream_init(
     State(state): State<Arc<HttpState>>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    MaybeConnectInfo(connect_info): MaybeConnectInfo,
     Path(method): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -4110,7 +4128,7 @@ async fn handle_stream_init(
 /// for it.
 async fn handle_protocol_stream_init(
     State(state): State<Arc<HttpState>>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    MaybeConnectInfo(connect_info): MaybeConnectInfo,
     Path((protocol, method)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -4705,7 +4723,7 @@ fn run_producer<W: std::io::Write>(
 
 async fn handle_stream_exchange(
     State(state): State<Arc<HttpState>>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    MaybeConnectInfo(connect_info): MaybeConnectInfo,
     Path(method): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -4717,7 +4735,7 @@ async fn handle_stream_exchange(
 /// addressed by the protocol that owns the method.
 async fn handle_protocol_stream_exchange(
     State(state): State<Arc<HttpState>>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    MaybeConnectInfo(connect_info): MaybeConnectInfo,
     Path((protocol, method)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,

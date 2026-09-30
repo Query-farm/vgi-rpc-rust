@@ -571,7 +571,10 @@ impl<R: Read> StreamReader<R> {
         // field types; keep the `catch_unwind` net (matching record-batch
         // decode) so any residual panic becomes a clean `RpcError` in normal
         // (panic=unwind) builds rather than escaping the reader.
-        let schema = decode_guard("schema message", || ipc_convert::fb_to_schema(ipc_schema))?;
+        let schema = decode_guard("schema message", || {
+            ipc_convert::try_fb_to_schema(ipc_schema)
+        })?
+        .map_err(RpcError::from)?;
         Ok(Self {
             reader,
             schema: Arc::new(schema),

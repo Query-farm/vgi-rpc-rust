@@ -29,6 +29,9 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
   `RpcClient::external_resolution` returns an error (use `external_config`).
 - `socket2` is no longer a dependency on emscripten (which counts as unix);
   `vgi_rpc::unix::widen_socket_buffers` is a no-op there.
+- **Breaking (dependencies):** arrow-rs 59 → 60 and axum 0.7 → 0.8. Arrow and
+  axum types appear in the public API (`RecordBatch`, `build_router`'s
+  `Router`), so dependents must move to the same major versions.
 
 ### Fixed
 

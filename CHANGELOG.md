@@ -2,6 +2,15 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.28.2] — 2026-10-01
+
+### Added
+
+- `OAuthResourceMetadata::device_code_client_id` / `device_code_client_secret`:
+  a separate client for the OAuth device flow (Google requires one), advertised
+  in the metadata document and the `WWW-Authenticate` challenge as in vgi-rpc
+  Python.
+
 ## [0.28.1] — 2026-10-01
 
 ### Fixed

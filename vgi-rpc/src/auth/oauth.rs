@@ -45,6 +45,14 @@ pub struct OAuthResourceMetadata {
     /// Advertised when non-empty, as in vgi-rpc Python.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub client_secret: String,
+    /// A separate client for the OAuth device flow, for providers that
+    /// require one (Google's "TVs and Limited Input devices" client).
+    /// Advertised when non-empty, as in vgi-rpc Python.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub device_code_client_id: String,
+    /// The device-flow client's secret. Advertised when non-empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub device_code_client_secret: String,
 }
 
 impl OAuthResourceMetadata {
@@ -117,6 +125,18 @@ impl OAuthResourceMetadata {
         if self.use_id_token_as_bearer {
             params.push("use_id_token_as_bearer=\"true\"".to_string());
         }
+        if !self.device_code_client_id.is_empty() {
+            params.push(format!(
+                "device_code_client_id=\"{}\"",
+                self.device_code_client_id
+            ));
+        }
+        if !self.device_code_client_secret.is_empty() {
+            params.push(format!(
+                "device_code_client_secret=\"{}\"",
+                self.device_code_client_secret
+            ));
+        }
         if params.is_empty() {
             "Bearer".to_string()
         } else {
@@ -179,6 +199,15 @@ mod tests {
             .with_scope("openid")
             .with_client_id("cupola");
         m.use_id_token_as_bearer = true;
+        assert!(!m.to_json().contains("device_code_client_id"));
+        let mut device = m.clone();
+        device.device_code_client_id = "tv".into();
+        assert!(device
+            .to_json()
+            .contains("\"device_code_client_id\":\"tv\""));
+        assert!(device
+            .www_authenticate()
+            .ends_with(", device_code_client_id=\"tv\""));
         let j = m.to_json();
         assert!(j.contains("\"client_id\":\"cupola\""));
         assert!(j.contains("\"use_id_token_as_bearer\":true"));

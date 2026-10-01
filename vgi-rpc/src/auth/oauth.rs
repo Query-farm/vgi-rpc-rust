@@ -31,16 +31,19 @@ pub struct OAuthResourceMetadata {
     /// URL to documentation for the resource.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_documentation: Option<String>,
-    /// Optional client ID used by browser PKCE login (non-RFC, used by
-    /// the [`crate::auth::pkce`] flow when enabled).
-    #[serde(skip_serializing)]
+    /// OAuth client ID clients should use with the authorization server
+    /// (non-RFC extension, as in vgi-rpc Python). Advertised when non-empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub client_id: String,
-    /// When `true`, the PKCE flow uses the OIDC `id_token` as the
-    /// bearer token (for audience-scoped APIs). Defaults to access_token.
-    #[serde(skip_serializing)]
+    /// When `true`, clients use the OIDC `id_token` as the bearer token
+    /// (for audience-scoped APIs) instead of the access token. Advertised
+    /// only when `true`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub use_id_token_as_bearer: bool,
-    /// Optional client secret for confidential PKCE clients.
-    #[serde(skip_serializing)]
+    /// Client secret for PKCE clients whose IdP requires one even for
+    /// browser/native apps (Google), where it is not truly confidential.
+    /// Advertised when non-empty, as in vgi-rpc Python.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub client_secret: String,
 }
 
@@ -95,15 +98,30 @@ impl OAuthResourceMetadata {
     pub fn www_authenticate(&self) -> String {
         // The metadata URL is derived from the resource; we append the
         // well-known path so the client can fetch it.
-        let mut v = String::from("Bearer");
+        let mut params = Vec::new();
         if !self.resource.is_empty() {
             let url = metadata_url_from_resource(&self.resource);
-            v.push_str(&format!(" resource_metadata=\"{url}\""));
+            params.push(format!("resource_metadata=\"{url}\""));
         }
         if !self.scopes_supported.is_empty() {
-            v.push_str(&format!(" scope=\"{}\"", self.scopes_supported.join(" ")));
+            params.push(format!("scope=\"{}\"", self.scopes_supported.join(" ")));
         }
-        v
+        // The client fields match vgi-rpc Python's challenge, which clients
+        // (e.g. the VGI DuckDB extension) read without fetching the metadata.
+        if !self.client_id.is_empty() {
+            params.push(format!("client_id=\"{}\"", self.client_id));
+        }
+        if !self.client_secret.is_empty() {
+            params.push(format!("client_secret=\"{}\"", self.client_secret));
+        }
+        if self.use_id_token_as_bearer {
+            params.push("use_id_token_as_bearer=\"true\"".to_string());
+        }
+        if params.is_empty() {
+            "Bearer".to_string()
+        } else {
+            format!("Bearer {}", params.join(", "))
+        }
     }
 
     /// Basic validation: `resource` must be absolute and use http(s).
@@ -145,6 +163,31 @@ mod tests {
         assert!(v.contains(
             "resource_metadata=\"https://api.example.com/v1/.well-known/oauth-protected-resource\""
         ));
+    }
+
+    #[test]
+    fn client_fields_are_advertised_only_when_set() {
+        let bare = OAuthResourceMetadata::new("https://api.example.com");
+        let j = bare.to_json();
+        assert!(!j.contains("client_id"));
+        assert!(!j.contains("client_secret"));
+        assert!(!j.contains("use_id_token_as_bearer"));
+        assert!(!bare.www_authenticate().contains("client_id"));
+
+        let mut m = OAuthResourceMetadata::new("https://api.example.com")
+            .with_authorization_server("https://issuer.example/")
+            .with_scope("openid")
+            .with_client_id("cupola");
+        m.use_id_token_as_bearer = true;
+        let j = m.to_json();
+        assert!(j.contains("\"client_id\":\"cupola\""));
+        assert!(j.contains("\"use_id_token_as_bearer\":true"));
+        assert!(!j.contains("client_secret"));
+        assert_eq!(
+            m.www_authenticate(),
+            "Bearer resource_metadata=\"https://api.example.com/.well-known/oauth-protected-resource\", \
+             scope=\"openid\", client_id=\"cupola\", use_id_token_as_bearer=\"true\""
+        );
     }
 
     #[test]

@@ -2,6 +2,16 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.28.1] — 2026-10-01
+
+### Fixed
+
+- `OAuthResourceMetadata` now advertises `client_id`, `client_secret` and
+  `use_id_token_as_bearer` (when set) in `/.well-known/oauth-protected-resource`
+  and the 401 `WWW-Authenticate` challenge, matching vgi-rpc Python. Browser
+  PKCE clients such as Cupola need the `client_id` to log in. The challenge's
+  parameters are now comma-separated (RFC 7235).
+
 ## [0.28.0] — 2026-09-30
 
 ### Added

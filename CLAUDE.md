@@ -426,6 +426,21 @@ reference, which does.
 Integration into `RpcServer` is transparent for unary results and stream
 output batches: set `RpcServer::builder().with_external_location(cfg)`.
 
+**Pre-published refs** (`external_ref.rs`, unfeatured). `ExternalRef { url,
+sha256: Option }` is a pointer to an object published earlier, typically by
+`external::publish_external(batch, storage, compression, include_sha256)`,
+which shares `encode_payload` / `upload_payload` with the per-call externalizer
+(`prepare_externalize_batch` / `upload_prepared`) — `upload_payload` is the
+single upload choke point the `ExternalizedScope` counter sits on. A handler
+answers with a ref through `CallContext::respond_with_external_ref` (the
+`#[unary] -> Result<RefOr<T>>` macro path calls it for `RefOr::Ref`); a
+side-channel on the context rather than a new `UnaryHandler` return type, so
+the public handler signature did not change. `serve_unary` (pipe/unix/tcp)
+and `http.rs`'s unary dispatch check it *before* shm and externalization and
+write `ExternalRef::pointer_batch(result_schema)` as-is: nothing uploaded, not
+counted toward `max_externalized_response_bytes`, `tracing` debug
+`route = "external_ref"`. A handler error still wins. Unary only.
+
 ## Wire protocol rules of thumb
 
 Gotchas discovered while porting (all baked into the Rust code but worth

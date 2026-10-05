@@ -2,6 +2,32 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased]
+
+### Added
+
+- Pre-published external references for unary results (vgi-rpc Python
+  `ExternalRef` / `publish_external`). `vgi_rpc::ExternalRef::new(url, sha256)`
+  validates a non-empty URL and an optional 64-lowercase-hex digest.
+  `vgi_rpc::external::publish_external(batch, storage, compression,
+  include_sha256)` serializes a 1-row result batch exactly like the per-call
+  externalizer (which now shares its hash / compress / upload code), uploads it
+  once, and returns the ref. A `#[unary]` method declared
+  `-> Result<RefOr<T>>` (result schema still derived from `T`, so the protocol
+  hash is unchanged) answers with `RefOr::Ref(r)`; hand-registered handlers
+  call `CallContext::respond_with_external_ref(r)`. The pipe/unix/tcp and HTTP
+  unary dispatchers then write the zero-row pointer batch directly
+  (`vgi_rpc.location`, plus `vgi_rpc.location.sha256` only when the ref has a
+  digest): no serialization or upload, never inlined or routed through shm,
+  regardless of external storage config or threshold, and outside
+  `max_externalized_response_bytes`. Wire format unchanged; clients need no
+  change.
+- Conformance worker: `ConformanceService.published_string(value,
+  include_sha256)`, publishing once per `(value, include_sha256)` through the
+  worker's `--fake-storage` / `--http-with-storage` backend and `--zstd`
+  setting. The worker now registers 90 methods; the pinned canonical
+  `ConformanceService` hash is `05479410…`.
+
 ## [0.28.2] — 2026-10-01
 
 ### Added

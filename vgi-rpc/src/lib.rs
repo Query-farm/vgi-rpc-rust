@@ -14,6 +14,9 @@ pub mod retry;
 
 #[cfg(feature = "external")]
 pub mod external;
+/// Pre-published [`ExternalRef`] results for unary methods. Unfeatured:
+/// answering with a ref needs no storage backend or HTTP stack.
+pub mod external_ref;
 
 #[cfg(feature = "otel")]
 pub mod otel;
@@ -92,8 +95,10 @@ pub use auth::{chain_all, chain_authenticate, AuthContext, AuthRequest, AuthResu
 pub use errors::{Result, RpcError};
 #[cfg(feature = "external")]
 pub use external::{
-    upload_url_params_schema, upload_url_response_schema, MAX_UPLOAD_URL_COUNT, UPLOAD_URL_METHOD,
+    publish_external, upload_url_params_schema, upload_url_response_schema, MAX_UPLOAD_URL_COUNT,
+    UPLOAD_URL_METHOD,
 };
+pub use external_ref::{ExternalRef, RefOr};
 pub use hooks::{
     AccessSink, CallStatistics, ChainHook, DeferredRecord, DispatchHook, DispatchInfo, HookToken,
     SharedHook,

@@ -1,0 +1,5 @@
+error: RefOr<()> has no result to publish; a void method cannot answer with an ExternalRef
+  --> tests/macro_compile_fail/unary_ref_or_void.rs:11:33
+   |
+11 |     fn nothing(&self) -> Result<RefOr<()>> {
+   |                                 ^^^^^^^^^

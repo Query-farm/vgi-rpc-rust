@@ -370,7 +370,9 @@ fn build_unary(
     };
 
     let helper_fns = match &return_ty {
-        ReturnSpec::Value(ty) => {
+        // `RefOr<T>` derives its schema from `T`: a ref is an alternative
+        // *encoding* of the same result, so the protocol hash is unchanged.
+        ReturnSpec::Value(ty) | ReturnSpec::RefOr(ty) => {
             quote! {
                 #[doc(hidden)]
                 fn #params_schema_fn() -> ::arrow_schema::SchemaRef {
@@ -466,6 +468,25 @@ fn build_unary(
             )?;
             Ok(Some(__batch))
         },
+        ReturnSpec::RefOr(ty) => quote! {
+            #(#param_reads)*
+            let __out: ::vgi_rpc::RefOr<#ty> = #call_inst;
+            match __out {
+                ::vgi_rpc::RefOr::Ref(__ref) => {
+                    // The dispatcher writes the ref's pointer batch.
+                    _ctx.respond_with_external_ref(__ref);
+                    Ok(None)
+                }
+                ::vgi_rpc::RefOr::Value(__value) => {
+                    let __arr = <#ty as ::vgi_rpc::VgiArrow>::build_singleton(__value)?;
+                    let __batch = ::arrow_array::RecordBatch::try_new(
+                        #result_schema_fn(),
+                        vec![__arr],
+                    )?;
+                    Ok(Some(__batch))
+                }
+            }
+        },
         ReturnSpec::Void => quote! {
             #(#param_reads)*
             #call_inst_void
@@ -538,7 +559,28 @@ fn build_unary(
 #[allow(clippy::large_enum_variant)]
 enum ReturnSpec {
     Value(Type),
+    /// `-> Result<RefOr<T>>`: a `T`, or a pre-published `ExternalRef`.
+    RefOr(Type),
     Void,
+}
+
+/// `Some(T)` when `ty` is `RefOr<T>` (any path ending in `RefOr`).
+fn ref_or_inner(ty: &Type) -> Option<&Type> {
+    let Type::Path(tp) = ty else { return None };
+    let last = tp.path.segments.last()?;
+    if last.ident != "RefOr" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(a) = &last.arguments else {
+        return None;
+    };
+    if a.args.len() != 1 {
+        return None;
+    }
+    match a.args.first()? {
+        syn::GenericArgument::Type(t) => Some(t),
+        _ => None,
+    }
 }
 
 /// Extract `T` from `-> Result<T>` or `-> Result<T, E>`. Treats
@@ -598,6 +640,15 @@ fn parse_return_type(sig: &syn::Signature) -> syn::Result<ReturnSpec> {
         if tup.elems.is_empty() {
             return Ok(ReturnSpec::Void);
         }
+    }
+    if let Some(value_ty) = ref_or_inner(&inner_ty) {
+        if matches!(value_ty, Type::Tuple(tup) if tup.elems.is_empty()) {
+            return Err(syn::Error::new_spanned(
+                &inner_ty,
+                "RefOr<()> has no result to publish; a void method cannot answer with an ExternalRef",
+            ));
+        }
+        return Ok(ReturnSpec::RefOr(value_ty.clone()));
     }
     Ok(ReturnSpec::Value(inner_ty))
 }

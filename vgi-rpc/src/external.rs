@@ -16,6 +16,10 @@
 //! The crate stays storage-agnostic: users register an [`ExternalStorage`]
 //! implementation and a [`Fetcher`] for resolution. The companion
 //! `vgi-rpc-s3` and `vgi-rpc-gcs` crates ship ready-made backends.
+//!
+//! A unary result that is large and rarely changes can instead be published
+//! once with [`publish_external`] and answered on every later call with the
+//! returned [`ExternalRef`] — see [`crate::external_ref`].
 
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Arc;
@@ -30,15 +34,18 @@ use crate::metadata::{
 };
 use crate::wire::{bytes_to_hex, empty_batch, md_get, write_one_batch_as, Metadata, StreamReader};
 
+pub use crate::external_ref::{ExternalRef, RefOr};
+
 thread_local! {
     /// Bytes uploaded to external storage during the call in flight.
     ///
     /// Externalised payloads never appear in the response body — only a
     /// pointer batch does — so they are invisible to any accounting done at
     /// the transport, and for egress they are usually the larger number by
-    /// orders of magnitude. Incremented at the single upload choke point in
-    /// [`maybe_externalize_batch`], so a new upload path cannot drift from
-    /// the total; scoped and read by [`ExternalizedScope`].
+    /// orders of magnitude. Incremented at the single upload choke point
+    /// (`upload_payload`, shared by the per-call externalizer and
+    /// `publish_external`), so a new upload path cannot drift from the total;
+    /// scoped and read by `ExternalizedScope`.
     static EXTERNALIZED_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -595,6 +602,48 @@ fn decompress(bytes: &[u8], compression: Compression, max_size: usize) -> Result
 }
 
 // ---------------------------------------------------------------------------
+// Shared hash / compress / upload
+// ---------------------------------------------------------------------------
+
+/// One serialized IPC stream, hashed and (optionally) compressed for upload.
+struct EncodedPayload {
+    /// Raw (pre-compression) IPC byte count.
+    raw_len: usize,
+    /// SHA-256 of the **raw** IPC bytes, hex-lowercased.
+    sha: String,
+    /// The bytes that will actually be uploaded.
+    payload: Vec<u8>,
+}
+
+/// Hash the raw IPC bytes, then compress them as configured.
+///
+/// Shared by every server-side externalisation path — the per-call
+/// externalizer ([`prepare_externalize_batch`]) and [`publish_external`] —
+/// so the bytes a pointer names, and the digest it carries, are always
+/// produced the same way.
+fn encode_payload(ipc_bytes: &[u8], compression: Compression) -> Result<EncodedPayload> {
+    Ok(EncodedPayload {
+        raw_len: ipc_bytes.len(),
+        sha: sha256_hex(ipc_bytes),
+        payload: compress(ipc_bytes, compression)?,
+    })
+}
+
+/// Upload one encoded payload and return the backend's URL.
+///
+/// The single upload choke point: the externalised-bytes counter read by
+/// [`ExternalizedScope`] is incremented here, so a new call site cannot make
+/// the total drift from reality.
+fn upload_payload(
+    storage: &dyn ExternalStorage,
+    payload: &[u8],
+    compression: Compression,
+) -> Result<String> {
+    EXTERNALIZED_BYTES.with(|c| c.set(c.get() + payload.len() as u64));
+    Ok(storage.upload(payload, compression)?.url)
+}
+
+// ---------------------------------------------------------------------------
 // Server-side: externalize large batches
 // ---------------------------------------------------------------------------
 
@@ -616,12 +665,8 @@ pub fn pointer_schema() -> SchemaRef {
 /// [`upload_prepared`] is called, so dropping a `PreparedExternal` is a
 /// clean abort.
 pub struct PreparedExternal {
-    /// Raw (pre-compression) IPC bytes — what the cap is measured in.
-    raw_len: usize,
-    /// The bytes that will actually be uploaded.
-    payload: Vec<u8>,
-    /// SHA-256 of the **raw** IPC bytes.
-    sha: String,
+    /// Hashed + compressed payload; `raw_len` is what the cap is measured in.
+    encoded: EncodedPayload,
     /// Zero-row pointer batch matching the source batch's schema.
     ptr: RecordBatch,
     /// Caller metadata with any stale location keys already stripped.
@@ -654,7 +699,7 @@ impl PreparedExternal {
     /// same number and cannot disagree. Same units, same
     /// "uncompressed size of the data" semantics, no estimate error.
     pub fn cap_bytes(&self) -> usize {
-        self.raw_len
+        self.encoded.raw_len
     }
 }
 
@@ -727,9 +772,7 @@ fn prepare_externalize_batch_inner(
     if !force && ipc_bytes.len() < cfg.threshold_bytes {
         return Ok(None);
     }
-    let raw_len = ipc_bytes.len();
-    let sha = sha256_hex(&ipc_bytes);
-    let payload = compress(&ipc_bytes, cfg.compression)?;
+    let encoded = encode_payload(&ipc_bytes, cfg.compression)?;
 
     // Pointer batch: zero-row but matching the enclosing stream's schema,
     // matching Python's `make_external_location_batch` shape so the
@@ -737,37 +780,28 @@ fn prepare_externalize_batch_inner(
     // schema it validates the fetched payload against is the one the
     // payload declares.
     let ptr = empty_batch(declared_schema)?;
-    Ok(Some(PreparedExternal {
-        raw_len,
-        payload,
-        sha,
-        ptr,
-        md,
-    }))
+    Ok(Some(PreparedExternal { encoded, ptr, md }))
 }
 
 /// Upload a [`PreparedExternal`] and return the pointer batch + metadata.
 ///
-/// This is the single upload choke point: the externalised-bytes counter
-/// read by [`ExternalizedScope`] is incremented here, so a new call site
-/// cannot make the total drift from reality.
+/// The upload itself goes through the same choke point as
+/// [`publish_external`], where the externalised-bytes counter read by
+/// [`ExternalizedScope`] is incremented.
 pub fn upload_prepared(
     prepared: PreparedExternal,
     cfg: &ExternalLocationConfig,
 ) -> Result<(RecordBatch, Metadata)> {
     let PreparedExternal {
-        payload,
-        sha,
+        encoded,
         ptr,
         mut md,
-        ..
     } = prepared;
-    EXTERNALIZED_BYTES.with(|c| c.set(c.get() + payload.len() as u64));
-    let upload = cfg.storage.upload(&payload, cfg.compression)?;
+    let url = upload_payload(cfg.storage.as_ref(), &encoded.payload, cfg.compression)?;
     // Validator runs over the final URL.
-    validate_external_url(&cfg.url_validator, &upload.url)?;
-    md.insert(LOCATION_KEY.to_string(), upload.url);
-    md.insert(LOCATION_SHA256_KEY.to_string(), sha);
+    validate_external_url(&cfg.url_validator, &url)?;
+    md.insert(LOCATION_KEY.to_string(), url);
+    md.insert(LOCATION_SHA256_KEY.to_string(), encoded.sha);
     Ok((ptr, md))
 }
 
@@ -794,6 +828,62 @@ pub fn maybe_externalize_batch(
         None => Ok(None),
         Some(prepared) => upload_prepared(prepared, cfg).map(Some),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Server-side: pre-published references
+// ---------------------------------------------------------------------------
+
+/// Publish a unary result batch once and return a reusable [`ExternalRef`].
+///
+/// Serializes `batch` exactly as the per-call externalizer does (an IPC
+/// stream of the batch's schema plus this one batch, no custom metadata),
+/// hashes the raw bytes, compresses them with `compression` (the same codec
+/// handling, and the same `compression` handed to
+/// [`ExternalStorage::upload`], as per-call uploads), and calls `upload`
+/// **once**. Cache the returned ref and answer later calls with it — return
+/// [`RefOr::Ref`] from a `#[unary]` method, or call
+/// [`CallContext::respond_with_external_ref`](crate::CallContext::respond_with_external_ref)
+/// — and the server writes the pointer directly, with no serialization or
+/// upload during the call.
+///
+/// Build `batch` against the method's result schema: a single `result`
+/// column holding the one value. Pass the server's
+/// [`ExternalLocationConfig::compression`] to match per-call uploads, or
+/// [`Compression::None`]. With `include_sha256 = false` the ref carries no
+/// digest, so clients skip the content check.
+///
+/// The upload counts toward the calling dispatch's externalised-bytes total
+/// (the access log's egress figure) like any other upload, but a ref returned
+/// later uploads nothing and never counts toward
+/// `max_externalized_response_bytes`. The caller owns the ref's cache and the
+/// object's lifecycle; see [`ExternalRef`].
+///
+/// ```ignore
+/// let schema = Arc::new(Schema::new(vec![Field::new("result", DataType::Utf8, false)]));
+/// let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![value]))])?;
+/// let r = publish_external(&batch, cfg.storage.as_ref(), cfg.compression, true)?;
+/// ```
+///
+/// # Errors
+///
+/// A `ValueError` when `batch` does not have exactly one row; otherwise any
+/// serialization, compression, or storage error.
+pub fn publish_external(
+    batch: &RecordBatch,
+    storage: &dyn ExternalStorage,
+    compression: Compression,
+    include_sha256: bool,
+) -> Result<ExternalRef> {
+    if batch.num_rows() != 1 {
+        return Err(RpcError::value_error(format!(
+            "publish_external expects a 1-row result batch, got {} rows",
+            batch.num_rows()
+        )));
+    }
+    let encoded = encode_payload(&serialize_batch_to_ipc(batch)?, compression)?;
+    let url = upload_payload(storage, &encoded.payload, compression)?;
+    ExternalRef::new(url, include_sha256.then_some(encoded.sha))
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,5 +1308,103 @@ mod tests {
         }
         let err = resolve_external_location(&ptr, &md, &cfg).unwrap_err();
         assert!(err.message.contains("SHA-256 mismatch"));
+    }
+
+    fn result_batch(value: &str) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "result",
+            DataType::Utf8,
+            false,
+        )]));
+        let col: Ar<dyn arrow_array::Array> = Arc::new(arrow_array::StringArray::from(vec![value]));
+        RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    #[test]
+    fn publish_external_uploads_once_and_round_trips() {
+        let storage = InMemoryStorage::new();
+        let cfg = cfg_with(storage.clone(), usize::MAX);
+        let batch = result_batch("hello");
+
+        let scope = ExternalizedScope::new();
+        let r = publish_external(&batch, cfg.storage.as_ref(), Compression::None, true).unwrap();
+        assert!(
+            scope.finish() > 0,
+            "the publish upload is counted like any other"
+        );
+        assert_eq!(storage.len(), 1);
+        assert!(r.url().starts_with("https://inmem.test/"));
+
+        // The digest covers the raw IPC stream the object holds.
+        let raw = storage
+            .fetch(r.url(), Compression::None, usize::MAX)
+            .unwrap();
+        assert_eq!(r.sha256(), Some(sha256_hex(&raw).as_str()));
+
+        // The pointer resolves to the published 1-row batch.
+        let (ptr, md) = r.pointer_batch(batch.schema().as_ref()).unwrap();
+        assert_eq!(ptr.num_rows(), 0);
+        let (resolved, _) = resolve_external_location(&ptr, &md, &cfg).unwrap();
+        assert_eq!(resolved, batch);
+    }
+
+    /// `publish_external` and the per-call externalizer share one serializer,
+    /// so the same result produces byte-identical objects (and digests).
+    #[test]
+    fn publish_external_matches_the_per_call_externalizer() {
+        let storage = InMemoryStorage::new();
+        let cfg = cfg_with(storage.clone(), 0);
+        let batch = result_batch("same bytes");
+        let (_, md) = maybe_externalize_batch(&batch, batch.schema().as_ref(), None, &cfg)
+            .unwrap()
+            .unwrap();
+        let r = publish_external(&batch, cfg.storage.as_ref(), Compression::None, true).unwrap();
+        assert_eq!(md_get(&md, LOCATION_SHA256_KEY), r.sha256());
+    }
+
+    #[test]
+    fn publish_external_compresses_and_hashes_raw_bytes() {
+        let storage = InMemoryStorage::new();
+        let cfg = cfg_with(storage.clone(), usize::MAX).with_compression(Compression::Zstd(3));
+        let batch = result_batch(&"z".repeat(10_000));
+        let r = publish_external(&batch, cfg.storage.as_ref(), cfg.compression, true).unwrap();
+        let stored = storage
+            .fetch(r.url(), Compression::None, usize::MAX)
+            .unwrap();
+        let raw = decompress(&stored, Compression::Zstd(3), usize::MAX).unwrap();
+        assert!(
+            stored.len() < raw.len(),
+            "uploaded bytes should be compressed"
+        );
+        assert_eq!(r.sha256(), Some(sha256_hex(&raw).as_str()));
+        let (ptr, md) = r.pointer_batch(batch.schema().as_ref()).unwrap();
+        let (resolved, _) = resolve_external_location(&ptr, &md, &cfg).unwrap();
+        assert_eq!(resolved, batch);
+    }
+
+    #[test]
+    fn publish_external_without_digest_omits_it() {
+        let storage = InMemoryStorage::new();
+        let cfg = cfg_with(storage.clone(), usize::MAX);
+        let batch = result_batch("no digest");
+        let r = publish_external(&batch, cfg.storage.as_ref(), Compression::None, false).unwrap();
+        assert_eq!(r.sha256(), None);
+        let (ptr, md) = r.pointer_batch(batch.schema().as_ref()).unwrap();
+        assert!(md_get(&md, LOCATION_SHA256_KEY).is_none());
+        let (resolved, _) = resolve_external_location(&ptr, &md, &cfg).unwrap();
+        assert_eq!(resolved, batch);
+    }
+
+    #[test]
+    fn publish_external_requires_exactly_one_row() {
+        let storage = InMemoryStorage::new();
+        for rows in [0usize, 2] {
+            let batch = big_batch(rows);
+            let err =
+                publish_external(&batch, storage.as_ref(), Compression::None, true).unwrap_err();
+            assert_eq!(err.error_type, "ValueError");
+            assert!(err.message.contains("1-row"), "{}", err.message);
+        }
+        assert!(storage.is_empty(), "a rejected publish must not upload");
     }
 }

@@ -9,6 +9,7 @@
 #[allow(dead_code)]
 mod macro_demo;
 mod params;
+mod published;
 mod streams;
 mod types;
 mod unary;
@@ -91,6 +92,9 @@ fn build_server_with_external_and_hook(
         .protocol_version("2.0.0")
         .server_version("rust-conformance-0.2.0");
 
+    // `published_string` publishes through the worker's own storage and
+    // compression, so it needs them before the builder takes the config.
+    let published_external = external.clone();
     if let Some(cfg) = external {
         builder = builder.with_external_location(cfg);
     }
@@ -158,6 +162,7 @@ fn build_server_with_external_and_hook(
 
     let mut srv = builder.build();
     unary::register(&mut srv);
+    published::register(&mut srv, published_external.as_ref());
     streams::register(&mut srv);
     srv
 }
@@ -221,7 +226,7 @@ mod hash_tests {
     /// over serialized Arrow IPC bytes of the retired `__describe__` payload,
     /// and each language may legitimately spell those differently for the same
     /// logical schema -- so it was only ever comparable against itself.
-    const CANONICAL: &str = "4b0269208a5a8fdeb7d8fe0f62a352713a3bfc071d7de99e5e12408c5f0b9402";
+    const CANONICAL: &str = "05479410c96f34410a2b10a4f6a49d59dcfd9d6d1d45ce9a9807d060a3bd6014";
 
     #[test]
     fn the_access_log_publishes_the_canonical_digest() {

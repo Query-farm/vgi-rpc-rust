@@ -132,6 +132,39 @@ async fn main() {
 }
 ```
 
+### Pre-published results (`ExternalRef`)
+
+A unary result that is large and rarely changes can be uploaded once and
+answered on every later call with the same pointer — no per-call
+serialization or upload:
+
+```rust
+use vgi_rpc::external::{publish_external, Compression};
+use vgi_rpc::{service, ExternalRef, RefOr, Result};
+
+#[service]
+impl Catalog {
+    #[unary]
+    fn catalog(&self) -> Result<RefOr<String>> {
+        let mut cached = self.cached.lock().unwrap();
+        if cached.is_none() {
+            // A 1-row batch against the method's result schema.
+            let batch = self.build_result_batch()?;
+            *cached = Some(publish_external(&batch, self.storage.as_ref(), Compression::Zstd(1), true)?);
+        }
+        Ok(cached.clone().unwrap().into())
+    }
+}
+```
+
+The server writes the ExternalLocation pointer (`vgi_rpc.location`, plus
+`vgi_rpc.location.sha256` unless the ref was built without a digest)
+whatever its storage or threshold configuration. You own the ref's cache and
+the object's lifecycle: keep long-lived objects out of the short-TTL rule used
+for per-call uploads, re-sign pre-signed URLs before they expire, and only hand
+a ref to callers entitled to the same content. Hand-registered handlers call
+`ctx.respond_with_external_ref(r)` instead.
+
 ## Running conformance tests
 
 Requires a checkout of the canonical Python reference,

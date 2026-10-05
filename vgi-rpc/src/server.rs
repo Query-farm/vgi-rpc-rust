@@ -200,6 +200,9 @@ pub struct CallContext {
     /// HTTP servers without sticky support — [`CallContext::open_session`]
     /// then raises a clear "not available on this transport" error.
     pub(crate) sticky: Option<Arc<dyn StickySink>>,
+    /// A pre-published reference the unary handler answered with, if any
+    /// (see [`CallContext::respond_with_external_ref`]).
+    pub(crate) external_ref: Arc<Mutex<Option<crate::external_ref::ExternalRef>>>,
 }
 
 /// Authentication and peer evidence fixed for the lifetime of a stateful
@@ -261,6 +264,31 @@ impl CallContext {
         std::mem::take(&mut *lock_ok(&self.log_sink))
     }
 
+    /// Answer this unary call with a pre-published
+    /// [`ExternalRef`](crate::external_ref::ExternalRef) instead of a result
+    /// batch.
+    ///
+    /// When the handler then returns `Ok(..)`, the dispatcher discards
+    /// whatever batch it returned and writes `r`'s ExternalLocation pointer
+    /// batch (`vgi_rpc.location`, plus `vgi_rpc.location.sha256` only when the
+    /// ref has a digest) with the method's result schema: no result
+    /// serialization, upload, inlining, or shared-memory routing, whether or
+    /// not the server has external storage configured. The pointer does not
+    /// count toward `max_externalized_response_bytes`. A handler error still
+    /// wins — the error envelope is written and the ref is dropped.
+    ///
+    /// This is the hand-registered-handler spelling; a `#[unary]` method
+    /// returns [`RefOr::Ref`](crate::external_ref::RefOr::Ref) instead, which
+    /// calls this for it. Unary methods only: stream dispatch ignores it.
+    pub fn respond_with_external_ref(&self, r: crate::external_ref::ExternalRef) {
+        *lock_ok(&self.external_ref) = Some(r);
+    }
+
+    /// Take the ref recorded by [`Self::respond_with_external_ref`], if any.
+    pub(crate) fn take_external_ref(&self) -> Option<crate::external_ref::ExternalRef> {
+        lock_ok(&self.external_ref).take()
+    }
+
     /// Per-tick input-batch custom metadata value (e.g. `vgi_pushdown_filters`),
     /// set by the producer/exchange loop for the current iteration.
     pub fn tick_metadata(&self, key: &str) -> Option<String> {
@@ -299,6 +327,7 @@ impl CallContext {
             log_sink: Arc::new(Mutex::new(Vec::new())),
             tick_metadata: Arc::new(Mutex::new(Metadata::default())),
             sticky: None,
+            external_ref: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -328,6 +357,7 @@ impl CallContext {
             log_sink: Arc::new(Mutex::new(Vec::new())),
             tick_metadata: Arc::new(Mutex::new(Metadata::default())),
             sticky: None,
+            external_ref: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1571,6 +1601,21 @@ impl RpcServer {
                 for log in logs {
                     let md = envelope.log(&log);
                     sw.write(&empty_batch(&info.result_schema)?, Some(md))?;
+                }
+                // A pre-published reference: write its pointer as-is. Nothing
+                // to build, upload, inline, or route through shm.
+                if let Some(r) = ctx.take_external_ref() {
+                    let (ptr, md) = r.pointer_batch(&info.result_schema)?;
+                    lock_ok(stats).output_batches = 1;
+                    tracing::debug!(
+                        target: "vgi_rpc.wire.response",
+                        method = %info.name,
+                        route = "external_ref",
+                        "Write result batch"
+                    );
+                    sw.write(&ptr, Some(&md))?;
+                    sw.finish()?;
+                    return Ok(());
                 }
                 let out_batch = match maybe_batch {
                     Some(b) => b,

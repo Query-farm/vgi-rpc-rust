@@ -3840,8 +3840,36 @@ async fn unary_dispatch(
             let md = build_log_metadata(log, &server.server_id, &req.request_id);
             let _ = sw.write(&empty_batch(&info.result_schema).unwrap(), Some(&md));
         }
-        match result {
-            Ok(batch_opt) => {
+        // A handler that answered with a pre-published reference (an error
+        // still wins, and drops the ref).
+        let external_ref = match &result {
+            Ok(_) => ctx.take_external_ref(),
+            Err(_) => None,
+        };
+        match (result, external_ref) {
+            (Ok(_), Some(r)) => {
+                // Write the ref's pointer as-is. No result batch to build or
+                // upload, so the external-channel pre-flight does not apply;
+                // the wire-body budget below still sees the (tiny) pointer.
+                stats.output_batches = 1;
+                match r.pointer_batch(&info.result_schema) {
+                    Ok((ptr, md)) => {
+                        tracing::debug!(
+                            target: "vgi_rpc.wire.response",
+                            method = %method,
+                            route = "external_ref",
+                            "Write result batch"
+                        );
+                        let _ = sw.write(&ptr, Some(&md));
+                    }
+                    Err(err) => {
+                        let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+                        let _ = sw.write(&empty_batch(&info.result_schema).unwrap(), Some(&md));
+                        app_err = Some(err);
+                    }
+                }
+            }
+            (Ok(batch_opt), None) => {
                 let out_batch =
                     batch_opt.unwrap_or_else(|| empty_batch(&info.result_schema).unwrap());
                 stats.output_batches = 1;
@@ -3912,7 +3940,7 @@ async fn unary_dispatch(
                     let _ = sw.write(&out_batch, None);
                 }
             }
-            Err(err) => {
+            (Err(err), _) => {
                 let md = build_error_metadata(&err, &server.server_id, &req.request_id);
                 let _ = sw.write(&empty_batch(&info.result_schema).unwrap(), Some(&md));
                 app_err = Some(err);

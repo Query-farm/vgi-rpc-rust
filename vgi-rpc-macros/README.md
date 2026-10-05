@@ -95,6 +95,8 @@ Calc::register_with(&mut server, Arc::new(Calc));
 #[unary]                                  // sync; result schema from return type
 #[unary]
 async fn slow(...) -> Result<T>           // async unary
+#[unary]
+fn big(...) -> Result<RefOr<T>>           // T, or a pre-published ExternalRef
 #[producer(state = S, output = T)]        // single-column "value" output
 #[producer(state = S, output_schema = my_schema_fn)] // custom output schema fn
 #[producer(state = S, output = T,
@@ -105,6 +107,12 @@ async fn slow(...) -> Result<T>           // async unary
 #[param(name = "n", doc = "the count", default = 10)]
 #[param(name = "n", rename = "wireName")] // method param `n`, wire name `wireName`
 ```
+
+A unary method returning `Result<RefOr<T>>` derives its result schema from
+`T` (the protocol hash is the same as `-> Result<T>`). `RefOr::Value(v)` is
+sent like a plain `T`; `RefOr::Ref(r)` (or `r.into()`) makes the dispatcher
+write `r`'s ExternalLocation pointer batch instead — see
+`vgi_rpc::external::publish_external`. `RefOr<()>` is a compile error.
 
 `header_fn` / `schema_fn` paths must point to free functions taking
 `&vgi_rpc::server::Request` and returning `Result<HeaderType>` /

@@ -79,6 +79,12 @@ proptest = "1"
 name = "external_integration"
 required-features = ["test-utils", "external"]
 
+# Unary methods answering with a pre-published `ExternalRef`, over the pipe
+# loop and the axum router; uses `InMemoryStorage` and `#[service]`.
+[[test]]
+name = "external_ref"
+required-features = ["test-utils", "http", "macros"]
+
 # axum/tower router tests: need the server stack.
 [[test]]
 name = "access_log_egress"

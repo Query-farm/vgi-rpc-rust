@@ -287,7 +287,10 @@ mod tests {
         let (resolver, calls) = counting();
         let auth = compose_identity_authenticate(None, Some(keys()), Some(resolver)).unwrap();
         let good = grant(now(), 600);
-        let tampered = format!("{}A", &good[..good.len() - 1]);
+        // Swap the last character for a different one: a fixed replacement is
+        // a no-op whenever the fresh token already ends in it.
+        let last = if good.ends_with('A') { 'Q' } else { 'A' };
+        let tampered = format!("{}{last}", &good[..good.len() - 1]);
         let err = call(&auth, &bearer(&tampered)).unwrap_err();
         assert_eq!(err.auth_reason, Some(AuthReason::InvalidCredential));
         let expired = grant(now() - 3000, 60);

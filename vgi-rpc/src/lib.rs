@@ -11,10 +11,10 @@ pub mod conformance_identity;
 pub mod conformance_secondary;
 #[cfg(feature = "crypto")]
 pub mod crypto;
-#[cfg(feature = "crypto")]
-pub mod grants;
 pub mod error_model;
 pub mod errors;
+#[cfg(feature = "crypto")]
+pub mod grants;
 pub mod retry;
 
 #[cfg(feature = "external")]

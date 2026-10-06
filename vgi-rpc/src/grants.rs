@@ -340,7 +340,9 @@ impl<'a> Cursor<'a> {
     }
 
     fn i64(&mut self) -> std::result::Result<i64, GrantInvalid> {
-        Ok(i64::from_le_bytes(self.take(8)?.try_into().expect("8 bytes")))
+        Ok(i64::from_le_bytes(
+            self.take(8)?.try_into().expect("8 bytes"),
+        ))
     }
 
     fn u16(&mut self) -> std::result::Result<usize, GrantInvalid> {
@@ -600,9 +602,7 @@ mod tests {
             )
             .unwrap();
             let req = &case["request"];
-            let nonce: [u8; 24] = hex(case["nonce_hex"].as_str().unwrap())
-                .try_into()
-                .unwrap();
+            let nonce: [u8; 24] = hex(case["nonce_hex"].as_str().unwrap()).try_into().unwrap();
             let (token, claims) = mint_grant_token(
                 &keys,
                 req["principal"].as_str().unwrap(),
@@ -635,21 +635,15 @@ mod tests {
             let want = &case["claims"];
             assert_eq!(claims.expires_at, want["expires_at"].as_i64().unwrap());
             // And the verifier opens what the minter made.
-            let verified = verify_grant_token(
-                &keys,
-                &token,
-                Some((claims.issued_at + 60) as f64),
-            )
-            .unwrap();
+            let verified =
+                verify_grant_token(&keys, &token, Some((claims.issued_at + 60) as f64)).unwrap();
             assert_eq!(verified, claims, "{name}: round trip");
         }
     }
 
     fn verify_case(v: &Value, case: &Value) -> std::result::Result<GrantClaims, GrantInvalid> {
         let d = &v["defaults"];
-        let keys_b64 = case
-            .get("verify_keys_b64")
-            .unwrap_or(&d["verify_keys_b64"]);
+        let keys_b64 = case.get("verify_keys_b64").unwrap_or(&d["verify_keys_b64"]);
         let keys = GrantKeys::new(
             strings(keys_b64).iter().map(|k| b64(k)),
             case.get("audience")

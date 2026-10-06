@@ -868,7 +868,8 @@ impl RpcServerBuilder {
             // hash -- reflects only the hooks the deployment actually
             // supplied. `None` when neither hook exists: with nothing to
             // answer, the protocol is not registered at all.
-            identity: identity.and_then(crate::token_identity::IdentityBinding::new)
+            identity: identity
+                .and_then(crate::token_identity::IdentityBinding::new)
                 .map(Arc::new),
             dispatch_hook: self.dispatch_hook,
             on_serve_start: self.on_serve_start,

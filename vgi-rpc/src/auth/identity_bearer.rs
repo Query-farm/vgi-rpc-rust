@@ -270,7 +270,10 @@ mod tests {
         let (resolver, calls) = counting();
         let auth = compose_identity_authenticate(None, Some(keys()), Some(resolver)).unwrap();
         let ctx = call(&auth, &bearer(&grant(now(), 600))).unwrap();
-        assert_eq!((ctx.domain.as_str(), ctx.principal.as_str()), ("grant", "alice"));
+        assert_eq!(
+            (ctx.domain.as_str(), ctx.principal.as_str()),
+            ("grant", "alice")
+        );
         assert_eq!(grant_scopes(&ctx), ["read", "write"]);
         assert_eq!(ctx.claims["purpose"], "nightly");
         assert!(!ctx.claims.contains_key("auth_time"));
@@ -290,7 +293,11 @@ mod tests {
         let expired = grant(now() - 3000, 60);
         let err = call(&auth, &bearer(&expired)).unwrap_err();
         assert_eq!(err.auth_reason, Some(AuthReason::ExpiredCredential));
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "a grant reached resolve_token");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a grant reached resolve_token"
+        );
     }
 
     /// Only the exact prefix routes to the grant verifier.
@@ -325,7 +332,11 @@ mod tests {
         assert!(err.is_auth_unavailable());
         assert_eq!(err.retry_after_seconds, Some(7));
         // A JWS never reaches the hook.
-        let err = call(&auth, &bearer("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2ln")).unwrap_err();
+        let err = call(
+            &auth,
+            &bearer("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2ln"),
+        )
+        .unwrap_err();
         assert_eq!(err.auth_reason, Some(AuthReason::InvalidCredential));
         // No credential stays anonymous.
         assert!(!call(&auth, &[]).unwrap().authenticated);
@@ -337,12 +348,18 @@ mod tests {
     fn the_deployment_authenticator_runs_first() {
         let deployment: Authenticate = Arc::new(|req| match extract_bearer(req) {
             Some("static") => Ok(AuthContext::for_principal("bearer", "static-user")),
-            Some(_) => Err(RpcError::auth_failure(AuthReason::InvalidCredential, "jwt says no")),
+            Some(_) => Err(RpcError::auth_failure(
+                AuthReason::InvalidCredential,
+                "jwt says no",
+            )),
             None => Ok(AuthContext::anonymous()),
         });
         let auth = compose_identity_authenticate(Some(deployment), Some(keys()), None).unwrap();
         assert_eq!(call(&auth, &bearer("static")).unwrap().domain, "bearer");
-        assert_eq!(call(&auth, &bearer(&grant(now(), 600))).unwrap().domain, "grant");
+        assert_eq!(
+            call(&auth, &bearer(&grant(now(), 600))).unwrap().domain,
+            "grant"
+        );
         let err = call(&auth, &bearer("other")).unwrap_err();
         assert_eq!(err.message, "jwt says no");
         assert!(compose_identity_authenticate(None, None, None).is_none());

@@ -31,9 +31,9 @@ fn request_body(method: &str) -> Vec<u8> {
 
 async fn post(app: axum::Router, method: &str, stream_init: bool) -> StatusCode {
     let path = if stream_init {
-        format!("/{method}/init")
+        format!("/Service/{method}/init")
     } else {
-        format!("/{method}")
+        format!("/Service/{method}")
     };
     app.oneshot(
         Request::builder()

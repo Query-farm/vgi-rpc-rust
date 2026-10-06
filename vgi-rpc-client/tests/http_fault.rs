@@ -147,6 +147,7 @@ fn request_times_out() {
         std::thread::sleep(Duration::from_secs(30)); // never respond
     });
     let mut client = HttpClient::connect(url)
+        .protocol("Service")
         .timeout(Some(Duration::from_millis(300)))
         .retry(RetryConfig::disabled())
         .build()
@@ -173,6 +174,7 @@ fn retries_then_succeeds() {
         // attempts 1,2: drop the stream → client sees a connection error.
     });
     let mut client = HttpClient::connect(url)
+        .protocol("Service")
         .timeout(Some(Duration::from_secs(2)))
         .retry(RetryConfig {
             max_attempts: 3,
@@ -200,6 +202,7 @@ fn unary_connection_failure_is_not_retried_by_default() {
         // whether a side-effecting unary handler ran, so it must not replay.
     });
     let mut client = HttpClient::connect(url)
+        .protocol("Service")
         .timeout(Some(Duration::from_millis(500)))
         .build()
         .unwrap();
@@ -265,6 +268,7 @@ fn assert_response_cap_then_recovery(
         stream.flush().unwrap();
     });
     let mut client = HttpClient::connect(url)
+        .protocol("Service")
         .retry(RetryConfig::disabled())
         .max_encoded_response_bytes(max_encoded)
         .max_decoded_response_bytes(max_decoded)
@@ -337,6 +341,7 @@ fn identity_response_is_bounded_by_the_server_advertised_maximum() {
         stream.flush().unwrap();
     });
     let mut client = HttpClient::connect(url)
+        .protocol("Service")
         .retry(RetryConfig::disabled())
         .max_encoded_response_bytes(128 * 1024)
         .max_decoded_response_bytes(128 * 1024)
@@ -416,7 +421,10 @@ fn gzip_response_decodes_to_a_valid_arrow_result() {
             .unwrap();
         stream.flush().unwrap();
     });
-    let mut client = HttpClient::connect(url).build().unwrap();
+    let mut client = HttpClient::connect(url)
+        .protocol("Service")
+        .build()
+        .unwrap();
     let (batch, _) = client
         .call_unary("echo_int", &echo_params(), None)
         .expect("gzip response must decode before Arrow parsing");
@@ -491,6 +499,7 @@ fn known_length_oversize_keep_alive_response_is_discarded_before_recovery() {
     });
 
     let mut client = HttpClient::connect(format!("http://127.0.0.1:{port}"))
+        .protocol("Service")
         .timeout(Some(Duration::from_secs(5)))
         .retry(RetryConfig::disabled())
         .max_encoded_response_bytes(64 * 1024)
@@ -526,6 +535,7 @@ fn garbage_response_is_error_not_panic() {
             let _ = stream.flush();
         });
         let mut client = HttpClient::connect(url)
+            .protocol("Service")
             .retry(RetryConfig::disabled())
             .build()
             .unwrap();
@@ -544,6 +554,7 @@ fn no_retry_exhausted_is_transport_error() {
         // drop immediately
     });
     let mut client = HttpClient::connect(url)
+        .protocol("Service")
         .timeout(Some(Duration::from_millis(500)))
         .retry(RetryConfig {
             max_attempts: 2,

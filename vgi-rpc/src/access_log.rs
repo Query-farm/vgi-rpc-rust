@@ -527,6 +527,9 @@ fn render(max_record_bytes: usize, mut rec: Record) -> String {
     if let Some(message) = rec.get("error_message") {
         sentinel.insert("error_message".into(), message.clone());
     }
+    if let Some(code) = rec.get("error_code") {
+        sentinel.insert("error_code".into(), code.clone());
+    }
     sentinel.insert("truncated".into(), json!("record_too_large"));
     serde_json::Value::Object(sentinel).to_string()
 }
@@ -613,6 +616,10 @@ impl DispatchHook for AccessLogHook {
 
         if let Some(err) = error {
             rec.insert("error_message".into(), json!(err.message));
+            // The same canonical code the client received in
+            // `vgi_rpc.error_code`: an operator alerts on the code, not on a
+            // language's exception class name.
+            rec.insert("error_code".into(), json!(err.wire_code()));
         }
         if !self.server_version.is_empty() {
             rec.insert("server_version".into(), json!(self.server_version));
@@ -787,15 +794,16 @@ pub(crate) fn rfc3339_utc_millis() -> String {
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut chunks = bytes.chunks_exact(3);
-    for chunk in chunks.by_ref() {
+    // `as_chunks` (stable since 1.88, under the 1.97 MSRV) yields fixed-size
+    // arrays, so the indexing below is bounds-check free.
+    let (chunks, rem) = bytes.as_chunks::<3>();
+    for chunk in chunks {
         let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
         out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
         out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
         out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
         out.push(ALPHABET[(n & 0x3F) as usize] as char);
     }
-    let rem = chunks.remainder();
     match rem.len() {
         1 => {
             let n = (rem[0] as u32) << 16;

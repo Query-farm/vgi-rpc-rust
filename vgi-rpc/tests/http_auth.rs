@@ -41,7 +41,7 @@ async fn anonymous_request_hits_unknown_method_404() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/echo_string")
+                .uri("/Test/echo_string")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .body(Body::from(vec![]))
                 .unwrap(),
@@ -74,7 +74,7 @@ async fn bearer_auth_rejects_missing_header() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/echo_string")
+                .uri("/Test/echo_string")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .body(Body::from(vec![]))
                 .unwrap(),
@@ -152,7 +152,7 @@ async fn a_transient_authenticator_failure_is_not_a_401() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/echo_string")
+                .uri("/Test/echo_string")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .body(Body::from(vec![]))
                 .unwrap(),

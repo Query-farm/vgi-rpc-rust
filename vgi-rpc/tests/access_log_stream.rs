@@ -27,8 +27,8 @@ use tower::ServiceExt;
 use vgi_rpc::hooks::{CallStatistics, DispatchHook, DispatchInfo, HookToken};
 use vgi_rpc::http::{HttpState, ARROW_CONTENT_TYPE};
 use vgi_rpc::metadata::{
-    CALL_STATE_KEY, PROTOCOL_KEY, REQUEST_ID_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY,
-    RPC_METHOD_KEY, STATE_KEY,
+    CALL_STATE_KEY, PROTOCOL_KEY, PROTOCOL_VERSION_KEY, REQUEST_ID_KEY, REQUEST_VERSION,
+    REQUEST_VERSION_KEY, RPC_METHOD_KEY, STATE_KEY,
 };
 use vgi_rpc::server::MethodType;
 use vgi_rpc::stream::{OutputCollector, ProducerState, StreamResult, StreamStateKind};
@@ -194,6 +194,7 @@ fn init_body(limit: i64) -> Vec<u8> {
         (PROTOCOL_KEY.to_string(), PROTOCOL.to_string()),
         (REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string()),
         (REQUEST_ID_KEY.to_string(), "stream-init".to_string()),
+        (PROTOCOL_VERSION_KEY.to_string(), "1.0.0".to_string()),
     ]);
     let mut buf = Vec::new();
     {

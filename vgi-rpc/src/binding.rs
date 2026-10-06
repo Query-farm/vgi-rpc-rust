@@ -71,6 +71,10 @@ pub fn protocol_not_specified(hosted: &[&str]) -> RpcError {
         "Request carries no 'vgi_rpc.protocol' routing key. Every request must name \
          the protocol it addresses. This server hosts: {hosted:?}."
     ))
+    .with_status(
+        crate::error_model::Code::InvalidArgument,
+        crate::errors::ERROR_KIND_PROTOCOL_NOT_SPECIFIED,
+    )
 }
 
 /// A protocol this server does not host.
@@ -82,6 +86,10 @@ pub fn protocol_not_supported(requested: &str, hosted: &[&str]) -> RpcError {
     RpcError::protocol_error(format!(
         "This server does not host protocol {requested:?}. Hosted: {hosted:?}."
     ))
+    .with_status(
+        crate::error_model::Code::Unimplemented,
+        crate::errors::ERROR_KIND_PROTOCOL_NOT_SUPPORTED,
+    )
 }
 
 #[cfg(test)]

@@ -118,7 +118,11 @@ fn run_tcp_client(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         )?
     } else {
         vgi_rpc_client::RpcClient::tcp_connect(host, port)?
-    };
+    }
+    // The probe server is `ConformanceService` 2.0.0: every request names
+    // the protocol and declares the version.
+    .protocol("ConformanceService")
+    .protocol_version("2.0.0");
     let expected = client_expectation(args)?;
     let mut first = None;
     for _ in 0..2 {
@@ -139,8 +143,10 @@ fn run_tcp_client(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_http_client(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let url = required(args, "--url")?;
-    let mut builder =
-        vgi_rpc_client::HttpClient::connect(url).timeout(Some(Duration::from_secs(20)));
+    let mut builder = vgi_rpc_client::HttpClient::connect(url)
+        .protocol("ConformanceService")
+        .protocol_version("2.0.0")
+        .timeout(Some(Duration::from_secs(20)));
     if let Some(login) = optional(args, "--spoof-login") {
         builder = builder.header("Tailscale-User-Login", login)?;
     }

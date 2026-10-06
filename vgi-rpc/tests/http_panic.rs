@@ -154,7 +154,7 @@ async fn post(app: axum::Router, path: &str, body: Vec<u8>) -> axum::response::R
     app.oneshot(
         Request::builder()
             .method("POST")
-            .uri(path)
+            .uri(format!("/Service{path}"))
             .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
             .body(Body::from(body))
             .unwrap(),
@@ -196,7 +196,7 @@ async fn unary_handler_panic_yields_structured_error_not_500() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/boom")
+                .uri("/Service/boom")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .body(Body::from(request_body("boom")))
                 .unwrap(),
@@ -225,7 +225,7 @@ async fn stream_init_handler_panic_yields_structured_error_not_500() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/flow/init")
+                .uri("/Service/flow/init")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .body(Body::from(request_body("flow")))
                 .unwrap(),

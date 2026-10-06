@@ -93,7 +93,7 @@ async fn call(accept_encoding: &str) -> (usize, usize, serde_json::Value) {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/big")
+                .uri("/Test/big")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .header(header::ACCEPT_ENCODING, accept_encoding)
                 .body(Body::from(body))

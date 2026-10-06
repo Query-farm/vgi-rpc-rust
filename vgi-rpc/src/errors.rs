@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+pub use crate::error_model::{Code, ErrorDetail};
+
 /// An RPC-level error, serialized on the wire as an EXCEPTION log batch.
 #[derive(Debug, Clone)]
 pub struct RpcError {
@@ -46,6 +48,22 @@ pub struct RpcError {
     /// would have to substring-match a message to know whether retrying is
     /// correct or abusive.
     pub error_kind: Option<Box<str>>,
+    /// The canonical code and typed details (WIRE_PROTOCOL.md §8), boxed so
+    /// an error that carries neither -- most of them -- pays one pointer.
+    /// Read through [`Self::error_code`] / [`Self::error_details`]; set
+    /// through [`Self::with_code`] / [`Self::with_details`].
+    status: Option<Box<ErrorStatus>>,
+}
+
+/// The code and details layers of an [`RpcError`].
+#[derive(Debug, Clone, Default)]
+struct ErrorStatus {
+    /// The code's wire name. Kept as a string, not a [`Code`], so a client
+    /// reports what the server sent verbatim -- `""` (absent) and an
+    /// unrecognised value are different answers from `"UNKNOWN"`.
+    code: String,
+    /// The detail objects in wire order, unknown types included.
+    details: Vec<serde_json::Value>,
 }
 
 /// [`RpcError::error_type`] marking "I could not determine whether the
@@ -61,6 +79,22 @@ pub const AUTH_UNAVAILABLE_ERROR_TYPE: &str = "AuthUnavailableError";
 /// purpose: it is a hint to retry, not a backoff schedule.
 pub const DEFAULT_AUTH_RETRY_AFTER_SECONDS: u32 = 5;
 
+/// `RetryInfo` a draining server attaches to `server_draining`.
+pub const DEFAULT_DRAINING_RETRY_AFTER_SECONDS: f64 = 1.0;
+
+/// Framework error kinds (WIRE_PROTOCOL.md §8), each with its fixed code.
+pub const ERROR_KIND_METHOD_NOT_IMPLEMENTED: &str = "method_not_implemented";
+/// `protocol_not_specified` -> `INVALID_ARGUMENT`.
+pub const ERROR_KIND_PROTOCOL_NOT_SPECIFIED: &str = "protocol_not_specified";
+/// `protocol_not_supported` -> `UNIMPLEMENTED`.
+pub const ERROR_KIND_PROTOCOL_NOT_SUPPORTED: &str = "protocol_not_supported";
+/// `protocol_version_mismatch` -> `FAILED_PRECONDITION`.
+pub const ERROR_KIND_PROTOCOL_VERSION_MISMATCH: &str = "protocol_version_mismatch";
+/// `session_lost` -> `ABORTED`.
+pub const ERROR_KIND_SESSION_LOST: &str = "session_lost";
+/// `server_draining` -> `UNAVAILABLE` + `RetryInfo`.
+pub const ERROR_KIND_SERVER_DRAINING: &str = "server_draining";
+
 impl RpcError {
     pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
@@ -71,6 +105,7 @@ impl RpcError {
             auth_reason: None,
             retry_after_seconds: None,
             error_kind: None,
+            status: None,
         }
     }
 
@@ -92,7 +127,7 @@ impl RpcError {
     /// Raise it for transport failures, timeouts, and 5xx from a remote
     /// authority. Never for a credential the authority answered about.
     pub fn auth_unavailable(detail: impl Into<String>) -> Self {
-        let mut err = Self::new(AUTH_UNAVAILABLE_ERROR_TYPE, detail);
+        let mut err = Self::new(AUTH_UNAVAILABLE_ERROR_TYPE, detail).with_code(Code::Unavailable);
         err.retry_after_seconds = Some(DEFAULT_AUTH_RETRY_AFTER_SECONDS);
         err
     }
@@ -161,14 +196,229 @@ impl RpcError {
     /// (missing, expired, evicted, wrong worker, or principal mismatch).
     /// Mirrors Python's `vgi_rpc.rpc.SessionLostError`.
     pub fn session_lost_error(msg: impl Into<String>) -> Self {
-        Self::new("SessionLostError", msg)
+        Self::new("SessionLostError", msg).with_status(Code::Aborted, ERROR_KIND_SESSION_LOST)
     }
 
     /// Server is draining: new `ctx.open_session` calls are rejected while
     /// existing sessions continue to serve. Mirrors Python's
     /// `vgi_rpc.rpc.ServerDrainingError`.
+    ///
+    /// Carries `RetryInfo` of [`DEFAULT_DRAINING_RETRY_AFTER_SECONDS`]: a
+    /// retry is usually routed to a worker that is not draining.
     pub fn server_draining_error(msg: impl Into<String>) -> Self {
         Self::new("ServerDrainingError", msg)
+            .with_status(Code::Unavailable, ERROR_KIND_SERVER_DRAINING)
+            .with_details([ErrorDetail::retry_info(
+                DEFAULT_DRAINING_RETRY_AFTER_SECONDS,
+            )])
+    }
+
+    /// The protocol the request addresses is hosted, but has no such method.
+    /// Kind `method_not_implemented`, code `UNIMPLEMENTED`: the capability
+    /// probe signal, distinct from "this server does not host that protocol".
+    pub fn method_not_implemented(msg: impl Into<String>) -> Self {
+        Self::attribute_error(msg)
+            .with_status(Code::Unimplemented, ERROR_KIND_METHOD_NOT_IMPLEMENTED)
+    }
+
+    /// The client's `vgi_rpc.protocol_version` is absent, malformed or
+    /// incompatible with the resolved binding's. Kind
+    /// `protocol_version_mismatch`, code `FAILED_PRECONDITION`, and one
+    /// `PreconditionFailure` violation naming `protocol`. `client_version` is
+    /// `""` when the client sent none; `direction` says which side to upgrade.
+    pub fn protocol_version_mismatch(
+        protocol: &str,
+        client_version: &str,
+        server_version: &str,
+        direction: &str,
+    ) -> Self {
+        let client = if client_version.is_empty() {
+            "<not declared>"
+        } else {
+            client_version
+        };
+        Self::version_error(format!(
+            "protocol_version mismatch for protocol {protocol:?}.\n  Client: {client}\n  \
+             Server: {server_version}\n  Direction: {direction}"
+        ))
+        .with_status(
+            Code::FailedPrecondition,
+            ERROR_KIND_PROTOCOL_VERSION_MISMATCH,
+        )
+        .with_details([ErrorDetail::PreconditionFailure {
+            violations: vec![crate::error_model::PreconditionViolation {
+                r#type: "protocol_version".into(),
+                subject: protocol.into(),
+                description: format!(
+                    "client declares {client}, server requires {server_version}; \
+                     major and minor must match"
+                ),
+            }],
+        }])
+    }
+
+    // --- The error model (WIRE_PROTOCOL.md §8) --------------------------
+
+    /// Set the canonical code.
+    pub fn with_code(mut self, code: Code) -> Self {
+        self.status.get_or_insert_with(Default::default).code = code.as_str().to_string();
+        self
+    }
+
+    /// Set the code and the kind together -- the pair a kind is defined with.
+    pub fn with_status(self, code: Code, kind: impl Into<String>) -> Self {
+        self.with_code(code).with_error_kind(kind)
+    }
+
+    /// Append catalog details. Each type at most once; a list breaking the
+    /// rules, or over [`MAX_ERROR_DETAILS_BYTES`](crate::error_model::MAX_ERROR_DETAILS_BYTES)
+    /// serialized, is dropped whole on the wire.
+    pub fn with_details(self, details: impl IntoIterator<Item = ErrorDetail>) -> Self {
+        self.with_raw_details(details.into_iter().map(|d| d.to_json()))
+    }
+
+    /// Append already-built detail objects -- the way a protocol-defined type
+    /// (under the protocol's own name) is attached.
+    pub fn with_raw_details(
+        mut self,
+        details: impl IntoIterator<Item = serde_json::Value>,
+    ) -> Self {
+        self.status
+            .get_or_insert_with(Default::default)
+            .details
+            .extend(details);
+        self
+    }
+
+    /// Install a decoded wire status verbatim. Used by clients.
+    pub fn set_wire_status(&mut self, code: &str, details: Vec<serde_json::Value>) {
+        if code.is_empty() && details.is_empty() {
+            self.status = None;
+        } else {
+            self.status = Some(Box::new(ErrorStatus {
+                code: code.to_string(),
+                details,
+            }));
+        }
+    }
+
+    /// The `vgi_rpc.error_code` value: the code's name, or `""` when none was
+    /// set (on a client: when the server sent none, i.e. predates the model).
+    pub fn error_code(&self) -> &str {
+        self.status.as_ref().map_or("", |s| s.code.as_str())
+    }
+
+    /// The canonical code; [`Code::Unknown`] when absent or unrecognised.
+    pub fn code(&self) -> Code {
+        Code::parse(self.error_code())
+    }
+
+    /// The `vgi_rpc.error_kind` value, or `""`.
+    pub fn error_kind(&self) -> &str {
+        self.error_kind.as_deref().unwrap_or("")
+    }
+
+    /// The detail objects as received (or as attached), unknown types
+    /// included, in order.
+    pub fn error_details(&self) -> &[serde_json::Value] {
+        self.status.as_ref().map_or(&[], |s| s.details.as_slice())
+    }
+
+    /// The catalog details this crate understands, in order; unknown or
+    /// malformed ones skipped.
+    pub fn details(&self) -> Vec<ErrorDetail> {
+        self.error_details()
+            .iter()
+            .filter_map(ErrorDetail::from_json)
+            .collect()
+    }
+
+    fn detail_of(&self, ty: &str) -> Option<ErrorDetail> {
+        self.details().into_iter().find(|d| d.type_name() == ty)
+    }
+
+    /// The `vgi_rpc.ErrorInfo` metadata, if present.
+    pub fn error_info(&self) -> Option<std::collections::BTreeMap<String, String>> {
+        match self.detail_of(crate::error_model::ERROR_INFO_TYPE)? {
+            ErrorDetail::ErrorInfo { metadata } => Some(metadata),
+            _ => None,
+        }
+    }
+
+    /// The `vgi_rpc.RetryInfo` delay in seconds, if present.
+    pub fn retry_info(&self) -> Option<f64> {
+        match self.detail_of(crate::error_model::RETRY_INFO_TYPE)? {
+            ErrorDetail::RetryInfo {
+                retry_delay_seconds,
+            } => Some(retry_delay_seconds),
+            _ => None,
+        }
+    }
+
+    /// The `vgi_rpc.BadRequest` detail, if present.
+    pub fn bad_request(&self) -> Option<ErrorDetail> {
+        self.detail_of(crate::error_model::BAD_REQUEST_TYPE)
+    }
+
+    /// The `vgi_rpc.PreconditionFailure` detail, if present.
+    pub fn precondition_failure(&self) -> Option<ErrorDetail> {
+        self.detail_of(crate::error_model::PRECONDITION_FAILURE_TYPE)
+    }
+
+    /// The `vgi_rpc.QuotaFailure` detail, if present.
+    pub fn quota_failure(&self) -> Option<ErrorDetail> {
+        self.detail_of(crate::error_model::QUOTA_FAILURE_TYPE)
+    }
+
+    /// The `vgi_rpc.ResourceInfo` detail, if present.
+    pub fn resource_info(&self) -> Option<ErrorDetail> {
+        self.detail_of(crate::error_model::RESOURCE_INFO_TYPE)
+    }
+
+    /// The `vgi_rpc.Help` detail, if present.
+    pub fn help(&self) -> Option<ErrorDetail> {
+        self.detail_of(crate::error_model::HELP_TYPE)
+    }
+
+    /// The `vgi_rpc.LocalizedMessage` detail, if present.
+    pub fn localized_message(&self) -> Option<ErrorDetail> {
+        self.detail_of(crate::error_model::LOCALIZED_MESSAGE_TYPE)
+    }
+
+    /// Whether retrying *this call* is warranted, by WIRE_PROTOCOL.md §8:
+    /// `UNAVAILABLE` always, `RESOURCE_EXHAUSTED` only with `RetryInfo`.
+    /// When [`Self::retry_info`] is present a retry waits at least that long.
+    ///
+    /// A classification, not a policy: no client in this crate retries an RPC
+    /// error automatically, because a method may not be idempotent.
+    pub fn is_retryable(&self) -> bool {
+        crate::error_model::is_retryable(self.error_code(), self.error_details())
+    }
+
+    /// The code a server emits: the one set, else `UNKNOWN`.
+    pub(crate) fn wire_code(&self) -> &str {
+        match self.error_code() {
+            "" => Code::Unknown.as_str(),
+            code => code,
+        }
+    }
+
+    /// The details a server emits: those attached, plus a `RetryInfo` built
+    /// from [`Self::retry_after_seconds`] when the error carries a hint and no
+    /// `RetryInfo` of its own -- which is how a transient auth failure's
+    /// `Retry-After` reaches every transport, not only the HTTP header.
+    pub(crate) fn wire_details(&self) -> Vec<serde_json::Value> {
+        let mut details = self.error_details().to_vec();
+        if let Some(seconds) = self.retry_after_seconds {
+            let has_retry = details.iter().any(|d| {
+                d.get("@type").and_then(serde_json::Value::as_str)
+                    == Some(crate::error_model::RETRY_INFO_TYPE)
+            });
+            if !has_retry {
+                details.push(ErrorDetail::retry_info(f64::from(seconds)).to_json());
+            }
+        }
+        details
     }
 }
 

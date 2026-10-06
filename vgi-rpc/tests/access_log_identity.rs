@@ -37,8 +37,8 @@ use tower::ServiceExt; // for oneshot
 
 use vgi_rpc::hooks::{CallStatistics, DispatchHook, DispatchInfo, HookToken};
 use vgi_rpc::metadata::{
-    LOG_LEVEL_KEY, LOG_MESSAGE_KEY, PROTOCOL_KEY, REQUEST_ID_KEY, REQUEST_VERSION,
-    REQUEST_VERSION_KEY, RPC_METHOD_KEY,
+    LOG_LEVEL_KEY, LOG_MESSAGE_KEY, PROTOCOL_KEY, PROTOCOL_VERSION_KEY, REQUEST_ID_KEY,
+    REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY,
 };
 use vgi_rpc::reflection::{describe_retired, REFLECTION_PROTOCOL_NAME, RETIRED_DESCRIBE_METHOD};
 use vgi_rpc::server::ConnectionContext;
@@ -128,6 +128,8 @@ fn request_bytes(protocol: &str, method: &str) -> Vec<u8> {
             md.insert(PROTOCOL_KEY.into(), protocol.into());
         }
         md.insert(REQUEST_VERSION_KEY.into(), REQUEST_VERSION.into());
+        // The application binding declares 2.0.0; a conforming client sends it.
+        md.insert(PROTOCOL_VERSION_KEY.into(), "2.0.0".into());
         md.insert(REQUEST_ID_KEY.into(), format!("req-{method}"));
         w.write(&batch, Some(&md)).unwrap();
         w.finish().unwrap();

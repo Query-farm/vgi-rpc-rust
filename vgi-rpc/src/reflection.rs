@@ -457,16 +457,17 @@ impl crate::server::RpcServer {
         w: &mut W,
         req: &crate::server::Request,
         ctx: &crate::server::CallContext,
+        tracebacks: Option<&str>,
     ) -> Result<bool> {
         let Some(hook) = self.dispatch_hook.as_ref() else {
-            return self.serve_reflection(w, req);
+            return self.serve_reflection(w, req, tracebacks);
         };
         let mut info = crate::hooks::DispatchInfo::from_request(self, req, "unary", &ctx.auth);
         if let Ok(bytes) = crate::server::serialize_request_batch(&req.batch) {
             info.request_data = bytes;
         }
         let token = hook.on_dispatch_start(&info);
-        let outcome = self.serve_reflection(w, req);
+        let outcome = self.serve_reflection(w, req, tracebacks);
         let stats = crate::hooks::CallStatistics {
             input_batches: 1,
             input_rows: req.batch.num_rows() as u64,
@@ -483,6 +484,7 @@ impl crate::server::RpcServer {
         &self,
         w: &mut W,
         req: &crate::server::Request,
+        tracebacks: Option<&str>,
     ) -> Result<bool> {
         let app_hash = binding_hash(&self.protocol_name, &self.methods)?;
         // Reflection describes itself out of the same table it answers from,
@@ -500,18 +502,26 @@ impl crate::server::RpcServer {
 
         let batch = match req.method.as_str() {
             LIST_PROTOCOLS_METHOD => {
-                let mut protocols = vec![
+                let mut protocols = vec![(
+                    self.protocol_name.clone(),
+                    self.protocol_version.clone(),
+                    app_hash,
+                )];
+                // Application protocols in registration order, primary
+                // first: a client's "describe this server" takes the first
+                // name outside the reserved prefix, and the rest in order.
+                protocols.extend(self.extra_protocols.iter().map(|p| {
                     (
-                        self.protocol_name.clone(),
-                        self.protocol_version.clone(),
-                        app_hash,
-                    ),
-                    (
-                        REFLECTION_PROTOCOL_NAME.to_string(),
-                        String::new(),
-                        refl_hash,
-                    ),
-                ];
+                        p.name.clone(),
+                        p.version.clone(),
+                        p.protocol_hash().to_string(),
+                    )
+                }));
+                protocols.extend([(
+                    REFLECTION_PROTOCOL_NAME.to_string(),
+                    String::new(),
+                    refl_hash,
+                )]);
                 if let Some(binding) = identity {
                     protocols.push((
                         crate::token_identity::IDENTITY_PROTOCOL_NAME.to_string(),
@@ -534,6 +544,15 @@ impl crate::server::RpcServer {
                         &self.protocol_version,
                         &app_hash,
                         &self.methods,
+                    )?
+                } else if let Some(extra) =
+                    self.extra_protocols.iter().find(|p| p.name == requested)
+                {
+                    build_service_description(
+                        &extra.name,
+                        &extra.version,
+                        extra.protocol_hash(),
+                        &extra.methods,
                     )?
                 } else if requested == REFLECTION_PROTOCOL_NAME {
                     build_service_description(
@@ -564,6 +583,7 @@ impl crate::server::RpcServer {
                         &crate::binding::protocol_not_supported(&requested, &hosted),
                         &self.server_id,
                         &req.request_id,
+                        tracebacks,
                     )?;
                     return Ok(true);
                 }
@@ -572,13 +592,14 @@ impl crate::server::RpcServer {
                 crate::server::write_error_stream(
                     w,
                     &empty_schema(),
-                    &RpcError::attribute_error(format!(
+                    &RpcError::method_not_implemented(format!(
                         "Protocol '{REFLECTION_PROTOCOL_NAME}' has no method '{other}'. \
                          Available: {:?}",
                         sorted_reflection_method_names()
                     )),
                     &self.server_id,
                     &req.request_id,
+                    tracebacks,
                 )?;
                 return Ok(true);
             }

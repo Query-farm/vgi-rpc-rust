@@ -171,7 +171,7 @@ async fn post_arrow(app: axum::Router, path: &str, body: Vec<u8>) -> Bytes {
     let resp = app
         .oneshot(
             Request::builder()
-                .uri(path)
+                .uri(format!("/Service{path}"))
                 .method("POST")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .body(Body::from(body))
@@ -245,7 +245,7 @@ async fn worker_with_different_key_rejects_peer_token() {
     let resp = app_h
         .oneshot(
             Request::builder()
-                .uri("/counter/exchange")
+                .uri("/Service/counter/exchange")
                 .method("POST")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .body(Body::from(exchange_body(&token_a, &call_token)))

@@ -101,7 +101,7 @@ pub fn build_error_stream(
     let mut buf = Vec::new();
     {
         let mut sw = StreamWriter::new(&mut buf, schema)?;
-        let mut md = crate::server::build_error_metadata(err, server_id.unwrap_or(""), "");
+        let mut md = crate::server::build_error_metadata(err, server_id.unwrap_or(""), "", None);
         // `build_error_metadata` omits an empty server id already; drop an
         // explicitly-empty one for symmetry with Python's `server_id=None`.
         if server_id.is_none_or(str::is_empty) {
@@ -339,8 +339,12 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut sw = StreamWriter::new(&mut buf, &schema).unwrap();
-            let err_md =
-                crate::server::build_error_metadata(&RpcError::runtime_error("boom"), "srv", "req");
+            let err_md = crate::server::build_error_metadata(
+                &RpcError::runtime_error("boom"),
+                "srv",
+                "req",
+                None,
+            );
             sw.write(&empty_batch(&schema).unwrap(), Some(&err_md))
                 .unwrap();
             let batch = RecordBatch::try_new(

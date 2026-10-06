@@ -103,7 +103,7 @@ async fn post(
 ) {
     let mut req = Request::builder()
         .method("POST")
-        .uri(format!("/{INTROSPECT_TOKEN_METHOD}"))
+        .uri(format!("/{protocol}/{INTROSPECT_TOKEN_METHOD}"))
         .header(header::CONTENT_TYPE, "application/vnd.apache.arrow.stream");
     if let Some(c) = caller {
         req = req.header(PRINCIPAL_HEADER, c);
@@ -193,7 +193,7 @@ async fn a_caller_off_the_allowlist_is_refused_over_http() {
     );
 }
 
-/// The protocol is addressed by the routing key, not the URL path. A request
+/// The protocol is addressed by name (path and routing key agree). A request
 /// that names the *application* protocol is asking for an application method
 /// called `introspect_token`, which does not exist -- so identity cannot be
 /// reached by accident, nor shadowed by an application that declares the name.

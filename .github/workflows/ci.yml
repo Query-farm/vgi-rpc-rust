@@ -303,6 +303,39 @@ jobs:
           fi
           python -m pytest test_rust_conformance.py --timeout=20 --timeout-method=signal -v
 
+      # The multi-protocol-hosting / error-model groups skip *loudly* when the
+      # harness lacks `conformance_protocol_connector` -- and a skip there is
+      # an unfinished port, not a pass (MULTI_PROTOCOL_HOSTING.md §1, decision
+      # 10). The step above would report such a skip as green, so these groups
+      # run again here with skips made fatal.
+      - name: New shared groups ran rather than skipped (role=${{ matrix.role }}, server=${{ matrix.server }})
+        env:
+          VGI_CONFORMANCE_ROLE: ${{ matrix.role }}
+          VGI_CONFORMANCE_SERVER: ${{ matrix.server }}
+          VGI_TRANSPORTS: pipe,subprocess,http,unix,tcp,http_externalize_always,shm_pipe
+          VGI_CLIENT_DRIVER: ${{ github.workspace }}/target/debug/vgi-rpc-conformance-client-driver
+        run: |
+          if [ "${{ matrix.server }}" = "python" ]; then
+            export RUST_CONFORMANCE_WORKER="$(command -v vgi-rpc-conformance)"
+            export VGI_RPC_PYTHON="$(command -v python)"
+            export VGI_RPC_PYTHON_REPO="${{ github.workspace }}/vgi-python"
+          else
+            export RUST_CONFORMANCE_WORKER="${{ github.workspace }}/conformance-worker-rust"
+          fi
+          set -o pipefail
+          groups="TestSecondaryIsHosted or TestSecondaryDescribes or TestRoutingByPair"
+          groups="$groups or TestSecondaryRouting or TestVersionMismatchCode"
+          groups="$groups or TestErrorModelRoundTrip or TestTracebackPolicy"
+          groups="$groups or TestErrorModelOnTheWire or TestUnclassifiedErrorsAreUnknown"
+          groups="$groups or TestUnavailableCarriesARetryHint or TestErrorKindsReachTheWire"
+          python -m pytest test_rust_conformance.py -k "$groups" \
+            --timeout=20 --timeout-method=signal -q -rs | tee new-groups.log
+          if grep -q "^SKIPPED" new-groups.log; then
+            echo "::error::a multi-protocol / error-model group skipped; see SKIPPED lines above"
+            exit 1
+          fi
+          grep -Eq "[1-9][0-9]* passed" new-groups.log || { echo "::error::no new-group test ran"; exit 1; }
+
       - name: Verify native Rust client typed serialization against Python
         if: matrix.role == 'client' && matrix.server == 'python'
         env:

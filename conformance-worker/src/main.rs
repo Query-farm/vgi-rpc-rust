@@ -132,40 +132,6 @@ fn reject_all(req: &vgi_rpc::auth::AuthRequest) -> vgi_rpc::auth::AuthResult {
     }
 }
 
-/// Resolve the principal named in `X-Conformance-Principal`, or stay anonymous.
-///
-/// Naming yourself in a header is obviously not authentication — it is the
-/// cheapest thing every port can implement identically, and the cases that use
-/// it only need two identities to be distinguishable. Requests without the
-/// header stay anonymous rather than being rejected: the suite probes /health
-/// and the capability endpoint before it authenticates anything, and the
-/// identity group relies on the absence to test fail-closed behaviour.
-///
-/// `X-Conformance-Auth-Time` rides along as the `auth_time` claim, which is
-/// what `vgi_rpc.Identity.v1`'s freshness guard reads. The value is placed in
-/// the claim map **verbatim and unparsed**: parsing it here and dropping what
-/// will not parse would collapse "carries an unusable auth_time" into "carries
-/// no auth_time", and the guard would then be refusing for a reason the test
-/// did not ask for. Nothing else goes in the claim map.
-///
-/// # Warning
-///
-/// Trivially spoofable by anyone who can reach the port. It exists so six
-/// language ports can produce a deterministic authenticated caller without an
-/// identity provider, and must never be deployed.
-fn principal_from_header(req: &vgi_rpc::auth::AuthRequest) -> vgi_rpc::auth::AuthResult {
-    Ok(match req.header(identity_fixture::PRINCIPAL_HEADER) {
-        Some(principal) if !principal.is_empty() => {
-            let ctx = vgi_rpc::auth::AuthContext::for_principal("conformance", principal);
-            match req.header(identity_fixture::AUTH_TIME_HEADER) {
-                Some(auth_time) => ctx.with_claim("auth_time", auth_time),
-                None => ctx,
-            }
-        }
-        _ => vgi_rpc::auth::AuthContext::anonymous(),
-    })
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -711,7 +677,9 @@ fn run_http(
             // Unlike the reject-all mode above, this deliberately leaves the
             // prefix at the root — the suite connects to this worker exactly as
             // to the plain one.
-            builder = builder.authenticate(std::sync::Arc::new(principal_from_header));
+            builder = builder.authenticate(std::sync::Arc::new(
+                identity_fixture::authenticate_from_headers,
+            ));
         }
         if no_compression {
             builder = builder.disable_response_compression();

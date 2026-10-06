@@ -210,6 +210,7 @@ fn typed_unary_capabilities_and_describe_over_httpi() {
     let target = format!("httpi://{endpoint_id}/vgi");
     let mut client = HttpClient::connect_httpi(&target)
         .expect("parse httpi target")
+        .protocol("Service")
         .no_relay(true)
         .direct_addresses(direct)
         .connect_timeout(Duration::from_secs(5))
@@ -247,6 +248,7 @@ fn httpi_resolves_externalized_response_over_separate_http_fetch() {
     let target = format!("httpi://{endpoint_id}/vgi");
     let mut client = HttpClient::connect_httpi(&target)
         .expect("parse httpi target")
+        .protocol("Service")
         .no_relay(true)
         .direct_addresses(direct)
         .connect_timeout(Duration::from_secs(5))
@@ -283,11 +285,13 @@ fn default_ephemeral_identity_is_process_stable() {
     );
     let first = HttpClient::connect_httpi(target)
         .unwrap()
+        .protocol("Service")
         .no_relay(true)
         .build()
         .unwrap();
     let second = HttpClient::connect_httpi(target)
         .unwrap()
+        .protocol("Service")
         .no_relay(true)
         .build()
         .unwrap();

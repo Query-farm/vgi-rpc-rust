@@ -2164,28 +2164,16 @@ fn attach_capability_headers(
 fn build_router_inner(state: Arc<HttpState>) -> Router {
     let prefix = state.prefix.clone();
     let api = Router::new()
-        .route("/{method}", post(handle_unary).options(handle_preflight))
-        .route(
-            "/{method}/init",
-            post(handle_stream_init).options(handle_preflight),
-        )
-        .route(
-            "/{method}/exchange",
-            post(handle_stream_exchange).options(handle_preflight),
-        )
+        // A single segment is never an RPC: every call names its protocol in
+        // the path (WIRE_PROTOCOL.md §3.1). It is answered -- server-level
+        // reserved names (`__describe__`) get their framework answer, anything
+        // else `protocol_not_specified` -- rather than left to a bare 404, so
+        // a caller still on the retired flat shape is told what is wrong.
+        .route("/{method}", post(handle_unrouted).options(handle_preflight))
         // The protocol-qualified shape, `{protocol}/{method}[/init|/exchange]`
-        // -- what the rest of the fleet routes on, and what the Python
-        // reference client builds every request path from.
-        //
-        // The bare routes above cannot reach a co-hosted protocol whose method
-        // name collides with something already mounted -- reflection's
-        // `describe` collides with the human-facing describe *page*, so on the
-        // bare route it resolves to an HTML document that answers GET and 405s
-        // a POST. A protocol-qualified path has no such collision.
-        //
-        // Static segments still win at each position, so `/:method/init` and
-        // `/:method/exchange` keep their own traffic; a three-segment path can
-        // only ever be the qualified form.
+        // -- the only RPC shape, and what every client in the family builds.
+        // A two-segment `/{x}/init` is a unary call to a method named `init`
+        // on protocol `x`; the flat stream routes are gone.
         .route(
             "/{protocol}/{method}",
             post(handle_protocol_unary).options(handle_preflight),
@@ -2926,21 +2914,25 @@ fn enforce_response_body_cap(
     method: &str,
     server_id: &str,
     request_id: &str,
+    tracebacks: Option<&str>,
 ) -> Response {
     if let Some(limit) = limit {
         if body.len() > limit {
             let err = response_cap_error(body.len(), limit, method);
-            return cap_error_response(schema, &err, server_id, request_id);
+            return cap_error_response(schema, &err, server_id, request_id, tracebacks);
         }
     }
     arrow_response(StatusCode::OK, body)
 }
 
+/// `RESOURCE_EXHAUSTED` with no `RetryInfo`: not retryable, because the same
+/// call against the same limits fails again.
 fn response_cap_error(bytes: usize, limit: usize, method: &str) -> RpcError {
     RpcError::new(
         "ResponseTooLargeError",
         format!("max_response_bytes ({bytes} > {limit}) for method {method:?}"),
     )
+    .with_code(crate::error_model::Code::ResourceExhausted)
 }
 
 /// The one message shape for a `max_externalized_response_bytes` overshoot.
@@ -2966,11 +2958,12 @@ fn cap_error_response(
     err: &RpcError,
     server_id: &str,
     request_id: &str,
+    tracebacks: Option<&str>,
 ) -> Response {
     let mut buf = Vec::new();
     {
         let mut sw = StreamWriter::new(&mut buf, schema).unwrap();
-        let md = build_error_metadata(err, server_id, request_id);
+        let md = build_error_metadata(err, server_id, request_id, tracebacks);
         let _ = sw.write(&empty_batch(schema).unwrap(), Some(&md));
         let _ = sw.finish();
     }
@@ -3219,10 +3212,11 @@ fn error_stream_bytes(
     err: &RpcError,
     server_id: &str,
     request_id: &str,
+    tracebacks: Option<&str>,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut w = StreamWriter::new(&mut buf, schema).unwrap();
-    let md = build_error_metadata(err, server_id, request_id);
+    let md = build_error_metadata(err, server_id, request_id, tracebacks);
     let _ = w.write(&empty_batch(schema).unwrap(), Some(&md));
     let _ = w.finish();
     drop(w);
@@ -3240,7 +3234,13 @@ fn arrow_error(
 ) -> Response {
     arrow_response(
         status,
-        error_stream_bytes(&Schema::empty(), err, &state.server.server_id, request_id),
+        error_stream_bytes(
+            &Schema::empty(),
+            err,
+            &state.server.server_id,
+            request_id,
+            state.server.traceback_origin("", "").as_deref(),
+        ),
     )
 }
 
@@ -3270,6 +3270,7 @@ fn sticky_for_request(
             &err,
             &state.server.server_id,
             "",
+            state.server.traceback_origin("", "").as_deref(),
         )),
     }
 }
@@ -3310,7 +3311,8 @@ fn decode_hex_key(s: &str) -> std::result::Result<Vec<u8>, String> {
     }
     let mut out = Vec::with_capacity(s.len() / 2);
     let bytes = s.as_bytes();
-    for pair in bytes.chunks_exact(2) {
+    // Length is even (checked above), so `as_chunks` leaves no remainder.
+    for pair in bytes.as_chunks::<2>().0 {
         let hi = hex_nibble(pair[0])?;
         let lo = hex_nibble(pair[1])?;
         out.push((hi << 4) | lo);
@@ -3416,9 +3418,9 @@ async fn handle_upload_url(
         ));
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
-    if let Err(err) = validate_protocol_version(state.server.protocol_version(), &req.metadata) {
-        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
-    }
+    // `__upload_url__` is a framework endpoint owned by no protocol, so no
+    // binding's version gate applies (as in the reference): a client of any
+    // version may need somewhere to upload.
     if let Err(err) = validate_parameter_batch(&req.batch, &upload_url_params_schema()) {
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
@@ -3487,8 +3489,15 @@ async fn handle_upload_url(
                     Ok(b) => b,
                     Err(e) => {
                         let err = RpcError::runtime_error(format!("upload-url batch: {e}"));
-                        let md =
-                            build_error_metadata(&err, &state.server.server_id, &req.request_id);
+                        let md = build_error_metadata(
+                            &err,
+                            &state.server.server_id,
+                            &req.request_id,
+                            state
+                                .server
+                                .traceback_origin(&req.protocol, &req.method)
+                                .as_deref(),
+                        );
                         let _ = sw.write(&empty_batch(schema_ref).unwrap(), Some(&md));
                         let _ = sw.finish();
                         drop(sw);
@@ -3499,13 +3508,25 @@ async fn handle_upload_url(
                             UPLOAD_URL_METHOD,
                             &state.server.server_id,
                             &req.request_id,
+                            state
+                                .server
+                                .traceback_origin(&req.protocol, &req.method)
+                                .as_deref(),
                         );
                     }
                 };
                 let _ = sw.write(&batch, None);
             }
             Err(err) => {
-                let md = build_error_metadata(&err, &state.server.server_id, &req.request_id);
+                let md = build_error_metadata(
+                    &err,
+                    &state.server.server_id,
+                    &req.request_id,
+                    state
+                        .server
+                        .traceback_origin(&req.protocol, &req.method)
+                        .as_deref(),
+                );
                 let _ = sw.write(&empty_batch(schema_ref).unwrap(), Some(&md));
             }
         }
@@ -3518,6 +3539,10 @@ async fn handle_upload_url(
         UPLOAD_URL_METHOD,
         &state.server.server_id,
         &req.request_id,
+        state
+            .server
+            .traceback_origin(&req.protocol, &req.method)
+            .as_deref(),
     )
 }
 
@@ -3557,6 +3582,26 @@ fn dispatch_sync<T>(callback: impl FnOnce() -> T) -> T {
 /// a protocol the request never named. A request that carries no key at all
 /// adopts the path's, which is what lets a plain HTTP caller address a
 /// co-hosted protocol without hand-building metadata.
+/// Resolve an HTTP request's binding from its routing key, which
+/// [`adopt_path_protocol`] has already reconciled with the path.
+fn route_http<'a>(
+    server: &'a RpcServer,
+    req: &Request,
+) -> Result<crate::server::ResolvedBinding<'a>> {
+    server.route(&req.protocol)
+}
+
+/// The answer to an unroutable protocol: 400 when the request named none,
+/// 404 when it named one this server does not host.
+fn route_error(state: &Arc<HttpState>, err: &RpcError, request_id: &str) -> Response {
+    let status = if err.error_kind() == crate::errors::ERROR_KIND_PROTOCOL_NOT_SPECIFIED {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::NOT_FOUND
+    };
+    arrow_error(state, status, err, request_id)
+}
+
 fn adopt_path_protocol(req: &mut Request, path_protocol: Option<&str>) -> Result<()> {
     let Some(path_protocol) = path_protocol else {
         return Ok(());
@@ -3574,7 +3619,10 @@ fn adopt_path_protocol(req: &mut Request, path_protocol: Option<&str>) -> Result
     Ok(())
 }
 
-async fn handle_unary(
+/// `POST {prefix}/{name}` -- no protocol in the path. Dispatched through the
+/// same unary path (so authentication still answers first), which refuses it
+/// as unrouted unless `name` is a server-level reserved method.
+async fn handle_unrouted(
     State(state): State<Arc<HttpState>>,
     MaybeConnectInfo(connect_info): MaybeConnectInfo,
     Path(method): Path<String>,
@@ -3665,15 +3713,20 @@ async fn unary_dispatch(
     if let Err(err) = adopt_path_protocol(&mut req, path_protocol.as_deref()) {
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
-    // `vgi_rpc.Identity.v1` is co-hosted, and -- unlike the application
-    // surface, which HTTP addresses by URL path -- resolved through the
-    // request's routing key. A deployment that configured no hook has no
-    // binding, so the name resolves to nothing and the caller gets the
-    // ordinary "unknown method" rather than a route that exists and refuses.
-    let identity_call = server
-        .identity_binding()
-        .filter(|_| req.protocol == crate::token_identity::IDENTITY_PROTOCOL_NAME);
-
+    // No protocol in the path: only a server-level reserved method may be
+    // addressed this way. Anything else is unrouted -- whatever its metadata
+    // says, the path is the carrier a proxy or WAF routes on, and a request
+    // it cannot route is refused rather than landed on a default protocol.
+    if path_protocol.is_none() && method != crate::reflection::RETIRED_DESCRIBE_METHOD {
+        let err = if method.starts_with("__") && method.ends_with("__") {
+            RpcError::method_not_implemented(format!(
+                "This server does not implement the reserved method {method:?}."
+            ))
+        } else {
+            crate::binding::protocol_not_specified(&server.hosted_protocol_names())
+        };
+        return route_error(&state, &err, &req.request_id);
+    }
     // `__describe__` is retired, and says so rather than falling through to
     // the generic "Unknown method" below -- which is true, useless, and
     // indistinguishable from "this server was built without introspection".
@@ -3706,7 +3759,12 @@ async fn unary_dispatch(
             cookies.clone(),
         );
         let mut buf = Vec::new();
-        if let Err(err) = server.serve_reflection_logged(&mut buf, &req, &ctx) {
+        if let Err(err) = server.serve_reflection_logged(
+            &mut buf,
+            &req,
+            &ctx,
+            server.traceback_origin("", "").as_deref(),
+        ) {
             return arrow_error(
                 &state,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3721,17 +3779,24 @@ async fn unary_dispatch(
             &method,
             &server.server_id,
             &req.request_id,
+            server
+                .traceback_origin(&req.protocol, &req.method)
+                .as_deref(),
         );
     }
 
-    // The identity protocol declares no version of its own, so the
-    // application's version gate does not apply to it: a fronting proxy must
-    // still be able to resolve a credential against a worker whose
-    // application protocol it is out of step with.
-    if identity_call.is_none() {
-        if let Err(err) = validate_protocol_version(server.protocol_version(), &req.metadata) {
-            return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
-        }
+    // Resolve `(protocol, method)` against the binding the routing key
+    // names -- the primary, an added protocol, or `vgi_rpc.Identity.v1` when
+    // the deployment configured it -- and gate the call on *that* binding's
+    // version. A binding that declares none (identity, or an added protocol
+    // without one) is not gated, so a fronting proxy can still resolve a
+    // credential against a worker whose application it is out of step with.
+    let binding = match route_http(&server, &req) {
+        Ok(binding) => binding,
+        Err(err) => return route_error(&state, &err, &req.request_id),
+    };
+    if let Err(err) = validate_protocol_version(binding.name, binding.version, &req.metadata) {
+        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
 
     // If the request batch is an external-location pointer (zero rows +
@@ -3755,19 +3820,26 @@ async fn unary_dispatch(
                         &err,
                         &server.server_id,
                         &req.request_id,
+                        server
+                            .traceback_origin(&req.protocol, &req.method)
+                            .as_deref(),
                     );
                 }
             }
         }
     }
 
-    let Some(info) = (match identity_call {
-        Some(binding) => binding.methods.get(&method),
-        None => server.method(&method),
-    })
-    .filter(|m| m.method_type == MethodType::Unary) else {
-        let err = RpcError::attribute_error(format!("Unknown method: '{}'", method));
-        return arrow_error(&state, StatusCode::NOT_FOUND, &err, &req.request_id);
+    let Some(info) = binding
+        .methods
+        .get(&method)
+        .filter(|m| m.method_type == MethodType::Unary)
+    else {
+        return arrow_error(
+            &state,
+            StatusCode::NOT_FOUND,
+            &binding.no_such_method(&method),
+            &req.request_id,
+        );
     };
     if let Err(err) = validate_parameter_batch(&req.batch, &info.params_schema) {
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
@@ -3863,7 +3935,14 @@ async fn unary_dispatch(
                         let _ = sw.write(&ptr, Some(&md));
                     }
                     Err(err) => {
-                        let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+                        let md = build_error_metadata(
+                            &err,
+                            &server.server_id,
+                            &req.request_id,
+                            server
+                                .traceback_origin(&req.protocol, &req.method)
+                                .as_deref(),
+                        );
                         let _ = sw.write(&empty_batch(&info.result_schema).unwrap(), Some(&md));
                         app_err = Some(err);
                     }
@@ -3931,7 +4010,14 @@ async fn unary_dispatch(
                             let _ = sw.write(&out_batch, None);
                         }
                         Err(err) => {
-                            let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+                            let md = build_error_metadata(
+                                &err,
+                                &server.server_id,
+                                &req.request_id,
+                                server
+                                    .traceback_origin(&req.protocol, &req.method)
+                                    .as_deref(),
+                            );
                             let _ = sw.write(&empty_batch(&info.result_schema).unwrap(), Some(&md));
                             app_err = Some(err);
                         }
@@ -3941,7 +4027,14 @@ async fn unary_dispatch(
                 }
             }
             (Err(err), _) => {
-                let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+                let md = build_error_metadata(
+                    &err,
+                    &server.server_id,
+                    &req.request_id,
+                    server
+                        .traceback_origin(&req.protocol, &req.method)
+                        .as_deref(),
+                );
                 let _ = sw.write(&empty_batch(&info.result_schema).unwrap(), Some(&md));
                 app_err = Some(err);
             }
@@ -3983,6 +4076,9 @@ async fn unary_dispatch(
             &err,
             &server.server_id,
             &req.request_id,
+            server
+                .traceback_origin(&req.protocol, &req.method)
+                .as_deref(),
         );
         if let Some(s) = sticky_sink.as_ref() {
             stamp_session_headers(&mut resp, &state, s);
@@ -4140,16 +4236,6 @@ fn finish_stream_record(
 // routes to. `tests/access_log_identity.rs` walks the source tree and fails the
 // build if any emit site stamps either field itself.
 
-async fn handle_stream_init(
-    State(state): State<Arc<HttpState>>,
-    MaybeConnectInfo(connect_info): MaybeConnectInfo,
-    Path(method): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    stream_init_dispatch(state, connect_info, None, method, headers, body).await
-}
-
 /// `POST {prefix}/{protocol}/{method}/init` -- the same stream init, addressed
 /// by the protocol that owns the method. See [`handle_protocol_unary`] for why
 /// the path segment is checked against the routing key rather than substituted
@@ -4222,7 +4308,11 @@ async fn stream_init_dispatch(
     if let Err(err) = adopt_path_protocol(&mut req, path_protocol.as_deref()) {
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
-    if let Err(err) = validate_protocol_version(server.protocol_version(), &req.metadata) {
+    let binding = match route_http(&server, &req) {
+        Ok(binding) => binding,
+        Err(err) => return route_error(&state, &err, &req.request_id),
+    };
+    if let Err(err) = validate_protocol_version(binding.name, binding.version, &req.metadata) {
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
 
@@ -4242,18 +4332,26 @@ async fn stream_init_dispatch(
                         &err,
                         &server.server_id,
                         &req.request_id,
+                        server
+                            .traceback_origin(&req.protocol, &req.method)
+                            .as_deref(),
                     );
                 }
             }
         }
     }
 
-    let Some(info) = server
-        .method(&method)
+    let Some(info) = binding
+        .methods
+        .get(&method)
         .filter(|m| m.method_type != MethodType::Unary)
     else {
-        let err = RpcError::attribute_error(format!("Unknown stream method: '{}'", method));
-        return arrow_error(&state, StatusCode::NOT_FOUND, &err, &req.request_id);
+        return arrow_error(
+            &state,
+            StatusCode::NOT_FOUND,
+            &binding.no_such_method(&method),
+            &req.request_id,
+        );
     };
     if let Err(err) = validate_parameter_batch(&req.batch, &info.params_schema) {
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
@@ -4298,7 +4396,15 @@ async fn stream_init_dispatch(
         Err(err) => {
             let mut resp = arrow_response(
                 StatusCode::OK,
-                error_stream_bytes(&empty_schema(), &err, &server.server_id, &req.request_id),
+                error_stream_bytes(
+                    &empty_schema(),
+                    &err,
+                    &server.server_id,
+                    &req.request_id,
+                    server
+                        .traceback_origin(&req.protocol, &req.method)
+                        .as_deref(),
+                ),
             );
             stamp_rpc_error(&mut resp);
             finish_stream_record(record, Some(&err), &mut resp);
@@ -4397,7 +4503,14 @@ async fn stream_init_dispatch(
                     // Handler doesn't implement encode_state — emit as an
                     // error envelope so the client sees a useful message
                     // instead of a hung stream.
-                    let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+                    let md = build_error_metadata(
+                        &err,
+                        &server.server_id,
+                        &req.request_id,
+                        server
+                            .traceback_origin(&req.protocol, &req.method)
+                            .as_deref(),
+                    );
                     let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                     wrote_error = true;
                     turn_error = Some(err);
@@ -4418,6 +4531,9 @@ async fn stream_init_dispatch(
         &method,
         &server.server_id,
         &req.request_id,
+        server
+            .traceback_origin(&req.protocol, &req.method)
+            .as_deref(),
     );
     if wrote_error {
         // The body is an EXCEPTION envelope behind a 200; without the flag a
@@ -4680,7 +4796,14 @@ fn run_producer<W: std::io::Write>(
         let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
     }
     if let Err(err) = result {
-        let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+        let md = build_error_metadata(
+            &err,
+            &server.server_id,
+            &req.request_id,
+            server
+                .traceback_origin(&req.protocol, &req.method)
+                .as_deref(),
+        );
         let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
         return ProducerTurn {
             finished: true,
@@ -4720,7 +4843,14 @@ fn run_producer<W: std::io::Write>(
                         // the client sees an `RpcError` on iteration
                         // rather than a stream that quietly resumes past
                         // a cap it just blew.
-                        let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+                        let md = build_error_metadata(
+                            &err,
+                            &server.server_id,
+                            &req.request_id,
+                            server
+                                .traceback_origin(&req.protocol, &req.method)
+                                .as_deref(),
+                        );
                         let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                         return ProducerTurn {
                             finished: true,
@@ -4748,16 +4878,6 @@ fn run_producer<W: std::io::Write>(
 // ---------------------------------------------------------------------------
 // Stream exchange / producer continuation / cancel
 // ---------------------------------------------------------------------------
-
-async fn handle_stream_exchange(
-    State(state): State<Arc<HttpState>>,
-    MaybeConnectInfo(connect_info): MaybeConnectInfo,
-    Path(method): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    stream_exchange_dispatch(state, connect_info, None, method, headers, body).await
-}
 
 /// `POST {prefix}/{protocol}/{method}/exchange` — the same continuation,
 /// addressed by the protocol that owns the method.
@@ -4834,7 +4954,13 @@ async fn stream_exchange_dispatch(
                     metadata = inner_metadata;
                 }
                 Err(err) => {
-                    return cap_error_response(&Schema::empty(), &err, &server.server_id, "");
+                    return cap_error_response(
+                        &Schema::empty(),
+                        &err,
+                        &server.server_id,
+                        "",
+                        server.traceback_origin("", "").as_deref(),
+                    );
                 }
             }
         }
@@ -4883,13 +5009,25 @@ async fn stream_exchange_dispatch(
         }
     };
 
-    // Resolve the method's state decoder from URL path.
-    let Some(info) = server
-        .method(&method)
+    // Resolve the method's state decoder against the binding the
+    // continuation's path names -- the only exchange route is
+    // protocol-qualified.
+    let exchange_protocol = path_protocol.clone().unwrap_or_default();
+    let binding = match server.route(&exchange_protocol) {
+        Ok(binding) => binding,
+        Err(err) => return route_error(&state, &err, ""),
+    };
+    let Some(info) = binding
+        .methods
+        .get(&method)
         .filter(|m| m.method_type != MethodType::Unary)
     else {
-        let err = RpcError::attribute_error(format!("Unknown stream method: '{}'", method));
-        return arrow_error(&state, StatusCode::NOT_FOUND, &err, "");
+        return arrow_error(
+            &state,
+            StatusCode::NOT_FOUND,
+            &binding.no_such_method(&method),
+            "",
+        );
     };
     let Some(decoder) = info.state_decoder.as_ref() else {
         let err = RpcError::runtime_error(format!(
@@ -4971,7 +5109,14 @@ async fn stream_exchange_dispatch(
                 let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
             }
             if let Err(err) = &cancel_result {
-                let md = build_error_metadata(err, &server.server_id, &req.request_id);
+                let md = build_error_metadata(
+                    err,
+                    &server.server_id,
+                    &req.request_id,
+                    server
+                        .traceback_origin(&req.protocol, &req.method)
+                        .as_deref(),
+                );
                 let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
             }
             let _ = sw.finish();
@@ -4986,6 +5131,9 @@ async fn stream_exchange_dispatch(
             &method,
             &server.server_id,
             &req.request_id,
+            server
+                .traceback_origin(&req.protocol, &req.method)
+                .as_deref(),
         );
         if cancel_result.is_err() {
             stamp_rpc_error(&mut resp);
@@ -5047,7 +5195,14 @@ async fn stream_exchange_dispatch(
                         }
                     }
                     Err(err) => {
-                        let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+                        let md = build_error_metadata(
+                            &err,
+                            &server.server_id,
+                            &req.request_id,
+                            server
+                                .traceback_origin(&req.protocol, &req.method)
+                                .as_deref(),
+                        );
                         let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                         wrote_error = true;
                         turn_error = Some(err);
@@ -5066,6 +5221,9 @@ async fn stream_exchange_dispatch(
             &method,
             &server.server_id,
             &req.request_id,
+            server
+                .traceback_origin(&req.protocol, &req.method)
+                .as_deref(),
         );
         if wrote_error {
             stamp_rpc_error(&mut resp);
@@ -5083,7 +5241,14 @@ async fn stream_exchange_dispatch(
             Ok(b) => b,
             Err(e) => {
                 let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
-                let md = build_error_metadata(&e, &server.server_id, &req.request_id);
+                let md = build_error_metadata(
+                    &e,
+                    &server.server_id,
+                    &req.request_id,
+                    server
+                        .traceback_origin(&req.protocol, &req.method)
+                        .as_deref(),
+                );
                 let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                 let _ = sw.finish();
                 drop(sw);
@@ -5129,7 +5294,14 @@ async fn stream_exchange_dispatch(
             let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
         }
         if let Err(err) = res {
-            let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+            let md = build_error_metadata(
+                &err,
+                &server.server_id,
+                &req.request_id,
+                server
+                    .traceback_origin(&req.protocol, &req.method)
+                    .as_deref(),
+            );
             let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
             wrote_error = true;
             turn_error = Some(err);
@@ -5142,7 +5314,14 @@ async fn stream_exchange_dispatch(
                     token
                 }
                 Err(err) => {
-                    let md = build_error_metadata(&err, &server.server_id, &req.request_id);
+                    let md = build_error_metadata(
+                        &err,
+                        &server.server_id,
+                        &req.request_id,
+                        server
+                            .traceback_origin(&req.protocol, &req.method)
+                            .as_deref(),
+                    );
                     let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                     let _ = sw.finish();
                     drop(sw);
@@ -5187,8 +5366,14 @@ async fn stream_exchange_dispatch(
                                 let _ = sw.write(&batch, Some(&md));
                             }
                             StreamEmit::Failed(err) => {
-                                let emd =
-                                    build_error_metadata(&err, &server.server_id, &req.request_id);
+                                let emd = build_error_metadata(
+                                    &err,
+                                    &server.server_id,
+                                    &req.request_id,
+                                    server
+                                        .traceback_origin(&req.protocol, &req.method)
+                                        .as_deref(),
+                                );
                                 let _ = sw.write(
                                     &empty_batch(output_schema.as_ref()).unwrap(),
                                     Some(&emd),
@@ -5235,6 +5420,7 @@ async fn stream_exchange_dispatch(
         &method,
         &server.server_id,
         "",
+        server.traceback_origin("", "").as_deref(),
     );
     if wrote_error {
         // The handler raised; the envelope is in the body behind a 200.
@@ -5398,6 +5584,7 @@ mod tests {
             "producer",
             "budget-server",
             "budget-request",
+            None,
         );
         assert_eq!(response.headers().get(RPC_ERROR_HEADER).unwrap(), "true");
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)

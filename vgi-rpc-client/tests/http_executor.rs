@@ -172,6 +172,7 @@ fn header<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 fn client_with(port: u16, executor: Arc<RecordingExecutor>) -> HttpClient {
     HttpClient::connect(format!("http://127.0.0.1:{port}"))
+        .protocol("Service")
         .executor(executor)
         .build()
         .unwrap()
@@ -306,13 +307,58 @@ fn transparent_decompression_trusts_transport_decoded_content_encoding() {
 fn build_without_backend_or_with_executor() {
     // With reqwest compiled in, a plain build still works; with an executor
     // the executor is used even though reqwest is available.
-    assert!(HttpClient::connect("http://127.0.0.1:1").build().is_ok());
+    assert!(HttpClient::connect("http://127.0.0.1:1")
+        .protocol("Service")
+        .build()
+        .is_ok());
     let executor = RecordingExecutor::new(ExecutorCaps::default(), false);
     let client = HttpClient::connect("http://127.0.0.1:1")
+        .protocol("Service")
         .executor(executor.clone())
         .build()
         .unwrap();
     // Default caps (all false) ⇒ GET discovery; the connection fails.
     assert!(client.capabilities().is_err());
     assert!(executor.seen().is_empty());
+}
+
+/// Every RPC request names its protocol in the URL path: `{protocol}/{method}`
+/// (and `/init`, `/exchange`). Only framework endpoints -- `/health`,
+/// `__upload_url__` -- sit outside a protocol.
+#[test]
+fn every_request_names_its_protocol() {
+    let port = start_server();
+    let executor = RecordingExecutor::new(ExecutorCaps::default(), false);
+    let mut client = client_with(port, executor.clone());
+    assert_eq!(echo(&mut client, "x"), "echo: x");
+    let rpc: Vec<_> = executor
+        .seen()
+        .into_iter()
+        .filter(|s| s.method == "POST")
+        .collect();
+    assert!(!rpc.is_empty());
+    for seen in rpc {
+        assert!(
+            seen.url.contains("/Service/") || seen.url.contains("/__upload_url__"),
+            "unrouted request URL {}",
+            seen.url
+        );
+    }
+}
+
+/// A client with no protocol cannot be built: there is no flat route to
+/// fall back to.
+#[test]
+fn a_client_without_a_protocol_is_refused_at_build() {
+    let err = HttpClient::connect("http://127.0.0.1:1")
+        .build()
+        .err()
+        .unwrap();
+    assert!(err.message.contains(".protocol("), "{}", err.message);
+    let err = HttpClient::connect("http://127.0.0.1:1")
+        .protocol("")
+        .build()
+        .err()
+        .unwrap();
+    assert!(err.message.contains(".protocol("), "{}", err.message);
 }

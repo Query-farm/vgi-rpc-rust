@@ -29,6 +29,15 @@ pub const REQUEST_ID_KEY: &str = "vgi_rpc.request_id";
 /// every handler failure surfaces through the same envelope.
 pub const ERROR_KIND_KEY: &str = "vgi_rpc.error_kind";
 
+/// Canonical error code (closed set, the code's *name*) on EXCEPTION batches.
+/// Emitted on every EXCEPTION batch -- `UNKNOWN` when unclassified. See
+/// [`crate::error_model::Code`].
+pub const ERROR_CODE_KEY: &str = "vgi_rpc.error_code";
+
+/// Typed error details: a JSON array from the fixed catalog, at most 4 KiB,
+/// omitted whole when larger. See [`crate::error_model`].
+pub const ERROR_DETAILS_KEY: &str = "vgi_rpc.error_details";
+
 pub const LOG_LEVEL_KEY: &str = "vgi_rpc.log_level";
 pub const LOG_MESSAGE_KEY: &str = "vgi_rpc.log_message";
 pub const LOG_EXTRA_KEY: &str = "vgi_rpc.log_extra";

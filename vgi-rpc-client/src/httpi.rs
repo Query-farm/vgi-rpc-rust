@@ -258,6 +258,14 @@ impl HttpiClientBuilder {
         self
     }
 
+    /// Bind the client to a protocol. Required: every request names it, in
+    /// the routing key and the URL path. See
+    /// [`HttpClientBuilder::protocol`](crate::HttpClientBuilder::protocol).
+    pub fn protocol(mut self, protocol: impl Into<String>) -> Self {
+        self.http = self.http.protocol(protocol);
+        self
+    }
+
     pub fn protocol_version(mut self, version: impl Into<String>) -> Self {
         self.http = self.http.protocol_version(version);
         self
@@ -307,6 +315,14 @@ impl HttpiClientBuilder {
     }
 
     pub fn build(mut self) -> Result<HttpClient> {
+        // Checked before any endpoint is created: a client that cannot name
+        // its protocol cannot make a request, so fail before dialling.
+        if !self.http.has_protocol() {
+            return Err(RpcError::new(
+                "ValueError",
+                "httpi client needs a protocol: call .protocol(\"<name>\") on the builder",
+            ));
+        }
         if self.no_relay && self.relay_urls.is_some() {
             return Err(invalid_target(
                 "custom relay URLs and no_relay are mutually exclusive",

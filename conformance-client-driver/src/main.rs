@@ -153,11 +153,18 @@ fn drain_logs(buf: &LogBuf) -> Vec<Value> {
     out
 }
 
+/// The structured error object (CLIENT_DRIVER_PROTOCOL.md §2). The three
+/// error-model fields come from the client library's own error, verbatim:
+/// never defaulted here, because `""` (the server sent no code) and
+/// `"UNKNOWN"` (it sent that) are different answers.
 fn error_to_json(e: &vgi_rpc::errors::RpcError) -> Value {
     json!({
         "error_type": e.error_type,
         "error_message": e.message,
         "traceback": e.traceback,
+        "error_code": e.error_code(),
+        "error_kind": e.error_kind(),
+        "error_details": e.error_details(),
     })
 }
 

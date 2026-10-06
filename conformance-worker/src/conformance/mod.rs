@@ -90,7 +90,12 @@ fn build_server_with_external_and_hook(
         .server_id(server_id.unwrap_or("rust-conf-0001"))
         .protocol_name("ConformanceService")
         .protocol_version("2.0.0")
-        .server_version("rust-conformance-0.2.0");
+        .server_version("rust-conformance-0.2.0")
+        // Registered through the public hosting API, not special-cased:
+        // `conformance.Secondary.v1` is how the shared suite observes
+        // routing by `(protocol, method)`, the per-binding version gate and
+        // the error model (MULTI_PROTOCOL_HOSTING.md §2).
+        .add_protocol(vgi_rpc::conformance_secondary::conformance_secondary_protocol());
 
     // `published_string` publishes through the worker's own storage and
     // compression, so it needs them before the builder takes the config.

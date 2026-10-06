@@ -134,6 +134,7 @@ fn start_server() -> u16 {
 
 fn client(port: u16) -> HttpClient {
     HttpClient::connect(format!("http://127.0.0.1:{port}"))
+        .protocol("Service")
         .build()
         .unwrap()
 }

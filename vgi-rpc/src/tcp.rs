@@ -422,6 +422,14 @@ fn serve_tcp_inner<F: FnOnce(&str, u16)>(
 ) -> io::Result<()> {
     #[cfg(not(feature = "tcp-mtls"))]
     let _ = &connection_options.security;
+    // Bind the transport kind when the caller has not, so transport-scoped
+    // defaults (tracebacks are omitted on TCP) hold for every embedder.
+    if server.transport_kind().is_none() {
+        server.notify_transport(
+            crate::transport::TransportKind::Tcp,
+            crate::transport::TransportCapabilities::none(),
+        );
+    }
     let listener = TcpListener::bind((host, port))?;
     let bound_port = listener.local_addr()?.port();
     listener.set_nonblocking(true)?;

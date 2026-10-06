@@ -56,6 +56,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use sha2::{Digest, Sha256};
 
 use crate::auth::AuthContext;
+use crate::error_model::Code;
 use crate::errors::{Result, RpcError};
 use crate::server::{CallContext, MethodInfo, Request};
 
@@ -217,7 +218,8 @@ pub const ERROR_KIND_IDENTITY_UNAVAILABLE: &str = "identity_unavailable";
 /// introspect lets any user test guesses of any other user's credential at
 /// unlimited rate, and resolve a stolen one to its owner.
 pub fn introspection_refused(detail: impl Into<String>) -> RpcError {
-    RpcError::permission_error(detail).with_error_kind(ERROR_KIND_INTROSPECTION_REFUSED)
+    RpcError::permission_error(detail)
+        .with_status(Code::PermissionDenied, ERROR_KIND_INTROSPECTION_REFUSED)
 }
 
 /// The subject credential did not resolve.
@@ -227,7 +229,7 @@ pub fn introspection_refused(detail: impl Into<String>) -> RpcError {
 /// exists. It takes no detail argument for the same reason -- a detail
 /// parameter is an invitation to distinguish them later.
 pub fn token_unresolved() -> RpcError {
-    RpcError::value_error("unresolved").with_error_kind(ERROR_KIND_TOKEN_UNRESOLVED)
+    RpcError::value_error("unresolved").with_status(Code::NotFound, ERROR_KIND_TOKEN_UNRESOLVED)
 }
 
 /// The caller has not authenticated recently enough to mint a grant.
@@ -236,14 +238,14 @@ pub fn token_unresolved() -> RpcError {
 /// always about the caller themselves, so naming the reason leaks nothing and
 /// is the only way a console learns to re-prompt.
 pub fn stale_auth(detail: impl Into<String>) -> RpcError {
-    RpcError::permission_error(detail).with_error_kind(ERROR_KIND_STALE_AUTH)
+    RpcError::permission_error(detail).with_status(Code::Unauthenticated, ERROR_KIND_STALE_AUTH)
 }
 
 /// The worker declined to mint this grant.
 ///
 /// Definitive. The worker holds the policy; the framework only asked.
 pub fn grant_refused(detail: impl Into<String>) -> RpcError {
-    RpcError::permission_error(detail).with_error_kind(ERROR_KIND_GRANT_REFUSED)
+    RpcError::permission_error(detail).with_status(Code::PermissionDenied, ERROR_KIND_GRANT_REFUSED)
 }
 
 /// The answer is not *knowable* -- a backing store is down, a 5xx upstream.
@@ -260,21 +262,23 @@ pub fn grant_refused(detail: impl Into<String>) -> RpcError {
 pub fn identity_unavailable(detail: impl Into<String>) -> RpcError {
     RpcError::auth_unavailable(detail)
         .with_retry_after(DEFAULT_IDENTITY_RETRY_AFTER_SECONDS)
-        .with_error_kind(ERROR_KIND_IDENTITY_UNAVAILABLE)
+        .with_status(Code::Unavailable, ERROR_KIND_IDENTITY_UNAVAILABLE)
 }
 
 /// Normalise whatever a hook returned into the transient signal.
 ///
 /// A hook that already said "unavailable" keeps its own `Retry-After`; any
 /// other failure is a server fault and is treated the same way, because a
-/// wrong answer here is worse than a retry.
+/// wrong answer here is worse than a retry. The hint reaches the wire as
+/// `vgi_rpc.RetryInfo` (WIRE_PROTOCOL.md §16): it is never replaced by a
+/// default when the hook named one.
 fn as_unavailable(err: RpcError) -> RpcError {
     let retry = err
         .retry_after_seconds
         .unwrap_or(DEFAULT_IDENTITY_RETRY_AFTER_SECONDS);
     RpcError::auth_unavailable(err.message)
         .with_retry_after(retry)
-        .with_error_kind(ERROR_KIND_IDENTITY_UNAVAILABLE)
+        .with_status(Code::Unavailable, ERROR_KIND_IDENTITY_UNAVAILABLE)
 }
 
 // ---------------------------------------------------------------------------
@@ -731,7 +735,19 @@ impl IdentityImpl {
             return Err(grant_refused("this worker does not mint grants"));
         };
         check_freshness(auth, self.max_auth_age)?;
-        mint(&auth.principal, purpose, scopes, ttl_seconds)
+        // A mint hook calling the same store an authenticator calls raises
+        // what the authenticator raises when that store is down -- the
+        // transport-auth "unavailable" error. That is translated, never
+        // passed through unclassified (WIRE_PROTOCOL.md §16), keeping the
+        // hook's own retry hint. Every other refusal (`grant_refused`, ...)
+        // passes through as the hook classified it.
+        mint(&auth.principal, purpose, scopes, ttl_seconds).map_err(|err| {
+            if err.is_auth_unavailable() {
+                as_unavailable(err)
+            } else {
+                err
+            }
+        })
     }
 
     /// The TTL a resolution that named none is advertised with.

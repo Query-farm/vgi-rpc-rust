@@ -258,7 +258,7 @@ async fn post(app: axum::Router, method: &str, body: Vec<u8>) -> Vec<(RecordBatc
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/{method}"))
+                .uri(format!("/{PROTOCOL}/{method}"))
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .body(Body::from(body))
                 .unwrap(),

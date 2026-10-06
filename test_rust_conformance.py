@@ -1205,6 +1205,119 @@ def conformance_conn(
     return factory
 
 
+@pytest.fixture(scope="session")
+def conformance_protocol_connector(
+    request: pytest.FixtureRequest,
+    rust_transport: SubprocessTransport,
+) -> Callable[..., contextlib.AbstractContextManager[Any]]:
+    """Connect a proxy bound to *any* protocol to the worker a transport reaches.
+
+    The runner contract in ``MULTI_PROTOCOL_HOSTING.md`` §4:
+    ``connector(transport, protocol, on_log=None)`` where *transport* is a
+    ``conformance_conn`` parameter id and the proxy talks to **the same
+    worker** that transport reaches, routing on *protocol*'s wire name. In
+    the client role the Rust client (through the driver) is the proxy, bound
+    to *protocol* by ``ClientDriver(service=protocol)``.
+    """
+
+    def _target(transport: str) -> tuple[str, Any, Any]:
+        """(driver transport, driver target, external config) for the client role."""
+        if transport in ("pipe", "subprocess"):
+            return "stdio", _worker_cmd("stdio"), None
+        if transport == "shm_pipe":
+            return "shm", _worker_cmd("stdio"), None
+        if transport == "http":
+            return "http", f"http://127.0.0.1:{request.getfixturevalue('rust_http_port')}", None
+        if transport == "http_externalize_always":
+            from vgi_rpc.external import ExternalLocationConfig
+
+            port = request.getfixturevalue("conformance_http_externalize_always_port")
+            return "http", f"http://127.0.0.1:{port}", ExternalLocationConfig(url_validator=None)
+        if transport == "unix":
+            return "unix", request.getfixturevalue("rust_unix_path"), None
+        if transport == "tcp":
+            host, port = request.getfixturevalue("rust_tcp_addr")
+            return "tcp", f"{host}:{port}", None
+        raise ValueError(f"no conformance transport named {transport!r}")
+
+    def connect(
+        transport: str,
+        protocol: type,
+        on_log: Callable[[Message], None] | None = None,
+    ) -> contextlib.AbstractContextManager[Any]:
+        if ROLE == "client":
+            from vgi_rpc.conformance.client_driver import ClientDriver
+            from rust_client_proxy import DRIVER
+
+            driver = ClientDriver(DRIVER.command, service=protocol, env=DRIVER.env, cwd=DRIVER.cwd)
+            kind, target, external = _target(transport)
+
+            @contextlib.contextmanager
+            def _driven() -> Iterator[Any]:
+                proxy = driver.connect(kind, target, on_log, external_config=external)
+                try:
+                    yield proxy
+                finally:
+                    proxy.close()
+
+            return _driven()
+        if transport == "pipe":
+
+            @contextlib.contextmanager
+            def _pipe() -> Iterator[_RpcProxy]:
+                sub = SubprocessTransport([RUST_WORKER])
+                try:
+                    yield _RpcProxy(protocol, sub, on_log)
+                finally:
+                    sub.close()
+
+            return _pipe()
+        if transport == "subprocess":
+
+            @contextlib.contextmanager
+            def _shared() -> Iterator[_RpcProxy]:
+                yield _RpcProxy(protocol, rust_transport, on_log)
+
+            return _shared()
+        if transport == "shm_pipe":
+            from vgi_rpc.shm import ShmSegment
+
+            @contextlib.contextmanager
+            def _shm() -> Iterator[_RpcProxy]:
+                shm = ShmSegment.create(4 * 1024 * 1024)
+                inner = SubprocessTransport([RUST_WORKER])
+                try:
+                    yield _RpcProxy(protocol, _ShmSubprocessTransport(inner, shm), on_log)
+                finally:
+                    inner.close()
+                    with contextlib.suppress(BufferError):
+                        shm.close()
+                    shm.unlink()
+
+            return _shm()
+        if transport == "unix":
+            return unix_connect(protocol, request.getfixturevalue("rust_unix_path"), on_log=on_log)
+        if transport == "tcp":
+            host, port = request.getfixturevalue("rust_tcp_addr")
+            return tcp_connect(protocol, host, port, on_log=on_log)
+        if transport == "http":
+            port = request.getfixturevalue("rust_http_port")
+            return http_connect(protocol, f"http://127.0.0.1:{port}", on_log=on_log)
+        if transport == "http_externalize_always":
+            from vgi_rpc.external import ExternalLocationConfig
+
+            port = request.getfixturevalue("conformance_http_externalize_always_port")
+            return http_connect(
+                protocol,
+                f"http://127.0.0.1:{port}",
+                on_log=on_log,
+                external_location=ExternalLocationConfig(url_validator=None),
+            )
+        raise ValueError(f"no conformance transport named {transport!r}")
+
+    return connect
+
+
 _RAW_TRANSPORTS = [
     transport
     for transport in _TRANSPORTS

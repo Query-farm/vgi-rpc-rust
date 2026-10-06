@@ -216,7 +216,7 @@ async fn preflight_includes_cors_headers() {
         .oneshot(
             Request::builder()
                 .method("OPTIONS")
-                .uri("/echo_string")
+                .uri("/Test/echo_string")
                 .header(header::ORIGIN, "https://app.example.com")
                 .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
                 .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
@@ -301,7 +301,7 @@ async fn small_response_below_threshold_is_not_compressed() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/echo_string")
+                .uri("/Test/echo_string")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .header(header::ACCEPT_ENCODING, "zstd")
                 .body(Body::from(vec![]))
@@ -341,7 +341,7 @@ async fn large_response_above_threshold_is_zstd_compressed() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/big")
+                .uri("/Test/big")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .header(header::ACCEPT_ENCODING, "zstd")
                 .body(Body::from(body))
@@ -380,7 +380,7 @@ async fn big_response_headers_on(
     let body = encode_unary_body(&params_schema, &batch);
     let mut builder = Request::builder()
         .method("POST")
-        .uri("/big")
+        .uri("/Test/big")
         .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE);
     for (k, v) in headers {
         builder = builder.header(*k, *v);
@@ -527,7 +527,7 @@ async fn compression_disabled_server_advertises_and_behaves_consistently() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/big")
+                .uri("/Test/big")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .header(header::ACCEPT_ENCODING, "zstd")
                 .header("x-vgi-accept-encoding", "zstd")
@@ -587,7 +587,7 @@ async fn default_compression_level_is_one() {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/big")
+                    .uri("/Test/big")
                     .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                     .header(header::ACCEPT_ENCODING, "zstd")
                     .body(Body::from(encode_unary_body(&params_schema, &batch)))
@@ -813,7 +813,7 @@ async fn oversize_request_body_is_rejected_by_body_limit() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/echo_string")
+                .uri("/Test/echo_string")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .body(Body::from(vec![0u8; 4096]))
                 .unwrap(),
@@ -847,7 +847,7 @@ async fn body_limit_above_axums_default_is_honoured() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/echo_string")
+                .uri("/Test/echo_string")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .body(Body::from(vec![0u8; 4 * 1024 * 1024]))
                 .unwrap(),
@@ -865,7 +865,7 @@ async fn body_limit_above_axums_default_is_honoured() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/echo_string")
+                .uri("/Test/echo_string")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .body(Body::from(vec![0u8; LIMIT + 1024]))
                 .unwrap(),
@@ -886,7 +886,7 @@ async fn structured_request_error_survives_the_minimum_response_cap() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/echo_string")
+                .uri("/Test/echo_string")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .body(Body::from(vec![]))
                 .unwrap(),

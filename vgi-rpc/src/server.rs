@@ -13,9 +13,10 @@ use crate::log::{LogLevel, LogMessage};
 #[cfg(feature = "shm")]
 use crate::metadata::SHM_SEGMENT_SIZE_KEY;
 use crate::metadata::{
-    CANCEL_KEY, ERROR_KIND_KEY, LOCATION_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY,
-    PROTOCOL_KEY, PROTOCOL_VERSION_KEY, REQUEST_ID_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY,
-    RPC_METHOD_KEY, SERVER_ID_KEY, SHM_OFFSET_KEY, SHM_SEGMENT_NAME_KEY,
+    CANCEL_KEY, ERROR_CODE_KEY, ERROR_DETAILS_KEY, ERROR_KIND_KEY, LOCATION_KEY, LOG_EXTRA_KEY,
+    LOG_LEVEL_KEY, LOG_MESSAGE_KEY, PROTOCOL_KEY, PROTOCOL_VERSION_KEY, REQUEST_ID_KEY,
+    REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY, SERVER_ID_KEY, SHM_OFFSET_KEY,
+    SHM_SEGMENT_NAME_KEY,
 };
 #[cfg(feature = "shm")]
 use crate::shm::{is_shm_pointer_batch, maybe_write_to_shm, resolve_shm_batch, ShmSegment};
@@ -139,31 +140,98 @@ pub(crate) fn call_guard<T>(f: impl FnOnce() -> T) -> Result<T> {
         .map_err(|_| RpcError::new("RuntimeError", "handler panicked"))
 }
 
-/// Validate the optional application protocol version carried by a request.
+/// Parse canonical semver `MAJOR.MINOR.PATCH`: non-negative integers, no
+/// leading zeros (except a literal `0`), no prerelease, no build metadata.
+pub(crate) fn parse_semver(value: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = value.split('.');
+    let mut next = || -> Option<u64> {
+        let p = parts.next()?;
+        let canonical = !p.is_empty()
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && (p == "0" || !p.starts_with('0'));
+        if canonical {
+            p.parse().ok()
+        } else {
+            None
+        }
+    };
+    let v = (next()?, next()?, next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(v)
+}
+
+/// Gate a request on the resolved binding's declared `protocol_version`
+/// (WIRE_PROTOCOL.md §13).
 ///
-/// An absent client version remains compatible for backward compatibility.
-/// When both sides provide a version, only the major component is a breaking
-/// boundary. This helper is shared by the pipe/unix and HTTP dispatch paths so
-/// their behavior cannot drift.
+/// A binding that declares no version is not gated. When it declares one,
+/// the client MUST send its own, in canonical semver, and the **major and
+/// minor** must match exactly; patch is ignored. An absent, malformed or
+/// mismatched client version is `protocol_version_mismatch`, with a message
+/// naming both versions and which side to upgrade. Shared by the pipe/unix
+/// and HTTP dispatch paths so their behaviour cannot drift.
+///
+/// A server version that is not itself canonical semver (the builder accepts
+/// a free-form label) is compared on its first two dot-separated components.
 pub(crate) fn validate_protocol_version(
+    protocol: &str,
     server_version: &str,
     request_metadata: &Metadata,
 ) -> Result<()> {
     if server_version.is_empty() {
         return Ok(());
     }
-    let Some(client_version) = md_get(request_metadata, PROTOCOL_VERSION_KEY) else {
-        return Ok(());
+    let mismatch = |client: &str, direction: &str| {
+        RpcError::protocol_version_mismatch(protocol, client, server_version, direction)
     };
-    let client_major = client_version.split('.').next().unwrap_or("");
-    let server_major = server_version.split('.').next().unwrap_or("");
-    if client_major != server_major {
-        return Err(RpcError::version_error(format!(
-            "protocol_version mismatch: client {:?} is incompatible with server {:?}",
-            client_version, server_version
-        )));
+    let Some(client_version) = md_get(request_metadata, PROTOCOL_VERSION_KEY) else {
+        return Err(mismatch(
+            "",
+            "the client did not send a vgi_rpc.protocol_version metadata key. This is \
+             either a framework bug or a client of another protocol connecting to this one.",
+        ));
+    };
+    let Some(client) = parse_semver(client_version) else {
+        return Err(mismatch(
+            client_version,
+            "client sent a malformed protocol_version. Expected canonical semver \
+             MAJOR.MINOR.PATCH.",
+        ));
+    };
+    let compatible = match parse_semver(server_version) {
+        Some(server) => {
+            if (client.0, client.1) == (server.0, server.1) {
+                true
+            } else {
+                let direction = if (client.0, client.1) < (server.0, server.1) {
+                    format!(
+                        "client is too old; upgrade the client to a version supporting \
+                         protocol_version {server_version}."
+                    )
+                } else {
+                    format!(
+                        "server is too old; upgrade the server to a version supporting \
+                         protocol_version {client_version}."
+                    )
+                };
+                return Err(mismatch(client_version, &direction));
+            }
+        }
+        None => {
+            let mut s = server_version.split('.');
+            let (major, minor) = (s.next().unwrap_or(""), s.next().unwrap_or(""));
+            client.0.to_string() == major && client.1.to_string() == minor
+        }
+    };
+    if compatible {
+        Ok(())
+    } else {
+        Err(mismatch(
+            client_version,
+            "the major and minor versions must match.",
+        ))
     }
-    Ok(())
 }
 
 /// Context supplied to each handler invocation.
@@ -573,11 +641,52 @@ pub struct RpcServerBuilder {
     identity: Option<Arc<crate::token_identity::IdentityImpl>>,
     dispatch_hook: Option<Arc<dyn crate::hooks::DispatchHook>>,
     on_serve_start: Option<crate::transport::ServeStartHook>,
+    extra_protocols: Vec<HostedProtocol>,
+    omit_tracebacks: bool,
     #[cfg(feature = "http")]
     external_config: Option<Arc<crate::external::ExternalLocationConfig>>,
 }
 
 impl RpcServerBuilder {
+    /// Host an additional application protocol beside the primary.
+    ///
+    /// Any number may be added; they are listed by `list_protocols` in the
+    /// order added, after the primary, and routed by the pair
+    /// `(protocol, method)` -- so a method name may repeat across protocols.
+    /// The set is fixed when [`build`](Self::build) runs and is the same on
+    /// every transport the server is offered on (WIRE_PROTOCOL.md §3.1).
+    ///
+    /// There is deliberately no way to host a *subset* of a protocol's
+    /// methods: the protocol is the unit of optionality, so a capability that
+    /// may be absent is its own protocol.
+    pub fn add_protocol(mut self, protocol: HostedProtocol) -> Self {
+        self.extra_protocols.push(protocol);
+        self
+    }
+
+    /// Host several additional application protocols, in order. See
+    /// [`add_protocol`](Self::add_protocol).
+    pub fn add_protocols(mut self, protocols: impl IntoIterator<Item = HostedProtocol>) -> Self {
+        self.extra_protocols.extend(protocols);
+        self
+    }
+
+    /// Whether EXCEPTION batches carry `log_extra.traceback`.
+    ///
+    /// Included by default on **every** transport (WIRE_PROTOCOL.md §8,
+    /// "Tracebacks"): the DuckDB extension shows the remote traceback to the
+    /// user, and omitting it hid chained causes. `false` omits it everywhere
+    /// -- one switch per server, no per-transport defaults.
+    ///
+    /// Rust errors carry no stack, so an included traceback is the one the
+    /// handler attached to [`RpcError::traceback`] or, when it attached none,
+    /// a synthesized `<ErrorType>: <message>` plus the `<protocol>/<method>`
+    /// that raised it.
+    pub fn include_tracebacks(mut self, include: bool) -> Self {
+        self.omit_tracebacks = !include;
+        self
+    }
+
     pub fn server_id(mut self, id: impl Into<String>) -> Self {
         self.server_id = Some(id.into());
         self
@@ -644,8 +753,43 @@ impl RpcServerBuilder {
         self
     }
 
+    /// Build the server, panicking on an invalid protocol registration.
+    ///
+    /// A reserved (`vgi_rpc.`), malformed or duplicate protocol name is a
+    /// programming error in the application, caught here rather than at the
+    /// first request. Use [`try_build`](Self::try_build) to handle it.
     pub fn build(self) -> RpcServer {
-        RpcServer {
+        match self.try_build() {
+            Ok(server) => server,
+            Err(err) => panic!("invalid vgi-rpc server configuration: {}", err.message),
+        }
+    }
+
+    /// Build the server, refusing an invalid protocol registration.
+    ///
+    /// Every application protocol -- the primary and each added one -- must
+    /// have a valid name outside the reserved `vgi_rpc.` prefix, and no two
+    /// may share a name. The reserved prefix is refused however the name was
+    /// derived: an application claiming `vgi_rpc.Reflection.v1` would shadow
+    /// the one surface a client trusts before it knows anything else.
+    pub fn try_build(self) -> Result<RpcServer> {
+        let protocol_name = self
+            .protocol_name
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "Service".to_string());
+        let mut seen = std::collections::HashSet::new();
+        for name in std::iter::once(protocol_name.as_str())
+            .chain(self.extra_protocols.iter().map(|p| p.name.as_str()))
+        {
+            crate::binding::validate_protocol_name(name, false).map_err(RpcError::value_error)?;
+            if !seen.insert(name) {
+                return Err(RpcError::value_error(format!(
+                    "Protocol {name:?} is registered more than once. Each hosted protocol \
+                     needs a distinct name."
+                )));
+            }
+        }
+        Ok(RpcServer {
             methods: HashMap::new(),
             server_id: self.server_id.unwrap_or_else(crate::util::short_random_id),
             server_version: self.server_version.unwrap_or_default(),
@@ -653,10 +797,7 @@ impl RpcServerBuilder {
             // routing key is required on every request, so an empty name would
             // make the server unreachable rather than permissive. "Service"
             // matches the other ports' default.
-            protocol_name: self
-                .protocol_name
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| "Service".to_string()),
+            protocol_name,
             protocol_version: self.protocol_version.unwrap_or_default(),
             protocol_hash: std::sync::OnceLock::new(),
             reflection_hash: std::sync::OnceLock::new(),
@@ -672,9 +813,148 @@ impl RpcServerBuilder {
             on_serve_start: self.on_serve_start,
             transport_notify: Mutex::new(()),
             transport_state: Mutex::new(None),
+            extra_protocols: self.extra_protocols,
+            omit_tracebacks: self.omit_tracebacks,
             #[cfg(feature = "http")]
             external_config: self.external_config,
+        })
+    }
+}
+
+/// Anything methods can be registered against: an [`RpcServer`] (its primary
+/// protocol) or a [`HostedProtocol`]. The `register_with` that
+/// `#[vgi_rpc::service]` generates takes either.
+pub trait MethodRegistry {
+    /// Register one method.
+    fn register_method(&mut self, info: MethodInfo);
+}
+
+impl MethodRegistry for RpcServer {
+    fn register_method(&mut self, info: MethodInfo) {
+        self.register(info);
+    }
+}
+
+/// An application protocol hosted beside the server's primary one.
+///
+/// Built with its methods, then handed to
+/// [`RpcServerBuilder::add_protocol`]. Has its own name, its own optional
+/// `protocol_version` (gated independently of the primary's), and its own
+/// canonical hash.
+///
+/// ```
+/// use vgi_rpc::server::HostedProtocol;
+/// use vgi_rpc::{MethodInfo, RpcServer};
+/// # fn empty_schema() -> arrow_schema::SchemaRef { std::sync::Arc::new(arrow_schema::Schema::empty()) }
+///
+/// let extra = HostedProtocol::new("example.Extra.v1").with_method(MethodInfo::unary(
+///     "ping",
+///     empty_schema(),
+///     empty_schema(),
+///     |_req, _ctx| Ok(None),
+/// ));
+/// let server = RpcServer::builder()
+///     .protocol_name("example.Primary.v1")
+///     .add_protocol(extra)
+///     .build();
+/// assert_eq!(
+///     server.hosted_protocol_names()[..2],
+///     ["example.Primary.v1", "example.Extra.v1"]
+/// );
+/// ```
+pub struct HostedProtocol {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) methods: HashMap<String, MethodInfo>,
+    hash: std::sync::OnceLock<String>,
+}
+
+impl HostedProtocol {
+    /// A protocol with no methods yet. The name is validated when the server
+    /// is built.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: String::new(),
+            methods: HashMap::new(),
+            hash: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Declare the protocol's contract version, gated on its own calls only.
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = version.into();
+        self
+    }
+
+    /// Add a method (builder form of [`register`](Self::register)).
+    pub fn with_method(mut self, info: MethodInfo) -> Self {
+        self.register(info);
+        self
+    }
+
+    /// Add a method.
+    pub fn register(&mut self, info: MethodInfo) {
+        self.methods.insert(info.name.clone(), info);
+    }
+
+    /// The protocol's wire name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The declared version, or `""`.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// The registered methods.
+    pub fn methods(&self) -> &HashMap<String, MethodInfo> {
+        &self.methods
+    }
+
+    /// The canonical protocol hash. Computed lazily and cached.
+    pub fn protocol_hash(&self) -> &str {
+        self.hash.get_or_init(|| {
+            crate::reflection::binding_hash(&self.name, &self.methods).unwrap_or_default()
+        })
+    }
+}
+
+impl MethodRegistry for HostedProtocol {
+    fn register_method(&mut self, info: MethodInfo) {
+        self.register(info);
+    }
+}
+
+/// The binding a routing key resolved to: everything dispatch needs to gate
+/// and look up a call against the right protocol.
+#[derive(Clone, Copy)]
+pub(crate) struct ResolvedBinding<'a> {
+    /// The protocol's wire name.
+    pub(crate) name: &'a str,
+    /// Its declared version (`""` for none), the one the gate checks.
+    pub(crate) version: &'a str,
+    /// Its method table.
+    pub(crate) methods: &'a HashMap<String, MethodInfo>,
+}
+
+impl ResolvedBinding<'_> {
+    /// The binding's method names, sorted, for diagnostics.
+    pub(crate) fn sorted_method_names(&self) -> Vec<&str> {
+        let mut names: Vec<_> = self.methods.keys().map(String::as_str).collect();
+        names.sort();
+        names
+    }
+
+    /// The "hosted, but no such method" answer.
+    pub(crate) fn no_such_method(&self, method: &str) -> RpcError {
+        RpcError::method_not_implemented(format!(
+            "Protocol '{}' has no method '{}'. Available: {:?}",
+            self.name,
+            method,
+            self.sorted_method_names()
+        ))
     }
 }
 
@@ -879,11 +1159,94 @@ pub struct RpcServer {
             crate::transport::TransportCapabilities,
         )>,
     >,
+    /// Additional application protocols, in registration order. Fixed at
+    /// construction.
+    pub(crate) extra_protocols: Vec<HostedProtocol>,
+    /// [`RpcServerBuilder::include_tracebacks`]`(false)`.
+    omit_tracebacks: bool,
     #[cfg(feature = "http")]
     pub(crate) external_config: Option<Arc<crate::external::ExternalLocationConfig>>,
 }
 
 impl RpcServer {
+    /// The additional application protocols, in registration order.
+    pub fn extra_protocols(&self) -> &[HostedProtocol] {
+        &self.extra_protocols
+    }
+
+    /// Whether EXCEPTION batches carry a traceback -- on every transport.
+    pub fn include_tracebacks(&self) -> bool {
+        !self.omit_tracebacks
+    }
+
+    /// The traceback origin for an error raised by `protocol`/`method`, or
+    /// `None` when tracebacks are switched off. Passed to every EXCEPTION
+    /// envelope builder; a stackless error is rendered with it.
+    pub(crate) fn traceback_origin(&self, protocol: &str, method: &str) -> Option<String> {
+        if self.omit_tracebacks {
+            return None;
+        }
+        Some(match (protocol.is_empty(), method.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => method.to_string(),
+            _ => format!("{protocol}/{method}"),
+        })
+    }
+
+    /// Resolve an application or identity routing key to its binding.
+    ///
+    /// `None` for an unhosted name. Reflection is not resolved here: it is
+    /// served outside the method tables, before the version gate.
+    pub(crate) fn resolve_binding(&self, protocol: &str) -> Option<ResolvedBinding<'_>> {
+        if protocol == self.protocol_name {
+            return Some(ResolvedBinding {
+                name: &self.protocol_name,
+                version: &self.protocol_version,
+                methods: &self.methods,
+            });
+        }
+        if let Some(extra) = self.extra_protocols.iter().find(|p| p.name == protocol) {
+            return Some(ResolvedBinding {
+                name: &extra.name,
+                version: &extra.version,
+                methods: &extra.methods,
+            });
+        }
+        if protocol == crate::token_identity::IDENTITY_PROTOCOL_NAME {
+            if let Some(binding) = self.identity_binding() {
+                return Some(ResolvedBinding {
+                    name: crate::token_identity::IDENTITY_PROTOCOL_NAME,
+                    // The identity protocol declares no version of its own, so
+                    // the application's gate does not apply to it.
+                    version: "",
+                    methods: &binding.methods,
+                });
+            }
+        }
+        None
+    }
+
+    /// Route a request's protocol: the refusal a caller gets for a missing,
+    /// malformed or unhosted routing key, or the binding it addresses.
+    ///
+    /// The routing key is required even against a server hosting exactly one
+    /// protocol: an exemption would let an intermediary that rebuilds a
+    /// request and drops the field land silently on whichever protocol
+    /// happened to be first. The name is validated before the lookup so an
+    /// arbitrary request-supplied string never reaches an error message, a
+    /// log field or a metric label.
+    pub(crate) fn route(&self, protocol: &str) -> Result<ResolvedBinding<'_>> {
+        let hosted = self.hosted_protocol_names();
+        if protocol.is_empty() {
+            return Err(crate::binding::protocol_not_specified(&hosted));
+        }
+        if crate::binding::validate_protocol_name(protocol, true).is_err() {
+            return Err(crate::binding::protocol_not_supported("<invalid>", &hosted));
+        }
+        self.resolve_binding(protocol)
+            .ok_or_else(|| crate::binding::protocol_not_supported(protocol, &hosted))
+    }
+
     /// Create a new `RpcServer`. For richer configuration, use [`RpcServer::builder`].
     pub fn new(server_id: impl Into<String>) -> Self {
         Self::builder().server_id(server_id).build()
@@ -907,10 +1270,9 @@ impl RpcServer {
     /// configured it -- a name that appears here is a name this server will
     /// actually answer on.
     pub fn hosted_protocol_names(&self) -> Vec<&str> {
-        let mut hosted = vec![
-            self.protocol_name.as_str(),
-            crate::reflection::REFLECTION_PROTOCOL_NAME,
-        ];
+        let mut hosted = vec![self.protocol_name.as_str()];
+        hosted.extend(self.extra_protocols.iter().map(|p| p.name.as_str()));
+        hosted.push(crate::reflection::REFLECTION_PROTOCOL_NAME);
         if self.identity.is_some() {
             hosted.push(crate::token_identity::IDENTITY_PROTOCOL_NAME);
         }
@@ -998,6 +1360,13 @@ impl RpcServer {
                 };
             }
         }
+        if let Some(extra) = self.extra_protocols.iter().find(|p| p.name == protocol) {
+            return ProtocolIdentity {
+                name: &extra.name,
+                hash: extra.protocol_hash(),
+                version: &extra.version,
+            };
+        }
         ProtocolIdentity {
             name: &self.protocol_name,
             hash: self.protocol_hash(),
@@ -1060,9 +1429,41 @@ impl RpcServer {
         *lock_ok(&self.transport_state) = Some((kind, caps));
     }
 
-    /// Register a method described by a [`MethodInfo`].
+    /// Register a method described by a [`MethodInfo`] on the primary
+    /// protocol.
+    ///
+    /// # Panics
+    ///
+    /// Once the server has started serving -- a transport was bound, or its
+    /// description or hash was computed -- the hosted surface is sealed:
+    /// reflection output and protocol hashes are fixed for the life of the
+    /// process (WIRE_PROTOCOL.md §3.1), so a late registration is a
+    /// programming error. [`try_register`](Self::try_register) reports it
+    /// instead. Additional protocols can only be added before
+    /// [`RpcServerBuilder::build`], so they are sealed by construction.
     pub fn register(&mut self, info: MethodInfo) {
+        if let Err(err) = self.try_register(info) {
+            panic!("{}", err.message);
+        }
+    }
+
+    /// [`register`](Self::register), refusing rather than panicking once the
+    /// server has started serving.
+    pub fn try_register(&mut self, info: MethodInfo) -> Result<()> {
+        let serving = self
+            .transport_state
+            .get_mut()
+            .map_or(true, |state| state.is_some())
+            || self.protocol_hash.get().is_some();
+        if serving {
+            return Err(RpcError::runtime_error(format!(
+                "cannot register method {:?}: the server has started serving, and the \
+                 protocols it hosts are fixed once it does",
+                info.name
+            )));
+        }
         self.methods.insert(info.name.clone(), info);
+        Ok(())
     }
 
     /// Convenience wrapper for the old positional API — equivalent to
@@ -1271,7 +1672,14 @@ impl RpcServer {
         let req = match Request::from_read_batch(batch, metadata, true) {
             Ok(req) => req,
             Err(err) => {
-                write_error_stream(w, &empty_schema(), &err, &self.server_id, &request_id)?;
+                write_error_stream(
+                    w,
+                    &empty_schema(),
+                    &err,
+                    &self.server_id,
+                    &request_id,
+                    self.traceback_origin("", "").as_deref(),
+                )?;
                 return Ok(true);
             }
         };
@@ -1307,6 +1715,7 @@ impl RpcServer {
                 &crate::reflection::describe_retired(),
                 &self.server_id,
                 &req.request_id,
+                self.traceback_origin(&req.protocol, &req.method).as_deref(),
             )?;
             return Ok(true);
         }
@@ -1318,30 +1727,46 @@ impl RpcServer {
         // it would deny the client the diagnosis it came for.
         if req.protocol == crate::reflection::REFLECTION_PROTOCOL_NAME {
             let ctx = CallContext::for_request_on_connection(self, &req, connection);
-            return self.serve_reflection_logged(w, &req, &ctx);
+            let tb = self.traceback_origin(&req.protocol, &req.method);
+            return self.serve_reflection_logged(w, &req, &ctx, tb.as_deref());
         }
 
         // Which protocol's method table this request resolves against. The
         // routing key is part of the lookup rather than a label on it:
         // method names may collide across protocols, which is what makes
         // protocols independently authorable.
-        let identity_call = self
-            .identity_binding()
-            .filter(|_| req.protocol == crate::token_identity::IDENTITY_PROTOCOL_NAME);
-
-        // Enforce application protocol-version compatibility (the transport
-        // capability handshake above remains available for negotiation).
-        //
-        // Skipped for the framework's own identity protocol, which declares no
-        // version of its own: gating it on the *application's* version would
-        // refuse a credential resolution that has nothing to do with the
-        // application surface, and identity is exactly what a fronting proxy
-        // needs to work even when it and the worker disagree about the app.
-        if identity_call.is_none() {
-            if let Err(err) = validate_protocol_version(&self.protocol_version, &req.metadata) {
-                write_error_stream(w, &empty_schema(), &err, &self.server_id, &req.request_id)?;
+        let tb = self.traceback_origin(&req.protocol, &req.method);
+        let tracebacks = tb.as_deref();
+        let binding = match self.route(&req.protocol) {
+            Ok(binding) => binding,
+            Err(err) => {
+                write_error_stream(
+                    w,
+                    &empty_schema(),
+                    &err,
+                    &self.server_id,
+                    &req.request_id,
+                    tracebacks,
+                )?;
                 return Ok(true);
             }
+        };
+
+        // Enforce protocol-version compatibility against the *resolved*
+        // binding (the transport capability handshake above remains
+        // available for negotiation). A binding that declares no version --
+        // the identity protocol, or an added protocol without one -- is not
+        // gated, so a client of the primary's version can still reach it.
+        if let Err(err) = validate_protocol_version(binding.name, binding.version, &req.metadata) {
+            write_error_stream(
+                w,
+                &empty_schema(),
+                &err,
+                &self.server_id,
+                &req.request_id,
+                tracebacks,
+            )?;
+            return Ok(true);
         }
 
         let ctx = CallContext::for_request_on_connection(self, &req, connection);
@@ -1354,60 +1779,18 @@ impl RpcServer {
             s.input_rows = req.batch.num_rows() as u64;
         }
 
-        // Resolve (protocol, method). The routing key is required even
-        // against a server hosting exactly one protocol: an exemption would
-        // let an intermediary that rebuilds a request and drops the field land
-        // silently on whichever protocol happened to be first, rather than
-        // being told.
-        let hosted = self.hosted_protocol_names();
-        if req.protocol.is_empty() {
-            write_error_stream(
-                w,
-                &empty_schema(),
-                &crate::binding::protocol_not_specified(&hosted),
-                &self.server_id,
-                &req.request_id,
-            )?;
-            return Ok(true);
-        }
-        // Checked before the lookup so an arbitrary request-supplied string
-        // never reaches an error message, a log field or a metric label.
-        if crate::binding::validate_protocol_name(&req.protocol, true).is_err()
-            || (req.protocol != self.protocol_name && identity_call.is_none())
-        {
-            write_error_stream(
-                w,
-                &empty_schema(),
-                &crate::binding::protocol_not_supported(&req.protocol, &hosted),
-                &self.server_id,
-                &req.request_id,
-            )?;
-            return Ok(true);
-        }
-
-        let table = match identity_call {
-            Some(binding) => &binding.methods,
-            None => &self.methods,
-        };
-        let Some(info) = table.get(&req.method) else {
-            let names: Vec<&str> = match identity_call {
-                Some(binding) => binding.sorted_method_names(),
-                None => self.sorted_method_names(),
-            };
+        let Some(info) = binding.methods.get(&req.method) else {
             // "The protocol is hosted but has no such method" -- deliberately a
             // different answer from "this server does not host that protocol",
             // because a client probing for an optional method depends on the
             // difference.
-            let msg = format!(
-                "Protocol '{}' has no method '{}'. Available: {:?}",
-                req.protocol, req.method, names
-            );
             write_error_stream(
                 w,
                 &empty_schema(),
-                &RpcError::attribute_error(msg),
+                &binding.no_such_method(&req.method),
                 &self.server_id,
                 &req.request_id,
+                tracebacks,
             )?;
             return Ok(true);
         };
@@ -1419,6 +1802,7 @@ impl RpcServer {
                 &err,
                 &self.server_id,
                 &req.request_id,
+                tracebacks,
             )?;
             return Ok(true);
         }
@@ -1592,9 +1976,10 @@ impl RpcServer {
         // A panic in handler code is converted to an `RpcError` and
         // flows into the error-envelope path below, rather than
         // unwinding through the serve loop.
+        let tb = self.traceback_origin(&req.protocol, &req.method);
         let result = call_guard(|| (info.unary.as_ref().unwrap())(req, ctx)).and_then(|r| r);
         let logs = ctx.drain_logs();
-        let mut envelope = EnvelopeMeta::new(&self.server_id, &req.request_id);
+        let mut envelope = EnvelopeMeta::new(&self.server_id, &req.request_id, tb.as_deref());
         match result {
             Ok(maybe_batch) => {
                 let mut sw = StreamWriter::new(w, &info.result_schema)?;
@@ -1686,6 +2071,7 @@ impl RpcServer {
         app_err: &mut Option<RpcError>,
         #[cfg_attr(not(feature = "shm"), allow(unused_variables))] shm: Option<&ShmSegment>,
     ) -> Result<()> {
+        let tb = self.traceback_origin(&req.protocol, &req.method);
         let init_result = call_guard(|| (info.stream.as_ref().unwrap())(req, ctx)).and_then(|r| r);
         let init_logs = ctx.drain_logs();
         let stream = match init_result {
@@ -1694,7 +2080,8 @@ impl RpcServer {
                 // Init error: write as unary-style error stream.
                 let output_schema = info.result_schema.clone();
                 let mut sw = StreamWriter::new(w, &output_schema)?;
-                let mut envelope = EnvelopeMeta::new(&self.server_id, &req.request_id);
+                let mut envelope =
+                    EnvelopeMeta::new(&self.server_id, &req.request_id, tb.as_deref());
                 for log in init_logs {
                     let md = envelope.log(&log);
                     sw.write(&empty_batch(&output_schema)?, Some(md))?;
@@ -1721,7 +2108,7 @@ impl RpcServer {
         // Reused across every log/error envelope in this stream: the stable
         // server_id/request_id entries are allocated once and each envelope
         // only overwrites the transient level/message/extra values.
-        let mut envelope = EnvelopeMeta::new(&self.server_id, &req.request_id);
+        let mut envelope = EnvelopeMeta::new(&self.server_id, &req.request_id, tb.as_deref());
 
         // Write header as its own IPC stream if present.
         let wrote_header = header.is_some();
@@ -1976,16 +2363,26 @@ pub(crate) fn cast_batch(batch: &RecordBatch, target: &SchemaRef) -> Result<Reco
 pub(crate) struct EnvelopeMeta<'a> {
     server_id: &'a str,
     request_id: &'a str,
+    /// `None` omits `log_extra.traceback` (WIRE_PROTOCOL.md §8,
+    /// "Tracebacks"); `Some(origin)` includes it, synthesizing one from the
+    /// error and `origin` (`<protocol>/<method>`) when the error has none.
+    /// Callers pass [`RpcServer::traceback_origin`].
+    tracebacks: Option<&'a str>,
     /// Allocated lazily on the first log/error so a call that never logs
     /// (the common case) pays nothing.
     md: Option<Metadata>,
 }
 
 impl<'a> EnvelopeMeta<'a> {
-    pub(crate) fn new(server_id: &'a str, request_id: &'a str) -> Self {
+    pub(crate) fn new(
+        server_id: &'a str,
+        request_id: &'a str,
+        tracebacks: Option<&'a str>,
+    ) -> Self {
         Self {
             server_id,
             request_id,
+            tracebacks,
             md: None,
         }
     }
@@ -2017,6 +2414,11 @@ impl<'a> EnvelopeMeta<'a> {
         }
     }
 
+    /// Clear an error-model key a previous envelope may have left behind.
+    fn clear(&mut self, key: &str) {
+        self.map().remove(key);
+    }
+
     /// Populate for a log message and return the reused metadata map.
     pub(crate) fn log(&mut self, msg: &LogMessage) -> &Metadata {
         self.set(LOG_LEVEL_KEY, msg.level.as_str().to_string());
@@ -2027,38 +2429,65 @@ impl<'a> EnvelopeMeta<'a> {
             // Clear any extra left by a previous error/log envelope.
             self.map().remove(LOG_EXTRA_KEY);
         }
+        // A log is not an error: none of the error model rides on it.
+        self.clear(ERROR_KIND_KEY);
+        self.clear(ERROR_CODE_KEY);
+        self.clear(ERROR_DETAILS_KEY);
         self.md.as_ref().unwrap()
     }
 
     /// Populate for an error (EXCEPTION level) and return the reused map.
+    ///
+    /// Writes all three layers of the error model (WIRE_PROTOCOL.md §8): the
+    /// code always (`UNKNOWN` when unclassified), the kind when set, and the
+    /// details when they obey the catalog rules and fit the 4 KiB cap --
+    /// omitted whole otherwise, from both the top-level key and the
+    /// `log_extra` mirror. Hoisted to top-level keys as well as living in the
+    /// extra blob: a caller deciding whether to retry should not have to parse
+    /// JSON to find out, and an intermediary that forwards metadata but not
+    /// bodies can still route on it.
     pub(crate) fn error(&mut self, err: &RpcError) -> &Metadata {
-        let extra = match &err.error_kind {
-            Some(kind) => serde_json::json!({
-                "exception_type": err.error_type,
-                "exception_message": err.message,
-                "traceback": err.traceback,
-                "error_kind": kind,
-            }),
-            None => serde_json::json!({
-                "exception_type": err.error_type,
-                "exception_message": err.message,
-                "traceback": err.traceback,
-            }),
+        let code = err.wire_code().to_string();
+        let details = err.wire_details();
+        let encoded = crate::error_model::encode_error_details(&details);
+
+        let mut extra = serde_json::Map::new();
+        extra.insert("exception_type".into(), err.error_type.clone().into());
+        extra.insert("exception_message".into(), err.message.clone().into());
+        extra.insert("error_code".into(), code.clone().into());
+        if let Some(kind) = &err.error_kind {
+            extra.insert("error_kind".into(), kind.to_string().into());
         }
-        .to_string();
+        if encoded.is_some() {
+            extra.insert("error_details".into(), serde_json::Value::Array(details));
+        }
+        if let Some(origin) = self.tracebacks {
+            // Rust errors carry no stack. A handler may attach one; otherwise
+            // the traceback is synthesized from the error and the
+            // `<protocol>/<method>` that raised it, so the field is never empty
+            // when tracebacks are on.
+            let tb = if !err.traceback.is_empty() {
+                err.traceback.to_string()
+            } else if origin.is_empty() {
+                format!("{}: {}", err.error_type, err.message)
+            } else {
+                format!("{}: {}\n  raised by {origin}", err.error_type, err.message)
+            };
+            extra.insert("traceback".into(), tb.into());
+        }
+
         self.set(LOG_LEVEL_KEY, "EXCEPTION".to_string());
         self.set(LOG_MESSAGE_KEY, err.message.clone());
-        self.set(LOG_EXTRA_KEY, extra);
-        // Hoisted to a top-level key as well as living in the extra blob: a
-        // caller deciding whether to retry should not have to parse JSON to
-        // find out, and an intermediary that forwards metadata but not bodies
-        // can still route on it.
+        self.set(LOG_EXTRA_KEY, serde_json::Value::Object(extra).to_string());
+        self.set(ERROR_CODE_KEY, code);
         match &err.error_kind {
             Some(kind) => self.set(ERROR_KIND_KEY, kind.to_string()),
             // Clear any kind left by a previous error on this reused envelope.
-            None => {
-                self.map().remove(ERROR_KIND_KEY);
-            }
+            None => self.clear(ERROR_KIND_KEY),
+        }
+        match encoded {
+            Some(text) => self.set(ERROR_DETAILS_KEY, text),
+            None => self.clear(ERROR_DETAILS_KEY),
         }
         self.md.as_ref().unwrap()
     }
@@ -2069,20 +2498,27 @@ impl<'a> EnvelopeMeta<'a> {
 // build (e.g. the conformance client-driver) doesn't flag it as dead code.
 #[cfg(feature = "http")]
 pub(crate) fn build_log_metadata(msg: &LogMessage, server_id: &str, request_id: &str) -> Metadata {
-    let mut e = EnvelopeMeta::new(server_id, request_id);
+    let mut e = EnvelopeMeta::new(server_id, request_id, None);
     e.log(msg);
     e.md.unwrap()
 }
 
 /// Response envelope metadata: server id and echoed request id.
 pub(crate) fn build_envelope_metadata(server_id: &str, request_id: &str) -> Metadata {
-    EnvelopeMeta::new(server_id, request_id)
+    EnvelopeMeta::new(server_id, request_id, None)
         .md
         .unwrap_or_default()
 }
 
-pub(crate) fn build_error_metadata(err: &RpcError, server_id: &str, request_id: &str) -> Metadata {
-    let mut e = EnvelopeMeta::new(server_id, request_id);
+/// EXCEPTION envelope metadata. `tracebacks` is
+/// [`RpcServer::traceback_origin`] for the call that failed.
+pub(crate) fn build_error_metadata(
+    err: &RpcError,
+    server_id: &str,
+    request_id: &str,
+    tracebacks: Option<&str>,
+) -> Metadata {
+    let mut e = EnvelopeMeta::new(server_id, request_id, tracebacks);
     e.error(err);
     e.md.unwrap()
 }
@@ -2094,9 +2530,10 @@ pub(crate) fn write_error_stream<W: Write>(
     err: &RpcError,
     server_id: &str,
     request_id: &str,
+    tracebacks: Option<&str>,
 ) -> Result<()> {
     let mut sw = StreamWriter::new(w, schema)?;
-    let md = build_error_metadata(err, server_id, request_id);
+    let md = build_error_metadata(err, server_id, request_id, tracebacks);
     sw.write(&empty_batch(schema)?, Some(&md))?;
     sw.finish()?;
     Ok(())

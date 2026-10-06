@@ -67,7 +67,7 @@ fn rpc_client_round_trips_over_direct_mtls() {
     )]));
     let mut server = RpcServer::builder()
         .protocol_name("TlsTest")
-        .protocol_version("1")
+        .protocol_version("1.0.0")
         .build();
     server.register(MethodInfo::unary(
         "whoami",
@@ -153,7 +153,7 @@ fn rpc_client_round_trips_over_direct_mtls() {
     )
     .unwrap()
     .protocol("TlsTest")
-    .protocol_version("1");
+    .protocol_version("1.0.0");
     let request = RecordBatch::new_empty(Arc::new(Schema::empty()));
     assert!(
         anonymous.call_unary("whoami", &request, None).is_err(),
@@ -170,7 +170,7 @@ fn rpc_client_round_trips_over_direct_mtls() {
     )
     .unwrap()
     .protocol("TlsTest")
-    .protocol_version("1");
+    .protocol_version("1.0.0");
     let (response, _) = client.call_unary("whoami", &request, None).unwrap();
     assert!(response
         .column(0)

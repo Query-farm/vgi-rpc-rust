@@ -7,8 +7,9 @@
 //! continuation request and never decodes it.
 //!
 //! Endpoints (relative to the configured `prefix`, default empty):
-//! `POST {prefix}/{method}` unary, `POST {prefix}/{method}/init` stream init,
-//! `POST {prefix}/{method}/exchange` exchange / producer continuation / cancel,
+//! `POST {prefix}/{protocol}/{method}` unary,
+//! `POST {prefix}/{protocol}/{method}/init` stream init,
+//! `POST {prefix}/{protocol}/{method}/exchange` exchange / producer continuation / cancel,
 //! `DELETE {prefix}/__session__` sticky teardown,
 //! `POST {prefix}/__upload_url__/init` request-externalization upload URLs.
 //!
@@ -132,6 +133,11 @@ struct BackendRequestError {
 }
 
 impl HttpBackend {
+    // `RpcError` carries the error model (code + details, boxed) and sits just
+    // under clippy's 128-byte threshold; the `retry_safe` flag beside it tips
+    // this private, short-lived wrapper over. Not worth a heap allocation on
+    // every transport failure.
+    #[allow(clippy::result_large_err)]
     fn execute(
         &self,
         method: Method,
@@ -834,9 +840,18 @@ impl HttpClientBuilder {
     /// reference Python server routes *only* `{protocol}/{method}`, so an
     /// unbound client posting a bare `/{method}` gets a 404 from it however
     /// correct its metadata is.
+    ///
+    /// Not optional: [`build`](Self::build) refuses a client with no protocol
+    /// (WIRE_PROTOCOL.md §3.1).
     pub fn protocol(mut self, v: impl Into<String>) -> Self {
         self.protocol = Some(v.into());
         self
+    }
+
+    /// Whether a non-empty protocol is bound.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn has_protocol(&self) -> bool {
+        self.protocol.as_deref().is_some_and(|p| !p.is_empty())
     }
 
     pub fn protocol_version(mut self, v: impl Into<String>) -> Self {
@@ -997,6 +1012,21 @@ impl HttpClientBuilder {
         backend: HttpBackend,
         external_http: ExternalHttp,
     ) -> Result<HttpClient> {
+        // Every RPC names its protocol, in the routing key and in the URL
+        // path (WIRE_PROTOCOL.md §3.1); there is no flat `/{method}` route to
+        // fall back to. This client is not bound to a generated service, so
+        // there is nothing to derive the name from: the caller must say.
+        match self.protocol.as_deref() {
+            Some(p) if !p.is_empty() => {}
+            _ => {
+                return Err(RpcError::new(
+                    "ValueError",
+                    "HttpClient needs a protocol: call .protocol(\"<name>\") on the builder. \
+                     Every request names the protocol it addresses ({protocol}/{method}); \
+                     list a server's protocols with vgi_rpc.Reflection.v1 list_protocols.",
+                ));
+            }
+        }
         let external = match self.external_validator {
             Some(validator) => {
                 let mut cfg = ExternalLocationConfig::new(
@@ -1128,15 +1158,10 @@ impl HttpClient {
     ///
     /// HTTP carries the routing key twice -- in the request metadata and in
     /// the URL -- and a server is entitled to require both and to require
-    /// that they agree. The reference Python server routes *only* the
-    /// qualified shape, so a bare `/{method}` is a 404 there however correct
-    /// the metadata is. With no protocol bound there is nothing to qualify
-    /// with, and the bare path is the only thing left to send.
+    /// that they agree. A protocol is always bound (the builder refuses a
+    /// client without one), so there is no bare `/{method}` shape.
     fn route(&self, method: &str) -> String {
-        match self.protocol.as_deref().filter(|p| !p.is_empty()) {
-            Some(p) => format!("{p}/{method}"),
-            None => method.to_string(),
-        }
+        format!("{}/{method}", self.protocol.as_deref().unwrap_or_default())
     }
 
     /// Build per-request headers: content type, codec advertisement, and
@@ -2945,13 +2970,16 @@ mod tests {
     /// A builder whose backend never touches the network, so builder-level
     /// tests run with or without the `reqwest` feature.
     fn offline_builder() -> HttpClientBuilder {
-        HttpClient::connect("http://127.0.0.1").executor(scripted(Vec::new(), false))
+        HttpClient::connect("http://127.0.0.1")
+            .protocol("Service")
+            .executor(scripted(Vec::new(), false))
     }
 
     #[cfg(not(feature = "reqwest"))]
     #[test]
     fn build_without_reqwest_or_executor_is_a_clear_error() {
         let err = HttpClient::connect("http://127.0.0.1")
+            .protocol("Service")
             .build()
             .err()
             .unwrap();

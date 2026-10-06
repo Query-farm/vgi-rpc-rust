@@ -27,6 +27,66 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
   worker's `--fake-storage` / `--http-with-storage` backend and `--zstd`
   setting. The worker now registers 90 methods; the pinned canonical
   `ConformanceService` hash is `05479410…`.
+- Multi-protocol hosting (WIRE_PROTOCOL.md §3.1): `server::HostedProtocol`
+  and `RpcServerBuilder::add_protocol` / `add_protocols` host any number of
+  application protocols beside the primary, routed by `(protocol, method)`,
+  each with its own version gate and hash, listed by reflection in
+  registration order on every transport. `#[vgi_rpc::service]`'s
+  `register_with` now accepts either an `RpcServer` or a `HostedProtocol`
+  (the new `MethodRegistry` trait).
+- The gRPC-shaped error model (§8): `error_model::{Code, ErrorDetail}` and
+  the detail catalog; every EXCEPTION batch carries `vgi_rpc.error_code`
+  (`UNKNOWN` when unclassified), `vgi_rpc.error_kind` and
+  `vgi_rpc.error_details` (≤ 4 KiB, dropped whole when over or when it breaks
+  the catalog rules), mirrored in `log_extra`. Framework errors carry their
+  kinds and codes (`method_not_implemented`, `protocol_not_specified`,
+  `protocol_not_supported`, `protocol_version_mismatch` + `PreconditionFailure`,
+  `session_lost`, `server_draining` + `RetryInfo`); `ResponseTooLargeError`
+  is `RESOURCE_EXHAUSTED`. Access-log error records carry `error_code`.
+- `RpcError::with_code` / `with_status` / `with_details` / `with_raw_details`,
+  and on the client side `error_code()`, `error_kind()`, `error_details()`,
+  `code()`, typed accessors (`retry_info()`, `error_info()`, …) and
+  `is_retryable()`. Nothing retries RPC errors automatically.
+- `RpcServerBuilder::include_tracebacks`: tracebacks are included by default
+  on **every** transport; `false` omits them everywhere. Rust errors carry no
+  stack, so an included traceback is the handler's own or, when it attached
+  none, a synthesized `<ErrorType>: <message>` plus the `<protocol>/<method>`
+  that raised it.
+- `conformance_secondary` (`conformance.Secondary.v1`) and
+  `conformance_identity` (the identity fixture policy), shared by the
+  conformance worker and SDK fixture workers.
+- `RpcServerBuilder::try_build`.
+
+### Changed
+
+- **Breaking:** the reserved `vgi_rpc.` prefix, name grammar and uniqueness
+  are now enforced for the primary protocol name and every added protocol;
+  `build()` panics on a violation (`try_build()` returns it).
+- `vgi_rpc.Identity.v1`: `identity_unavailable` carries `RetryInfo`, and an
+  `auth_unavailable` error from the **mint** hook is now translated to
+  `identity_unavailable` with its own retry hint (resolve already was).
+- **Breaking:** the legacy flat HTTP routes `{prefix}/{method}[/init|/exchange]`
+  are removed (WIRE_PROTOCOL.md §3.1). Every RPC is
+  `{prefix}/{protocol}/{method}[/init|/exchange]`; an unhosted protocol is
+  `protocol_not_supported` (404). A single-segment POST is answered with
+  `protocol_not_specified` / `INVALID_ARGUMENT` (400) -- even when its
+  metadata names a protocol -- except server-level reserved names
+  (`__describe__` keeps its retirement notice; other `__x__` are
+  `method_not_implemented`). `__upload_url__/init` stays flat.
+- **Breaking (`vgi-rpc-client`):** `HttpClientBuilder::build` and
+  `HttpiClientBuilder::build` refuse a client with no `.protocol(..)`; every
+  request path is protocol-qualified (no flat fallback).
+  `HttpiClientBuilder::protocol` is new.
+- `serve_tcp` / `serve_unix` bind their transport kind when the caller has not.
+- **Breaking:** the `protocol_version` gate now follows WIRE_PROTOCOL.md §13:
+  the client must send a canonical `MAJOR.MINOR.PATCH`, and major **and
+  minor** must match (patch ignored). An absent or malformed client version is
+  `protocol_version_mismatch` (previously absent was accepted and only the
+  major compared). `__upload_url__` is no longer gated: it belongs to no
+  protocol.
+- **Breaking:** `RpcServer::register` panics once the server has started
+  serving (a transport was bound or the hash computed); `try_register`
+  returns the error. Added protocols are fixed at `build()`.
 
 ## [0.28.2] — 2026-10-01
 

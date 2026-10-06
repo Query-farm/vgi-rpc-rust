@@ -233,7 +233,7 @@ async fn post_arrow(app: axum::Router, path: &str, body: Vec<u8>) -> Bytes {
     let resp = app
         .oneshot(
             Request::builder()
-                .uri(path)
+                .uri(format!("/Calc{path}"))
                 .method("POST")
                 .header(header::CONTENT_TYPE, ARROW_CONTENT_TYPE)
                 .body(Body::from(body))

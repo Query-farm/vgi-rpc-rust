@@ -9,7 +9,8 @@ use serde_json::Value;
 use vgi_rpc::errors::RpcError;
 use vgi_rpc::log::{LogLevel, LogMessage};
 use vgi_rpc::metadata::{
-    LOCATION_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY, LOG_MESSAGE_KEY, REQUEST_ID_KEY,
+    ERROR_CODE_KEY, ERROR_DETAILS_KEY, ERROR_KIND_KEY, LOCATION_KEY, LOG_EXTRA_KEY, LOG_LEVEL_KEY,
+    LOG_MESSAGE_KEY, REQUEST_ID_KEY,
 };
 use vgi_rpc::wire::{md_get, Metadata};
 
@@ -55,11 +56,7 @@ pub fn classify(batch: &RecordBatch, md: &Metadata) -> BatchKind {
     let extra_json = md_get(md, LOG_EXTRA_KEY);
 
     if level_str == "EXCEPTION" {
-        let (etype, traceback) = parse_exception_extra(extra_json);
-        let mut err = RpcError::new(etype, message);
-        err.traceback = traceback.into_boxed_str();
-        err.request_id = request_id.into_boxed_str();
-        return BatchKind::Exception(err);
+        return BatchKind::Exception(decode_exception(md, message, request_id, extra_json));
     }
 
     let mut msg = LogMessage::new(parse_level(level_str), message);
@@ -87,6 +84,62 @@ fn parse_level(s: &str) -> LogLevel {
         "EXCEPTION" => LogLevel::Exception,
         _ => LogLevel::Info,
     }
+}
+
+/// Build the client-side [`RpcError`] for an EXCEPTION envelope.
+///
+/// The single decode point every path funnels through -- unary, stream
+/// init, stream exchange, and an externalized error batch -- so the error
+/// model (WIRE_PROTOCOL.md §8) cannot be dropped on one of them. Each of
+/// `error_code` / `error_kind` / `error_details` is read from its top-level
+/// key first and from the `log_extra` mirror when that key is absent. The code
+/// is kept verbatim (`""` when the server sent none -- a different answer
+/// from `"UNKNOWN"`), and the details keep every element, unknown types
+/// included; only the typed accessors filter.
+fn decode_exception(
+    md: &Metadata,
+    message: String,
+    request_id: String,
+    extra_json: Option<&str>,
+) -> RpcError {
+    let (etype, traceback) = parse_exception_extra(extra_json);
+    let extra: Option<serde_json::Map<String, Value>> = extra_json
+        .and_then(|j| serde_json::from_str::<Value>(j).ok())
+        .and_then(|v| match v {
+            Value::Object(m) => Some(m),
+            _ => None,
+        });
+    let mirror_str = |key: &str| -> String {
+        extra
+            .as_ref()
+            .and_then(|m| m.get(key))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let code = match md_get(md, ERROR_CODE_KEY) {
+        Some(code) => code.to_string(),
+        None => mirror_str("error_code"),
+    };
+    let kind = match md_get(md, ERROR_KIND_KEY) {
+        Some(kind) => kind.to_string(),
+        None => mirror_str("error_kind"),
+    };
+    let details = match md_get(md, ERROR_DETAILS_KEY) {
+        Some(raw) => vgi_rpc::error_model::decode_error_details(raw),
+        None => match extra.as_ref().and_then(|m| m.get("error_details")) {
+            Some(Value::Array(items)) => items.iter().filter(|v| v.is_object()).cloned().collect(),
+            _ => Vec::new(),
+        },
+    };
+    let mut err = RpcError::new(etype, message);
+    err.traceback = traceback.into_boxed_str();
+    err.request_id = request_id.into_boxed_str();
+    if !kind.is_empty() {
+        err = err.with_error_kind(kind);
+    }
+    err.set_wire_status(&code, details);
+    err
 }
 
 /// Pull `exception_type` and `traceback` out of the `vgi_rpc.log_extra` JSON.

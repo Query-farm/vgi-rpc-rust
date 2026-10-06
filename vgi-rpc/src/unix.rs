@@ -193,6 +193,14 @@ pub fn serve_unix<F: FnOnce()>(
     shutdown: Arc<AtomicBool>,
     on_bound: F,
 ) -> io::Result<()> {
+    // Bind the transport kind when the caller has not, so transport-scoped
+    // defaults (tracebacks are included on unix) hold for every embedder.
+    if server.transport_kind().is_none() {
+        server.notify_transport(
+            crate::transport::TransportKind::Unix,
+            crate::transport::TransportCapabilities::none(),
+        );
+    }
     prepare_socket_path(path)?;
     let listener = UnixListener::bind(path)?;
     let bound_identity = socket_identity(path)?;

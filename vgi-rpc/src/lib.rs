@@ -7,8 +7,11 @@
 pub mod access_log;
 pub mod arrow_type;
 pub mod auth;
+pub mod conformance_identity;
+pub mod conformance_secondary;
 #[cfg(feature = "crypto")]
 pub mod crypto;
+pub mod error_model;
 pub mod errors;
 pub mod retry;
 
@@ -92,6 +95,7 @@ pub use auth::tailscale::{
     TailscaleLocalApiEndpoint, TailscaleServeConfig,
 };
 pub use auth::{chain_all, chain_authenticate, AuthContext, AuthRequest, AuthResult, Authenticate};
+pub use error_model::{Code, ErrorDetail};
 pub use errors::{Result, RpcError};
 #[cfg(feature = "external")]
 pub use external::{
@@ -115,8 +119,8 @@ pub use proxy_protocol::{
 };
 pub use retry::RetryConfig;
 pub use server::{
-    CallContext, ConnectionContext, MethodInfo, MethodType, Request, RpcServer, RpcServerBuilder,
-    StickySink,
+    CallContext, ConnectionContext, HostedProtocol, MethodInfo, MethodRegistry, MethodType,
+    Request, RpcServer, RpcServerBuilder, StickySink,
 };
 #[cfg(feature = "http")]
 pub use sticky::{DrainHandle, SessionRegistry};

@@ -20,10 +20,14 @@ pub enum IdentityMode {
     Both,
     /// Resolve only: one method, the one-method digest.
     IntrospectOnly,
+    /// The grant worker (IDENTITY_CONFORMANCE_FIXTURE.md §10): the resolver,
+    /// the fixture grant keys and no mint hook -- the framework mints sealed
+    /// grants and accepts them, and `resolve_token`'s credentials, as bearers.
+    Grants,
 }
 
 impl IdentityMode {
-    /// Parse the `--identity {off,both,introspect-only}` argument.
+    /// Parse the `--identity {off,both,introspect-only,grants}` argument.
     pub fn from_args(args: &[String]) -> Self {
         match args
             .iter()
@@ -34,9 +38,10 @@ impl IdentityMode {
             None | Some("off") => Self::Off,
             Some("both") => Self::Both,
             Some("introspect-only") => Self::IntrospectOnly,
+            Some("grants") => Self::Grants,
             Some(other) => {
                 eprintln!(
-                    "[vgi-rpc] --identity must be one of off, both, introspect-only; got {other:?}"
+                    "[vgi-rpc] --identity must be one of off, both, introspect-only, grants; got {other:?}"
                 );
                 std::process::exit(2);
             }
@@ -47,6 +52,9 @@ impl IdentityMode {
     pub fn build(self) -> Option<IdentityImpl> {
         if self == Self::Off {
             return None;
+        }
+        if self == Self::Grants {
+            return Some(conformance_grant_identity());
         }
         let mut builder = IdentityImpl::builder()
             .resolve_token(std::sync::Arc::new(conformance_resolve_token))

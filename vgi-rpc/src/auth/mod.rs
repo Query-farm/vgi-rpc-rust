@@ -22,6 +22,8 @@
 
 pub mod bearer;
 pub mod identity;
+#[cfg(feature = "crypto")]
+pub mod identity_bearer;
 pub mod iroh;
 pub mod mtls;
 pub mod oauth;

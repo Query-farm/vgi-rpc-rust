@@ -245,7 +245,11 @@ pub fn conformance_mint_grant(
 ///
 /// Naming yourself in a header is obviously not authentication -- it is the
 /// cheapest thing every port can implement identically. Requests without the
-/// header stay anonymous rather than being rejected. `X-Conformance-Auth-Time`
+/// header stay anonymous rather than being rejected -- in this port that
+/// anonymous answer *is* "not mine", so a request carrying an `Authorization`
+/// header but no principal header passes through to the identity bearer
+/// authenticators (sealed grants, `resolve_token`) the grant worker composes
+/// after this one (IDENTITY_CONFORMANCE_FIXTURE.md §10). `X-Conformance-Auth-Time`
 /// rides along as the `auth_time` claim **verbatim and unparsed**: the guard
 /// parses, the fixture only transports.
 ///
@@ -353,5 +357,157 @@ mod tests {
             err.retry_after_seconds,
             Some(AUTH_UNAVAILABLE_RETRY_SECONDS)
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sealed grants and bearer acceptance (IDENTITY_CONFORMANCE_FIXTURE.md §10)
+// ---------------------------------------------------------------------------
+
+/// The grant worker's minting key: bytes `0x10..0x2f`. Published on purpose
+/// -- the shared suite mints with it to prove this port's *verifier* accepts
+/// reference-minted grants, and decodes this port's grants to prove its
+/// *minter* matches. A fixture key, never a deployment one.
+pub const GRANT_KEY_CURRENT: [u8; 32] = {
+    let mut k = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        k[i] = 0x10 + i as u8;
+        i += 1;
+    }
+    k
+};
+
+/// The previous key, still configured to verify (rotation): `0x30..0x4f`.
+pub const GRANT_KEY_PREVIOUS: [u8; 32] = {
+    let mut k = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        k[i] = 0x30 + i as u8;
+        i += 1;
+    }
+    k
+};
+
+/// Audience bound into the grant worker's tokens.
+pub const GRANT_AUDIENCE: &str = "conformance";
+
+/// The grant worker's lifetime ceiling, in seconds.
+pub const GRANT_MAX_TTL: i64 = 3600;
+
+/// The grant worker's configuration: the current key mints, both verify.
+#[cfg(feature = "crypto")]
+pub fn conformance_grant_keys() -> crate::grants::GrantKeys {
+    crate::grants::GrantKeys::new(
+        [GRANT_KEY_CURRENT.to_vec(), GRANT_KEY_PREVIOUS.to_vec()],
+        GRANT_AUDIENCE,
+        GRANT_MAX_TTL,
+        crate::grants::DEFAULT_CLOCK_SKEW_SECONDS,
+    )
+    .expect("the fixture grant keys are well-formed")
+}
+
+/// The grant worker's identity deployment: the fixture resolver, allowlist
+/// and `max_auth_age`, the fixture grant keys, and **no mint hook** -- the
+/// framework mints sealed grants.
+#[cfg(feature = "crypto")]
+pub fn conformance_grant_identity() -> crate::token_identity::IdentityImpl {
+    crate::token_identity::IdentityImpl::builder()
+        .resolve_token(std::sync::Arc::new(conformance_resolve_token))
+        .grant_keys(conformance_grant_keys())
+        .introspect_principals([INTROSPECTOR_PRINCIPAL])
+        .max_auth_age(std::time::Duration::from_secs(MAX_AUTH_AGE_SECONDS))
+        .build()
+}
+
+/// Routing key of the probe that reports how a request was authenticated.
+pub const WHOAMI_PROTOCOL_NAME: &str = "conformance.Whoami.v1";
+
+/// Pinned digest of `conformance.Whoami.v1`.
+pub const WHOAMI_PROTOCOL_HASH: &str =
+    "a280333ba72432020e162cab388a78355969a30aa74f0665ad9d2932d7a10b8f";
+
+/// The caller's `AuthContext` as compact JSON with sorted keys:
+/// `{"authenticated":bool,"claims":{...},"domain":str,"principal":str}`.
+///
+/// This port's claims are string-valued; a claim whose text is a JSON array
+/// (a grant's `scopes`) is rendered as that array, so the probe reports the
+/// same document the reference does.
+pub fn whoami_json(auth: &AuthContext) -> String {
+    let claims: serde_json::Map<String, serde_json::Value> = auth
+        .claims
+        .iter()
+        .map(|(k, v)| {
+            let value = match serde_json::from_str::<serde_json::Value>(v) {
+                Ok(array @ serde_json::Value::Array(_)) => array,
+                _ => serde_json::Value::String(v.clone()),
+            };
+            (k.clone(), value)
+        })
+        .collect();
+    serde_json::json!({
+        "authenticated": auth.authenticated,
+        "claims": claims,
+        "domain": auth.domain,
+        "principal": auth.principal,
+    })
+    .to_string()
+}
+
+/// `conformance.Whoami.v1`: `whoami() -> utf8`, answering [`whoami_json`].
+pub fn whoami_protocol() -> crate::server::HostedProtocol {
+    use arrow_schema::{DataType, Field, Schema};
+    let result = std::sync::Arc::new(Schema::new(vec![Field::new(
+        "result",
+        DataType::Utf8,
+        false,
+    )]));
+    let out = result.clone();
+    crate::server::HostedProtocol::new(WHOAMI_PROTOCOL_NAME).with_method(
+        crate::server::MethodInfo::unary(
+            "whoami",
+            std::sync::Arc::new(Schema::empty()),
+            result,
+            move |_req, ctx| {
+                let value = arrow_array::StringArray::from(vec![whoami_json(&ctx.auth)]);
+                Ok(Some(arrow_array::RecordBatch::try_new(
+                    out.clone(),
+                    vec![std::sync::Arc::new(value)],
+                )?))
+            },
+        ),
+    )
+}
+
+#[cfg(test)]
+mod grant_fixture_tests {
+    use super::*;
+
+    #[test]
+    fn whoami_hashes_to_the_pin() {
+        assert_eq!(whoami_protocol().protocol_hash(), WHOAMI_PROTOCOL_HASH);
+    }
+
+    #[test]
+    fn whoami_renders_list_claims_as_arrays() {
+        let ctx = AuthContext::for_principal("grant", "p")
+            .with_claim("scopes", "[\"a\",\"b\"]")
+            .with_claim("purpose", "x");
+        assert_eq!(
+            whoami_json(&ctx),
+            r#"{"authenticated":true,"claims":{"purpose":"x","scopes":["a","b"]},"domain":"grant","principal":"p"}"#
+        );
+        assert_eq!(
+            whoami_json(&AuthContext::anonymous()),
+            r#"{"authenticated":false,"claims":{},"domain":"","principal":""}"#
+        );
+    }
+
+    #[test]
+    fn the_fixture_keys_are_the_published_bytes() {
+        assert_eq!(GRANT_KEY_CURRENT[0], 0x10);
+        assert_eq!(GRANT_KEY_CURRENT[31], 0x2f);
+        assert_eq!(GRANT_KEY_PREVIOUS[0], 0x30);
+        assert_eq!(GRANT_KEY_PREVIOUS[31], 0x4f);
     }
 }

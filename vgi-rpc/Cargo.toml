@@ -105,6 +105,10 @@ name = "http_identity"
 required-features = ["http"]
 
 [[test]]
+name = "grant_auth"
+required-features = ["http"]
+
+[[test]]
 name = "http_auth"
 required-features = ["http"]
 

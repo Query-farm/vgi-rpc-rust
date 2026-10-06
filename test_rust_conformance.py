@@ -222,8 +222,8 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
                 ],
                 expect_port=port,
             )
-        if variant in ("identity", "identity_introspect_only"):
-            mode = "both" if variant == "identity" else "introspect-only"
+        if variant in ("identity", "identity_introspect_only", "identity_grants"):
+            mode = {"identity": "both", "identity_introspect_only": "introspect-only"}.get(variant, "grants")
             return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--identity", mode])
         if variant in ("storage", "zstd_storage", "externalize_always", "external_security"):
             port = _free_port()
@@ -351,11 +351,11 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
                     _CORS_ORIGIN,
                 ]
             )
-        if variant in ("identity", "identity_introspect_only"):
+        if variant in ("identity", "identity_introspect_only", "identity_grants"):
             # Same binary, different flag — which is the point: the narrowing
             # under test is a *configuration* difference, so two binaries
             # could not show it.
-            mode = "both" if variant == "identity" else "introspect-only"
+            mode = {"identity": "both", "identity_introspect_only": "introspect-only"}.get(variant, "grants")
             return _spawn_read_port([RUST_WORKER, "--http", "--identity", mode])
     else:  # go
         if variant == "plain":
@@ -844,6 +844,17 @@ def conformance_http_identity_port() -> Iterator[int]:
     deployment configuring no hook hosts no identity protocol at all.
     """
     yield from _http_variant_fixture("identity")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_grant_port() -> Iterator[int]:
+    """The sealed-grant worker (``--identity grants``, IDENTITY_CONFORMANCE_FIXTURE.md §10).
+
+    Resolver plus the fixture grant keys and no mint hook, so the framework
+    mints and accepts its own grants; hosts ``conformance.Whoami.v1``. The
+    fixture name is load-bearing: the grant groups skip loudly without it.
+    """
+    yield from _http_variant_fixture("identity_grants")
 
 
 @pytest.fixture(scope="session")

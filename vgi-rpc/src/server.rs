@@ -643,11 +643,44 @@ pub struct RpcServerBuilder {
     on_serve_start: Option<crate::transport::ServeStartHook>,
     extra_protocols: Vec<HostedProtocol>,
     omit_tracebacks: bool,
+    #[cfg(feature = "crypto")]
+    grant_keys: GrantKeysSetting,
     #[cfg(feature = "http")]
     external_config: Option<Arc<crate::external::ExternalLocationConfig>>,
 }
 
+/// Where a server's sealed-grant configuration comes from
+/// ([`RpcServerBuilder::grant_keys`]).
+#[cfg(feature = "crypto")]
+#[derive(Clone, Debug, Default)]
+pub enum GrantKeysSetting {
+    /// Read `VGI_RPC_GRANT_KEYS` and friends at build -- unset means grants
+    /// are off and nothing changes. The default.
+    #[default]
+    Env,
+    /// This configuration, regardless of the environment.
+    Keys(crate::grants::GrantKeys),
+    /// No sealed grants, regardless of the environment.
+    Off,
+}
+
 impl RpcServerBuilder {
+    /// Sealed-grant configuration (WIRE_PROTOCOL.md §16, IDENTITY_V1_SPEC §9).
+    ///
+    /// Default [`GrantKeysSetting::Env`]: `VGI_RPC_GRANT_KEYS` (comma-separated
+    /// base64 32-byte keys, minting key first), `VGI_RPC_GRANT_AUDIENCE`,
+    /// `VGI_RPC_GRANT_MAX_TTL_SECONDS`; unset means grants are off. With keys,
+    /// the framework mints sealed grants through `issue_grant` (unless the
+    /// [`identity`](Self::identity) supplies its own `mint_grant`) and the HTTP
+    /// transport accepts them back as bearer credentials. A malformed key
+    /// fails [`try_build`](Self::try_build) -- a worker refuses to start
+    /// rather than run with a key it misread.
+    #[cfg(feature = "crypto")]
+    pub fn grant_keys(mut self, setting: GrantKeysSetting) -> Self {
+        self.grant_keys = setting;
+        self
+    }
+
     /// Host an additional application protocol beside the primary.
     ///
     /// Any number may be added; they are listed by `list_protocols` in the
@@ -789,6 +822,36 @@ impl RpcServerBuilder {
                 )));
             }
         }
+        // Sealed grants: read the keys at build, so a malformed one refuses
+        // to start the worker rather than failing the first mint.
+        #[cfg(feature = "crypto")]
+        let identity = {
+            let keys = match self.grant_keys {
+                GrantKeysSetting::Env => crate::grants::GrantKeys::from_env()?,
+                GrantKeysSetting::Keys(keys) => Some(keys),
+                GrantKeysSetting::Off => None,
+            };
+            match (keys, self.identity) {
+                // Grants on, no other identity hooks: the framework mints and
+                // accepts its own, and hosts issue_grant alone.
+                (Some(keys), None) => Some(Arc::new(
+                    crate::token_identity::IdentityImpl::builder()
+                        .grant_keys(keys)
+                        .build(),
+                )),
+                (Some(_), Some(identity)) if identity.grant_keys().is_none() => {
+                    return Err(RpcError::value_error(
+                        "grant keys were configured (grant_keys or VGI_RPC_GRANT_KEYS) and an \
+                         IdentityImpl was supplied without them. Build it with \
+                         IdentityImplBuilder::grant_keys so the minter and the verifier use the \
+                         same keys.",
+                    ));
+                }
+                (_, identity) => identity,
+            }
+        };
+        #[cfg(not(feature = "crypto"))]
+        let identity = self.identity;
         Ok(RpcServer {
             methods: HashMap::new(),
             server_id: self.server_id.unwrap_or_else(crate::util::short_random_id),
@@ -805,9 +868,7 @@ impl RpcServerBuilder {
             // hash -- reflects only the hooks the deployment actually
             // supplied. `None` when neither hook exists: with nothing to
             // answer, the protocol is not registered at all.
-            identity: self
-                .identity
-                .and_then(crate::token_identity::IdentityBinding::new)
+            identity: identity.and_then(crate::token_identity::IdentityBinding::new)
                 .map(Arc::new),
             dispatch_hook: self.dispatch_hook,
             on_serve_start: self.on_serve_start,

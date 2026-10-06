@@ -31,7 +31,8 @@ use sha2::{Digest, Sha256};
 /// XChaCha20-Poly1305 key length (256 bits).
 const KEY_LEN: usize = 32;
 /// XChaCha20-Poly1305 nonce length (192 bits).
-const NONCE_LEN: usize = 24;
+/// XChaCha20-Poly1305 nonce length.
+pub const NONCE_LEN: usize = 24;
 /// Poly1305 authentication-tag length appended by the AEAD construction.
 const TAG_LEN: usize = 16;
 /// Single version-selector byte.
@@ -81,20 +82,34 @@ pub fn normalize_key(key: &[u8]) -> [u8; KEY_LEN] {
 ///
 /// Returns the sealed envelope: `version || nonce || ciphertext+tag`.
 pub fn seal_bytes(payload: &[u8], key: &[u8], aad: &[u8], version: u8) -> Vec<u8> {
-    let normalized = normalize_key(key);
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    seal_bytes_with_nonce(payload, key, aad, version, &nonce_bytes)
+}
+
+/// [`seal_bytes`] with a caller-chosen 24-byte nonce -- **for test vectors
+/// only**. Reusing a nonce under one key destroys XChaCha20-Poly1305's
+/// confidentiality and authenticity; production code calls [`seal_bytes`],
+/// which draws a fresh random nonce.
+pub fn seal_bytes_with_nonce(
+    payload: &[u8],
+    key: &[u8],
+    aad: &[u8],
+    version: u8,
+    nonce_bytes: &[u8; NONCE_LEN],
+) -> Vec<u8> {
+    let normalized = normalize_key(key);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&normalized));
     let ciphertext = cipher
         .encrypt(
-            XNonce::from_slice(&nonce_bytes),
+            XNonce::from_slice(nonce_bytes),
             Payload { msg: payload, aad },
         )
         .expect("XChaCha20-Poly1305 encrypt cannot fail for in-memory plaintext");
 
     let mut wire = Vec::with_capacity(VERSION_LEN + NONCE_LEN + ciphertext.len());
     wire.push(version);
-    wire.extend_from_slice(&nonce_bytes);
+    wire.extend_from_slice(nonce_bytes);
     wire.extend_from_slice(&ciphertext);
     wire
 }

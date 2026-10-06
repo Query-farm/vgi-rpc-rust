@@ -328,6 +328,8 @@ jobs:
           groups="$groups or TestErrorModelRoundTrip or TestTracebackPolicy"
           groups="$groups or TestErrorModelOnTheWire or TestUnclassifiedErrorsAreUnknown"
           groups="$groups or TestUnavailableCarriesARetryHint or TestErrorKindsReachTheWire"
+          groups="$groups or TestSealedGrants or TestSealedGrantRejections"
+          groups="$groups or TestGrantPrefixRouting or TestResolveTokenBearer"
           python -m pytest test_rust_conformance.py -k "$groups" \
             --timeout=20 --timeout-method=signal -q -rs | tee new-groups.log
           if grep -q "^SKIPPED" new-groups.log; then

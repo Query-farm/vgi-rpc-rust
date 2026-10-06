@@ -107,6 +107,13 @@ fn build_server_with_external_and_hook(
         builder = builder.on_serve_start(hook);
     }
     if let Some(identity) = identity {
+        // The grant worker (`--identity grants`, IDENTITY_CONFORMANCE_FIXTURE.md
+        // §10) also hosts `conformance.Whoami.v1`, so a test can see which
+        // authenticator accepted a bearer.
+        if identity.grant_keys().is_some() {
+            builder =
+                builder.add_protocol(vgi_rpc::conformance_identity::whoami_protocol());
+        }
         builder = builder.identity(identity);
     }
 

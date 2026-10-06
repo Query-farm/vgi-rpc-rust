@@ -2,6 +2,45 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased]
+
+### Added
+
+- **Sealed grants** (`vgi_rpc::grants`, IDENTITY_V1_SPEC §9): the
+  `vgig1.` token -- XChaCha20-Poly1305 envelope under a 32-byte grant key,
+  key id and audience bound in the AAD, fixed little-endian payload,
+  canonical unpadded base64url only -- with `GrantKeys` (`VGI_RPC_GRANT_KEYS`
+  / `VGI_RPC_GRANT_AUDIENCE` / `VGI_RPC_GRANT_MAX_TTL_SECONDS`, a malformed key
+  refuses to start), `mint_grant_token`, `verify_grant_token` (normative
+  order; 60 s skew; only an authentic token can be "expired") and
+  `sealed_mint_grant`. Reproduces every case in
+  `tests/data/grant_token_vectors.json` (copied from vgi-rpc 0.49.0).
+- `IdentityImplBuilder::grant_keys`: with keys and no `mint_grant` hook the
+  framework mints sealed grants. `RpcServerBuilder::grant_keys`
+  (`GrantKeysSetting::{Env, Keys, Off}`, default `Env`): keys alone host
+  `issue_grant`; keys beside an identity built without them refuse to start.
+- `auth::identity_bearer::{grant_authenticate, resolve_token_authenticate,
+  compose_identity_authenticate}`, wired automatically by `HttpStateBuilder`
+  for a server hosting `vgi_rpc.Identity.v1` with grant keys or
+  `resolve_token` (`identity_bearer(false)` opts out). Order: the deployment's
+  authenticator, then sealed grants (exact `vgig1.` prefix; a bad grant is a
+  401 that never reaches the resolver; `expired_credential` only after the
+  tag verifies), then `resolve_token` (`domain = "token"`; `None` falls
+  through to 401; an outage is 503 with the hook's `Retry-After`; never sees
+  a grant, a JWS, a blank or an over-long token). Grant- and token-
+  authenticated callers carry no `auth_time`, so they cannot mint. Refuses to
+  start beside proxy-evidence authentication (proof gate, declared proxy
+  headers).
+- Conformance: the grant worker (`--identity grants`) hosting
+  `conformance.Whoami.v1` (hash `a280333b…`), and the harness's
+  `conformance_http_grant_port`.
+- `crypto::seal_bytes_with_nonce` (test vectors only).
+
+### Changed
+
+- With identity bearers active, a request carrying an `Authorization` header
+  that nothing accepts is 401 (no credential at all stays anonymous).
+
 ## [0.29.0] — 2026-10-05
 
 ### Added

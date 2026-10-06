@@ -530,6 +530,8 @@ pub fn check_freshness_at(auth: &AuthContext, max_auth_age: f64, now: f64) -> Re
 pub struct IdentityImpl {
     resolve_token: Option<TokenResolver>,
     mint_grant: Option<GrantMinter>,
+    #[cfg(feature = "crypto")]
+    grant_keys: Option<crate::grants::GrantKeys>,
     principals: BTreeSet<String>,
     default_ttl_seconds: u64,
     max_auth_age: f64,
@@ -550,6 +552,8 @@ impl std::fmt::Debug for IdentityImpl {
 pub struct IdentityImplBuilder {
     resolve_token: Option<TokenResolver>,
     mint_grant: Option<GrantMinter>,
+    #[cfg(feature = "crypto")]
+    grant_keys: Option<crate::grants::GrantKeys>,
     principals: Vec<String>,
     default_ttl_seconds: Option<u64>,
     max_auth_age: Option<f64>,
@@ -571,6 +575,18 @@ impl IdentityImplBuilder {
     /// Supplying this hosts `issue_grant`.
     pub fn mint_grant(mut self, minter: GrantMinter) -> Self {
         self.mint_grant = Some(minter);
+        self
+    }
+
+    /// Configure sealed grants (IDENTITY_V1_SPEC §9).
+    ///
+    /// With keys, the framework mints sealed grants when no
+    /// [`mint_grant`](Self::mint_grant) hook is supplied -- so `issue_grant`
+    /// is hosted -- and the HTTP transport accepts the deployment's grants as
+    /// bearer credentials. Without, nothing changes.
+    #[cfg(feature = "crypto")]
+    pub fn grant_keys(mut self, keys: crate::grants::GrantKeys) -> Self {
+        self.grant_keys = Some(keys);
         self
     }
 
@@ -616,9 +632,21 @@ impl IdentityImplBuilder {
         } else {
             BTreeSet::new()
         };
+        // A configured grant key and no hook of the worker's own: the
+        // framework mints sealed grants itself.
+        #[cfg(feature = "crypto")]
+        let mint_grant = self.mint_grant.or_else(|| {
+            self.grant_keys
+                .clone()
+                .map(crate::grants::sealed_mint_grant)
+        });
+        #[cfg(not(feature = "crypto"))]
+        let mint_grant = self.mint_grant;
         IdentityImpl {
             resolve_token: self.resolve_token,
-            mint_grant: self.mint_grant,
+            mint_grant,
+            #[cfg(feature = "crypto")]
+            grant_keys: self.grant_keys,
             principals,
             default_ttl_seconds: self
                 .default_ttl_seconds
@@ -632,6 +660,17 @@ impl IdentityImpl {
     /// Start building an implementation.
     pub fn builder() -> IdentityImplBuilder {
         IdentityImplBuilder::default()
+    }
+
+    /// The sealed-grant configuration, when one was supplied.
+    #[cfg(feature = "crypto")]
+    pub fn grant_keys(&self) -> Option<&crate::grants::GrantKeys> {
+        self.grant_keys.as_ref()
+    }
+
+    /// The worker's `resolve_token` hook, when one was supplied.
+    pub fn token_resolver(&self) -> Option<&TokenResolver> {
+        self.resolve_token.as_ref()
     }
 
     /// The methods this deployment can actually answer.
@@ -907,6 +946,10 @@ fn read_grant_args(req: &Request) -> Result<(String, Vec<String>, i64)> {
 /// One protocol hosted by a server: the implementation, the methods its hooks
 /// actually justify, and the fingerprint that narrows with them.
 pub struct IdentityBinding {
+    /// The implementation the methods answer from -- also what the HTTP
+    /// transport reads grant keys and the resolver from to accept identity
+    /// credentials as bearers.
+    pub implementation: Arc<IdentityImpl>,
     /// The methods this deployment hosts -- never the full protocol, only what
     /// the configured hooks can answer.
     pub methods: HashMap<String, MethodInfo>,
@@ -974,6 +1017,7 @@ impl IdentityBinding {
         let protocol_hash =
             crate::reflection::binding_hash(IDENTITY_PROTOCOL_NAME, &methods).unwrap_or_default();
         Some(Self {
+            implementation: identity,
             methods,
             protocol_hash,
         })

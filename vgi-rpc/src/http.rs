@@ -471,6 +471,7 @@ pub struct HttpStateBuilder {
     sticky_echo_headers: Vec<(String, String)>,
     landing_info: Option<LandingInfo>,
     proxy_proof_required: Option<bool>,
+    identity_bearer: Option<bool>,
     extra_proxy_auth_headers: Vec<String>,
     call_state_cache_entries: Option<usize>,
 }
@@ -647,6 +648,21 @@ impl HttpStateBuilder {
 
     pub fn proxy_proof_required(mut self, required: bool) -> Self {
         self.proxy_proof_required = Some(required);
+        self
+    }
+
+    /// Whether to accept `vgi_rpc.Identity.v1` credentials as bearers
+    /// (default `true`; IDENTITY_V1_SPEC §9).
+    ///
+    /// When the server hosts the identity protocol with grant keys and/or a
+    /// `resolve_token` hook, [`build`](Self::build) appends the sealed-grant
+    /// and `resolve_token` authenticators after [`Self::authenticate`] (see
+    /// [`compose_identity_authenticate`](crate::auth::identity_bearer::compose_identity_authenticate)).
+    /// Pass `false` to compose them yourself -- required when authentication
+    /// depends on proxy-injected evidence, where OR-ing alternatives beside
+    /// the gate would bypass it and `build` refuses to start.
+    pub fn identity_bearer(mut self, enabled: bool) -> Self {
+        self.identity_bearer = Some(enabled);
         self
     }
 
@@ -857,6 +873,41 @@ impl HttpStateBuilder {
              authenticate callback — browsers reject credentialed requests \
              against a wildcard origin. Configure a specific origin."
         );
+        // Close the identity loop: accept the deployment's sealed grants and
+        // its resolve_token's credentials as bearers, after its own
+        // authenticator (IDENTITY_V1_SPEC §9.3).
+        let identity_sources = if self.identity_bearer.unwrap_or(true) {
+            server
+                .identity_binding()
+                .map(|b| {
+                    (
+                        b.implementation.grant_keys().cloned(),
+                        b.implementation.token_resolver().cloned(),
+                    )
+                })
+                .filter(|(keys, resolver)| keys.is_some() || resolver.is_some())
+        } else {
+            None
+        };
+        let authenticate = match identity_sources {
+            Some((keys, resolver)) => {
+                assert!(
+                    !self.proxy_proof_required.unwrap_or(false)
+                        && self.extra_proxy_auth_headers.is_empty(),
+                    "HttpStateBuilder: this server's authentication depends on proxy-injected \
+                     evidence, and accepting sealed grants or resolve_token bearers would be an \
+                     OR beside it that bypasses that requirement. Compose it yourself with \
+                     auth::identity_bearer::{{grant_authenticate, resolve_token_authenticate}} \
+                     and pass identity_bearer(false)."
+                );
+                crate::auth::identity_bearer::compose_identity_authenticate(
+                    self.authenticate,
+                    keys,
+                    resolver,
+                )
+            }
+            None => self.authenticate,
+        };
         let token_key = self.token_key.unwrap_or_else(|| {
             tracing::warn!(
                 target: "vgi_rpc.http",
@@ -928,7 +979,7 @@ impl HttpStateBuilder {
             request_timeout: self
                 .request_timeout
                 .unwrap_or_else(|| std::time::Duration::from_secs(30)),
-            authenticate: self.authenticate,
+            authenticate,
             peer_identity_providers: Arc::from(self.peer_identity_providers),
             peer_identity_provider_permits: Arc::new(tokio::sync::Semaphore::new(
                 self.peer_identity_provider_concurrency

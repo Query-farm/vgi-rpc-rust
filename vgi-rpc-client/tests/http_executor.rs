@@ -194,6 +194,47 @@ fn big_value() -> String {
 }
 
 #[test]
+fn first_rpc_negotiates_without_a_probe_and_shares_capabilities() {
+    let port = start_server();
+    for browser in [false, true] {
+        let executor = RecordingExecutor::new(
+            ExecutorCaps {
+                supports_options: !browser,
+                transparent_decompression: browser,
+            },
+            browser,
+        );
+        let build = || {
+            HttpClient::connect(format!("http://127.0.0.1:{port}"))
+                .protocol("Service")
+                .capabilities_from_response(4096)
+                .executor(executor.clone())
+        };
+        let mut client = build().build().unwrap();
+        assert!(client.capabilities().is_err());
+        assert!(executor.seen().is_empty());
+        assert_eq!(echo(&mut client, "first"), "echo: first");
+        let caps = client.capabilities().unwrap();
+        assert!(caps.accept_max_response_bytes_support);
+        assert_eq!(caps.supported_encodings, vec!["zstd", "gzip"]);
+        // New protocol clients can share negotiation through a connection pool.
+        let mut pooled = build().server_capabilities(caps).build().unwrap();
+        let big = big_value();
+        assert_eq!(echo(&mut pooled, &big), format!("echo: {big}"));
+        let seen = executor.seen();
+        assert_eq!(seen.len(), 2);
+        assert!(seen
+            .iter()
+            .all(|r| r.method == "POST" && r.url.ends_with("/echo_string")));
+        assert_eq!(header(&seen[0].request_headers, "content-encoding"), None);
+        assert_eq!(
+            header(&seen[1].request_headers, "content-encoding"),
+            Some("zstd")
+        );
+    }
+}
+
+#[test]
 fn executor_unary_round_trip_uses_options_by_default() {
     let port = start_server();
     let executor = RecordingExecutor::new(

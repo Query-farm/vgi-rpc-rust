@@ -784,9 +784,32 @@ pub struct HttpClientBuilder {
     max_decoded_response_bytes: usize,
     max_decoded_response_bytes_explicit: bool,
     accepted_max_response_bytes: usize,
+    first_response_request_limit: Option<usize>,
+    server_capabilities: Option<HttpServerCapabilities>,
 }
 
 impl HttpClientBuilder {
+    /// Learn transport capabilities from the first RPC response instead of
+    /// probing `/health`. The initial request is uncompressed and must fit
+    /// `max_request_bytes`; the response must acknowledge the receive budget
+    /// before its body is read. There is no discovery fallback or RPC replay.
+    pub fn capabilities_from_response(mut self, max_request_bytes: usize) -> Self {
+        assert!(
+            max_request_bytes > 0,
+            "initial request limit must be positive"
+        );
+        self.first_response_request_limit = Some(max_request_bytes);
+        self
+    }
+
+    /// Reuse capabilities obtained from a successful negotiation with this
+    /// same endpoint and credentials. Intended for an application's client
+    /// pool; never transfer capabilities between servers or identities.
+    pub fn server_capabilities(mut self, capabilities: HttpServerCapabilities) -> Self {
+        self.server_capabilities = Some(capabilities);
+        self
+    }
+
     /// Mount endpoints under a URL prefix (default empty).
     pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = prefix.into();
@@ -1038,7 +1061,16 @@ impl HttpClientBuilder {
             }
             None => None,
         };
-        Ok(HttpClient {
+        if self
+            .server_capabilities
+            .as_ref()
+            .is_some_and(|c| !c.accept_max_response_bytes_support)
+        {
+            return Err(RpcError::value_error(
+                "cached capabilities must acknowledge response budgets",
+            ));
+        }
+        let client = HttpClient {
             base_url: self.base_url.trim_end_matches('/').to_string(),
             prefix: self.prefix,
             headers: self.headers,
@@ -1057,11 +1089,16 @@ impl HttpClientBuilder {
                 .min(self.max_decoded_response_bytes)
                 .min(self.max_encoded_response_bytes),
             external,
-            caps: RefCell::new(None),
+            first_response_request_limit: self.first_response_request_limit,
+            caps: RefCell::new(self.server_capabilities),
             send_compressed: RefCell::new(self.compression_level.is_some()),
             session: None,
             session_stack: Vec::new(),
-        })
+        };
+        if let Some(caps) = client.caps.borrow().as_ref() {
+            client.apply_supported_encodings(&caps.supported_encodings);
+        }
+        Ok(client)
     }
 }
 
@@ -1099,6 +1136,7 @@ pub struct HttpClient {
     max_encoded_response_bytes: usize,
     max_decoded_response_bytes: usize,
     accepted_max_response_bytes: usize,
+    first_response_request_limit: Option<usize>,
     external: Option<ExternalLocationConfig>,
     caps: RefCell<Option<HttpServerCapabilities>>,
     /// Whether to zstd-compress request bodies (disabled after a 415).
@@ -1133,6 +1171,8 @@ impl HttpClient {
             max_decoded_response_bytes: DEFAULT_MAX_DECODED_RESPONSE_BYTES,
             max_decoded_response_bytes_explicit: false,
             accepted_max_response_bytes: DEFAULT_ACCEPTED_MAX_RESPONSE_BYTES,
+            first_response_request_limit: None,
+            server_capabilities: None,
         }
     }
 
@@ -1246,13 +1286,27 @@ impl HttpClient {
     /// externalization (413), explicitly configured connection replay, and
     /// sticky-session header capture. Returns the response body bytes.
     fn post(&mut self, path: &str, body: Vec<u8>, retryable: bool) -> Result<Vec<u8>> {
-        // The advertised/default receive budget is meaningful only after the
-        // server has positively acknowledged the contract. This auth-exempt
-        // probe is cached for the client lifetime.
-        self.capabilities()?;
+        if let Some(limit) = self.first_response_request_limit {
+            if self.caps.borrow().is_none() && body.len() > limit {
+                return Err(RpcError::new(
+                    "RequestTooLargeError",
+                    format!("initial uncompressed RPC request exceeds {limit} bytes"),
+                ));
+            }
+        } else {
+            self.capabilities()?;
+        }
         // Proactive externalization when caps are known and the body is large.
         let body = self.maybe_externalize_request(body)?;
         let (mut resp_headers, mut bytes, mut status) = self.send(path, &body, retryable)?;
+        if self.first_response_request_limit.is_some() {
+            // `send` checked the support marker and bounded the first body.
+            // All capabilities come from this response, not guessed defaults.
+            let mut caps = parse_caps(&resp_headers);
+            caps.max_response_bytes = parse_max_response_bytes(&resp_headers)?;
+            self.apply_supported_encodings(&caps.supported_encodings);
+            *self.caps.borrow_mut() = Some(caps);
+        }
         // The server stamps `VGI-Supported-Encodings` on every response, so
         // the first reply already tells us whether it speaks compression —
         // no OPTIONS probe, and no wasted 415 round-trip against a server
@@ -1311,7 +1365,8 @@ impl HttpClient {
         body: &[u8],
         retryable: bool,
     ) -> Result<(HeaderMap, Vec<u8>, StatusCode)> {
-        let compress = *self.send_compressed.borrow();
+        let compress = *self.send_compressed.borrow()
+            && (self.first_response_request_limit.is_none() || self.caps.borrow().is_some());
         let (payload, content_encoding) = if compress {
             let level = self.compression_level.unwrap_or(DEFAULT_COMPRESSION_LEVEL);
             // Embed the content-size in the frame header — Python's one-shot
@@ -1641,6 +1696,12 @@ impl HttpClient {
     pub fn capabilities(&self) -> Result<HttpServerCapabilities> {
         if let Some(c) = self.caps.borrow().as_ref() {
             return Ok(c.clone());
+        }
+        if self.first_response_request_limit.is_some() {
+            return Err(RpcError::new(
+                "ProtocolError",
+                "capabilities are available after the first RPC response",
+            ));
         }
         let caps = self.fetch_capabilities()?;
         self.apply_supported_encodings(&caps.supported_encodings);
@@ -3055,6 +3116,81 @@ mod tests {
             status: 302,
             headers: vec![("Location".into(), location.into())],
             body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn first_response_negotiation_bounds_the_initial_request() {
+        for size in [15, 16, 17] {
+            let executor = scripted(
+                vec![(
+                    "http://server.test/rpc",
+                    HttpResponse {
+                        status: 200,
+                        headers: vec![(
+                            ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER.into(),
+                            "true".into(),
+                        )],
+                        body: vec![],
+                    },
+                )],
+                false,
+            );
+            let mut client = HttpClient::connect("http://server.test")
+                .protocol("Service")
+                .executor(executor.clone())
+                .capabilities_from_response(16)
+                .build()
+                .unwrap();
+            let result = client.post("rpc", vec![0; size], false);
+            assert_eq!(result.is_ok(), size <= 16, "{result:?}");
+            assert_eq!(
+                executor.requests.lock().unwrap().len(),
+                usize::from(size <= 16)
+            );
+            if size > 16 {
+                assert!(result.unwrap_err().message.contains("initial uncompressed"));
+            }
+        }
+    }
+
+    #[test]
+    fn first_response_negotiation_requires_one_support_marker_and_a_bounded_body() {
+        for (markers, size, valid) in [
+            (0, 8, false),
+            (2, 8, false),
+            (1, 65535, true),
+            (1, 65536, true),
+            (1, 65537, false),
+        ] {
+            let executor = scripted(
+                vec![(
+                    "http://server.test/rpc",
+                    HttpResponse {
+                        status: 200,
+                        headers: (0..markers)
+                            .map(|_| {
+                                (
+                                    ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER.into(),
+                                    "true".into(),
+                                )
+                            })
+                            .collect(),
+                        body: vec![0; size],
+                    },
+                )],
+                false,
+            );
+            let mut client = HttpClient::connect("http://server.test")
+                .protocol("Service")
+                .executor(executor.clone())
+                .capabilities_from_response(16)
+                .accepted_max_response_bytes(65536)
+                .build()
+                .unwrap();
+            assert_eq!(client.post("rpc", vec![0; 8], false).is_ok(), valid);
+            assert_eq!(executor.requests.lock().unwrap().len(), 1);
+            assert_eq!(client.capabilities().is_ok(), valid);
         }
     }
 

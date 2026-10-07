@@ -139,6 +139,14 @@ server marks with `X-VGI-Content-Encoding`, and treats a standard
 fetches set `follow_redirects: false`; the client validates each redirect hop
 against its URL policy itself.
 
+Applications with a small initial RPC can set
+`.capabilities_from_response(64 * 1024)` to learn capabilities from that reply
+and avoid `/health` entirely. The first request is uncompressed and bounded
+by the supplied limit; response-budget acknowledgement and size limits apply
+immediately. `capabilities()` returns an error until a response supplies them.
+An application pool can pass these capabilities to another client with
+`.server_capabilities(caps)`, scoped to the same endpoint and credentials.
+
 For direct mutual TLS, construct a `rustls::ClientConfig` with the deployment
 CA and client certificate, then connect the stateful byte stream explicitly:
 

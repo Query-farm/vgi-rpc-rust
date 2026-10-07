@@ -2,6 +2,17 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.31.1] — 2026-10-07
+
+### Added
+
+- HTTP clients can opt into `capabilities_from_response(max_request_bytes)`
+  to learn transport capabilities from their first RPC response, without a
+  separate health probe. The initial request is bounded and uncompressed;
+  response-size acknowledgement and limits apply from the first response.
+- `server_capabilities` lets application connection pools share negotiated
+  capabilities between clients for the same endpoint and credentials.
+
 ## [0.31.0] — 2026-10-06
 
 ### Added

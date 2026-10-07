@@ -101,6 +101,10 @@ name = "access_log_stream"
 required-features = ["http", "stream-codec"]
 
 [[test]]
+name = "no_payload_in_logs"
+required-features = ["http", "stream-codec"]
+
+[[test]]
 name = "http_identity"
 required-features = ["http"]
 

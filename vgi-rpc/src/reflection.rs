@@ -463,9 +463,7 @@ impl crate::server::RpcServer {
             return self.serve_reflection(w, req, tracebacks);
         };
         let mut info = crate::hooks::DispatchInfo::from_request(self, req, "unary", &ctx.auth);
-        if let Ok(bytes) = crate::server::serialize_request_batch(&req.batch) {
-            info.request_data = bytes;
-        }
+        info.request_shape = Some(crate::hooks::RequestShape::of(&req.batch));
         let token = hook.on_dispatch_start(&info);
         let outcome = self.serve_reflection(w, req, tracebacks);
         let stats = crate::hooks::CallStatistics {

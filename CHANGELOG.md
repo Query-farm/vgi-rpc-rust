@@ -2,6 +2,31 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased]
+
+### Security
+
+- No request or response payload reaches any log, at any level (vgi-rpc
+  0.50.1). The access log wrote each HTTP stream turn's **decrypted** state as
+  `response_state` on every record, and the request as base64 `request_data`
+  under `with_verbose(true)`. A VGI `catalog_attach`'s secret options (API
+  keys, passwords) could land in logs in plaintext.
+  - Records describe the request by `request_fields` (`[{name, type}]`) and
+    `request_rows`, and stream state by `request_state_bytes` /
+    `response_state_bytes`.
+  - `AccessLogHook::with_verbose` is removed. There is no opt-in.
+  - `DispatchInfo::request_data` / `response_state` are replaced by
+    `request_shape: Option<RequestShape>` and the two sizes, so no hook can
+    see a payload or decrypted state.
+  - The size cap no longer has a `request_data` shedding step.
+  - Unary records keep `truncated: "payload_omitted"` until CI validates
+    against vgi-rpc >= 0.50.1, whose schema accepts the legacy marker.
+- Stream-state decode errors name the error type only (`bincode decode:
+  Custom`, "Stream state could not be decoded (...)"). A serde message can
+  quote the decrypted value it rejected.
+- The conformance worker's `--access-log-debug` is gone, and CI no longer
+  passes `--require-request-data`, which the reference now refuses.
+
 ## [0.31.1] — 2026-10-07
 
 ### Added

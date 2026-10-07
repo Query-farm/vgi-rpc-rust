@@ -151,13 +151,12 @@ async fn response_bytes_reports_the_compressed_body() {
 }
 
 #[tokio::test]
-async fn http_records_mark_the_payload_as_omitted() {
-    // Not logging the request payload at this level loses nothing, so the
-    // record must say `payload_omitted` rather than claim data was shed —
-    // and it must say something, or the schema's "unary requires
-    // request_data" rule fails for every HTTP record.
+async fn http_records_describe_the_request_never_its_payload() {
     let (_, _, record) = call("identity").await;
-    assert_eq!(record["truncated"], "payload_omitted");
+    assert!(record["request_fields"].is_array(), "{record}");
+    assert!(record["request_rows"].is_u64(), "{record}");
     assert!(record.get("request_data").is_none());
-    assert!(record["original_request_bytes"].as_u64().unwrap() > 0);
+    assert!(record.get("original_request_bytes").is_none());
+    // Transitional marker for vgi-rpc 0.50.0's schema (see access_log.rs).
+    assert_eq!(record["truncated"], "payload_omitted");
 }

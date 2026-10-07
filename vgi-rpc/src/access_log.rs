@@ -220,13 +220,6 @@ pub fn no_redaction(claims: &BTreeMap<String, String>) -> BTreeMap<String, Strin
 pub struct AccessLogHook {
     sink: Sink,
     server_version: String,
-    /// When true, emit the full base64-encoded request batch as
-    /// `request_data` (DEBUG-equivalent — see [`Self::with_verbose`]).
-    /// When false (default), emit `original_request_bytes` +
-    /// `truncated: "payload_omitted"` instead so the access-log schema's
-    /// "unary requires request_data unless truncated" invariant still
-    /// holds without ballooning every record by 8+ KiB.
-    verbose: bool,
     /// Per-record byte cap; `0` disables it. See [`Self::with_max_record_bytes`].
     max_record_bytes: usize,
     /// Fraction of non-error calls kept; `1.0` keeps everything.
@@ -255,7 +248,6 @@ impl AccessLogHook {
         Self {
             sink,
             server_version,
-            verbose: false,
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
             sample_rate: 1.0,
             claim_redactor: Arc::new(redact_claims),
@@ -273,7 +265,6 @@ impl AccessLogHook {
         let mut next = Self {
             sink: self.sink.clone(),
             server_version: self.server_version.clone(),
-            verbose: self.verbose,
             max_record_bytes: self.max_record_bytes,
             sample_rate: self.sample_rate,
             claim_redactor: self.claim_redactor.clone(),
@@ -282,18 +273,6 @@ impl AccessLogHook {
         };
         mutate(&mut next);
         Arc::new(next)
-    }
-
-    /// Return a new `Arc<AccessLogHook>` with verbose request-data
-    /// emission enabled. Mirrors Python's
-    /// `_access_logger.isEnabledFor(logging.DEBUG)` behaviour where
-    /// the full base64-encoded request batch is included verbatim
-    /// rather than being elided via `truncated: "payload_omitted"`.
-    pub fn with_verbose(self: Arc<Self>, verbose: bool) -> Arc<Self> {
-        if self.verbose == verbose {
-            return self;
-        }
-        self.derive(|h| h.verbose = verbose)
     }
 
     /// Cap each record at `max_bytes`, shedding optional fields to fit;
@@ -484,26 +463,13 @@ fn write_record(sink: &Sink, max_record_bytes: usize, rec: Record) {
 /// Render a record to one JSON line, shedding fields when it exceeds
 /// `max_record_bytes` (`0` disables the cap).
 ///
-/// The shed order is the spec's: `request_data` first (it is almost always
-/// what blew the budget), then `claims`, then the sentinel form.
+/// The shed order is the spec's: `claims`, then the sentinel form.
 /// `error_message` is never truncated — the full server-side message is what
 /// an operator is reading the record for.
 fn render(max_record_bytes: usize, mut rec: Record) -> String {
     let mut line = serde_json::Value::Object(rec.clone()).to_string();
     if max_record_bytes == 0 || line.len() <= max_record_bytes {
         return line;
-    }
-
-    if let Some(serde_json::Value::String(payload)) = rec.remove("request_data") {
-        rec.insert("original_request_bytes".into(), json!(payload.len()));
-        // `true` here and nowhere else: this record genuinely lost data to a
-        // cap, as distinct from a deployment that simply never logs payloads
-        // (`"payload_omitted"`).
-        rec.insert("truncated".into(), json!(true));
-        line = serde_json::Value::Object(rec.clone()).to_string();
-        if line.len() <= max_record_bytes {
-            return line;
-        }
     }
 
     if rec.contains_key("claims") {
@@ -640,25 +606,27 @@ impl DispatchHook for AccessLogHook {
             rec.insert("trace_id".into(), json!(trace_id));
             rec.insert("span_id".into(), json!(span_id));
         }
-        // Payload capture. A record that would carry `request_data` but does
-        // not must say so, or the schema's "unary requires request_data"
-        // invariant fails.
-        let carries_payload = info.method_type == "unary" || !info.request_data.is_empty();
-        if self.verbose && !info.request_data.is_empty() {
-            rec.insert(
-                "request_data".into(),
-                json!(base64_encode(&info.request_data)),
-            );
-        } else if carries_payload {
-            // `"payload_omitted"`, not `true`: nothing was lost to a size
-            // cap here — this deployment simply does not log payloads at
-            // this level. Sharing one marker with genuine shedding made it
-            // fire on essentially every record and left a consumer looking
-            // for real data loss with nothing to filter on.
-            if !info.request_data.is_empty() {
-                let encoded_len = info.request_data.len().div_ceil(3) * 4;
-                rec.insert("original_request_bytes".into(), json!(encoded_len));
-            }
+        // The request's shape -- names, Arrow types, row count -- never its
+        // values. The framework cannot know which parameters are secret (a
+        // VGI `catalog_attach` carries API keys and passwords), so no payload
+        // reaches this record at any level, and there is no switch to make
+        // it. No digest either: a hash of a request whose other fields are
+        // known is a brute-force oracle for a short secret.
+        if let Some(shape) = info.request_shape.as_ref() {
+            let fields: Vec<serde_json::Value> = shape
+                .fields
+                .iter()
+                .map(|(name, ty)| json!({"name": name, "type": ty}))
+                .collect();
+            rec.insert("request_fields".into(), json!(fields));
+            rec.insert("request_rows".into(), json!(shape.rows));
+        }
+        // Transitional: vgi-rpc 0.50.0's schema requires `request_data` on
+        // every unary record unless the record is marked truncated. The
+        // reference (>= 0.50.1) forbids `request_data` and still accepts this
+        // legacy marker, so it satisfies both validators.
+        // Remove once CI validates against vgi-rpc >= 0.50.1.
+        if info.method_type == "unary" {
             rec.insert("truncated".into(), json!("payload_omitted"));
         }
         if info.method_type == "stream" {
@@ -668,14 +636,15 @@ impl DispatchHook for AccessLogHook {
                 info.stream_id.clone()
             };
             rec.insert("stream_id".into(), json!(sid));
-            // Present exactly when the turn handed back a cursor. Its absence
-            // is what marks the terminal turn, so an empty value must stay
-            // absent rather than be logged as an empty string.
-            if !info.response_state.is_empty() {
-                rec.insert(
-                    "response_state".into(),
-                    json!(base64_encode(&info.response_state)),
-                );
+            // Sizes only: a state token serializes whatever the call was
+            // given (secrets included) and is replayable. `response_state_bytes`
+            // is present exactly when the turn handed back a cursor; its
+            // absence marks the terminal turn.
+            if let Some(n) = info.request_state_bytes {
+                rec.insert("request_state_bytes".into(), json!(n));
+            }
+            if let Some(n) = info.response_state_bytes {
+                rec.insert("response_state_bytes".into(), json!(n));
             }
         }
         if info.cancelled {
@@ -789,41 +758,6 @@ pub(crate) fn rfc3339_utc_millis() -> String {
     )
 }
 
-/// Standard base64 (RFC 4648, padded). Inlined here so the access-log module
-/// stays usable without the optional `base64` crate dependency.
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    // `as_chunks` (stable since 1.88, under the 1.97 MSRV) yields fixed-size
-    // arrays, so the indexing below is bounds-check free.
-    let (chunks, rem) = bytes.as_chunks::<3>();
-    for chunk in chunks {
-        let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
-        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
-        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
-        out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
-        out.push(ALPHABET[(n & 0x3F) as usize] as char);
-    }
-    match rem.len() {
-        1 => {
-            let n = (rem[0] as u32) << 16;
-            out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
-            out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
-            out.push('=');
-            out.push('=');
-        }
-        2 => {
-            let n = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
-            out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
-            out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
-            out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
-            out.push('=');
-        }
-        _ => {}
-    }
-    out
-}
-
 /// Mint a 32-character lowercase hex stream_id. Use this at the start of a
 /// stream call and reuse the same value across init and continuations.
 pub(crate) fn random_stream_id() -> String {
@@ -927,42 +861,70 @@ mod tests {
 
     // -- truncation ---------------------------------------------------------
 
+    fn shape() -> crate::hooks::RequestShape {
+        crate::hooks::RequestShape {
+            fields: vec![("value".into(), "Utf8".into())],
+            rows: 1,
+        }
+    }
+
     #[test]
-    fn payload_omission_is_distinct_from_size_driven_shedding() {
-        // Not logging payloads at this level loses nothing, so it must not
-        // look like data loss to a consumer scanning for exactly that.
+    fn request_is_described_by_shape_never_by_value() {
         let (buf, sink) = buffer();
         let hook = AccessLogHook::new(sink, "v");
         let mut i = info("echo_string");
-        i.request_data = vec![7u8; 4096];
+        i.request_shape = Some(shape());
         run(&hook, &i, None);
         let rec = &lines(&buf)[0];
+        assert_eq!(
+            rec["request_fields"],
+            json!([{"name": "value", "type": "Utf8"}])
+        );
+        assert_eq!(rec["request_rows"], 1);
+        for forbidden in ["request_data", "request_state", "response_state"] {
+            assert!(rec.get(forbidden).is_none(), "{forbidden} in {rec}");
+        }
+        // Transitional marker for the 0.50.0 schema (see the emit site).
         assert_eq!(rec["truncated"], "payload_omitted");
-        assert!(rec.get("request_data").is_none());
-        assert!(rec["original_request_bytes"].as_u64().unwrap() > 0);
+        assert!(rec.get("original_request_bytes").is_none());
+    }
 
-        // A cap that actually sheds the payload reports `true`.
+    #[test]
+    fn stream_state_is_reported_by_size() {
         let (buf, sink) = buffer();
-        let hook = AccessLogHook::new(sink, "v")
-            .with_verbose(true)
-            .with_max_record_bytes(1024);
+        let hook = AccessLogHook::new(sink, "v");
+        let mut i = info("produce");
+        i.method_type = "stream";
+        i.stream_id = format!("{:032x}", 7);
+        i.request_state_bytes = Some(12);
+        i.response_state_bytes = Some(34);
+        run(&hook, &i, None);
+        let rec = &lines(&buf)[0];
+        assert_eq!(rec["request_state_bytes"], 12);
+        assert_eq!(rec["response_state_bytes"], 34);
+        assert!(rec.get("truncated").is_none());
+    }
+
+    #[test]
+    fn oversized_claims_are_shed_with_truncated_true() {
+        let (buf, sink) = buffer();
+        let hook = AccessLogHook::new(sink, "v").with_max_record_bytes(1024);
+        let mut i = info("echo_string");
+        i.claims.insert("blob".into(), "x".repeat(4096));
         run(&hook, &i, None);
         let rec = &lines(&buf)[0];
         assert_eq!(rec["truncated"], true);
-        assert!(rec.get("request_data").is_none());
-        assert_eq!(rec["original_request_bytes"].as_u64().unwrap(), 5464);
+        assert_eq!(rec["claims"], json!({}));
         assert_eq!(rec["method"], "echo_string");
     }
 
     #[test]
     fn unshippable_record_collapses_to_the_sentinel_form() {
         let (buf, sink) = buffer();
-        let hook = AccessLogHook::new(sink, "v")
-            .with_verbose(true)
-            // Below even the envelope, so shedding the payload cannot save it.
-            .with_max_record_bytes(64);
+        // Below even the envelope, so shedding claims cannot save it.
+        let hook = AccessLogHook::new(sink, "v").with_max_record_bytes(64);
         let mut i = info("echo_string");
-        i.request_data = vec![7u8; 4096];
+        i.request_shape = Some(shape());
         run(&hook, &i, Some(&RpcError::value_error("boom")));
 
         let rec = &lines(&buf)[0];
@@ -971,7 +933,7 @@ mod tests {
         // reading the record for.
         assert_eq!(rec["error_message"], "boom");
         assert_eq!(rec["status"], "error");
-        assert!(rec.get("original_request_bytes").is_none());
+        assert!(rec.get("request_fields").is_none());
     }
 
     // -- sampling -----------------------------------------------------------

@@ -3,8 +3,8 @@
 //! `access-log-spec.md` is "one record per RPC call", and over HTTP a stream's
 //! call is not one request: it is the `/init` plus every `/exchange`. So the
 //! rule reads, concretely, as one record per *turn*, all of them carrying the
-//! same `stream_id`, with `request_data` on the init record alone and
-//! `response_state` present exactly while the stream is resumable.
+//! same `stream_id`, with the request shape on the init record alone and
+//! `response_state_bytes` present exactly while the stream is resumable.
 //!
 //! Nothing caught the port that emitted *nothing* here, because a record
 //! validator validates the records that exist: no records means nothing to
@@ -47,8 +47,9 @@ struct Seen {
     protocol: String,
     protocol_hash: String,
     stream_id: String,
-    request_data_len: usize,
-    response_state_len: usize,
+    has_request_shape: bool,
+    request_state_bytes: Option<u64>,
+    response_state_bytes: Option<u64>,
     output_rows: u64,
     status_error: bool,
 }
@@ -87,8 +88,9 @@ impl DispatchHook for Recorder {
             protocol: info.protocol.clone(),
             protocol_hash: info.protocol_hash.clone(),
             stream_id: info.stream_id.clone(),
-            request_data_len: info.request_data.len(),
-            response_state_len: info.response_state.len(),
+            has_request_shape: info.request_shape.is_some(),
+            request_state_bytes: info.request_state_bytes,
+            response_state_bytes: info.response_state_bytes,
             output_rows: stats.output_rows,
             status_error: error.is_some(),
         });
@@ -368,11 +370,11 @@ async fn the_stream_id_survives_a_continuation_on_another_worker() {
     );
 }
 
-/// `request_data` belongs to the init record alone: a continuation's body is a
+/// The request shape belongs to the init record alone: a continuation's body is a
 /// cursor, not the call's arguments, and logging it every turn would multiply
 /// the payload by the length of the stream while adding nothing.
 #[tokio::test]
-async fn request_data_is_carried_by_the_init_record_only() {
+async fn request_shape_is_carried_by_the_init_record_only() {
     let hook = Arc::new(Recorder::default());
     let state = build(hook.clone());
     let records = drive_to_completion(&hook, &state).await;
@@ -382,22 +384,26 @@ async fn request_data_is_carried_by_the_init_record_only() {
         "the stream produced no access records at all"
     );
     assert!(
-        records[0].request_data_len > 0,
-        "the init record must carry the call's request payload"
+        records[0].has_request_shape && records[0].request_state_bytes.is_none(),
+        "the init record must describe the call's request and receives no state"
     );
     for rec in &records[1..] {
-        assert_eq!(
-            rec.request_data_len, 0,
-            "a continuation record must not carry request_data"
+        assert!(
+            !rec.has_request_shape,
+            "a continuation record must not describe the request"
+        );
+        assert!(
+            rec.request_state_bytes.is_some_and(|n| n > 0),
+            "a continuation must report the size of the state it received: {rec:?}"
         );
     }
 }
 
-/// `response_state` marks a turn as resumable, so its absence is what marks the
+/// `response_state_bytes` marks a turn as resumable, so its absence is what marks the
 /// terminal one. A port that stamped it on every turn would leave a reader
 /// unable to tell where a stream ended.
 #[tokio::test]
-async fn response_state_is_present_while_the_stream_is_resumable() {
+async fn response_state_bytes_is_present_while_the_stream_is_resumable() {
     let hook = Arc::new(Recorder::default());
     let state = build(hook.clone());
     let records = drive_to_completion(&hook, &state).await;
@@ -409,15 +415,14 @@ async fn response_state_is_present_while_the_stream_is_resumable() {
     let (terminal, resumable) = records.split_last().unwrap();
     for rec in resumable {
         assert!(
-            rec.response_state_len > 0,
-            "a turn that handed back a continuation token must log the state it \
-             handed back: {rec:?}"
+            rec.response_state_bytes.is_some_and(|n| n > 0),
+            "a turn that handed back a continuation token must log its size: {rec:?}"
         );
     }
     assert_eq!(
-        terminal.response_state_len, 0,
+        terminal.response_state_bytes, None,
         "the terminal turn hands back no cursor, so it must log no \
-         response_state -- that absence is how a reader finds the end of a stream"
+         response_state_bytes -- that absence is how a reader finds the end of a stream"
     );
 }
 

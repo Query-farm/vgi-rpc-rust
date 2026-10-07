@@ -357,15 +357,6 @@ jobs:
           cargo test -p vgi-rpc-client --features shm --test reflection_python
           -- --ignored --nocapture
 
-      # Access-log conformance was verified by hand for months and drifted
-      # anyway — four people checked it by inspection and the rule was still
-      # wrong. It runs here now so it cannot silently rot again.
-      #
-      # --access-log-debug is not optional: at INFO the worker omits
-      # `request_data`, and a log that never carries the field trivially
-      # satisfies every rule that governs it, so the whole payload contract
-      # goes unchecked. --require-request-data makes that absence a failure.
-      #
       # The runner-driven suite with no access log attached. This is where the
       # `large_payload` group runs, including the >2 GiB
       # `echo_binary_over_int32_max` that vgi-rpc 0.42.0 made required — the
@@ -382,21 +373,15 @@ jobs:
       # anyway — four people checked it by inspection and the rule was still
       # wrong. It runs here now so it cannot silently rot again.
       #
-      # --access-log-debug is not optional: at INFO the worker omits
-      # `request_data`, and a log that never carries the field trivially
-      # satisfies every rule that governs it, so the whole payload contract
-      # goes unchecked. --require-request-data makes that absence a failure.
+      # No payload is logged at any level: records describe the request by
+      # `request_fields` / `request_rows` and state tokens by size, and the
+      # validator rejects `request_data` / `request_state` / `response_state`.
+      # (`--require-request-data` used to demand the payload; the reference
+      # now refuses that flag.)
       #
-      # `large_payload` is excluded here, and only here. At --access-log-debug
-      # a record embeds the whole request payload, so both tests in that group
-      # overshoot the emitter's per-record cap; it sheds `request_data` and
-      # marks the record truncated, exactly as access-log-spec §5b prescribes,
-      # and --require-request-data then reports those records as missing the
-      # field. The >2 GiB one is worse than that — a multi-gigabyte JSONL line
-      # to write and schema-validate, which killed the worker outright and
-      # broke every test after it. The group still runs, in the step above.
-      # This step's job is the log's *shape*, which the ordinary payloads
-      # exercise just as well.
+      # `large_payload` is excluded here only for time: the >2 GiB echo
+      # already runs in the step above, and this step's job is the log's
+      # *shape*, which the ordinary payloads exercise just as well.
       #
       # Nothing else is filtered: the suite's zero-parameter methods (void*)
       # send an empty schema and no row, and they are the exact case a
@@ -406,9 +391,8 @@ jobs:
         if: matrix.role == 'server' && matrix.server == 'rust'
         run: |
           timeout 300 vgi-rpc-test \
-            --cmd "${{ github.workspace }}/conformance-worker-rust --access-log $RUNNER_TEMP/access-log.jsonl --access-log-debug" \
+            --cmd "${{ github.workspace }}/conformance-worker-rust --access-log $RUNNER_TEMP/access-log.jsonl" \
             --access-log "$RUNNER_TEMP/access-log.jsonl" \
-            --require-request-data \
             --filter '!large_payload'
 
   # Everything above compares this port to *itself*: our tests, our fixtures,

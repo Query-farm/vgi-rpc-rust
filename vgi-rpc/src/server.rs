@@ -106,22 +106,6 @@ use crate::wire::{
     empty_batch, md_get, Metadata, StreamReader, StreamWriter, INVALID_UTF8_METADATA_KEY,
 };
 
-/// Serialize a parsed request batch back to a self-contained Arrow IPC
-/// stream (one schema message + one record batch + EOS) for inclusion in
-/// access-log `request_data`.
-pub(crate) fn serialize_request_batch(batch: &RecordBatch) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    {
-        let mut w = arrow_ipc::writer::StreamWriter::try_new(&mut buf, batch.schema_ref())
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        w.write(batch)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        w.finish()
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-    }
-    Ok(buf)
-}
-
 /// Lock a mutex, recovering the guard even if a previous holder
 /// panicked. Handler code is arbitrary and *will* panic eventually; a
 /// poisoned lock must not turn that into a process abort on the next
@@ -1882,12 +1866,9 @@ impl RpcServer {
         let mut dispatch_info = self.dispatch_hook.as_ref().map(|_| {
             let mut di =
                 crate::hooks::DispatchInfo::from_request(self, &req, method_type, &ctx.auth);
-            // Best-effort capture of self-contained Arrow IPC bytes of the
-            // request batch for access-log `request_data`. Failures here must
-            // not abort dispatch — observability is non-essential.
-            if let Ok(bytes) = serialize_request_batch(&req.batch) {
-                di.request_data = bytes;
-            }
+            // The request's shape (names, types, rows) for the access log --
+            // never its values, which may carry secrets.
+            di.request_shape = Some(crate::hooks::RequestShape::of(&req.batch));
             if method_type == "stream" {
                 di.stream_id = crate::access_log::random_stream_id();
             }

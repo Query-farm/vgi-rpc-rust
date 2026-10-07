@@ -31,7 +31,28 @@ pub trait StreamStateCodec: Sized {
 /// derive macro rather than calling this directly.
 #[doc(hidden)]
 pub fn bincode_encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    bincode::serialize(value).map_err(|e| RpcError::runtime_error(format!("bincode encode: {e}")))
+    bincode::serialize(value)
+        .map_err(|e| RpcError::runtime_error(format!("bincode encode: {}", bincode_error_kind(&e))))
+}
+
+/// Name a bincode error by its kind alone.
+///
+/// A bincode/serde error's text can quote the value it choked on (serde's
+/// `invalid value: string "..."`), and stream state is whatever the call was
+/// given, secrets included. These errors travel to clients and logs, so they
+/// carry the error type and never the message.
+fn bincode_error_kind(e: &bincode::Error) -> &'static str {
+    match **e {
+        bincode::ErrorKind::Io(_) => "Io",
+        bincode::ErrorKind::InvalidUtf8Encoding(_) => "InvalidUtf8Encoding",
+        bincode::ErrorKind::InvalidBoolEncoding(_) => "InvalidBoolEncoding",
+        bincode::ErrorKind::InvalidCharEncoding => "InvalidCharEncoding",
+        bincode::ErrorKind::InvalidTagEncoding(_) => "InvalidTagEncoding",
+        bincode::ErrorKind::DeserializeAnyNotSupported => "DeserializeAnyNotSupported",
+        bincode::ErrorKind::SizeLimit => "SizeLimit",
+        bincode::ErrorKind::SequenceMustHaveLength => "SequenceMustHaveLength",
+        bincode::ErrorKind::Custom(_) => "Custom",
+    }
 }
 
 /// Hard ceiling on the number of bytes `bincode_decode` will allocate
@@ -55,5 +76,5 @@ pub fn bincode_decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
         .with_fixint_encoding()
         .with_limit(MAX_STATE_DECODE_BYTES)
         .deserialize(bytes)
-        .map_err(|e| RpcError::runtime_error(format!("bincode decode: {e}")))
+        .map_err(|e| RpcError::runtime_error(format!("bincode decode: {}", bincode_error_kind(&e))))
 }

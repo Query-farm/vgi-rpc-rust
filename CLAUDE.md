@@ -346,10 +346,16 @@ they rebuild the hook and reset its in-flight call table):
   `claims`. `access_log::no_redaction` opts out. A redactor that panics fails
   closed (claims dropped, never emitted raw).
 - `with_max_record_bytes(n)` — per-record cap, default 1 MiB. Sheds
-  `request_data`, then `claims`, then all but the required envelope.
-- `with_verbose(true)` — log `request_data` verbatim. Off by default, which is
-  what `truncated: "payload_omitted"` reports; `truncated: true` is reserved
-  for genuine size-driven shedding.
+  `claims`, then all but the required envelope.
+- **No payload values, at any level, and no switch for them.** The request is
+  described by `request_fields` (`[{name, type}]`) and `request_rows`; HTTP
+  stream state by `request_state_bytes` / `response_state_bytes`.
+  `DispatchInfo` carries only `request_shape` and the two sizes, so no hook
+  can see a payload or decrypted state either. The framework cannot know
+  which parameters are secret (VGI's `catalog_attach` carries API keys). Unary
+  records still carry `truncated: "payload_omitted"` until CI validates
+  against vgi-rpc >= 0.50.1 (0.50.0's schema requires `request_data` on a
+  unary record unless it is marked truncated).
 - `AccessLogHook::buffered(sink, version, capacity)` — async emission. Bounded,
   never blocks, and a full queue drops; the next record through reports
   `dropped_records`. Opt-in because it trades durability.
@@ -376,16 +382,15 @@ contract drifted anyway. To reproduce a CI failure locally:
 ```bash
 cargo build --release -p vgi-rpc-conformance-rust
 ~/Development/vgi-rpc-python/.venv/bin/vgi-rpc-test \
-  --cmd "target/release/vgi-rpc-conformance-rust --access-log /tmp/rust-al.jsonl --access-log-debug" \
-  --access-log /tmp/rust-al.jsonl \
-  --require-request-data
+  --cmd "target/release/vgi-rpc-conformance-rust --access-log /tmp/rust-al.jsonl" \
+  --access-log /tmp/rust-al.jsonl
 ```
 
 Exit 0 means every conformance test passed **and** every record validated
-against `vgi_rpc/access_log.schema.json`. `--access-log-debug` is what puts
-`request_data` on the record (DEBUG-equivalent, `with_verbose`); without it
-every rule governing that field is satisfied vacuously, which is what
-`--require-request-data` turns into a failure. Do not narrow the run with a
+against `vgi_rpc/access_log.schema.json`, which forbids `request_data`,
+`request_state` and `response_state`. (`--require-request-data` and the
+worker's `--access-log-debug` are gone: both existed to put payloads in the
+log.) Do not narrow the run with a
 `--filter` that drops the zero-parameter methods (`void*`) — an empty schema
 with no row is the case a row-demanding validator gets wrong.
 | `OtelHook`       | `otel`       | `otel`   | `tracing::info!(target: "vgi_rpc.otel", ...)` spans + in-memory counters. |

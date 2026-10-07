@@ -137,21 +137,26 @@ pub struct DispatchInfo {
     pub remote_addr: String,
     /// HTTP transport: response status; 0 when not applicable.
     pub http_status: u16,
-    /// Self-contained Arrow IPC stream of the request batch (unary + stream init only).
-    pub request_data: Vec<u8>,
+    /// The request's *shape* -- parameter names, Arrow types and row count --
+    /// on unary calls and stream `init` turns; `None` on stream continuations.
+    ///
+    /// Never the values. The framework cannot know which parameters are
+    /// secret (a VGI `catalog_attach` carries API keys and passwords in its
+    /// options), so a payload reaching any log is a credential leak. The
+    /// access log reports this as `request_fields` / `request_rows`.
+    pub request_shape: Option<RequestShape>,
     /// Stream lifecycle identifier (32-char lowercase hex); empty on unary.
     pub stream_id: String,
-    /// The **decrypted** outbound stream state, in the server's own state
-    /// encoding — what `access-log-spec.md` calls `response_state`. Set on a
-    /// stream `init` and on any continuation that hands back a cursor;
-    /// deliberately empty on the terminal turn, because "the stream ended"
-    /// and "the stream is resumable from here" are the two things a reader
-    /// reconstructing a stream from its records has to tell apart.
-    ///
-    /// Plaintext, not the AEAD-sealed token that travels on the wire: a log
-    /// reader holds no key, so logging the ciphertext would record a value
-    /// nobody can ever decode.
-    pub response_state: Vec<u8>,
+    /// Size in bytes of the stream state received on an HTTP continuation
+    /// (`request_state_bytes`). The state itself is never exposed to hooks.
+    pub request_state_bytes: Option<u64>,
+    /// Size in bytes of the stream state handed back on this turn
+    /// (`response_state_bytes`): set on a stream `init` and on any
+    /// continuation that hands back a cursor; `None` on the terminal turn,
+    /// which is how a reader tells "the stream ended" from "resumable from
+    /// here". The state itself -- which serializes whatever the call was
+    /// given, and is replayable -- is never exposed to hooks.
+    pub response_state_bytes: Option<u64>,
     /// True when a stream was cancelled by the client.
     pub cancelled: bool,
     /// Authentication claims — e.g. decoded JWT claims, X.509 cert
@@ -178,6 +183,32 @@ pub struct DispatchInfo {
     /// Where a hook parks a record it cannot finish yet. `None` means emit
     /// inline. See [`AccessSink`].
     pub access_sink: Option<AccessSink>,
+}
+
+/// The shape of a request batch, without any of its values: one
+/// `(name, Arrow type)` pair per parameter in schema order, and the row
+/// count (1, or 0 for a zero-parameter call).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestShape {
+    /// `(name, type)` per parameter; the type is the Arrow type rendered as text.
+    pub fields: Vec<(String, String)>,
+    /// Row count of the request batch.
+    pub rows: usize,
+}
+
+impl RequestShape {
+    /// Describe `batch` by its schema and row count. Reads no column data.
+    pub fn of(batch: &arrow_array::RecordBatch) -> Self {
+        Self {
+            fields: batch
+                .schema_ref()
+                .fields()
+                .iter()
+                .map(|f| (f.name().clone(), f.data_type().to_string()))
+                .collect(),
+            rows: batch.num_rows(),
+        }
+    }
 }
 
 impl DispatchInfo {
@@ -215,9 +246,10 @@ impl DispatchInfo {
             authenticated: auth.authenticated,
             remote_addr: String::new(),
             http_status: 0,
-            request_data: Vec::new(),
+            request_shape: None,
             stream_id: String::new(),
-            response_state: Vec::new(),
+            request_state_bytes: None,
+            response_state_bytes: None,
             cancelled: false,
             claims: auth.claims.clone(),
             request_bytes: None,

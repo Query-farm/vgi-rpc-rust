@@ -203,9 +203,10 @@ The wire protocol matches Python's `vgi_rpc` canonical:
   `WIRE_PROTOCOL.md §14`, identical in every port.
 - Access log records carry `logger: "vgi_rpc.access"` and validate
   cleanly against Python's `vgi_rpc.access_log_conformance` JSON
-  Schema. `request_data` is truncated at INFO level (replaced with
-  `original_request_bytes` + `truncated: true`) — opt in via
-  `AccessLogHook::with_verbose(true)` to get full payloads.
+  Schema. No request or response payload is logged at any level (the
+  framework cannot know which parameters are secret): the request is
+  described by `request_fields` (names + Arrow types) and `request_rows`,
+  HTTP stream state by `request_state_bytes` / `response_state_bytes`.
 - HTTP stream-state tokens are HMAC-SHA256-signed (token format v3,
   identical byte layout to Python's `_state_token.py`); set an
   explicit signing key with `HttpStateBuilder::signing_key_*` so

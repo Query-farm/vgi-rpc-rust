@@ -3923,11 +3923,8 @@ async fn unary_dispatch(
     if hook.is_some() {
         dispatch_info.request_bytes = Some(request_wire_bytes);
         dispatch_info.access_sink = access_sink.clone();
-        // Best-effort self-contained IPC bytes of the request batch for
-        // `request_data`; a failure here must not abort dispatch.
-        if let Ok(bytes) = crate::server::serialize_request_batch(&req.batch) {
-            dispatch_info.request_data = bytes;
-        }
+        // The request's shape (names, types, rows) -- never its values.
+        dispatch_info.request_shape = Some(crate::hooks::RequestShape::of(&req.batch));
     }
     let hook_token = hook.as_ref().map(|h| h.on_dispatch_start(&dispatch_info));
     // Externalised uploads never reach the HTTP body, so they are counted
@@ -4186,10 +4183,9 @@ impl StreamAccessRecord {
     /// Open the record for one turn.
     ///
     /// `request_batch` is `Some` only on `/init`: `access-log-spec.md` puts
-    /// `request_data` on the init record alone, because a continuation's body
-    /// is a cursor and whatever the caller is feeding back in, not the call's
-    /// arguments -- logging it on every turn would multiply the payload by the
-    /// length of the stream while adding nothing.
+    /// `request_fields` / `request_rows` on the init record alone, because a
+    /// continuation's body is a cursor and whatever the caller is feeding back
+    /// in, not the call's arguments.
     fn begin(
         server: &Arc<crate::server::RpcServer>,
         req: &Request,
@@ -4218,12 +4214,8 @@ impl StreamAccessRecord {
         info.request_bytes = Some(request_wire_bytes);
         let sink = crate::hooks::AccessSink::new();
         info.access_sink = Some(sink.clone());
-        if let Some(batch) = request_batch {
-            // Best-effort; a failure here must not abort dispatch.
-            if let Ok(bytes) = crate::server::serialize_request_batch(batch) {
-                info.request_data = bytes;
-            }
-        }
+        // The request's shape (names, types, rows) -- never its values.
+        info.request_shape = request_batch.map(crate::hooks::RequestShape::of);
         let token = hook.on_dispatch_start(&info);
         Some(Self {
             hook,
@@ -4238,7 +4230,9 @@ impl StreamAccessRecord {
     /// Left unset on the terminal turn -- that absence is how a reader tells
     /// "the stream ended" from "resume from here".
     fn set_response_state(&mut self, state_bytes: Vec<u8>) {
-        self.info.response_state = state_bytes;
+        // The size only: the state serializes whatever the call was given.
+        self.info.response_state_bytes =
+            (!state_bytes.is_empty()).then_some(state_bytes.len() as u64);
     }
 
     /// Bytes this turn pushed to external storage. They never reach the HTTP
@@ -4604,11 +4598,9 @@ async fn stream_init_dispatch(
 /// Mint a stream's pair of tokens at `/init`: the call token, which carries
 /// everything fixed for the life of the call, and the first cursor.
 ///
-/// Returns the plaintext state bytes alongside the tokens. The access log's
-/// `response_state` is the *decrypted* state, and re-encoding it at the emit
-/// site would call the handler's `encode_state` a second time — an
-/// application-supplied method, free to be expensive and not obliged to be
-/// pure. One encode, two consumers.
+/// Returns the plaintext state bytes alongside the tokens, so the access log
+/// can report `response_state_bytes` without calling the handler's
+/// `encode_state` a second time. Only the size is ever logged.
 fn build_init_tokens(
     state: &Arc<HttpState>,
     auth: &crate::auth::AuthContext,
@@ -5091,7 +5083,15 @@ async fn stream_exchange_dispatch(
         crate::server::call_guard(|| decoder(&unpacked.state_bytes)).and_then(|result| result)
     }) {
         Ok(s) => s,
-        Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
+        Err(err) => {
+            // The decoder ran over *decrypted* state, and an application
+            // decoder's message may quote it. Report the error type only.
+            let err = RpcError::runtime_error(format!(
+                "Stream state could not be decoded ({})",
+                err.error_type
+            ));
+            return arrow_error(&state, StatusCode::BAD_REQUEST, &err, "");
+        }
     };
 
     let mut req = Request {
@@ -5109,8 +5109,8 @@ async fn stream_exchange_dispatch(
     // The stream id comes back out of the call token, so every continuation
     // files under the id `/init` minted -- including one that lands on a
     // different worker than the one that opened the stream, which is the whole
-    // point of a stateless continuation. `request_data` is deliberately not
-    // set: the spec puts the call's arguments on the init record alone.
+    // point of a stateless continuation. No request shape is set: the spec
+    // describes the call's arguments on the init record alone.
     let mut record = StreamAccessRecord::begin(
         &server,
         &req,
@@ -5122,6 +5122,8 @@ async fn stream_exchange_dispatch(
     );
     if let Some(record) = record.as_mut() {
         record.set_cancelled(cancelled);
+        // The size of the state received, never the state itself.
+        record.info.request_state_bytes = Some(unpacked.state_bytes.len() as u64);
         record.stats.input_batches = 1;
         record.stats.input_rows = batch.num_rows() as u64;
     }
@@ -5193,7 +5195,7 @@ async fn stream_exchange_dispatch(
             stamp_session_headers(&mut resp, &state, s);
         }
         // A cancel turn is terminal, so it hands back no cursor and carries no
-        // `response_state`.
+        // `response_state_bytes`.
         finish_stream_record(record, cancel_result.as_ref().err(), &mut resp);
         return resp;
     }

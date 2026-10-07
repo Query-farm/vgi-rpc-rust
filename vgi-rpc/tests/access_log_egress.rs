@@ -157,6 +157,6 @@ async fn http_records_describe_the_request_never_its_payload() {
     assert!(record["request_rows"].is_u64(), "{record}");
     assert!(record.get("request_data").is_none());
     assert!(record.get("original_request_bytes").is_none());
-    // Transitional marker for vgi-rpc 0.50.0's schema (see access_log.rs).
-    assert_eq!(record["truncated"], "payload_omitted");
+    // Nothing is omitted, so no truncation marker (vgi-rpc 0.50.1).
+    assert!(record.get("truncated").is_none(), "{record}");
 }

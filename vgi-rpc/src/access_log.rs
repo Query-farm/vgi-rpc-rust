@@ -621,14 +621,6 @@ impl DispatchHook for AccessLogHook {
             rec.insert("request_fields".into(), json!(fields));
             rec.insert("request_rows".into(), json!(shape.rows));
         }
-        // Transitional: vgi-rpc 0.50.0's schema requires `request_data` on
-        // every unary record unless the record is marked truncated. The
-        // reference (>= 0.50.1) forbids `request_data` and still accepts this
-        // legacy marker, so it satisfies both validators.
-        // Remove once CI validates against vgi-rpc >= 0.50.1.
-        if info.method_type == "unary" {
-            rec.insert("truncated".into(), json!("payload_omitted"));
-        }
         if info.method_type == "stream" {
             let sid = if info.stream_id.is_empty() {
                 random_stream_id()
@@ -884,8 +876,8 @@ mod tests {
         for forbidden in ["request_data", "request_state", "response_state"] {
             assert!(rec.get(forbidden).is_none(), "{forbidden} in {rec}");
         }
-        // Transitional marker for the 0.50.0 schema (see the emit site).
-        assert_eq!(rec["truncated"], "payload_omitted");
+        // Nothing is omitted, so no truncation marker (vgi-rpc 0.50.1).
+        assert!(rec.get("truncated").is_none(), "{rec}");
         assert!(rec.get("original_request_bytes").is_none());
     }
 

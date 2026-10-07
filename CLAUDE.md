@@ -352,10 +352,9 @@ they rebuild the hook and reset its in-flight call table):
   stream state by `request_state_bytes` / `response_state_bytes`.
   `DispatchInfo` carries only `request_shape` and the two sizes, so no hook
   can see a payload or decrypted state either. The framework cannot know
-  which parameters are secret (VGI's `catalog_attach` carries API keys). Unary
-  records still carry `truncated: "payload_omitted"` until CI validates
-  against vgi-rpc >= 0.50.1 (0.50.0's schema requires `request_data` on a
-  unary record unless it is marked truncated).
+  which parameters are secret (VGI's `catalog_attach` carries API keys). Records
+  carry no `truncated: "payload_omitted"` marker: nothing is omitted, and the
+  reference stopped emitting it in 0.50.1.
 - `AccessLogHook::buffered(sink, version, capacity)` — async emission. Bounded,
   never blocks, and a full queue drops; the next record through reports
   `dropped_records`. Opt-in because it trades durability.

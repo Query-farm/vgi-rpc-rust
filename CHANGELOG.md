@@ -2,6 +2,15 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased]
+
+### Changed
+
+- Unary access-log records no longer carry the transitional
+  `truncated: "payload_omitted"` marker, matching the vgi-rpc 0.50.1
+  reference: nothing is omitted, so `truncated` again appears only when the
+  size cap sheds a record.
+
 ## [0.31.2] — 2026-10-07
 
 ### Security

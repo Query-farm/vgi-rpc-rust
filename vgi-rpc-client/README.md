@@ -157,6 +157,51 @@ let mut client = RpcClient::tls_tcp_connect(
 )?;
 ```
 
+## Discovering what a server hosts
+
+`list_protocols` and `describe_protocol` ask `vgi_rpc.Reflection.v1` over a
+client you already hold -- an `RpcClient` on any byte-stream transport
+(subprocess, pipe, shm, unix, TCP, TLS, raw Iroh) or an `HttpClient` (HTTP,
+HTTP over Iroh), bound to any protocol. The client's own connection is reused
+and never closed; the reflection request names `vgi_rpc.Reflection.v1` in its
+routing key, so the client's bound protocol does not matter.
+
+```rust,no_run
+use vgi_rpc_client::{describe_protocol, list_protocols, ReflectionError, RpcClient};
+
+# fn main() -> vgi_rpc_client::Result<()> {
+let mut client = RpcClient::connect(&["my-worker"])?.protocol("MyService");
+match list_protocols(&mut client) {
+    Ok(hosted) => {
+        // Server order: application protocols (primary first), then the
+        // framework's own. Each `HostedProtocol` carries name, version, hash,
+        // deprecated, deprecation_message and features.
+        for p in &hosted {
+            println!("{} {} {}", p.name, p.version, p.hash);
+        }
+        let description = describe_protocol(&mut client, &hosted[0].name)?;
+        println!("{}", description.methods.len());
+    }
+    // The server does not host reflection. Never an inferred listing; the
+    // connection is still usable.
+    Err(ReflectionError::NotSupported(e)) => eprintln!("no reflection: {}", e.message),
+    Err(e) => return Err(e.into()),
+}
+# Ok(()) }
+```
+
+The same calls are methods: `client.list_protocols()`,
+`client.describe_protocol(name)`. `describe_protocol` lists first, so a server
+without reflection is `ReflectionError::NotSupported` while an unknown name is
+`ReflectionError::Rpc` with `error_kind == "protocol_not_supported"`.
+`NotSupported` covers `protocol_not_supported` / `method_not_implemented` /
+`UNIMPLEMENTED` answers to `list_protocols` and an HTTP bare 404, and derefs to
+the server's `RpcError` fields.
+
+A Rust `vgi_rpc` server always hosts reflection. The Python reference hosts it
+only when built with `enable_describe=True` (the conformance worker's
+`--describe`); its default is off.
+
 ## Features
 
 | feature | default | what it adds |

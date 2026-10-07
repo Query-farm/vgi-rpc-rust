@@ -164,6 +164,14 @@ async fn one_connection_multiplexes_stateful_transports_with_one_identity_snapsh
 
         let (first, _) = client.call_unary("identity", &params, None).unwrap();
         let first = first.column(0).as_string::<i32>().value(0).to_owned();
+        // Reflection over this raw Iroh logical transport; the identity call
+        // below is the proof it stayed open and in sync.
+        let hosted = vgi_rpc_client::list_protocols(&mut client).unwrap();
+        assert_eq!(hosted[0].name, "Service");
+        assert!(hosted.iter().any(|p| p.name == "vgi_rpc.Reflection.v1"));
+        let description = vgi_rpc_client::describe_protocol(&mut client, "Service").unwrap();
+        assert!(description.methods.contains_key("identity"));
+        assert_eq!(description.protocol_hash, hosted[0].hash);
         let (second, _) = client.call_unary("identity", &params, None).unwrap();
         assert_eq!(second.column(0).as_string::<i32>().value(0), first);
 

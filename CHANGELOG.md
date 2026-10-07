@@ -2,6 +2,38 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased]
+
+### Added
+
+- Public reflection client, matching vgi-rpc 0.50.0:
+  `vgi_rpc_client::list_protocols(&mut target) -> Vec<HostedProtocol>` and
+  `describe_protocol(&mut target, name) -> ServiceDescription`, also as
+  `RpcClient` / `HttpClient` methods. `target` is any client the crate hands
+  out (subprocess, pipe, shm, unix, TCP, TLS, raw Iroh, HTTP, HTTP over Iroh),
+  bound to any protocol; its own connection is reused and never closed
+  (`ReflectionTarget` is sealed, the per-transport hook private).
+- `HostedProtocol { name, version, hash, deprecated, deprecation_message,
+  features }`, in server order.
+- `ReflectionError::{NotSupported, Rpc}` and `ReflectionNotSupportedError`
+  (derefs to the server's `RpcError`): `protocol_not_supported`,
+  `method_not_implemented` or `UNIMPLEMENTED` answers to `list_protocols`, and
+  an HTTP bare 404, are "no reflection" -- never an inferred listing; the
+  connection stays usable. `describe_protocol` lists first, so an unknown
+  name is `Rpc` with `error_kind = "protocol_not_supported"`.
+
+### Changed
+
+- `RpcClient::list_protocols` / `HttpClient::list_protocols` return
+  `Result<Vec<HostedProtocol>, ReflectionError>` (was `ProtocolList` of
+  `ProtocolSummary`, both now crate-private); `describe_protocol` lists first,
+  fills `server_id` / `request_version`, and returns `ReflectionError`.
+  `reflection_payload`, `parse_protocol_list` and `parse_service_description`
+  are no longer public.
+- `HttpClient`: a failure status whose body is not Arrow is now
+  `HttpError` "HTTP {status}: response is not a valid Arrow IPC stream …", as
+  in the reference client, rather than an IPC decode error that hid the status.
+
 ## [0.30.0] — 2026-10-06
 
 ### Added

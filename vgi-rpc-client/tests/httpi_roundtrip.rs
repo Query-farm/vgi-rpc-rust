@@ -234,6 +234,21 @@ fn typed_unary_capabilities_and_describe_over_httpi() {
         .unwrap()
         .methods
         .contains_key("echo_string"));
+    // Reflection over the held HTTPi client, which stays usable after.
+    let hosted = vgi_rpc_client::list_protocols(&mut client).expect("list over HTTPi");
+    assert_eq!(hosted[0].name, "Service");
+    assert!(hosted.iter().any(|p| p.name == "vgi_rpc.Reflection.v1"));
+    let desc = vgi_rpc_client::describe_protocol(&mut client, "Service").expect("describe");
+    assert_eq!(desc.protocol_hash, hosted[0].hash);
+    assert!(matches!(
+        vgi_rpc_client::describe_protocol(&mut client, "nope.v1"),
+        Err(vgi_rpc_client::ReflectionError::Rpc(e))
+            if e.error_kind.as_deref() == Some("protocol_not_supported")
+    ));
+    let (batch, _) = client
+        .call_unary("echo_string", &params, None)
+        .expect("unary after reflection");
+    assert_eq!(batch.column(0).as_string::<i32>().value(0), "echo: native");
     assert!(
         client
             .capabilities()

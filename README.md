@@ -93,7 +93,6 @@ async fn main() {
         .server_id("my-server-1")
         .protocol_name("MyService")
         .server_version(env!("CARGO_PKG_VERSION"))
-        .enable_describe(true)
         .build();
 
     let result_schema: Arc<Schema> = Arc::new(Schema::new(vec![

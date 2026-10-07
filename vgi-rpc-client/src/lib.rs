@@ -46,7 +46,10 @@ pub use httpi::{HttpiClientBuilder, HttpiTarget};
 
 pub use client::{ClientTransportOptions, OnLog, RpcClient, StreamKind, StreamSession};
 pub use envelope::{classify, BatchKind};
-pub use introspect::{MethodDescription, ServiceDescription};
+pub use introspect::{
+    describe_protocol, list_protocols, HostedProtocol, MethodDescription, ReflectionError,
+    ReflectionNotSupportedError, ReflectionTarget, ServiceDescription,
+};
 pub use transport::{
     PipeTransport, Socks5hProxy, StderrMode, SubprocessTransport, TcpTransport, Transport,
 };

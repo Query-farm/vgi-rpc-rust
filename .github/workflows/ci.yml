@@ -346,6 +346,17 @@ jobs:
           cargo test -p vgi-rpc-client --test python_native_client
           -- --ignored --nocapture
 
+      # list_protocols / describe_protocol against the reference on pipe, shm,
+      # unix, TCP and HTTP -- and against a reference built without
+      # reflection, which no Rust server can stand in for.
+      - name: Verify the reflection client against Python
+        if: matrix.role == 'client' && matrix.server == 'python'
+        env:
+          VGI_RPC_PYTHON: python
+        run: >-
+          cargo test -p vgi-rpc-client --features shm --test reflection_python
+          -- --ignored --nocapture
+
       # Access-log conformance was verified by hand for months and drifted
       # anyway — four people checked it by inspection and the rule was still
       # wrong. It runs here now so it cannot silently rot again.

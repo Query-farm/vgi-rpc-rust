@@ -46,8 +46,8 @@ pub use crate::http_executor::{
     ExecutorCaps, HttpExecError, HttpExecutor, HttpRequest, HttpResponse,
 };
 use crate::introspect::{
-    describe_params, empty_schema, no_application_protocol, parse_protocol_list,
-    parse_service_description, reflection_payload, ProtocolList, ServiceDescription,
+    describe_primary, reflection_payload, HostedProtocol, ReflectionCall, ReflectionError,
+    ServiceDescription,
 };
 use crate::request::{build_request_metadata, generate_request_id};
 
@@ -1283,6 +1283,21 @@ impl HttpClient {
             let txt = String::from_utf8_lossy(&bytes).to_string();
             return Err(RpcError::new("AuthenticationError", txt));
         }
+        // A failure status with a body that is not Arrow -- a bare 404 from a
+        // server older than protocol-scoped routes, or a proxy's error page --
+        // carries no error batch to decode. Report the status, as the
+        // reference client does, instead of an IPC decode failure that hides
+        // it: reflection reads `HTTP 404` as "not hosted".
+        if !status.is_success() && !is_arrow_content_type(&resp_headers) {
+            let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).to_string();
+            return Err(RpcError::new(
+                "HttpError",
+                format!(
+                    "HTTP {}: response is not a valid Arrow IPC stream (first 200 bytes: {preview:?})",
+                    status.as_u16()
+                ),
+            ));
+        }
         self.process_session_headers(&resp_headers);
         Ok(bytes)
     }
@@ -1499,56 +1514,25 @@ impl HttpClient {
         read_unary(&resp, &mut self.on_log, relax, external.as_ref())
     }
 
-    /// One unary call to `vgi_rpc.Reflection.v1`.
-    ///
-    /// HTTP addresses the application surface by URL path; a co-hosted
-    /// framework protocol is reached the same way identity is, by naming
-    /// itself in the request's routing key.
-    fn reflection_call(&mut self, method: &str, params: &RecordBatch) -> Result<RecordBatch> {
-        let (_id, md) = self.req_md_on(
-            Some(vgi_rpc::reflection::REFLECTION_PROTOCOL_NAME),
-            method,
-            None,
-        );
-        let body = write_one_batch(params, Some(&md))?;
-        // Protocol-qualified: reflection's `describe` collides with the
-        // human-facing describe page on the bare `/{method}` route, which
-        // answers GET and 405s a POST with an empty body.
-        let path = format!("{}/{method}", vgi_rpc::reflection::REFLECTION_PROTOCOL_NAME);
-        let resp = self.post(&path, body, true)?;
-        let relax = self.relax_nullability;
-        let external = self.external.clone();
-        let (batch, _md) = read_unary(&resp, &mut self.on_log, relax, external.as_ref())?;
-        reflection_payload(&batch)
+    /// What protocols this server hosts, via `vgi_rpc.Reflection.v1`, through
+    /// this client's own backend. See [`crate::list_protocols`].
+    pub fn list_protocols(&mut self) -> std::result::Result<Vec<HostedProtocol>, ReflectionError> {
+        crate::introspect::list_protocols(self)
     }
 
-    /// What protocols this server hosts, via `vgi_rpc.Reflection.v1`.
-    pub fn list_protocols(&mut self) -> Result<ProtocolList> {
-        let params = empty_batch(empty_schema().as_ref())?;
-        parse_protocol_list(&self.reflection_call("list_protocols", &params)?)
-    }
-
-    /// Describe one named protocol, in a single round trip.
-    ///
-    /// `server_id` and `request_version` come back empty; see
-    /// [`RpcClient::describe_protocol`](crate::RpcClient::describe_protocol).
-    pub fn describe_protocol(&mut self, protocol: &str) -> Result<ServiceDescription> {
-        let params = describe_params(protocol)?;
-        parse_service_description(&self.reflection_call("describe", &params)?, None)
+    /// Describe one named protocol through this client's own backend: lists
+    /// first, then describes. See [`crate::describe_protocol`].
+    pub fn describe_protocol(
+        &mut self,
+        protocol: &str,
+    ) -> std::result::Result<ServiceDescription, ReflectionError> {
+        crate::introspect::describe_protocol(self, protocol)
     }
 
     /// Describe the server's application protocol: `list_protocols`, then
-    /// `describe`. Name one with
-    /// [`describe_protocol`](Self::describe_protocol) to skip the first hop.
+    /// `describe`.
     pub fn describe(&mut self) -> Result<ServiceDescription> {
-        let listing = self.list_protocols()?;
-        let protocol = listing
-            .primary()
-            .ok_or_else(|| no_application_protocol(&listing))?
-            .protocol
-            .clone();
-        let params = describe_params(&protocol)?;
-        parse_service_description(&self.reflection_call("describe", &params)?, Some(&listing))
+        describe_primary(self)
     }
 
     /// Open a producer stream over HTTP.
@@ -1996,6 +1980,31 @@ fn unpack_resume_token(token: &str) -> (String, Option<String>) {
         Some(call.to_string())
     };
     (cursor.to_string(), call)
+}
+
+impl ReflectionCall for HttpClient {
+    /// One unary call to `vgi_rpc.Reflection.v1`.
+    ///
+    /// HTTP addresses the application surface by URL path; a co-hosted
+    /// framework protocol is reached the same way identity is, by naming
+    /// itself in the request's routing key.
+    fn reflection_call(&mut self, method: &str, params: &RecordBatch) -> Result<RecordBatch> {
+        let (_id, md) = self.req_md_on(
+            Some(vgi_rpc::reflection::REFLECTION_PROTOCOL_NAME),
+            method,
+            None,
+        );
+        let body = write_one_batch(params, Some(&md))?;
+        // Protocol-qualified: reflection's `describe` collides with the
+        // human-facing describe page on the bare `/{method}` route, which
+        // answers GET and 405s a POST with an empty body.
+        let path = format!("{}/{method}", vgi_rpc::reflection::REFLECTION_PROTOCOL_NAME);
+        let resp = self.post(&path, body, true)?;
+        let relax = self.relax_nullability;
+        let external = self.external.clone();
+        let (batch, _md) = read_unary(&resp, &mut self.on_log, relax, external.as_ref())?;
+        reflection_payload(&batch)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2634,6 +2643,15 @@ fn parse_caps(h: &HeaderMap) -> HttpServerCapabilities {
         supported_encodings: parse_supported_encodings(h)
             .unwrap_or_else(|| vec![DEFAULT_REQUEST_ENCODING.to_string()]),
     }
+}
+
+/// Whether the response declares the Arrow IPC stream media type.
+fn is_arrow_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case(ARROW_CONTENT_TYPE))
 }
 
 fn has_single_response_budget_support(headers: &HeaderMap) -> bool {

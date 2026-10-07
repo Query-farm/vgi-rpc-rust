@@ -14,8 +14,8 @@ use vgi_rpc::wire::{empty_batch, md_get, Metadata, StreamReader, StreamWriter};
 
 use crate::envelope::{classify, BatchKind};
 use crate::introspect::{
-    describe_params, empty_schema, no_application_protocol, parse_protocol_list,
-    parse_service_description, reflection_payload, ProtocolList, ServiceDescription,
+    describe_primary, empty_schema, reflection_payload, HostedProtocol, ReflectionCall,
+    ReflectionError, ServiceDescription,
 };
 use crate::pointer::{resolve_with, ExternalHandle};
 use crate::request::{build_request_metadata, generate_request_id};
@@ -534,62 +534,32 @@ impl RpcClient {
         })
     }
 
-    /// What protocols this server hosts, via `vgi_rpc.Reflection.v1`.
+    /// What protocols this server hosts, via `vgi_rpc.Reflection.v1`, over
+    /// this client's own connection. See [`crate::list_protocols`].
     ///
     /// The cheap question -- what is here, and has it changed -- and the only
-    /// one a warm client needs, because each entry's `protocol_hash` answers
-    /// "has it changed" without transferring a single schema.
-    pub fn list_protocols(&mut self) -> Result<ProtocolList> {
-        let params = empty_batch(empty_schema().as_ref())?;
-        let (batch, _md) = self.call_unary_on(
-            Some(vgi_rpc::reflection::REFLECTION_PROTOCOL_NAME),
-            "list_protocols",
-            &params,
-            None,
-        )?;
-        parse_protocol_list(&reflection_payload(&batch)?)
+    /// one a warm client needs, because each entry's `hash` answers "has it
+    /// changed" without transferring a single schema.
+    pub fn list_protocols(&mut self) -> std::result::Result<Vec<HostedProtocol>, ReflectionError> {
+        crate::introspect::list_protocols(self)
     }
 
-    /// Describe one named protocol, in a single round trip.
-    ///
-    /// `server_id` and `request_version` come back empty: they are properties
-    /// of the *server*, carried by [`list_protocols`](Self::list_protocols),
-    /// and a description deliberately carries no server identity -- two
-    /// processes serving the same protocol must describe it identically or the
-    /// description is not a property of the protocol. Use
-    /// [`describe`](Self::describe) when those fields are wanted.
-    pub fn describe_protocol(&mut self, protocol: &str) -> Result<ServiceDescription> {
-        let params = describe_params(protocol)?;
-        let (batch, _md) = self.call_unary_on(
-            Some(vgi_rpc::reflection::REFLECTION_PROTOCOL_NAME),
-            "describe",
-            &params,
-            None,
-        )?;
-        parse_service_description(&reflection_payload(&batch)?, None)
+    /// Describe one named protocol over this client's own connection: lists
+    /// first, then describes. See [`crate::describe_protocol`].
+    pub fn describe_protocol(
+        &mut self,
+        protocol: &str,
+    ) -> std::result::Result<ServiceDescription, ReflectionError> {
+        crate::introspect::describe_protocol(self, protocol)
     }
 
     /// Describe the server's application protocol.
     ///
     /// Two round trips -- `list_protocols`, then `describe` -- because a server
     /// may host several protocols, so there is no longer a single "the"
-    /// protocol to ask about without asking. Name one with
-    /// [`describe_protocol`](Self::describe_protocol) to skip the first hop.
+    /// protocol to ask about without asking.
     pub fn describe(&mut self) -> Result<ServiceDescription> {
-        let listing = self.list_protocols()?;
-        let protocol = listing
-            .primary()
-            .ok_or_else(|| no_application_protocol(&listing))?
-            .protocol
-            .clone();
-        let params = describe_params(&protocol)?;
-        let (batch, _md) = self.call_unary_on(
-            Some(vgi_rpc::reflection::REFLECTION_PROTOCOL_NAME),
-            "describe",
-            &params,
-            None,
-        )?;
-        parse_service_description(&reflection_payload(&batch)?, Some(&listing))
+        describe_primary(self)
     }
 
     /// Perform the `__transport_options__` capability handshake.
@@ -600,6 +570,20 @@ impl RpcClient {
             shm: md_get(&md, TRANSPORT_SHM_KEY) == Some("true"),
             raw: md,
         })
+    }
+}
+
+impl ReflectionCall for RpcClient {
+    /// The routing key names reflection, not the client's bound protocol, so
+    /// the request rides this client's byte stream to a co-hosted protocol.
+    fn reflection_call(&mut self, method: &str, params: &RecordBatch) -> Result<RecordBatch> {
+        let (batch, _md) = self.call_unary_on(
+            Some(vgi_rpc::reflection::REFLECTION_PROTOCOL_NAME),
+            method,
+            params,
+            None,
+        )?;
+        reflection_payload(&batch)
     }
 }
 

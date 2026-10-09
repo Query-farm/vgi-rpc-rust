@@ -423,8 +423,7 @@ fn refresh_jwks(
 /// returns the parsed [`Jwks`].
 #[cfg(feature = "jwt-jsonwebtoken")]
 pub fn reqwest_jwks_fetcher(url: &str) -> std::result::Result<Jwks, RpcError> {
-    // Neither the URL's `user:password@` nor its query reaches an error.
-    let shown = crate::external::redact_external_url(url);
+    let shown = redact_jwks_url(url);
     let resp = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -440,6 +439,19 @@ pub fn reqwest_jwks_fetcher(url: &str) -> std::result::Result<Jwks, RpcError> {
     }
     resp.json::<Jwks>()
         .map_err(|e| RpcError::runtime_error(format!("jwks JSON {shown}: {}", e.without_url())))
+}
+
+/// The JWKS URL as errors show it: no `user:password@`, query or fragment.
+#[cfg(feature = "jwt-jsonwebtoken")]
+fn redact_jwks_url(raw: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(raw) else {
+        return "<invalid JWKS URL>".to_string();
+    };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.to_string()
 }
 
 /// Build a verifier closure backed by the `jsonwebtoken` crate.

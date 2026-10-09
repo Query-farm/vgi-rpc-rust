@@ -3046,6 +3046,27 @@ mod tests {
         assert!(rendered.contains("/upload"));
     }
 
+    #[cfg(feature = "reqwest")]
+    #[test]
+    fn transport_errors_drop_url_credentials() {
+        // reqwest moves `user:password@` into an Authorization header before
+        // sending, so its errors show the URL without them. Port 1 on
+        // loopback refuses the connection at once.
+        let backend = HttpBackend::Reqwest(ReqwestClient::new());
+        let Err(failure) = backend.execute(
+            Method::POST,
+            "http://alice:s3cret@127.0.0.1:1/vgi/x".into(),
+            HeaderMap::new(),
+            Vec::new(),
+        ) else {
+            panic!("nothing listens on port 1");
+        };
+        let message = failure.error.message;
+        assert!(message.contains("error sending request"), "{message}");
+        assert!(!message.contains("alice"), "{message}");
+        assert!(!message.contains("s3cret"), "{message}");
+    }
+
     /// A builder whose backend never touches the network, so builder-level
     /// tests run with or without the `reqwest` feature.
     fn offline_builder() -> HttpClientBuilder {

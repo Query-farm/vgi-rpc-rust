@@ -184,7 +184,7 @@ pub fn validate_external_url(validator: &UrlValidator, raw: &str) -> Result<()> 
     })
 }
 
-fn redact_external_url(raw: &str) -> String {
+pub(crate) fn redact_external_url(raw: &str) -> String {
     let Ok(mut parsed) = url::Url::parse(raw) else {
         return "<invalid external URL>".to_string();
     };

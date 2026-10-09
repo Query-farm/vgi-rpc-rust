@@ -423,21 +423,23 @@ fn refresh_jwks(
 /// returns the parsed [`Jwks`].
 #[cfg(feature = "jwt-jsonwebtoken")]
 pub fn reqwest_jwks_fetcher(url: &str) -> std::result::Result<Jwks, RpcError> {
+    // Neither the URL's `user:password@` nor its query reaches an error.
+    let shown = crate::external::redact_external_url(url);
     let resp = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| RpcError::runtime_error(format!("jwks client: {e}")))?
         .get(url)
         .send()
-        .map_err(|e| RpcError::runtime_error(format!("jwks GET {url}: {e}")))?;
+        .map_err(|e| RpcError::runtime_error(format!("jwks GET {shown}: {}", e.without_url())))?;
     if !resp.status().is_success() {
         return Err(RpcError::runtime_error(format!(
-            "jwks GET {url} returned {}",
+            "jwks GET {shown} returned {}",
             resp.status()
         )));
     }
     resp.json::<Jwks>()
-        .map_err(|e| RpcError::runtime_error(format!("jwks JSON {url}: {e}")))
+        .map_err(|e| RpcError::runtime_error(format!("jwks JSON {shown}: {}", e.without_url())))
 }
 
 /// Build a verifier closure backed by the `jsonwebtoken` crate.
@@ -905,5 +907,19 @@ mod tests {
         let ctx = call(&auth, &fake_token_with_kid("k1")).unwrap();
         assert!(ctx.authenticated);
         assert_eq!(ctx.principal, "alice");
+    }
+
+    #[cfg(feature = "jwt-jsonwebtoken")]
+    #[test]
+    fn jwks_fetch_errors_drop_url_credentials() {
+        // Port 1 on loopback refuses the connection at once.
+        let message = reqwest_jwks_fetcher("http://alice:s3cret@127.0.0.1:1/jwks?key=q")
+            .err()
+            .unwrap()
+            .message;
+        assert!(message.contains("http://127.0.0.1:1/jwks"), "{message}");
+        for leaked in ["alice", "s3cret", "key=q"] {
+            assert!(!message.contains(leaked), "{message}");
+        }
     }
 }

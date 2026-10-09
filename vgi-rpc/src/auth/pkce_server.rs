@@ -669,6 +669,20 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn token_endpoint_errors_drop_url_credentials() {
+        // reqwest strips `user:password@` from the URL it reports. Port 1 on
+        // loopback refuses the connection at once.
+        let message = post_token_endpoint("http://alice:s3cret@127.0.0.1:1/token", Vec::new())
+            .await
+            .err()
+            .unwrap()
+            .message;
+        assert!(message.starts_with("token POST"), "{message}");
+        assert!(!message.contains("alice"), "{message}");
+        assert!(!message.contains("s3cret"), "{message}");
+    }
+
     #[test]
     fn sanitize_return_to_accepts_relative() {
         assert_eq!(sanitize_return_to(Some("/dashboard"), &[]), "/dashboard");

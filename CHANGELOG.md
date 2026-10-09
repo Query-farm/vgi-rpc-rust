@@ -2,6 +2,13 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased]
+
+### Security
+
+- `reqwest_jwks_fetcher` errors no longer echo the JWKS URL verbatim: a
+  `user:password@` or query string in it is dropped from every error.
+
 ## [0.31.3] — 2026-10-07
 
 ### Changed

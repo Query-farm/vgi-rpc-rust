@@ -666,7 +666,7 @@ pub(crate) fn schema_to_ipc(schema: &Schema) -> Result<Vec<u8>> {
 /// Write one batch as a complete unary response stream.
 ///
 /// Outlived `__describe__`, which is what it was written for: reflection and
-/// `vgi_rpc.Identity.v1` are ordinary unary methods served outside the
+/// `vgi_rpc.Identity.v2` are ordinary unary methods served outside the
 /// registered method table, and both frame their replies this way.
 pub fn write_unary_response<W: std::io::Write>(
     w: &mut W,

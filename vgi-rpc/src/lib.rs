@@ -50,7 +50,7 @@ pub mod reflection;
 #[cfg(feature = "stream-codec")]
 pub mod stream_codec;
 pub mod tcp;
-/// `vgi_rpc.Identity.v1` -- resolving an opaque credential to a principal, and
+/// `vgi_rpc.Identity.v2` -- resolving an opaque credential to a principal, and
 /// minting standing grants. Framework-owned and off unless configured.
 pub mod token_identity;
 pub mod transport;

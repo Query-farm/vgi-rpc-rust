@@ -482,7 +482,7 @@ jobs:
       # not find or could not audit. An exit code still does not say how much
       # was read, so `--verbose` is not decoration: the assertion below keeps
       # "this step passed" and "this step examined something" the same claim.
-      - name: Audit vgi_rpc.Identity.v1 invariants against the reference
+      - name: Audit vgi_rpc.Identity.v2 invariants against the reference
         working-directory: vgi-python
         env:
           VGI_RPC_REPOS: ${{ runner.temp }}/repos

@@ -1,5 +1,5 @@
-//! Bearer authenticators that close the `vgi_rpc.Identity.v1` loop
-//! (WIRE_PROTOCOL.md §16 "Accepting identity credentials", IDENTITY_V1_SPEC §9).
+//! Bearer authenticators that close the `vgi_rpc.Identity.v2` loop
+//! (WIRE_PROTOCOL.md §16 "Accepting identity credentials", IDENTITY_V2_SPEC §9).
 //!
 //! `issue_grant` mints a credential "presented later by unattended automation
 //! as an ordinary bearer", and `resolve_token` answers which principal an
@@ -13,7 +13,7 @@
 //! authenticator in the normative order -- the deployment's (JWT, static
 //! bearer, ...), then sealed grants (a cheap prefix check), then
 //! `resolve_token` -- and the HTTP transport calls it automatically for a
-//! server hosting `vgi_rpc.Identity.v1` with grant keys or a resolver.
+//! server hosting `vgi_rpc.Identity.v2` with grant keys or a resolver.
 //!
 //! Routing is by prefix and strict in both directions. A token without the
 //! `vgig1.` prefix never reaches the grant verifier. A token *with* it that
@@ -149,7 +149,7 @@ pub fn resolve_token_authenticate(resolve_token: TokenResolver) -> Authenticate 
 
 /// Append the identity bearer authenticators after the deployment's own.
 ///
-/// Order (IDENTITY_V1_SPEC §9.3): `deployment`, then sealed grants, then
+/// Order (IDENTITY_V2_SPEC §9.3): `deployment`, then sealed grants, then
 /// `resolve_token`. With neither identity source, `deployment` is returned
 /// unchanged. Otherwise:
 ///

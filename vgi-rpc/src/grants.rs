@@ -1,7 +1,7 @@
 //! Sealed grants: the framework's own `issue_grant` credential, and its
-//! verifier (IDENTITY_V1_SPEC.md §9, WIRE_PROTOCOL.md §16).
+//! verifier (IDENTITY_V2_SPEC.md §9, WIRE_PROTOCOL.md §16).
 //!
-//! `vgi_rpc.Identity.v1`'s `issue_grant` mints a standing delegation that
+//! `vgi_rpc.Identity.v2`'s `issue_grant` mints a standing delegation that
 //! unattended automation later presents *as an ordinary bearer*. Until this
 //! module nothing in this port accepted one: the loop was open. A sealed grant
 //! closes it without storage and without author code. When a deployment
@@ -483,7 +483,7 @@ pub fn mint_grant_token(
 
 /// Verify a sealed grant and return its claims.
 ///
-/// Order, normative (IDENTITY_V1_SPEC §9.1): prefix, length, canonical
+/// Order, normative (IDENTITY_V2_SPEC §9.1): prefix, length, canonical
 /// base64url, key id, AEAD open, strict payload, then lifetime -- the lifetime
 /// is inside the ciphertext, so it is trusted only after the tag verified.
 /// `now` overrides the clock (seconds), for tests.
@@ -550,7 +550,10 @@ pub fn sealed_mint_grant(keys: GrantKeys) -> GrantMinter {
             MintOverrides::default(),
         )
         .map_err(|e| grant_refused(e.message))?;
-        Ok(IssuedGrant::new(token, claims.expires_at as f64).with_grant_id(claims.grant_id))
+        Ok(
+            IssuedGrant::new(token, claims.expires_at.saturating_mul(1_000_000))
+                .with_grant_id(claims.grant_id),
+        )
     })
 }
 
@@ -719,6 +722,6 @@ mod tests {
         assert_eq!(claims.expires_at - claims.issued_at, 100);
         assert_eq!(claims.grant_id.len(), 32);
         assert_eq!(grant.grant_id, claims.grant_id);
-        assert_eq!(grant.expires_at, claims.expires_at as f64);
+        assert_eq!(grant.expires_at_micros, claims.expires_at * 1_000_000);
     }
 }

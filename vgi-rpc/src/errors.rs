@@ -42,7 +42,7 @@ pub struct RpcError {
     /// `error_type` names the *language* exception a port happened to raise,
     /// which differs across ports, while `error_kind` is the contract. It
     /// exists because some errors used to be distinguishable only by HTTP
-    /// status — `vgi_rpc.Identity.v1` was an HTTP route whose callers read
+    /// status — `vgi_rpc.Identity.v2` was an HTTP route whose callers read
     /// definitive-vs-transient off `404` versus `503`. As protocol methods
     /// every handler failure surfaces the same way, so without this a caller
     /// would have to substring-match a message to know whether retrying is

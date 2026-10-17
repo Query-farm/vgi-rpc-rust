@@ -56,7 +56,7 @@ pub fn build_server_with_id_and_hook(
     build_server_with_external_and_hook(None, server_id, Some(hook), None)
 }
 
-/// Build a conformance server that also co-hosts `vgi_rpc.Identity.v1`.
+/// Build a conformance server that also co-hosts `vgi_rpc.Identity.v2`.
 ///
 /// Backs the two identity fixtures the shared group needs. Deliberately a
 /// separate entry point rather than a default: the group asserts against the

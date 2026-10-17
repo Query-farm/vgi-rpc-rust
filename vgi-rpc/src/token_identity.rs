@@ -1,4 +1,4 @@
-//! `vgi_rpc.Identity.v1` -- resolving a credential, and minting a grant.
+//! `vgi_rpc.Identity.v2` -- resolving a credential, and minting a grant.
 //!
 //! Identity lives here, at the RPC layer, rather than in any application
 //! protocol: a bearer token is not an application concept, the auth primitives
@@ -52,7 +52,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use sha2::{Digest, Sha256};
 
 use crate::auth::AuthContext;
@@ -65,7 +65,7 @@ use crate::server::{CallContext, MethodInfo, Request};
 /// Under the reserved `vgi_rpc.` prefix because the framework defines it: an
 /// application that could claim this name could impersonate the surface a
 /// fronting proxy resolves identities against.
-pub const IDENTITY_PROTOCOL_NAME: &str = "vgi_rpc.Identity.v1";
+pub const IDENTITY_PROTOCOL_NAME: &str = "vgi_rpc.Identity.v2";
 
 /// Cap on a credential we will even attempt to resolve. Anything longer is not
 /// a bearer token; refusing early keeps a resolver from being handed megabytes.
@@ -299,22 +299,27 @@ pub struct IssuedGrant {
     /// brokered from the IdP are all equally valid and equally invisible
     /// here). Never parsed, never logged.
     pub token: String,
-    /// Unix timestamp after which the worker will stop honouring the grant.
+    /// When the worker will stop honouring the grant, as microseconds since
+    /// the Unix epoch (UTC). On the wire it is the non-nullable `expires_at`
+    /// column, `timestamp[us, tz="UTC"]` -- the same representation as
+    /// [`UploadUrl::expires_at_micros`](crate::external::UploadUrl).
+    ///
     /// Required *because* the framework cannot enforce it: the real lifetime
     /// lives inside the opaque token, so this is a declaration rather than an
     /// enforcement. A worker that must state a lifetime has thought about one.
-    pub expires_at: f64,
+    pub expires_at_micros: i64,
     /// Correlation handle for the audit trail. Not a credential and not secret
     /// -- it is what ties a mint record to later use.
     pub grant_id: String,
 }
 
 impl IssuedGrant {
-    /// A grant with no correlation handle.
-    pub fn new(token: impl Into<String>, expires_at: f64) -> Self {
+    /// A grant with no correlation handle. `expires_at_micros` is microseconds
+    /// since the Unix epoch (UTC).
+    pub fn new(token: impl Into<String>, expires_at_micros: i64) -> Self {
         Self {
             token: token.into(),
-            expires_at,
+            expires_at_micros,
             grant_id: String::new(),
         }
     }
@@ -578,7 +583,7 @@ impl IdentityImplBuilder {
         self
     }
 
-    /// Configure sealed grants (IDENTITY_V1_SPEC §9).
+    /// Configure sealed grants (IDENTITY_V2_SPEC §9).
     ///
     /// With keys, the framework mints sealed grants when no
     /// [`mint_grant`](Self::mint_grant) hook is supplied -- so `issue_grant`
@@ -864,7 +869,11 @@ pub fn token_identity_schema() -> SchemaRef {
 pub fn issued_grant_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("token", DataType::Utf8, false),
-        Field::new("expires_at", DataType::Float64, false),
+        Field::new(
+            "expires_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
         Field::new("grant_id", DataType::Utf8, false),
     ]))
 }
@@ -903,7 +912,10 @@ pub fn issued_grant_batch(grant: &IssuedGrant) -> Result<RecordBatch> {
         issued_grant_schema(),
         vec![
             Arc::new(arrow_array::StringArray::from(vec![grant.token.as_str()])) as ArrayRef,
-            Arc::new(arrow_array::Float64Array::from(vec![grant.expires_at])) as ArrayRef,
+            Arc::new(
+                arrow_array::TimestampMicrosecondArray::from(vec![grant.expires_at_micros])
+                    .with_timezone("UTC"),
+            ) as ArrayRef,
             Arc::new(arrow_array::StringArray::from(vec![grant
                 .grant_id
                 .as_str()])) as ArrayRef,
@@ -1047,10 +1059,11 @@ mod tests {
     fn minter() -> GrantMinter {
         Arc::new(
             |principal: &str, _purpose: &str, _scopes: &[String], ttl: i64| {
-                Ok(
-                    IssuedGrant::new(format!("grant-for-{principal}"), now_unix() + ttl as f64)
-                        .with_grant_id("g1"),
+                Ok(IssuedGrant::new(
+                    format!("grant-for-{principal}"),
+                    ((now_unix() + ttl as f64) * 1e6) as i64,
                 )
+                .with_grant_id("g1"))
             },
         )
     }
@@ -1168,17 +1181,17 @@ mod tests {
     fn matches_the_reference_hash_vectors() {
         assert_eq!(
             hash_for(&["introspect_token", "issue_grant"]),
-            "8317f2ad8e2476bb99e8b94800ab79b19a8cf0c6bdd6d66c2d82bd62ffbe69d5",
+            "145267755ff90d5c3313d79c7ff771306f2530626380d01cb0e57a951d0f9ec3",
             "both methods"
         );
         assert_eq!(
             hash_for(&["introspect_token"]),
-            "27b75bef22e4c70baab92a5188a473506b89055d2cb2b58cc187f6fe7a436385",
+            "4039fbf6db3e64ae234e0be605b977477150ace892f10b6c691920eaf925e7ac",
             "introspect_token only"
         );
         assert_eq!(
             hash_for(&["issue_grant"]),
-            "c71b12f453310139b6b6a445378064661c52711d03ae1e4fba29b8f7976ef4d8",
+            "4199df7403c9ca1a02c4c524b405a999eb1489614a1480873ffc23a0e5b0d312",
             "issue_grant only"
         );
     }
@@ -1207,7 +1220,7 @@ mod tests {
             crate::protocol_hash::canonical_description(IDENTITY_PROTOCOL_NAME, &entries).unwrap();
         assert_eq!(
             preimage,
-            r#"{"methods":[{"has_header":false,"has_return":true,"name":"introspect_token","params":[{"name":"token","nullable":false,"type":"utf8"}],"result":[{"name":"result","nullable":false,"type":"binary"}],"type":"unary"},{"has_header":false,"has_return":true,"name":"issue_grant","params":[{"name":"purpose","nullable":false,"type":"utf8"},{"name":"scopes","nullable":false,"type":"list<item?:utf8>"},{"name":"ttl_seconds","nullable":false,"type":"int64"}],"result":[{"name":"result","nullable":false,"type":"binary"}],"type":"unary"}],"protocol":"vgi_rpc.Identity.v1"}"#
+            r#"{"methods":[{"has_header":false,"has_return":true,"name":"introspect_token","params":[{"name":"token","nullable":false,"type":"utf8"}],"result":[{"name":"result","nullable":false,"type":"binary"}],"type":"unary"},{"has_header":false,"has_return":true,"name":"issue_grant","params":[{"name":"purpose","nullable":false,"type":"utf8"},{"name":"scopes","nullable":false,"type":"list<item?:utf8>"},{"name":"ttl_seconds","nullable":false,"type":"int64"}],"result":[{"name":"result","nullable":false,"type":"binary"}],"type":"unary"}],"protocol":"vgi_rpc.Identity.v2"}"#
         );
     }
 
@@ -1468,7 +1481,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(grant.token, "grant-for-alice");
-        assert!(grant.expires_at > now_unix());
+        assert!(grant.expires_at_micros as f64 / 1e6 > now_unix());
     }
 
     /// Cross-subject minting is closed by construction, not by a check.
@@ -1494,7 +1507,7 @@ mod tests {
             .mint_grant(Arc::new(
                 move |principal: &str, _p: &str, _s: &[String], _t: i64| {
                     *spy.lock().unwrap() = principal.to_string();
-                    Ok(IssuedGrant::new("t", 0.0))
+                    Ok(IssuedGrant::new("t", 0))
                 },
             ))
             .build();
@@ -1856,7 +1869,32 @@ mod tests {
         let schema = issued_grant_schema();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["token", "expires_at", "grant_id"]);
-        let batch = issued_grant_batch(&IssuedGrant::new("tok", 1.0)).unwrap();
+        let expires = schema.field_with_name("expires_at").unwrap();
+        assert_eq!(
+            expires.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(!expires.is_nullable());
+        let batch = issued_grant_batch(&IssuedGrant::new("tok", 1_893_456_000_000_000)).unwrap();
         assert_eq!(batch.num_rows(), 1);
+        // The payload is nested; decode it and confirm the instant survives.
+        let nested = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .unwrap()
+            .value(0)
+            .to_vec();
+        let reader =
+            arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(nested), None).unwrap();
+        let payload = reader.into_iter().next().unwrap().unwrap();
+        let col = payload
+            .column_by_name("expires_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(col.value(0), 1_893_456_000_000_000);
+        assert_eq!(col.timezone(), Some("UTC"));
     }
 }

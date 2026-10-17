@@ -651,8 +651,8 @@ impl HttpStateBuilder {
         self
     }
 
-    /// Whether to accept `vgi_rpc.Identity.v1` credentials as bearers
-    /// (default `true`; IDENTITY_V1_SPEC §9).
+    /// Whether to accept `vgi_rpc.Identity.v2` credentials as bearers
+    /// (default `true`; IDENTITY_V2_SPEC §9).
     ///
     /// When the server hosts the identity protocol with grant keys and/or a
     /// `resolve_token` hook, [`build`](Self::build) appends the sealed-grant
@@ -875,7 +875,7 @@ impl HttpStateBuilder {
         );
         // Close the identity loop: accept the deployment's sealed grants and
         // its resolve_token's credentials as bearers, after its own
-        // authenticator (IDENTITY_V1_SPEC §9.3).
+        // authenticator (IDENTITY_V2_SPEC §9.3).
         let identity_sources = if self.identity_bearer.unwrap_or(true) {
             server
                 .identity_binding()
@@ -3837,7 +3837,7 @@ async fn unary_dispatch(
     }
 
     // Resolve `(protocol, method)` against the binding the routing key
-    // names -- the primary, an added protocol, or `vgi_rpc.Identity.v1` when
+    // names -- the primary, an added protocol, or `vgi_rpc.Identity.v2` when
     // the deployment configured it -- and gate the call on *that* binding's
     // version. A binding that declares none (identity, or an added protocol
     // without one) is not gated, so a fronting proxy can still resolve a

@@ -1,4 +1,4 @@
-//! `vgi_rpc.Identity.v1` over HTTP.
+//! `vgi_rpc.Identity.v2` over HTTP.
 //!
 //! HTTP is the transport the protocol exists for -- a reverse proxy that
 //! terminates the only public listener and has to resolve an opaque credential
@@ -7,7 +7,7 @@
 //! reachable over HTTP, that it is addressed by the *routing key* rather than
 //! by the URL path (so an application method named `introspect_token` is a
 //! different method), that a worker that configured no hook grows no route, and
-//! that the retired `__introspect_token__` JSON route is gone -- `Identity.v1`
+//! that the retired `__introspect_token__` JSON route is gone -- `Identity.v2`
 //! is the only introspection surface (cross-port spec §8).
 
 use std::io::Cursor;
@@ -268,7 +268,7 @@ async fn the_retired_json_route_is_not_served() {
 }
 
 /// Its capability header went with it. A client learns whether a worker
-/// introspects from reflection (`vgi_rpc.Identity.v1` hosted), which is what
+/// introspects from reflection (`vgi_rpc.Identity.v2` hosted), which is what
 /// the reference and the conformance group use; a stale advert would send a
 /// proxy's preflight to a route that no longer exists.
 #[tokio::test]

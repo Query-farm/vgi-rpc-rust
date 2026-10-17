@@ -1,6 +1,6 @@
-//! Fixed deployment policy for the `vgi_rpc.Identity.v1` conformance group.
+//! Fixed deployment policy for the `vgi_rpc.Identity.v2` conformance group.
 //!
-//! `vgi_rpc.Identity.v1` is nearly all *guards*, and every guard reads
+//! `vgi_rpc.Identity.v2` is nearly all *guards*, and every guard reads
 //! deployment policy: who may introspect, what a credential resolves to,
 //! whether a grant is minted, how recently the caller authenticated. A
 //! cross-port assertion is impossible unless every port's conformance worker
@@ -191,10 +191,11 @@ pub const GRANT_TOKEN_PREFIX: &str = "conformance-grant-for:";
 /// round trip is visible in the response.
 pub const SCOPE_SEPARATOR: &str = "|";
 /// Fixed rather than `now + ttl`: a constant can be asserted exactly, which
-/// also pins the float64 round trip. `expires_at` is a declaration rather than
-/// an enforcement -- the real lifetime lives inside the opaque token -- so
-/// nothing is lost. 2030-01-01T00:00:00Z.
-pub const GRANT_EXPIRES_AT: f64 = 1_893_456_000.0;
+/// also pins the `timestamp[us, tz="UTC"]` round trip. `expires_at` is a
+/// declaration rather than an enforcement -- the real lifetime lives inside
+/// the opaque token -- so nothing is lost. 2030-01-01T00:00:00Z, in
+/// microseconds since the Unix epoch.
+pub const GRANT_EXPIRES_AT_MICROS: i64 = 1_893_456_000_000_000;
 /// Correlation handle a full grant carries.
 pub const GRANT_ID: &str = "conformance-grant-id";
 /// The purpose this policy refuses, so `grant_refused` reaches the wire.
@@ -230,7 +231,7 @@ pub fn conformance_mint_grant(
         "{GRANT_TOKEN_PREFIX}{principal}{SCOPE_SEPARATOR}{}",
         scopes.join(",")
     );
-    let grant = IssuedGrant::new(token, GRANT_EXPIRES_AT);
+    let grant = IssuedGrant::new(token, GRANT_EXPIRES_AT_MICROS);
     // Omitted for MINIMAL_PURPOSE rather than passed as `""`, so the default
     // is what reaches the wire.
     Ok(if purpose == MINIMAL_PURPOSE {
@@ -331,7 +332,7 @@ mod tests {
             "conformance-grant-for:minter@conformance.example|"
         );
         assert_eq!(grant.grant_id, GRANT_ID);
-        assert_eq!(grant.expires_at, GRANT_EXPIRES_AT);
+        assert_eq!(grant.expires_at_micros, GRANT_EXPIRES_AT_MICROS);
     }
 
     #[test]

@@ -68,7 +68,7 @@ fn build_plain_server(args: &[String]) -> vgi_rpc::RpcServer {
         .with_url_validator(vgi_rpc::external::any_url_validator());
         return conformance::build_server_with_external(Some(cfg), server_id.as_deref());
     }
-    // `--identity {off,both,introspect-only}` co-hosts `vgi_rpc.Identity.v1`
+    // `--identity {off,both,introspect-only}` co-hosts `vgi_rpc.Identity.v2`
     // under the fixed policy in `identity_fixture`. Off by default and read
     // here rather than defaulted in the builder: the shared group asserts
     // against the *plain* worker that a deployment configuring no hook hosts

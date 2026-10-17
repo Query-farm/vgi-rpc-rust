@@ -1,5 +1,5 @@
-//! Sealed grants close the `vgi_rpc.Identity.v1` loop over HTTP
-//! (IDENTITY_V1_SPEC §9): `issue_grant` mints, and the minted token then
+//! Sealed grants close the `vgi_rpc.Identity.v2` loop over HTTP
+//! (IDENTITY_V2_SPEC §9): `issue_grant` mints, and the minted token then
 //! authenticates an ordinary call as its owner. Also pins the configuration
 //! rules: grant keys host `issue_grant` alone, and keys beside an identity
 //! built without them refuse to start.

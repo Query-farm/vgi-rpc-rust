@@ -390,7 +390,7 @@ fn the_reserved_prefix_is_refused_for_every_application_protocol() {
     assert!(primary.is_err());
     let extra = RpcServer::builder()
         .protocol_name("App")
-        .add_protocol(HostedProtocol::new("vgi_rpc.Identity.v1"))
+        .add_protocol(HostedProtocol::new("vgi_rpc.Identity.v2"))
         .try_build();
     assert!(extra.err().unwrap().message.contains("reserved"));
     let dup = RpcServer::builder()

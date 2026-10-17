@@ -649,7 +649,7 @@ pub enum GrantKeysSetting {
 }
 
 impl RpcServerBuilder {
-    /// Sealed-grant configuration (WIRE_PROTOCOL.md §16, IDENTITY_V1_SPEC §9).
+    /// Sealed-grant configuration (WIRE_PROTOCOL.md §16, IDENTITY_V2_SPEC §9).
     ///
     /// Default [`GrantKeysSetting::Env`]: `VGI_RPC_GRANT_KEYS` (comma-separated
     /// base64 32-byte keys, minting key first), `VGI_RPC_GRANT_AUDIENCE`,
@@ -727,7 +727,7 @@ impl RpcServerBuilder {
         self
     }
 
-    /// Co-host [`vgi_rpc.Identity.v1`](crate::token_identity), which resolves
+    /// Co-host [`vgi_rpc.Identity.v2`](crate::token_identity), which resolves
     /// an opaque credential to a principal and mints standing grants.
     ///
     /// Absent by default, and absent rather than routed-and-refusing when
@@ -1186,7 +1186,7 @@ pub struct RpcServer {
     pub(crate) protocol_hash: std::sync::OnceLock<String>,
     /// Cache for [`RpcServer::reflection_protocol_hash`].
     reflection_hash: std::sync::OnceLock<String>,
-    /// `vgi_rpc.Identity.v1`, when the deployment configured at least one of
+    /// `vgi_rpc.Identity.v2`, when the deployment configured at least one of
     /// its hooks. See [`RpcServerBuilder::identity`].
     pub(crate) identity: Option<Arc<crate::token_identity::IdentityBinding>>,
     pub(crate) dispatch_hook: Option<Arc<dyn crate::hooks::DispatchHook>>,
@@ -1325,7 +1325,7 @@ impl RpcServer {
         hosted
     }
 
-    /// The `vgi_rpc.Identity.v1` binding, when hosted.
+    /// The `vgi_rpc.Identity.v2` binding, when hosted.
     pub(crate) fn identity_binding(&self) -> Option<&crate::token_identity::IdentityBinding> {
         self.identity.as_deref()
     }

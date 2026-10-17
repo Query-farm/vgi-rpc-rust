@@ -58,7 +58,7 @@ pub struct MethodDescription {
 /// A client-side view of the wire `ProtocolSummary`, returned by
 /// [`list_protocols`] in the server's order: application protocols in
 /// registration order (the primary first), then the framework's own
-/// (`vgi_rpc.Reflection.v1`, and `vgi_rpc.Identity.v1` on an HTTP server that
+/// (`vgi_rpc.Reflection.v1`, and `vgi_rpc.Identity.v2` on an HTTP server that
 /// hosts it).
 ///
 /// A value, not a handle: it owns its fields and nothing reads them back

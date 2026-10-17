@@ -2,6 +2,28 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased]
+
+### Changed (breaking)
+
+- **`vgi_rpc.Identity.v1` is replaced by `vgi_rpc.Identity.v2`**
+  (`IDENTITY_PROTOCOL_NAME`). The protocol has no `protocol_version`, so the
+  name is its version: a v1 peer now fails discovery cleanly instead of
+  mis-decoding the grant reply. v1 is not served alongside. The protocol
+  hashes change accordingly (both methods
+  `145267755ff90d5c3313d79c7ff771306f2530626380d01cb0e57a951d0f9ec3`,
+  introspect-only `4039fbf6...e7ac`, grant-only `4199df74...d312`).
+- `IssuedGrant.expires_at` is now `timestamp[us, tz="UTC"]` (non-nullable) on
+  the wire instead of float64 unix seconds. In Rust the field is renamed
+  `expires_at: f64` -> `expires_at_micros: i64` (microseconds since the Unix
+  epoch, UTC -- the same representation as `UploadUrl::expires_at_micros`),
+  and `IssuedGrant::new(token, expires_at_micros)` takes an `i64`. Mint hooks
+  must return the new unit. The sealed grant token's internal encoding is
+  unchanged.
+- The conformance fixture's fixed grant expiry is now
+  `GRANT_EXPIRES_AT_MICROS = 1_893_456_000_000_000` (2030-01-01T00:00:00Z),
+  replacing `GRANT_EXPIRES_AT = 1_893_456_000.0`.
+
 ## [0.31.4] — 2026-10-09
 
 ### Security

@@ -1,4 +1,4 @@
-//! `vgi_rpc.Identity.v1` end to end: registration, routing, and what a client
+//! `vgi_rpc.Identity.v2` end to end: registration, routing, and what a client
 //! discovers about a worker that hosts only half of it.
 //!
 //! The guards themselves are unit-tested beside the implementation. What can
@@ -43,7 +43,7 @@ fn minter() -> vgi_rpc::token_identity::GrantMinter {
         |principal: &str, purpose: &str, scopes: &[String], ttl: i64| {
             Ok(IssuedGrant::new(
                 format!("grant/{principal}/{purpose}/{}", scopes.join("+")),
-                1_000_000.0 + ttl as f64,
+                (1_000_000 + ttl) * 1_000_000,
             )
             .with_grant_id("g1"))
         },
@@ -484,7 +484,7 @@ fn reflection_reports_the_narrowed_identity_protocol() {
         .position(|n| n == IDENTITY_PROTOCOL_NAME)
         .unwrap();
     assert_eq!(
-        hashes[index], "c71b12f453310139b6b6a445378064661c52711d03ae1e4fba29b8f7976ef4d8",
+        hashes[index], "4199df7403c9ca1a02c4c524b405a999eb1489614a1480873ffc23a0e5b0d312",
         "the listed hash must be the issue_grant-only one"
     );
 

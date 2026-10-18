@@ -153,6 +153,58 @@ fn remove_owned_socket(path: &str, identity: SocketIdentity) {
     }
 }
 
+/// Readiness wait for the non-blocking accept loop.
+///
+/// Sleeping a fixed 50 ms between `accept` attempts made every new connection
+/// wait up to 50 ms to be served, and a launcher client opens a connection per
+/// unary RPC. A dup of the listener is registered with a selector instead, so
+/// a pending connection wakes the loop at once; the timeout only bounds the
+/// shutdown/idle bookkeeping. Accepts still go through the std listener, which
+/// the loop drains to `WouldBlock` before waiting again, so edge-triggered
+/// backends see every arrival.
+#[cfg(not(target_family = "wasm"))]
+struct AcceptWait {
+    // Drop the registered socket before its selector.
+    _registered: mio::net::UnixListener,
+    poll: mio::Poll,
+    events: mio::Events,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl AcceptWait {
+    fn new(listener: &UnixListener) -> io::Result<Self> {
+        let mut registered = mio::net::UnixListener::from_std(listener.try_clone()?);
+        let poll = mio::Poll::new()?;
+        poll.registry()
+            .register(&mut registered, mio::Token(0), mio::Interest::READABLE)?;
+        Ok(Self {
+            _registered: registered,
+            poll,
+            events: mio::Events::with_capacity(1),
+        })
+    }
+
+    fn wait(&mut self, timeout: Duration) {
+        // Spurious wakeups and EINTR are fine: the caller re-checks its state
+        // and retries accept.
+        let _ = self.poll.poll(&mut self.events, Some(timeout));
+    }
+}
+
+#[cfg(target_family = "wasm")]
+struct AcceptWait;
+
+#[cfg(target_family = "wasm")]
+impl AcceptWait {
+    fn new(_listener: &UnixListener) -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    fn wait(&mut self, timeout: Duration) {
+        thread::sleep(timeout);
+    }
+}
+
 fn reap_finished(threads: &mut Vec<thread::JoinHandle<()>>) {
     let mut index = 0;
     while index < threads.len() {
@@ -205,6 +257,7 @@ pub fn serve_unix<F: FnOnce()>(
     let listener = UnixListener::bind(path)?;
     let bound_identity = socket_identity(path)?;
     listener.set_nonblocking(true).ok();
+    let mut accept_wait = AcceptWait::new(&listener)?;
     on_bound();
 
     // Startup grace: max(idle_timeout, 60s) before the first client connects,
@@ -277,12 +330,22 @@ pub fn serve_unix<F: FnOnce()>(
                 }));
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
+                let maximum = Duration::from_millis(50);
+                let timeout = lock(&state)
+                    .deadline
+                    .map(|deadline| {
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(maximum)
+                    })
+                    .unwrap_or(maximum);
+                accept_wait.wait(timeout);
             }
             Err(_) => break,
         }
     }
 
+    drop(accept_wait);
     drop(listener);
     for connection in lock(&active).values() {
         let _ = connection.shutdown(Shutdown::Both);

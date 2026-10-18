@@ -116,6 +116,56 @@ fn unix_worker_serves_then_idle_exits() {
 }
 
 #[test]
+fn unix_worker_accepts_without_polling_delay() {
+    // A launcher client opens one connection per unary RPC. The accept loop
+    // used to sleep 50 ms between accept attempts, so each such RPC waited
+    // ~25 ms on average just to be accepted; now it wakes on readiness.
+    let path = socket_path("accept");
+    let mut server = RpcServer::new("accept-test");
+    let schema = Arc::new(Schema::empty());
+    server.register(MethodInfo::unary(
+        "ping",
+        schema.clone(),
+        schema.clone(),
+        |_req, _ctx| Ok(None),
+    ));
+    let server = Arc::new(server);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (bound_tx, bound_rx) = mpsc::channel();
+    let (srv, p, sd) = (server.clone(), path.clone(), shutdown.clone());
+    let handle = std::thread::spawn(move || {
+        vgi_rpc::unix::serve_unix(srv, &p, None, sd, move || {
+            bound_tx.send(()).ok();
+        })
+        .unwrap();
+    });
+    bound_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("server should bind and listen");
+    // Let the loop settle into waiting for a connection.
+    std::thread::sleep(Duration::from_millis(100));
+
+    const ROUND_TRIPS: u32 = 40;
+    let started = std::time::Instant::now();
+    for _ in 0..ROUND_TRIPS {
+        let mut stream = UnixStream::connect(&path).expect("connect to worker");
+        stream.write_all(&empty_body("ping")).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).ok();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).unwrap();
+        assert!(!resp.is_empty(), "expected an IPC response stream");
+    }
+    let elapsed = started.elapsed();
+    shutdown.store(true, Ordering::Relaxed);
+    handle.join().unwrap();
+    // A 50 ms sleep-poll averages ~1 s for 40 fresh connections.
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "{ROUND_TRIPS} connect+ping round trips took {elapsed:?}"
+    );
+}
+
+#[test]
 fn unix_listener_refuses_regular_files_and_symlinks() {
     let regular = socket_path("regular");
     std::fs::write(&regular, b"keep me").unwrap();

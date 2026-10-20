@@ -56,8 +56,20 @@ All via `scripts/conf.py`:
 ./scripts/conf.py names --status failure
 ```
 
+The suite runs **in parallel** under pytest-xdist: `-n auto` by default,
+`-n N` / `--workers N` or `CONFORMANCE_WORKERS=N` to cap it, and
+`--workers 0` (`CONFORMANCE_WORKERS=0`) for a serial run. Without xdist in
+the reference interpreter it warns and runs serially. Every fixture binds
+port 0 / `mkstemp` sockets / `tmp_path_factory`, so xdist workers never share
+a port, socket or scratch path; session-scoped servers start once per xdist
+worker. Keep new fixtures that way — the one server that cannot bind port 0
+itself (`serve_conformance_http_auth.py`) goes through `_spawn_on_free_port`,
+which retries on a fresh port when another worker wins the race. The cargo
+build happens once, before pytest starts, never inside a fixture.
+
 The script writes `.test-run/{junit.xml, pytest.log, build.log, args.txt}`
-so you can reason about results without re-running tests. The default
+(or `$CONF_RUN_DIR/…`, so two concurrent runs from one checkout don't clobber
+each other) so you can reason about results without re-running tests. The default
 deadlines (59s overall for role=server/rust, 2s per test) keep a casual run
 snappy; `--timeout` / `--per-test-timeout` override them, and they are
 overrides rather than clamps precisely so a suite that has outgrown the
@@ -490,8 +502,9 @@ run          Build (or --no-build) + run the suite, write junit.xml.
              --class "TestClass and not TestFoo" (forwarded as -k)
              -k "pytest_filter"
              --release / --debug
-             --timeout 55  (overall ceiling, capped at 59)
+             --timeout N   (overall deadline; default 59s for role=server/rust, else 300s)
              --per-test-timeout 2
+             -n/--workers N|auto|0  (pytest-xdist; default auto, env CONFORMANCE_WORKERS; 0 = serial)
 summary      Parse junit.xml and print pass/fail/error/skipped counts.
 failures     List failing tests with 1-line summaries.
 show PAT     Dump full message + body for tests matching regex PAT.
@@ -660,9 +673,9 @@ the release process.
   use the workspace cache and complete in under 10 s.
 - The conformance harness uses `pytest-timeout --timeout-method=signal`
   — that only works on POSIX. Windows would need a different method.
-- `scripts/conf.py` caps overall test wall-clock at 59 s. If the suite
-  legitimately takes longer, either split by `--class` or chase the
-  regression; don't raise the cap without thinking.
+- `scripts/conf.py` defaults the overall wall-clock deadline to 59 s for
+  role=server/rust. If the suite legitimately takes longer, either split by
+  `--class` or chase the regression; don't raise it without thinking.
 
 ## Memory system
 

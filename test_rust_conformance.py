@@ -111,17 +111,45 @@ def _spawn_read_port(
     tcp_only_ready: bool = False,
 ) -> tuple[subprocess.Popen, int]:
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert proc.stdout is not None
-    line = proc.stdout.readline().decode().strip()
-    assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r} (args={args})"
-    port = int(line.split(":", 1)[1])
-    if expect_port is not None:
-        assert port == expect_port, f"expected PORT:{expect_port}, got {port}"
-    if tcp_only_ready:
-        _wait_for_tcp("127.0.0.1", port)
-    else:
-        _wait_for_http(port)
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r} (args={args})"
+        port = int(line.split(":", 1)[1])
+        if expect_port is not None:
+            assert port == expect_port, f"expected PORT:{expect_port}, got {port}"
+        if tcp_only_ready:
+            _wait_for_tcp("127.0.0.1", port)
+        else:
+            _wait_for_http(port)
+    except BaseException:
+        # Never leak a half-started server (a retry, or a failed fixture).
+        proc.kill()
+        proc.wait()
+        raise
     return proc, port
+
+
+def _spawn_on_free_port(
+    make_args: Callable[[int], list[str]], attempts: int = 5
+) -> tuple[subprocess.Popen, int]:
+    """Spawn a server that can only take an explicit ``--port`` (no ``0``).
+
+    ``serve_conformance_http_auth.py`` prints ``PORT:<n>`` before it binds, so
+    the probe-then-release in ``_free_port`` is a race under pytest-xdist:
+    another worker can take the port in between, the server dies on
+    ``EADDRINUSE`` and the readiness poll times out. Retry on a fresh port
+    when that happens. Every server that binds ``0`` itself and reports the
+    real port is spawned without ``--port`` instead.
+    """
+    last: Exception | None = None
+    for _ in range(attempts):
+        port = _free_port()
+        try:
+            return _spawn_read_port(make_args(port), expect_port=port)
+        except (TimeoutError, AssertionError) as exc:
+            last = exc
+    raise RuntimeError(f"could not start {make_args(0)[:2]} on a free port: {last}")
 
 
 def _start_rust_http_with_storage(
@@ -196,7 +224,7 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
         if variant == "cold_call_cache":
             return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--no-call-state-cache"])
         if variant == "auth_reason":
-            return _spawn_read_port([_VENV_PY, _PY_SERVE_AUTH, "--port", str(_free_port())])
+            return _spawn_on_free_port(lambda port: [_VENV_PY, _PY_SERVE_AUTH, "--port", str(port)])
         if variant == "sticky_short_ttl":
             return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--sticky-ttl", "1"])
         if variant in ("sticky_peer_a", "sticky_peer_b"):
@@ -208,26 +236,21 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
         if variant == "sticky_auth":
             return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--sticky-auth"])
         if variant == "cors":
-            port = _free_port()
             return _spawn_read_port(
                 [
                     _VENV_PY,
                     _PY_SERVE_HTTP,
-                    "--port",
-                    str(port),
                     "--fake-storage",
                     storage_url or "",
                     "--cors-origin",
                     _CORS_ORIGIN,
                 ],
-                expect_port=port,
             )
         if variant in ("identity", "identity_introspect_only", "identity_grants"):
             mode = {"identity": "both", "identity_introspect_only": "introspect-only"}.get(variant, "grants")
             return _spawn_read_port([_VENV_PY, _PY_SERVE_HTTP, "--http", "--identity", mode])
         if variant in ("storage", "zstd_storage", "externalize_always", "external_security"):
-            port = _free_port()
-            args = [_VENV_PY, _PY_SERVE_HTTP, "--port", str(port), "--fake-storage", storage_url or ""]
+            args = [_VENV_PY, _PY_SERVE_HTTP, "--fake-storage", storage_url or ""]
             if variant == "zstd_storage":
                 args += ["--compression", "zstd"]
             if variant == "externalize_always":
@@ -242,21 +265,17 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
                     "8192",
                     "--reject-localhost-redirects",
                 ]
-            return _spawn_read_port(args, expect_port=port)
+            return _spawn_read_port(args)
         if variant == "strict":
             return _spawn_read_port([_VENV_PY, _PY_SERVE_STRICT])
         if variant == "small_request_cap":
-            port = _free_port()
             return _spawn_read_port(
                 [
                     _VENV_PY,
                     _PY_SERVE_HTTP,
-                    "--port",
-                    str(port),
                     "--max-request-bytes",
                     str(4 * 1024),
                 ],
-                expect_port=port,
             )
         if variant == "externalized_cap":
             return _spawn_read_port(
@@ -272,8 +291,7 @@ def _spawn_http_variant(variant: str, storage_url: str | None = None) -> tuple[s
                 ]
             )
         if variant == "auth":
-            port = _free_port()
-            return _spawn_read_port([_VENV_PY, _PY_SERVE_AUTH, "--port", str(port)], expect_port=port)
+            return _spawn_on_free_port(lambda port: [_VENV_PY, _PY_SERVE_AUTH, "--port", str(port)])
     elif SERVER == "rust":
         if variant == "plain":
             return _spawn_read_port(_worker_cmd("http"))

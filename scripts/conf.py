@@ -27,7 +27,9 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-RUN_DIR = ROOT / ".test-run"
+# CONF_RUN_DIR keeps two concurrent runs from one checkout (say, the server and
+# client roles side by side) from overwriting each other's junit/log.
+RUN_DIR = Path(os.environ.get("CONF_RUN_DIR") or ROOT / ".test-run")
 JUNIT = RUN_DIR / "junit.xml"
 LOG = RUN_DIR / "pytest.log"
 ARGS = RUN_DIR / "args.txt"
@@ -49,6 +51,9 @@ REF_REPO = Path(
 VENV_PY = Path(os.environ.get("VGI_RPC_PYTHON") or REF_REPO / ".venv" / "bin" / "python")
 VENV_BIN = VENV_PY.parent
 WORKER = ROOT / "conformance-worker-rust"
+# Honour CARGO_TARGET_DIR, so a build into a shared/out-of-tree target dir is
+# the one that gets run.
+TARGET = Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target")
 GO_WORKER = Path.home() / "Development" / "vgi-rpc-go" / "vgi-rpc-conformance-go"
 
 
@@ -66,7 +71,7 @@ def _cargo_build(pkg: str, release: bool, build_log: Path) -> None:
 
 def _build_rust_worker(release: bool, skip: bool) -> Path:
     profile = "release" if release else "dev"
-    target = ROOT / "target" / ("release" if release else "debug") / "vgi-rpc-conformance-rust"
+    target = TARGET / ("release" if release else "debug") / "vgi-rpc-conformance-rust"
     if not skip:
         RUN_DIR.mkdir(exist_ok=True)
         _cargo_build("vgi-rpc-conformance-rust", release, RUN_DIR / "build.log")
@@ -81,7 +86,7 @@ def _build_rust_worker(release: bool, skip: bool) -> Path:
 
 
 def _build_client_driver(release: bool, skip: bool) -> Path:
-    target = ROOT / "target" / ("release" if release else "debug") / "vgi-rpc-conformance-client-driver"
+    target = TARGET / ("release" if release else "debug") / "vgi-rpc-conformance-client-driver"
     if not skip:
         RUN_DIR.mkdir(exist_ok=True)
         _cargo_build("vgi-rpc-conformance-client-driver", release, RUN_DIR / "build.log")
@@ -235,6 +240,22 @@ def _run(args: argparse.Namespace, extras: list[str]) -> int:
         f"--timeout={args.per_test_timeout}",
         "--timeout-method=signal",
     ]
+    # Parallel by default (pytest-xdist). Every fixture binds port 0 / mkstemp
+    # sockets / tmp_path_factory, so xdist workers are isolated from each
+    # other; session-scoped servers are simply started once per xdist worker.
+    # `--workers 0` (or CONFORMANCE_WORKERS=0) runs serially.
+    workers = str(args.workers)
+    if workers != "0":
+        has_xdist = subprocess.run(
+            [str(VENV_PY), "-c", "import xdist"], capture_output=True
+        ).returncode == 0
+        if has_xdist:
+            cmd += ["-n", workers, "--dist", "load"]
+        else:
+            print(
+                f"[conf] WARNING: pytest-xdist is not installed in {VENV_PY}; "
+                "running SERIALLY (pip install pytest-xdist)"
+            )
     k_filter = args.k or args.klass
     if k_filter:
         cmd += ["-k", k_filter]
@@ -247,7 +268,8 @@ def _run(args: argparse.Namespace, extras: list[str]) -> int:
         log.write(
             f"$ {' '.join(cmd)}\n"
             f"  VGI_TRANSPORTS={env['VGI_TRANSPORTS']}\n"
-            f"  overall_timeout={args.timeout}s  per_test_timeout={args.per_test_timeout}s\n\n"
+            f"  overall_timeout={args.timeout}s  per_test_timeout={args.per_test_timeout}s"
+            f"  workers={args.workers}\n\n"
         )
         log.flush()
         try:
@@ -401,6 +423,9 @@ def main() -> int:
                     help="overall wall-clock deadline in seconds (default 59 for role=server/rust, else 300)")
     pr.add_argument("--per-test-timeout", type=int, default=2,
                     help="per-test timeout in seconds (default 2)")
+    pr.add_argument("-n", "--workers", default=os.environ.get("CONFORMANCE_WORKERS", "auto"),
+                    help="pytest-xdist worker count: N, 'auto' (default; env "
+                         "CONFORMANCE_WORKERS), or 0 for a serial run")
     pr.add_argument("--no-build", action="store_true",
                     help="skip cargo build (assume binary is current)")
     pr.add_argument("--class", dest="klass",

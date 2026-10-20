@@ -180,7 +180,8 @@ Note that `~/Development/vgi-rpc` is **not** the reference — it is `main`, and
 despite a numerically higher version it carries none of the multiservice work.
 
 ```bash
-# Build the worker and run the whole suite over all transports.
+# Build the worker and run the whole suite over all transports, in parallel
+# (pytest-xdist, -n auto; CONFORMANCE_WORKERS=N to cap, 0 for serial).
 ./scripts/conf.py run --transport all
 
 # One class on one transport.

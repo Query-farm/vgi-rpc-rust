@@ -2,6 +2,15 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.32.1] — 2026-11-04
+
+### Fixed
+
+- `serve_unix` waits for listener readiness instead of sleeping 50 ms between
+  accept attempts, so a new connection is served immediately. A launcher client
+  opens a connection per unary RPC: 40 sequential connect+ping round trips took
+  1.95 s before this change.
+
 ## [0.32.0] — 2026-10-20
 
 ### Changed (breaking)

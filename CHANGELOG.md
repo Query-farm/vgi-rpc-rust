@@ -2,6 +2,14 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.32.2] — 2026-11-04
+
+### Fixed
+
+- Release packaging only: 0.32.1 reached crates.io, but its browser npm package
+  and GitHub Release were not published because the npm package version had not
+  been bumped. This release publishes all of them. The crates' code is unchanged.
+
 ## [0.32.1] — 2026-11-04
 
 ### Fixed

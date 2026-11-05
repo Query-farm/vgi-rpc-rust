@@ -2,6 +2,13 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [0.32.3] — 2026-11-04
+
+### Changed
+
+- Align the Arrow dependency with Arrow 59 so VGI clients can share Arrow types
+  with DataFusion 55 without parallel Arrow versions.
+
 ## [0.32.2] — 2026-11-04
 
 ### Fixed

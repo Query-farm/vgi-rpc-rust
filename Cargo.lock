@@ -163,9 +163,9 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "arrow-array"
-version = "60.0.0"
+version = "59.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51dff6e4b9f158864a0aeb6a131ad53858ecbae7a2fc8989307b9b3c6b2f122e"
+checksum = "72b5b1682924f11ecf6929689c16cbc69efbb6dd141b06ad98ee1cb10d858c43"
 dependencies = [
  "ahash",
  "arrow-buffer",
@@ -181,9 +181,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-buffer"
-version = "60.0.0"
+version = "59.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7235b863533e9db3ab86905b4521251de11226275b436ff3cb2d0010558d1c5"
+checksum = "b5d687afc6c927965a8a759f3b68de91933d9dfa2e1bb6e156bac84b85665e92"
 dependencies = [
  "bytes",
  "half",
@@ -193,9 +193,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-cast"
-version = "60.0.0"
+version = "59.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d52cf840f0c34aeeb7e8b05aba72d66878e6c001827f423331f0b260209e7b7e"
+checksum = "3f23c3379feede42135ef27ca60e67f6e643cd4343ae74e4c8b16c83f55afd85"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -213,21 +213,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrow-cmp"
-version = "60.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73a0e9adb28d95739fabcdae637261a2c14e618caf58ba1b88857120f9ee2687"
-dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-schema",
-]
-
-[[package]]
 name = "arrow-data"
-version = "60.0.0"
+version = "59.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5aa06d5e22786c4966ffc4d2f171d0cb65d95f6bdea108a14e8c335e9faa437f"
+checksum = "bb0a031c7ff5e2bdb443117054fb466af1d4df5b7f0ecbe197713dc8b113b1ba"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -238,9 +227,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-ipc"
-version = "60.0.0"
+version = "59.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86c523472d22e31f984df7a44fc36e6323d3c9b05ffe53d267ee4c3aa7c128d2"
+checksum = "f5dd1afadda2eb821aaf851bb4c0adef60c30cc0f1a29bd02fb99dd07fb9f58d"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -252,13 +241,12 @@ dependencies = [
 
 [[package]]
 name = "arrow-ord"
-version = "60.0.0"
+version = "59.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a7ac2c6a9cdc782fa9548d3763461eaec8c93347e297fddbaa44807e70a3698"
+checksum = "561b8209faa2cd489764b7fd07d7cb9e8d274d78048c38de59f77c41140cb834"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
- "arrow-cmp",
  "arrow-data",
  "arrow-schema",
  "arrow-select",
@@ -266,20 +254,19 @@ dependencies = [
 
 [[package]]
 name = "arrow-schema"
-version = "60.0.0"
+version = "59.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f85a9a58cd03560526b0066487574aacb9008e413504fa0ee23d61141e96c338"
+checksum = "e87acb0c6bf6237fca7a50d7b51e801c98a18a5fe6f3bb34f7d77b85ca165388"
 
 [[package]]
 name = "arrow-select"
-version = "60.0.0"
+version = "59.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba3482b7d03bf4a3bf0b195f08a7f2b071595ccd54897e35b975ac63d3104977"
+checksum = "c844141958d805b47d1208e0d12aac53fcf388ce8011639fe82aa492adde0bb4"
 dependencies = [
  "ahash",
  "arrow-array",
  "arrow-buffer",
- "arrow-cmp",
  "arrow-data",
  "arrow-schema",
  "num-traits",
@@ -371,9 +358,9 @@ dependencies = [
 
 [[package]]
 name = "atoi"
-version = "3.1.0"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7a8bbe9949e43a1edaa043038c68703b04774156afdfb62ba2cef5bf93d67be"
+checksum = "f28d99ec8bfea296261ca1af174f24225171fea9664ba9003cbebee704810528"
 dependencies = [
  "num-traits",
 ]
@@ -5107,7 +5094,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi-iroh-bridge"
-version = "0.32.2"
+version = "0.32.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5133,7 +5120,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-iroh-cabi"
-version = "0.32.2"
+version = "0.32.3"
 dependencies = [
  "bytes",
  "iroh",
@@ -5145,7 +5132,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-iroh-transport"
-version = "0.32.2"
+version = "0.32.3"
 dependencies = [
  "bytes",
  "futures-util",
@@ -5163,7 +5150,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc"
-version = "0.32.2"
+version = "0.32.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5212,7 +5199,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-benchmark-rust"
-version = "0.32.2"
+version = "0.32.3"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5222,7 +5209,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-client"
-version = "0.32.2"
+version = "0.32.3"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -5253,7 +5240,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-conformance-client-driver"
-version = "0.32.2"
+version = "0.32.3"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -5267,7 +5254,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-conformance-rust"
-version = "0.32.2"
+version = "0.32.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5292,7 +5279,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-gcs"
-version = "0.32.2"
+version = "0.32.3"
 dependencies = [
  "reqwest 0.12.28",
  "uuid",
@@ -5302,7 +5289,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-iroh"
-version = "0.32.2"
+version = "0.32.3"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5319,7 +5306,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-iroh-browser"
-version = "0.32.2"
+version = "0.32.3"
 dependencies = [
  "bytes",
  "futures-util",
@@ -5339,7 +5326,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-macros"
-version = "0.32.2"
+version = "0.32.3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5348,7 +5335,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-s3"
-version = "0.32.2"
+version = "0.32.3"
 dependencies = [
  "reqwest 0.12.28",
  "tokio",
@@ -5358,7 +5345,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-tailnet-rust"
-version = "0.32.2"
+version = "0.32.3"
 dependencies = [
  "arrow-array",
  "arrow-schema",

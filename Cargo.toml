@@ -3,7 +3,7 @@ resolver = "2"
 members = ["vgi-rpc", "vgi-rpc-macros", "vgi-rpc-client", "vgi-iroh-transport", "vgi-iroh-cabi", "vgi-rpc-iroh", "vgi-rpc-iroh-browser", "vgi-iroh-bridge", "conformance-client-driver", "conformance-worker", "tailnet-integration", "benchmark-worker", "vgi-rpc-s3", "vgi-rpc-gcs"]
 
 [workspace.package]
-version = "0.32.2"
+version = "0.32.3"
 edition = "2021"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -12,14 +12,14 @@ homepage = "https://query.farm"
 repository = "https://github.com/Query-farm/vgi-rpc-rust"
 
 [workspace.dependencies]
-arrow = { version = "60", default-features = false, features = ["ipc"] }
-arrow-array = "60"
-arrow-buffer = "60"
-arrow-data = "60"
-arrow-ipc = "60"
-arrow-schema = "60"
-arrow-select = "60"
-arrow-cast = "60"
+arrow = { version = "59.2.0", default-features = false, features = ["ipc"] }
+arrow-array = "59.2.0"
+arrow-buffer = "59.2.0"
+arrow-data = "59.2.0"
+arrow-ipc = "59.2.0"
+arrow-schema = "59.2.0"
+arrow-select = "59.2.0"
+arrow-cast = "59.2.0"
 bytes = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

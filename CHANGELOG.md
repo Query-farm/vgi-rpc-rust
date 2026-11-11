@@ -2,6 +2,18 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## Unreleased
+
+### Fixed
+
+- A producer/exchange call whose input stream fails to decode (truncated
+  mid-message, corrupt IPC, unreadable input schema) now fails with that
+  decode error as the call's error envelope, recorded for hooks and the access
+  log. The pipe/unix serve loop used to treat the error as a clean end of
+  input: the handler saw only a prefix of the client's batches and the call
+  reported success. The connection is closed afterwards, since the input
+  framing is lost.
+
 ## [0.32.3] — 2026-11-04
 
 ### Changed

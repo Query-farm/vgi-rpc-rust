@@ -1911,14 +1911,18 @@ impl RpcServer {
         // synchronous on one thread per connection.
         #[cfg(feature = "http")]
         let externalized = crate::external::ExternalizedScope::new();
-        match info.method_type {
+        // `false` when a streaming call lost the input framing (an IPC decode
+        // error mid-stream): the error was reported to the client, but the
+        // next request boundary cannot be found, so the connection ends.
+        let connection_reusable = match info.method_type {
             MethodType::Unary => {
-                self.serve_unary(w, &req, info, &ctx, &stats, &mut app_err, shm_ref)?
+                self.serve_unary(w, &req, info, &ctx, &stats, &mut app_err, shm_ref)?;
+                true
             }
             MethodType::Producer | MethodType::Exchange | MethodType::Dynamic => {
                 self.serve_stream(r, w, &req, info, &ctx, &stats, &mut app_err, shm_ref)?
             }
-        }
+        };
         #[cfg(feature = "http")]
         let externalized_bytes = externalized.finish();
         #[cfg(feature = "http")]
@@ -1934,7 +1938,7 @@ impl RpcServer {
             let final_stats = lock_ok(&stats).clone();
             hook.on_dispatch_end(token, di, app_err.as_ref(), &final_stats);
         }
-        Ok(true)
+        Ok(connection_reusable)
     }
 
     /// Read one request off the wire. Returns the parsed request plus
@@ -2101,7 +2105,13 @@ impl RpcServer {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Serve one producer/exchange call.
+    ///
+    /// Returns `Ok(false)` when the client's input stream could not be
+    /// decoded (truncated or corrupt IPC): the decode error is sent to the
+    /// client as the call's error envelope and recorded as the call's error,
+    /// but the input framing is lost, so the caller must not read another
+    /// request from this connection.
     #[allow(clippy::too_many_arguments)]
     fn serve_stream<R: Read, W: Write>(
         &self,
@@ -2113,7 +2123,7 @@ impl RpcServer {
         stats: &Arc<Mutex<crate::hooks::CallStatistics>>,
         app_err: &mut Option<RpcError>,
         #[cfg_attr(not(feature = "shm"), allow(unused_variables))] shm: Option<&ShmSegment>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let tb = self.traceback_origin(&req.protocol, &req.method);
         let init_result = call_guard(|| (info.stream.as_ref().unwrap())(req, ctx)).and_then(|r| r);
         let init_logs = ctx.drain_logs();
@@ -2136,7 +2146,7 @@ impl RpcServer {
                 // is clean for the next request.
                 let _ = drain_input(r);
                 *app_err = Some(err);
-                return Ok(());
+                return Ok(true);
             }
         };
 
@@ -2172,13 +2182,32 @@ impl RpcServer {
         let mut out_writer = StreamWriter::new(&mut *w, output_schema.as_ref())?;
         out_writer.flush()?;
 
-        // Open the input stream (ticks for producer, real batches for exchange).
-        let mut input_reader = StreamReader::new(&mut *r)?;
-
         // A zero-row batch on the output schema, reused for every log/error
         // envelope in this stream (it's immutable and identical each time)
         // instead of rebuilding it per log line / per tick.
         let empty_out = empty_batch(output_schema.as_ref())?;
+
+        // Open the input stream (ticks for producer, real batches for exchange).
+        // An input schema that fails to decode is the call's error, not a
+        // silent transport drop: report it on the output stream, then give up
+        // the connection (its framing is lost).
+        let mut input_reader = match StreamReader::new(&mut *r) {
+            Ok(rdr) => rdr,
+            Err(err) => {
+                if !wrote_header {
+                    for log in &init_logs {
+                        let md = envelope.log(log);
+                        out_writer.write(&empty_out, Some(md))?;
+                    }
+                }
+                report_input_decode_error(&req.method, &err);
+                let md = envelope.error(&err);
+                out_writer.write(&empty_out, Some(md))?;
+                out_writer.finish()?;
+                *app_err = Some(err);
+                return Ok(false);
+            }
+        };
 
         // If we didn't already write init logs into a header stream, write them now.
         if !wrote_header {
@@ -2191,11 +2220,23 @@ impl RpcServer {
 
         let mut state = state;
         let mut cancelled = false;
+        let mut input_broken = false;
 
         'lockstep: loop {
             let read = match input_reader.read_next() {
                 Ok(x) => x,
-                Err(_) => break,
+                Err(err) => {
+                    // A truncated or corrupt input message must fail the
+                    // call. Ending the loop as if the client had closed the
+                    // stream would silently drop the rest of its input and
+                    // report success on a partial result.
+                    report_input_decode_error(&req.method, &err);
+                    let md = envelope.error(&err);
+                    out_writer.write(&empty_out, Some(md))?;
+                    *app_err = Some(err);
+                    input_broken = true;
+                    break;
+                }
             };
             let Some((input_batch, input_md)) = read else {
                 break;
@@ -2345,10 +2386,24 @@ impl RpcServer {
         let _ = cancelled;
         out_writer.finish()?;
 
+        if input_broken {
+            // The framing is gone; draining would read garbage (or block
+            // on a length prefix that never arrives).
+            return Ok(false);
+        }
         // Drain remaining input.
         let _ = input_reader.drain();
-        Ok(())
+        Ok(true)
     }
+}
+
+fn report_input_decode_error(method: &str, err: &RpcError) {
+    tracing::warn!(
+        target: "vgi_rpc.server",
+        method = %method,
+        error = %err,
+        "failed to decode streaming input; failing the call and closing the connection"
+    );
 }
 
 fn drain_input<R: Read>(r: &mut R) -> Result<()> {
@@ -2647,6 +2702,113 @@ mod tests {
         let mut r = StreamReader::new(output.as_slice()).unwrap();
         let (_b, md) = r.read_next().unwrap().expect("error batch");
         assert_eq!(md_get(&md, LOG_LEVEL_KEY), Some("EXCEPTION"));
+    }
+
+    /// Exchange input that stops mid-message (peer died, pipe truncated)
+    /// used to end the lockstep loop exactly like a clean end-of-stream:
+    /// the handler saw a prefix of its input and the call reported success.
+    /// The decode error must reach the client as the call's error, and the
+    /// connection (whose framing is now lost) must end.
+    #[test]
+    fn truncated_exchange_input_fails_the_call() {
+        use crate::metadata::LOG_MESSAGE_KEY;
+        use crate::stream::{ExchangeState, OutputCollector};
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType, Field};
+        use std::sync::atomic::AtomicUsize;
+
+        struct Echo(Arc<AtomicUsize>);
+        impl ExchangeState for Echo {
+            fn exchange(
+                &mut self,
+                input: &RecordBatch,
+                out: &mut OutputCollector,
+                _ctx: &CallContext,
+            ) -> Result<()> {
+                self.0.fetch_add(input.num_rows(), Ordering::SeqCst);
+                out.emit(input.clone())
+            }
+        }
+
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let rows_seen = Arc::new(AtomicUsize::new(0));
+        let mut server = RpcServer::new("test-srv");
+        {
+            let schema = schema.clone();
+            let rows_seen = rows_seen.clone();
+            server.register(MethodInfo::stream(
+                "echo",
+                MethodType::Exchange,
+                empty_schema(),
+                move |_req, _ctx| {
+                    Ok(StreamResult::exchange(
+                        schema.clone(),
+                        schema.clone(),
+                        Box::new(Echo(rows_seen.clone())),
+                    ))
+                },
+            ));
+        }
+
+        // Input stream: schema, one complete batch, then a second batch cut
+        // off half-way through its message.
+        let batch = |vals: Vec<i64>| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals))]).unwrap()
+        };
+        // `StreamWriter` writes the end-of-stream marker (8 bytes) when it
+        // finishes or drops, so measure each stream and strip it.
+        let encode = |batches: &[RecordBatch]| {
+            let mut buf = Vec::new();
+            {
+                let mut w = StreamWriter::new(&mut buf, &schema).unwrap();
+                for b in batches {
+                    w.write(b, None).unwrap();
+                }
+                w.finish().unwrap();
+            }
+            buf.truncate(buf.len() - 8);
+            buf
+        };
+        let first = batch(vec![1, 2, 3]);
+        let prefix = encode(std::slice::from_ref(&first));
+        let full = encode(&[first, batch(vec![4, 5, 6, 7])]);
+        let second_len = full.len() - prefix.len();
+        assert!(second_len > 16, "second batch message unexpectedly small");
+        let truncated = &full[..prefix.len() + second_len / 2];
+
+        let mut input = request_bytes("echo");
+        input.extend_from_slice(truncated);
+        let mut output: Vec<u8> = Vec::new();
+        let keep_going = server
+            .serve_one(&mut Cursor::new(input), &mut output)
+            .expect("the decode error is reported in-band, not as a transport error");
+        assert!(
+            !keep_going,
+            "input framing is lost after a decode error; the connection must end"
+        );
+        assert_eq!(
+            rows_seen.load(Ordering::SeqCst),
+            3,
+            "only the complete batch reaches the handler"
+        );
+
+        let mut r = StreamReader::new(output.as_slice()).unwrap();
+        let mut data_rows = 0;
+        let mut error = None;
+        while let Some((b, md)) = r.read_next().unwrap() {
+            if md_get(&md, LOG_LEVEL_KEY) == Some("EXCEPTION") {
+                error = md_get(&md, LOG_MESSAGE_KEY).map(str::to_owned);
+            } else {
+                data_rows += b.num_rows();
+            }
+        }
+        assert_eq!(data_rows, 3);
+        let error = error.expect("a truncated input stream must fail the call");
+        assert!(
+            error.to_lowercase().contains("eof"),
+            "error should name the decode failure, got {error:?}"
+        );
     }
 
     #[test]

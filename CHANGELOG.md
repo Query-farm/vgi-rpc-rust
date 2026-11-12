@@ -2,7 +2,7 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
-## Unreleased
+## [0.32.4] — 2026-11-11
 
 ### Fixed
 

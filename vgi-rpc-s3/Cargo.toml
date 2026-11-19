@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "S3-backed ExternalStorage for vgi-rpc (pluggable pre-signed URL factory + reqwest transfer)"
+description = "S3-backed ExternalStorage and blob-vendor client for vgi-rpc (pre-signed URLs + reqwest transfer)"
 readme = "README.md"
 keywords = ["vgi-rpc", "s3", "arrow", "storage"]
 categories = ["network-programming"]
@@ -16,6 +16,13 @@ categories = ["network-programming"]
 vgi-rpc = { path = "../vgi-rpc", version = "0.32.4", default-features = false, features = ["http"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
+# Blob-vendor client (`vendor`): JSON wire shapes, digests, expiry parsing.
+base64.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

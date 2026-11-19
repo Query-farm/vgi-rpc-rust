@@ -2,6 +2,30 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased]
+
+### Added
+
+- **Blob-vendor client** (`vgi_rpc_s3::vendor`), a port of vgi-rpc-python's
+  `vgi_rpc.vendor` with the same wire format. `VendorStorage` is an
+  `ExternalStorage` (results uploaded through sized, checksummed vendor grants,
+  purpose `rpc`) and an `UploadUrlProvider` (`/v1/upload_urls`).
+  `VendorBlobClient` puts, gets and deletes raw blobs (purpose `fs`, scoped,
+  idempotent) and verifies every read against the reference's size and
+  SHA-256, reporting `size_mismatch` / `sha256_mismatch` / missing.
+  `pinned_hosts_validator` and `vendor_url_validator` (from `/v1/info`, cached,
+  last-good kept) accept only URLs on the vendor's storage hosts;
+  `external_config_from_env` reads `VGI_BLOB_VENDOR_URL`,
+  `VGI_BLOB_VENDOR_TOKEN` (fallback `VGI_CF_DO_TOKEN`),
+  `VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES` and `VGI_RPC_EXTERNAL_COMPRESSION`.
+  Signed-URL requests go through a separate bare client with no caller
+  credentials, never follow redirects, and no token or signed query reaches an
+  error or a log line. Tested against the fake vendor in CI (`blob-vendor` job).
+- A handler that panics with an `RpcError` payload
+  (`std::panic::panic_any(err)`) now fails the call with that error. Any other
+  panic still reports only `handler panicked`. This lets an infallible
+  interface (a storage trait) report a failure the caller must read.
+
 ## [0.32.4] — 2026-11-11
 
 ### Fixed

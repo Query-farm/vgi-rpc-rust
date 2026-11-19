@@ -37,6 +37,8 @@
 
 use std::sync::Arc;
 
+pub mod vendor;
+
 use vgi_rpc::external::{
     validate_external_url, Compression, ExternalStorage, FetchedPayload, Fetcher, UploadResult,
     UploadUrl, UploadUrlProvider, UrlValidator,
@@ -62,7 +64,7 @@ pub fn default_blocking_client() -> reqwest::blocking::Client {
 /// Strip the query string (and fragment) from a URL before it goes into
 /// a client-facing error. Presigned URLs carry their credentials in the
 /// query string — those must never be echoed back to a caller.
-fn redact_url(url: &str) -> String {
+pub(crate) fn redact_url(url: &str) -> String {
     let Ok(mut parsed) = reqwest::Url::parse(url) else {
         return "<invalid external URL>".to_string();
     };

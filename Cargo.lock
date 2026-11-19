@@ -5337,8 +5337,14 @@ dependencies = [
 name = "vgi-rpc-s3"
 version = "0.32.4"
 dependencies = [
+ "base64 0.22.1",
+ "chrono",
  "reqwest 0.12.28",
+ "serde_json",
+ "sha2 0.10.9",
  "tokio",
+ "tracing",
+ "url",
  "uuid",
  "vgi-rpc",
 ]

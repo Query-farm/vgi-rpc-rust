@@ -139,6 +139,44 @@ jobs:
       - name: Verified native mTLS client
         run: cargo test -p vgi-rpc-client --features tcp-tls --locked --test tcp_tls
 
+  # The blob-vendor client (`vgi_rpc_s3::vendor`) against vgi-rpc-python's fake
+  # vendor, fault routes included. The same pinned commit the vgi extension's
+  # test/start_fake_blob_vendor.sh runs; bump the two together.
+  blob-vendor:
+    name: Blob vendor client vs fake vendor
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VGI_RPC_FAKE_VENDOR_REF: af57e6bb395e5198b2a5336def976d73bfc87d8f
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - name: Build the vendor test
+        run: cargo test -p vgi-rpc-s3 --test vendor_fake --locked --no-run
+      - name: Run against the fake vendor
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          uvx --from "git+https://github.com/Query-farm/vgi-rpc-python@${VGI_RPC_FAKE_VENDOR_REF}" \
+            vgi-rpc-fake-vendor --test-routes --token "test-token=tenant-a" >"$log" 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          url=""
+          for _ in $(seq 1 360); do
+            kill -0 "$pid" 2>/dev/null || { cat "$log"; exit 1; }
+            url="$(sed -n 's/^URL:\(.*\)$/\1/p' "$log" | head -1)"
+            [ -n "$url" ] && break
+            sleep 0.5
+          done
+          [ -n "$url" ] || { cat "$log"; exit 1; }
+          VGI_BLOB_VENDOR_URL="$url" VGI_BLOB_VENDOR_TOKEN=test-token \
+            cargo test -p vgi-rpc-s3 --test vendor_fake --locked -- --nocapture 2>&1 | tee test.log
+          # The test skips (passes) without the vendor; make sure it ran.
+          ! grep -q "skipping:" test.log
+
   fmt-clippy-test:
     runs-on: ubuntu-latest
     steps:

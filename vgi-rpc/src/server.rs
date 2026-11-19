@@ -117,11 +117,22 @@ fn lock_ok<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Invoke a handler closure, converting a panic into an `RpcError`
 /// instead of unwinding through the serve loop (which on stdio/pipe
-/// would kill the whole process). The panic message is intentionally
-/// not echoed to the client.
+/// would kill the whole process).
+///
+/// A panic's message is intentionally not echoed to the client: it is
+/// arbitrary text that may carry anything the handler had in scope. The one
+/// exception is a panic whose payload *is* an [`RpcError`]
+/// (`std::panic::panic_any(err)`): the code that raised it chose that error
+/// for the client, so it is returned as is. Infallible interfaces (a storage
+/// trait whose methods cannot return `Result`) use this to report a failure
+/// the caller must be able to read.
 pub(crate) fn call_guard<T>(f: impl FnOnce() -> T) -> Result<T> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
-        .map_err(|_| RpcError::new("RuntimeError", "handler panicked"))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
+        match payload.downcast::<RpcError>() {
+            Ok(err) => *err,
+            Err(_) => RpcError::new("RuntimeError", "handler panicked"),
+        }
+    })
 }
 
 /// Parse canonical semver `MAJOR.MINOR.PATCH`: non-negative integers, no
@@ -2662,6 +2673,20 @@ mod tests {
             w.finish().unwrap();
         }
         buf
+    }
+
+    #[test]
+    fn call_guard_hides_panic_text_but_returns_an_rpc_error_payload() {
+        let hidden = call_guard(|| -> u8 { panic!("secret-in-scope") }).unwrap_err();
+        assert_eq!(hidden.message, "handler panicked");
+        assert!(!format!("{hidden:?}").contains("secret-in-scope"));
+
+        let chosen = call_guard(|| -> u8 {
+            std::panic::panic_any(RpcError::runtime_error("storage blob x is missing"))
+        })
+        .unwrap_err();
+        assert_eq!(chosen.error_type, "RuntimeError");
+        assert_eq!(chosen.message, "storage blob x is missing");
     }
 
     #[test]

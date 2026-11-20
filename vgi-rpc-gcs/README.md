@@ -21,11 +21,15 @@ use std::sync::Arc;
 use vgi_rpc::external::{ExternalLocationConfig, Compression};
 use vgi_rpc_gcs::{SignedGcsStorage, HttpFetcher};
 
-let factory = Arc::new(|bucket: &str, object: &str| {
+// Sign the PUT for exactly `req.size` bytes (GCS cannot verify a SHA-256 at
+// storage; the server checks the pointer's digest) and return what you signed.
+let factory = Arc::new(|req: &vgi_rpc_gcs::PresignRequest| {
+    let (bucket, object) = (req.bucket, req.key);
     Ok(vgi_rpc::external::UploadUrl {
         upload_url: format!("https://storage.googleapis.com/{bucket}/{object}?put-signature=..."),
         download_url: format!("https://storage.googleapis.com/{bucket}/{object}?get-signature=..."),
         expires_at_micros: 0, // Set to the actual signing expiry.
+        headers: req.gcs_length_headers(),
     })
 });
 

@@ -101,8 +101,9 @@ pub use error_model::{Code, ErrorDetail};
 pub use errors::{Result, RpcError};
 #[cfg(feature = "external")]
 pub use external::{
-    publish_external, upload_url_params_schema, upload_url_response_schema, MAX_UPLOAD_URL_COUNT,
-    UPLOAD_URL_METHOD,
+    parse_upload_url_request, publish_external, resolve_request_pointer, upload_url_params_schema,
+    upload_url_request_batch, upload_url_response_batch, upload_url_response_schema, UploadRequest,
+    MAX_UPLOAD_URL_COUNT, UPLOAD_URL_METHOD, UPLOAD_URL_PROTOCOL_VERSION,
 };
 pub use external_ref::{ExternalRef, RefOr};
 pub use hooks::{

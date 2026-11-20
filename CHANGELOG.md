@@ -4,6 +4,38 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- **Upload-URL protocol v2** (`VGI-Upload-URL-Support: 2`, vgi protocol 3.4),
+  matching vgi-rpc-python `protocol-3.4` (wire shapes and error texts from its
+  `tools/cross-port/specs/UPLOAD_URL_V2.md`).
+  `__upload_url__/init` takes `uploads: list<struct<size: int64, sha256: utf8>>`
+  (1–100 entries) instead of `count`, and answers one row per entry with a new
+  `upload_headers: map<utf8, utf8>` column (never `Content-Length`). The
+  server refuses — 400 `ValueError`, before minting anything — the retired
+  `count` shape (`retired count shape`), bad entry counts, `size < 1`, a
+  `sha256` that is not 64 lowercase hex, and any `size` over
+  `max_upload_bytes` (`exceeds VGI-Max-Upload-Bytes`, now enforced, not just
+  advertised).
+  - `UploadUrlProvider::generate_upload_url(size, sha256_hex)`; `UploadUrl`
+    gains `headers`. `VendorStorage` mints client URLs through the sized
+    `/v1/blobs/put` (purpose `rpc`); `/v1/upload_urls` is no longer used.
+    `PresignedS3Storage` / `SignedGcsStorage` factories take a
+    `PresignRequest` (bucket, key, size, sha256) for result and client uploads
+    alike, with `s3_checksum_headers()` / `gcs_length_headers()` helpers.
+  - HTTP request pointers (unary, stream init, exchange input) must carry
+    `vgi_rpc.location.sha256` (`external::resolve_request_pointer`;
+    `Request pointer is missing vgi_rpc.location.sha256 ...`), refused before
+    any fetch and verified before decoding (`sha256 mismatch`).
+  - `vgi-rpc-client` refuses a server that is not v2 (`Server upload protocol
+    is too old` for `true`), hashes the body, sends `uploads`, PUTs with every
+    `upload_headers` entry (`application/octet-stream` unless one is a content
+    type) and stamps the digest on the pointer. A refused PUT reports the
+    storage's S3 error code. `HttpServerCapabilities::upload_url_version`;
+    `request_upload_urls(&[UploadRequest])`.
+  - `InMemoryStorage` (test-utils) is a verifying `UploadUrlProvider`
+    (`put` refuses a body that is not the signed size and digest).
+
 ### Added
 
 - **Blob-vendor client** (`vgi_rpc_s3::vendor`), a port of vgi-rpc-python's

@@ -195,7 +195,7 @@ fn upload_url_contract_is_exported() {
             .iter()
             .map(|f| f.name().as_str())
             .collect::<Vec<_>>(),
-        ["count"]
+        ["uploads"]
     );
     let response = vgi_rpc::upload_url_response_schema();
     assert_eq!(
@@ -204,7 +204,7 @@ fn upload_url_contract_is_exported() {
             .iter()
             .map(|f| f.name().as_str())
             .collect::<Vec<_>>(),
-        ["upload_url", "download_url", "expires_at"]
+        ["upload_url", "download_url", "expires_at", "upload_headers"]
     );
 }
 

@@ -410,6 +410,9 @@ pub struct HttpState {
     /// backstop on the unary path.
     max_externalized_response_bytes: Option<usize>,
     upload_url_provider: Option<Arc<dyn crate::external::UploadUrlProvider>>,
+    /// Largest single client-vended upload (`VGI-Max-Upload-Bytes`); an
+    /// `__upload_url__` entry over it is refused before a URL is minted.
+    max_upload_bytes: Option<usize>,
     /// Sticky-session context, `Some` when the server is sticky-enabled.
     sticky: Option<Arc<crate::sticky::StickyContext>>,
     /// Producer for the standardized landing contract (`describe.json` +
@@ -759,8 +762,8 @@ impl HttpStateBuilder {
     }
 
     /// Advertised upper bound on the size of any single client-vended
-    /// upload (header `VGI-Max-Upload-Bytes`). Advertisement only — no
-    /// server-side enforcement.
+    /// upload (header `VGI-Max-Upload-Bytes`). An `__upload_url__` entry
+    /// whose `size` exceeds it is refused before any URL is minted.
     pub fn max_upload_bytes(mut self, n: usize) -> Self {
         self.max_upload_bytes = Some(n);
         self
@@ -812,7 +815,7 @@ impl HttpStateBuilder {
 
     /// Install an [`UploadUrlProvider`](crate::external::UploadUrlProvider).
     /// When set, the server exposes `POST /__upload_url__/init` and
-    /// advertises `VGI-Upload-URL-Support: true`.
+    /// advertises `VGI-Upload-URL-Support: 2` (sized, checksummed uploads).
     pub fn upload_url_provider(
         mut self,
         provider: Arc<dyn crate::external::UploadUrlProvider>,
@@ -1003,6 +1006,7 @@ impl HttpStateBuilder {
             preferred_response_bytes: self.preferred_response_bytes,
             max_externalized_response_bytes: self.max_externalized_response_bytes,
             upload_url_provider: self.upload_url_provider,
+            max_upload_bytes: self.max_upload_bytes,
             sticky,
             landing_info: self.landing_info,
             capability_headers,
@@ -1120,7 +1124,10 @@ fn build_capability_headers(inputs: CapabilityInputs<'_>) -> (HeaderMap, bool, H
         }),
     );
     if upload_url_support {
-        out.insert("vgi-upload-url-support", HeaderValue::from_static("true"));
+        out.insert(
+            "vgi-upload-url-support",
+            HeaderValue::from(crate::external::UPLOAD_URL_PROTOCOL_VERSION),
+        );
         any = true;
         if let Some(n) = max_upload_bytes {
             if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
@@ -3415,11 +3422,10 @@ fn new_session_id() -> String {
 // Upload-URL endpoint
 // ---------------------------------------------------------------------------
 
-// The method name, count cap, and response schema are the public wire contract;
-// they live in `crate::external` so intermediaries share one definition.
-use crate::external::{
-    upload_url_params_schema, upload_url_response_schema, MAX_UPLOAD_URL_COUNT, UPLOAD_URL_METHOD,
-};
+// The method name, request/response schemas and their validation are the
+// public wire contract; they live in `crate::external` so intermediaries share
+// one definition.
+use crate::external::{parse_upload_url_request, upload_url_response_batch, UPLOAD_URL_METHOD};
 
 async fn handle_upload_url(
     State(state): State<Arc<HttpState>>,
@@ -3472,32 +3478,26 @@ async fn handle_upload_url(
     // `__upload_url__` is a framework endpoint owned by no protocol, so no
     // binding's version gate applies (as in the reference): a client of any
     // version may need somewhere to upload.
-    if let Err(err) = validate_parameter_batch(&req.batch, &upload_url_params_schema()) {
-        return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
-    }
-    // Pull `count` from the int64 column (default 1, clamped to [1, MAX]).
-    let mut count: i64 = 1;
-    if let Some(arr) = req.column("count") {
-        use arrow_array::Array;
-        if let Some(c) = arr.as_any().downcast_ref::<arrow_array::Int64Array>() {
-            if !c.is_empty() && !Array::is_null(c, 0) {
-                count = c.value(0);
-            }
-        }
-    }
-    count = count.clamp(1, MAX_UPLOAD_URL_COUNT);
+    //
+    // Every refusal -- the retired `count` shape, a bad entry, a size over
+    // `VGI-Max-Upload-Bytes` -- is a 400 before any URL is minted.
+    let uploads =
+        match parse_upload_url_request(&req.batch, state.max_upload_bytes.map(|n| n as u64)) {
+            Ok(u) => u,
+            Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id),
+        };
 
     // Generate URLs (provider may block on HTTP — same caveat as
     // ExternalStorage::upload, hence block_in_place).
     let urls_res = tokio::task::block_in_place(|| {
-        let mut out = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            out.push(provider.generate_upload_url()?);
-        }
-        Ok::<_, RpcError>(out)
-    });
+        uploads
+            .iter()
+            .map(|u| provider.generate_upload_url(u.size, &u.sha256))
+            .collect::<std::result::Result<Vec<_>, RpcError>>()
+    })
+    .and_then(|urls| upload_url_response_batch(&urls));
 
-    let schema = upload_url_response_schema();
+    let schema = crate::external::upload_url_response_schema();
     let schema_ref = schema.as_ref();
     let mut body_buf = Vec::new();
     {
@@ -3513,59 +3513,7 @@ async fn handle_upload_url(
             }
         };
         match urls_res {
-            Ok(urls) => {
-                use arrow_array::{StringArray, TimestampMicrosecondArray};
-                let upload_arr = StringArray::from(
-                    urls.iter()
-                        .map(|u| u.upload_url.clone())
-                        .collect::<Vec<_>>(),
-                );
-                let download_arr = StringArray::from(
-                    urls.iter()
-                        .map(|u| u.download_url.clone())
-                        .collect::<Vec<_>>(),
-                );
-                let expires_arr = TimestampMicrosecondArray::from(
-                    urls.iter().map(|u| u.expires_at_micros).collect::<Vec<_>>(),
-                )
-                .with_timezone("UTC");
-                let batch = match RecordBatch::try_new(
-                    schema.clone(),
-                    vec![
-                        Arc::new(upload_arr),
-                        Arc::new(download_arr),
-                        Arc::new(expires_arr),
-                    ],
-                ) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let err = RpcError::runtime_error(format!("upload-url batch: {e}"));
-                        let md = build_error_metadata(
-                            &err,
-                            &state.server.server_id,
-                            &req.request_id,
-                            state
-                                .server
-                                .traceback_origin(&req.protocol, &req.method)
-                                .as_deref(),
-                        );
-                        let _ = sw.write(&empty_batch(schema_ref).unwrap(), Some(&md));
-                        let _ = sw.finish();
-                        drop(sw);
-                        return enforce_response_body_cap(
-                            response_limit,
-                            schema_ref,
-                            body_buf,
-                            UPLOAD_URL_METHOD,
-                            &state.server.server_id,
-                            &req.request_id,
-                            state
-                                .server
-                                .traceback_origin(&req.protocol, &req.method)
-                                .as_deref(),
-                        );
-                    }
-                };
+            Ok(batch) => {
                 let _ = sw.write(&batch, None);
             }
             Err(err) => {
@@ -3859,7 +3807,7 @@ async fn unary_dispatch(
             let outer_md = req.metadata.clone();
             let outer_batch = req.batch.clone();
             let resolved = tokio::task::block_in_place(|| {
-                crate::external::resolve_external_location(&outer_batch, &outer_md, cfg)
+                crate::external::resolve_request_pointer(&outer_batch, &outer_md, cfg)
             });
             match resolved {
                 Ok((inner_batch, _user_md)) => {
@@ -4367,7 +4315,7 @@ async fn stream_init_dispatch(
     if md_get(&req.metadata, crate::metadata::LOCATION_KEY).is_some() {
         if let Some(cfg) = server.external_config().as_ref() {
             let resolved = tokio::task::block_in_place(|| {
-                crate::external::resolve_external_location(&req.batch, &req.metadata, cfg)
+                crate::external::resolve_request_pointer(&req.batch, &req.metadata, cfg)
             });
             match resolved {
                 Ok((inner_batch, _user_md)) => req.batch = inner_batch,
@@ -4989,7 +4937,7 @@ async fn stream_exchange_dispatch(
     if md_get(&metadata, crate::metadata::LOCATION_KEY).is_some() {
         if let Some(cfg) = server.external_config().as_ref() {
             let resolved = tokio::task::block_in_place(|| {
-                crate::external::resolve_external_location(&batch, &metadata, cfg)
+                crate::external::resolve_request_pointer(&batch, &metadata, cfg)
             });
             match resolved {
                 Ok((inner_batch, inner_metadata)) => {

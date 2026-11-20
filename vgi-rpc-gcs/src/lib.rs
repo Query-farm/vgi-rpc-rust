@@ -9,9 +9,15 @@ pub use vgi_rpc_s3::HttpFetcher;
 
 use vgi_rpc::external::{Compression, ExternalStorage, UploadResult, UploadUrl, UploadUrlProvider};
 use vgi_rpc::Result;
+pub use vgi_rpc_s3::PresignRequest;
 use vgi_rpc_s3::{PresignUrlPairFactory, PresignedPutStorage};
 
 /// User-supplied factory returning method-bound V4-signed PUT and GET URLs.
+///
+/// GCS cannot verify a SHA-256 at storage, so sign the PUT for the exact
+/// length instead ([`PresignRequest::gcs_length_headers`]) and return the
+/// signed headers; the server's `vgi_rpc.location.sha256` check catches a
+/// wrong body.
 pub type SignedUrlFactory = PresignUrlPairFactory;
 
 /// `ExternalStorage` that PUTs objects via a GCS V4-signed URL factory.
@@ -34,8 +40,8 @@ impl ExternalStorage for SignedGcsStorage {
 }
 
 impl UploadUrlProvider for SignedGcsStorage {
-    fn generate_upload_url(&self) -> Result<UploadUrl> {
-        self.0.generate_upload_url()
+    fn generate_upload_url(&self, size: u64, sha256_hex: &str) -> Result<UploadUrl> {
+        self.0.generate_upload_url(size, sha256_hex)
     }
 }
 
@@ -52,11 +58,12 @@ mod tests {
         let storage = SignedGcsStorage::new(
             "bkt",
             "tenant-a/",
-            Arc::new(|_, _| {
+            Arc::new(|_: &PresignRequest| {
                 Ok(UploadUrl {
                     upload_url: String::from("https://example/upload"),
                     download_url: String::from("https://example/download"),
                     expires_at_micros: 0,
+                    headers: Vec::new(),
                 })
             }),
         );
@@ -129,11 +136,12 @@ mod tests {
         let storage = SignedGcsStorage::new(
             "bucket",
             "prefix/",
-            Arc::new(move |_, _| {
+            Arc::new(move |_: &PresignRequest| {
                 Ok(UploadUrl {
                     upload_url: upload_url.clone(),
                     download_url: download_url.clone(),
                     expires_at_micros: 123,
+                    headers: Vec::new(),
                 })
             }),
         );

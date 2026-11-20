@@ -422,6 +422,7 @@ fn handle_http_admin(c: &mut HttpClient, op: &str, req: &Value) -> Value {
                 "sticky_default_ttl": caps.sticky_default_ttl,
                 "sticky_echo_headers": caps.sticky_echo_headers,
                 "upload_url_support": caps.upload_url_support,
+                "upload_url_version": caps.upload_url_version,
                 "max_request_bytes": caps.max_request_bytes,
                 "max_response_bytes": caps.max_response_bytes,
                 "max_externalized_response_bytes": caps.max_externalized_response_bytes,
@@ -432,12 +433,44 @@ fn handle_http_admin(c: &mut HttpClient, op: &str, req: &Value) -> Value {
             Err(e) => json!({"ok": false, "error": e.to_string()}),
         },
         "request_upload_urls" => {
-            let count = req.get("count").and_then(Value::as_u64).unwrap_or(1) as usize;
-            match c.request_upload_urls(count) {
+            // `uploads`: one (size, sha256) entry per URL, as `[size, sha]`
+            // pairs or `{"size": .., "sha256": ..}` objects.
+            let uploads: Vec<vgi_rpc::external::UploadRequest> = req
+                .get("uploads")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            let (size, sha) = match item {
+                                Value::Array(pair) if pair.len() == 2 => {
+                                    (pair[0].as_u64()?, pair[1].as_str()?)
+                                }
+                                Value::Object(m) => {
+                                    (m.get("size")?.as_u64()?, m.get("sha256")?.as_str()?)
+                                }
+                                _ => return None,
+                            };
+                            Some(vgi_rpc::external::UploadRequest {
+                                size,
+                                sha256: sha.to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            match c.request_upload_urls(&uploads) {
                 Ok(urls) => {
                     let list: Vec<Value> = urls
                         .into_iter()
-                        .map(|u| json!({"upload_url": u.upload_url, "download_url": u.download_url, "expires_at": u.expires_at}))
+                        .map(|u| {
+                            let headers: serde_json::Map<String, Value> = u
+                                .headers
+                                .into_iter()
+                                .map(|(k, v)| (k, Value::String(v)))
+                                .collect();
+                            json!({"upload_url": u.upload_url, "download_url": u.download_url, "expires_at": u.expires_at, "upload_headers": headers})
+                        })
                         .collect();
                     json!({"ok": true, "urls": list})
                 }

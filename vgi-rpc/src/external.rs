@@ -119,21 +119,55 @@ pub trait ExternalStorage: Send + Sync {
 /// The RPC method name of the upload-URL flow (`POST /__upload_url__/init`).
 pub const UPLOAD_URL_METHOD: &str = "__upload_url__";
 
-/// Upper bound on the `count` an `__upload_url__` request may ask for. The
-/// server clamps to `[1, MAX_UPLOAD_URL_COUNT]`.
-pub const MAX_UPLOAD_URL_COUNT: i64 = 100;
+/// Value of the `VGI-Upload-URL-Support` capability header for the sized
+/// upload protocol this crate speaks. Version 1 (`"true"`, a bare `count`
+/// of unsized URLs) is retired: a client must refuse a server advertising it,
+/// and a server refuses the `count` request shape.
+pub const UPLOAD_URL_PROTOCOL_VERSION: u32 = 2;
 
-/// Parameter schema of an `__upload_url__` request: a single `count` int64.
+/// Most entries one `__upload_url__` request may carry.
+pub const MAX_UPLOAD_URL_COUNT: usize = 100;
+
+/// Arrow type of one `uploads` entry: `struct<size: int64, sha256: utf8>`,
+/// both non-null.
+fn upload_entry_type() -> arrow_schema::DataType {
+    use arrow_schema::{DataType, Field, Fields};
+    DataType::Struct(Fields::from(vec![
+        Field::new("size", DataType::Int64, false),
+        Field::new("sha256", DataType::Utf8, false),
+    ]))
+}
+
+/// Parameter schema of an `__upload_url__` request: one non-null `uploads`
+/// column of `list<struct<size: int64, sha256: utf8>>`, one entry per upload.
 pub fn upload_url_params_schema() -> SchemaRef {
     use arrow_schema::{DataType, Field};
     Arc::new(Schema::new(vec![Field::new(
-        "count",
-        DataType::Int64,
-        true,
+        "uploads",
+        DataType::List(Arc::new(Field::new("item", upload_entry_type(), true))),
+        false,
     )]))
 }
 
-/// Response schema of an `__upload_url__` reply: one row per generated URL pair.
+/// Arrow type of the `upload_headers` response column, `map<utf8, utf8>`,
+/// laid out the way pyarrow's `pa.map_(pa.utf8(), pa.utf8())` is.
+fn upload_headers_type() -> arrow_schema::DataType {
+    use arrow_schema::{DataType, Field, Fields};
+    DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Utf8, true),
+            ])),
+            false,
+        )),
+        false,
+    )
+}
+
+/// Response schema of an `__upload_url__` reply: one row per request entry,
+/// in request order.
 pub fn upload_url_response_schema() -> SchemaRef {
     use arrow_schema::{DataType, Field, TimeUnit};
     Arc::new(Schema::new(vec![
@@ -144,28 +178,270 @@ pub fn upload_url_response_schema() -> SchemaRef {
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
         ),
+        Field::new("upload_headers", upload_headers_type(), false),
     ]))
 }
 
-/// Pre-signed URL pair for client-side data upload.
+/// One requested upload: the exact byte length and SHA-256 of the body the
+/// client will `PUT`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadRequest {
+    /// Exact byte length of the body; at least 1.
+    pub size: u64,
+    /// SHA-256 of exactly those bytes, 64 lowercase hex characters.
+    pub sha256: String,
+}
+
+impl UploadRequest {
+    /// Describe `body` for an upload request.
+    pub fn for_body(body: &[u8]) -> Self {
+        Self {
+            size: body.len() as u64,
+            sha256: sha256_hex(body),
+        }
+    }
+}
+
+/// True when `s` is 64 lowercase hex characters — the encoding of
+/// `vgi_rpc.location.sha256` and of an upload entry's `sha256`.
+pub fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The refusal for a request in the retired version-1 (`count`) shape.
+fn retired_count_shape() -> RpcError {
+    RpcError::value_error(format!(
+        "{UPLOAD_URL_METHOD} request uses the retired count shape: this server requires \
+         VGI-Upload-URL-Support: {UPLOAD_URL_PROTOCOL_VERSION} and an 'uploads' parameter \
+         (list<struct<size: int64, sha256: utf8>>, one entry per upload)"
+    ))
+}
+
+/// Build the parameter batch of an `__upload_url__` request.
+pub fn upload_url_request_batch(uploads: &[UploadRequest]) -> Result<RecordBatch> {
+    use arrow_array::builder::{Int64Builder, ListBuilder, StringBuilder, StructBuilder};
+    use arrow_schema::{DataType, Field};
+    let fields = vec![
+        Field::new("size", DataType::Int64, false),
+        Field::new("sha256", DataType::Utf8, false),
+    ];
+    let entries = StructBuilder::new(
+        fields,
+        vec![
+            Box::new(Int64Builder::new()) as Box<dyn arrow_array::builder::ArrayBuilder>,
+            Box::new(StringBuilder::new()),
+        ],
+    );
+    let mut list = ListBuilder::new(entries).with_field(Arc::new(Field::new(
+        "item",
+        upload_entry_type(),
+        true,
+    )));
+    for u in uploads {
+        let size = i64::try_from(u.size)
+            .map_err(|_| RpcError::value_error(format!("upload size {} is too large", u.size)))?;
+        let item = list.values();
+        item.field_builder::<Int64Builder>(0)
+            .expect("size builder")
+            .append_value(size);
+        item.field_builder::<StringBuilder>(1)
+            .expect("sha256 builder")
+            .append_value(&u.sha256);
+        item.append(true);
+    }
+    list.append(true);
+    Ok(RecordBatch::try_new(
+        upload_url_params_schema(),
+        vec![Arc::new(list.finish())],
+    )?)
+}
+
+/// Parse and validate an `__upload_url__` request's parameter batch.
+///
+/// Refuses (as a `ValueError`, before any URL is minted) the retired `count`
+/// shape, an empty or over-long `uploads` list, a `size` below 1, a `sha256`
+/// that is not 64 lowercase hex characters, and — when `max_upload_bytes` is
+/// set — any `size` above it. Accepts `list` and `large_list` encodings and
+/// any child nullability, so peers that spell the type slightly differently
+/// still interoperate; the values themselves must be present.
+pub fn parse_upload_url_request(
+    batch: &RecordBatch,
+    max_upload_bytes: Option<u64>,
+) -> Result<Vec<UploadRequest>> {
+    use arrow_array::{Array, Int64Array, LargeListArray, ListArray, StringArray, StructArray};
+    let schema = batch.schema();
+    if schema.column_with_name("count").is_some() {
+        return Err(retired_count_shape());
+    }
+    let Some(col) = batch.column_by_name("uploads") else {
+        return Err(retired_count_shape());
+    };
+    if batch.num_rows() != 1 {
+        return Err(RpcError::value_error(format!(
+            "__upload_url__ request must carry exactly one row, got {}",
+            batch.num_rows()
+        )));
+    }
+    if col.is_null(0) {
+        return Err(RpcError::value_error(format!(
+            "__upload_url__ 'uploads' must have 1-{MAX_UPLOAD_URL_COUNT} entries, got null"
+        )));
+    }
+    let entries = if let Some(l) = col.as_any().downcast_ref::<ListArray>() {
+        l.value(0)
+    } else if let Some(l) = col.as_any().downcast_ref::<LargeListArray>() {
+        l.value(0)
+    } else {
+        return Err(RpcError::value_error(
+            "__upload_url__ 'uploads' must be a list<struct<size: int64, sha256: utf8>>",
+        ));
+    };
+    let bad_type = || {
+        RpcError::value_error(
+            "__upload_url__ 'uploads' must be a list<struct<size: int64, sha256: utf8>>",
+        )
+    };
+    let entries = entries
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(bad_type)?;
+    let sizes = entries
+        .column_by_name("size")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(bad_type)?;
+    let hashes = entries
+        .column_by_name("sha256")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(bad_type)?;
+    let n = entries.len();
+    if n == 0 || n > MAX_UPLOAD_URL_COUNT {
+        return Err(RpcError::value_error(format!(
+            "__upload_url__ 'uploads' must have 1-{MAX_UPLOAD_URL_COUNT} entries, got {n}"
+        )));
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if entries.is_null(i) || sizes.is_null(i) || hashes.is_null(i) {
+            return Err(RpcError::value_error(format!(
+                "__upload_url__ uploads[{i}] must carry a non-null size and sha256"
+            )));
+        }
+        let size = sizes.value(i);
+        if size < 1 {
+            return Err(RpcError::value_error(format!(
+                "__upload_url__ uploads[{i}].size must be an integer >= 1, got {size}"
+            )));
+        }
+        let sha = hashes.value(i);
+        if !is_sha256_hex(sha) {
+            return Err(RpcError::value_error(format!(
+                "__upload_url__ uploads[{i}].sha256 must be 64 lowercase hex characters"
+            )));
+        }
+        let size = size as u64;
+        if let Some(max) = max_upload_bytes {
+            if size > max {
+                return Err(RpcError::value_error(format!(
+                    "__upload_url__ uploads[{i}].size {size} exceeds VGI-Max-Upload-Bytes ({max})"
+                )));
+            }
+        }
+        out.push(UploadRequest {
+            size,
+            sha256: sha.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Build the response batch of an `__upload_url__` reply, one row per URL.
+pub fn upload_url_response_batch(urls: &[UploadUrl]) -> Result<RecordBatch> {
+    use arrow_array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+    use arrow_array::{StringArray, TimestampMicrosecondArray};
+    let upload = StringArray::from_iter_values(urls.iter().map(|u| u.upload_url.as_str()));
+    let download = StringArray::from_iter_values(urls.iter().map(|u| u.download_url.as_str()));
+    let expires =
+        TimestampMicrosecondArray::from_iter_values(urls.iter().map(|u| u.expires_at_micros))
+            .with_timezone("UTC");
+    let names = MapFieldNames {
+        entry: "entries".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
+    };
+    let mut headers = MapBuilder::new(Some(names), StringBuilder::new(), StringBuilder::new());
+    for u in urls {
+        // The client frames the body with its own plain Content-Length; a
+        // provider that lists one (the vendor's required headers do) must
+        // not hand the client a second.
+        for (k, v) in u
+            .headers
+            .iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("content-length"))
+        {
+            headers.keys().append_value(k);
+            headers.values().append_value(v);
+        }
+        headers.append(true)?;
+    }
+    let headers = headers.finish();
+    Ok(RecordBatch::try_new(
+        upload_url_response_schema(),
+        vec![
+            Arc::new(upload),
+            Arc::new(download),
+            Arc::new(expires),
+            Arc::new(headers),
+        ],
+    )?)
+}
+
+/// Pre-signed URL pair for one client-side upload.
 ///
 /// `expires_at` is a Unix-epoch microseconds timestamp (UTC). Mirrors
 /// `vgi_rpc.external.UploadUrl`.
 #[derive(Clone, Debug)]
 pub struct UploadUrl {
+    /// Pre-signed `PUT`, signed for the requested size (and SHA-256 where the
+    /// backend can verify it).
     pub upload_url: String,
+    /// Pre-signed `GET` the server fetches the uploaded bytes from.
     pub download_url: String,
-    /// Expiration time as microseconds since the Unix epoch (UTC).
+    /// Expiration time of both URLs as microseconds since the Unix epoch (UTC).
     pub expires_at_micros: i64,
+    /// Headers the client must send on the `PUT`, verbatim — e.g.
+    /// `x-amz-checksum-sha256`. Never contains `Content-Length`; the client
+    /// sends exactly the requested size with a plain length.
+    pub headers: Vec<(String, String)>,
 }
 
 /// Generates pre-signed upload URL pairs for client-vended uploads.
 ///
-/// Mirror of Python `vgi_rpc.external.UploadUrlProvider`. Implementations
-/// must be thread-safe — `generate_upload_url()` may be called concurrently
-/// from different request handlers.
+/// Mirror of Python `vgi_rpc.external.UploadUrlProvider`. Each URL is minted
+/// for one body of exactly `size` bytes whose SHA-256 is `sha256_hex`
+/// (64 lowercase hex characters); backends that can sign those (S3, R2, the
+/// blob vendor) make storage itself refuse a mismatched body, and return the
+/// signed headers in [`UploadUrl::headers`]. Implementations must be
+/// thread-safe — `generate_upload_url()` may be called concurrently from
+/// different request handlers.
 pub trait UploadUrlProvider: Send + Sync {
-    fn generate_upload_url(&self) -> Result<UploadUrl>;
+    fn generate_upload_url(&self, size: u64, sha256_hex: &str) -> Result<UploadUrl>;
+}
+
+/// Base64 (standard, padded) of the 32 raw digest bytes behind a lowercase
+/// hex SHA-256 — the value S3's `x-amz-checksum-sha256` carries.
+pub fn sha256_hex_to_b64(sha256_hex: &str) -> Result<String> {
+    use base64::Engine as _;
+    if !is_sha256_hex(sha256_hex) {
+        return Err(RpcError::value_error(
+            "sha256 must be 64 lowercase hex characters",
+        ));
+    }
+    let raw: Vec<u8> = (0..32)
+        .map(|i| u8::from_str_radix(&sha256_hex[2 * i..2 * i + 2], 16).expect("validated hex"))
+        .collect();
+    Ok(base64::engine::general_purpose::STANDARD.encode(raw))
 }
 
 /// Callback verifying an external location URL. Called on both the
@@ -504,9 +780,7 @@ pub fn fetch_external_ipc_bytes(
     if let Some(expected) = md_get(metadata, LOCATION_SHA256_KEY) {
         let actual = sha256_hex(&ipc_bytes);
         if expected != actual.as_str() {
-            return Err(RpcError::runtime_error(format!(
-                "external location checksum: SHA-256 mismatch (expected {expected}, got {actual})"
-            )));
+            return Err(sha256_mismatch(url, expected, &actual));
         }
     }
     Ok(Some(ipc_bytes))
@@ -523,6 +797,14 @@ pub fn deserialize_single_batch_with_metadata(ipc_bytes: &[u8]) -> Result<(Recor
     let mut r = StreamReader::new(ipc_bytes)?;
     r.read_next()?
         .ok_or_else(|| RpcError::runtime_error("external batch stream is empty"))
+}
+
+/// The integrity failure of a fetched pointer payload.
+fn sha256_mismatch(url: &str, expected: &str, actual: &str) -> RpcError {
+    RpcError::runtime_error(format!(
+        "ExternalLocation sha256 mismatch (SHA-256 checksum mismatch) for {}: expected {expected}, got {actual}",
+        redact_external_url(url)
+    ))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -968,9 +1250,7 @@ pub fn resolve_external_location(
     if let Some(expected) = md_get(metadata, LOCATION_SHA256_KEY) {
         let actual = sha256_hex(&ipc_bytes);
         if expected != actual.as_str() {
-            return Err(RpcError::runtime_error(format!(
-                "external location checksum: SHA-256 mismatch (expected {expected}, got {actual})"
-            )));
+            return Err(sha256_mismatch(url, expected, &actual));
         }
     }
     let (resolved, inner_md) = deserialize_single_batch_with_metadata(&ipc_bytes)?;
@@ -980,6 +1260,40 @@ pub fn resolve_external_location(
         resolved,
         resolved_metadata(metadata, inner_md, url, fetch_ms),
     ))
+}
+
+/// Resolve a **request** pointer — one a client uploaded through the
+/// upload-URL flow and the server is about to dispatch.
+///
+/// Stricter than [`resolve_external_location`]: the pointer must carry
+/// `vgi_rpc.location.sha256` (a pointer without it is refused before any
+/// fetch), and the fetched bytes are verified against it before decoding.
+/// Non-pointer batches are returned untouched.
+pub fn resolve_request_pointer(
+    batch: &RecordBatch,
+    metadata: &Metadata,
+    cfg: &ExternalLocationConfig,
+) -> Result<(RecordBatch, Metadata)> {
+    let Some(url) = md_get(metadata, LOCATION_KEY) else {
+        return Ok((batch.clone(), metadata.clone()));
+    };
+    match md_get(metadata, LOCATION_SHA256_KEY) {
+        None => {
+            return Err(RpcError::value_error(format!(
+                "Request pointer is missing {LOCATION_SHA256_KEY} (required on request \
+                 pointers since vgi-rpc upload-URL protocol v2): {}",
+                redact_external_url(url)
+            )))
+        }
+        Some(sha) if !is_sha256_hex(sha) => {
+            return Err(RpcError::value_error(format!(
+                "Request pointer {LOCATION_SHA256_KEY} is not 64 lowercase hex characters: {}",
+                redact_external_url(url)
+            )))
+        }
+        Some(_) => {}
+    }
+    resolve_external_location(batch, metadata, cfg)
 }
 
 // ---------------------------------------------------------------------------
@@ -996,6 +1310,9 @@ pub fn resolve_external_location(
 #[cfg(any(test, feature = "test-utils"))]
 pub struct InMemoryStorage {
     map: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    /// Sized grants vended by [`UploadUrlProvider::generate_upload_url`],
+    /// keyed by upload URL: `(download URL, size, sha256 hex)`.
+    grants: std::sync::Mutex<std::collections::HashMap<String, (String, u64, String)>>,
     next_id: std::sync::atomic::AtomicU64,
     base_url: String,
 }
@@ -1005,6 +1322,7 @@ impl InMemoryStorage {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            grants: std::sync::Mutex::new(std::collections::HashMap::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
             base_url: "https://inmem.test/".to_string(),
         })
@@ -1016,6 +1334,62 @@ impl InMemoryStorage {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Store `body` under a URL vended by
+    /// [`generate_upload_url`](UploadUrlProvider::generate_upload_url),
+    /// verifying it the way S3/R2 verify a sized, checksummed PUT: the body
+    /// must be exactly the granted size, `x-amz-checksum-sha256` must be
+    /// sent, and the body's SHA-256 must match it. A refusal stores nothing.
+    pub fn put(&self, upload_url: &str, headers: &[(String, String)], body: &[u8]) -> Result<()> {
+        let Some((download, size, sha)) = self.grants.lock().unwrap().get(upload_url).cloned()
+        else {
+            return Err(RpcError::runtime_error("inmem put: unknown upload URL"));
+        };
+        if body.len() as u64 != size {
+            return Err(RpcError::runtime_error(format!(
+                "inmem put: IncompleteBody (signed {size} bytes, got {})",
+                body.len()
+            )));
+        }
+        let sent = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-checksum-sha256"))
+            .map(|(_, v)| v.as_str());
+        if sent != Some(sha256_hex_to_b64(&sha)?.as_str()) {
+            return Err(RpcError::runtime_error(
+                "inmem put: BadDigest (x-amz-checksum-sha256 missing or not the signed one)",
+            ));
+        }
+        if sha256_hex(body) != sha {
+            return Err(RpcError::runtime_error(
+                "inmem put: BadDigest (body does not match x-amz-checksum-sha256)",
+            ));
+        }
+        self.map.lock().unwrap().insert(download, body.to_vec());
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl UploadUrlProvider for InMemoryStorage {
+    fn generate_upload_url(&self, size: u64, sha256_hex: &str) -> Result<UploadUrl> {
+        let checksum = sha256_hex_to_b64(sha256_hex)?;
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let upload_url = format!("{}up/{id:016x}", self.base_url);
+        let download_url = format!("{}{id:016x}", self.base_url);
+        self.grants.lock().unwrap().insert(
+            upload_url.clone(),
+            (download_url.clone(), size, sha256_hex.to_string()),
+        );
+        Ok(UploadUrl {
+            upload_url,
+            download_url,
+            expires_at_micros: 0,
+            headers: vec![("x-amz-checksum-sha256".to_string(), checksum)],
+        })
     }
 }
 
@@ -1307,7 +1681,7 @@ mod tests {
             *v = "deadbeef".into();
         }
         let err = resolve_external_location(&ptr, &md, &cfg).unwrap_err();
-        assert!(err.message.contains("SHA-256 mismatch"));
+        assert!(err.message.contains("sha256 mismatch"));
     }
 
     fn result_batch(value: &str) -> RecordBatch {
@@ -1406,5 +1780,82 @@ mod tests {
             assert!(err.message.contains("1-row"), "{}", err.message);
         }
         assert!(storage.is_empty(), "a rejected publish must not upload");
+    }
+
+    #[test]
+    fn upload_url_request_round_trips_and_validates() {
+        let sha = sha256_hex(b"abc");
+        let req = vec![
+            UploadRequest {
+                size: 3,
+                sha256: sha.clone(),
+            },
+            UploadRequest::for_body(b"hello"),
+        ];
+        let batch = upload_url_request_batch(&req).unwrap();
+        assert_eq!(parse_upload_url_request(&batch, None).unwrap(), req);
+        assert_eq!(parse_upload_url_request(&batch, Some(5)).unwrap(), req);
+        let err = parse_upload_url_request(&batch, Some(4)).unwrap_err();
+        assert!(err
+            .message
+            .contains("uploads[1].size 5 exceeds VGI-Max-Upload-Bytes (4)"));
+        assert_eq!(err.error_type, "ValueError");
+    }
+
+    #[test]
+    fn upload_url_response_carries_headers_minus_content_length() {
+        let urls = vec![UploadUrl {
+            upload_url: "https://s/up".into(),
+            download_url: "https://s/down".into(),
+            expires_at_micros: 7,
+            headers: vec![
+                ("x-amz-checksum-sha256".into(), "abc=".into()),
+                ("Content-Length".into(), "3".into()),
+            ],
+        }];
+        let batch = upload_url_response_batch(&urls).unwrap();
+        assert_eq!(batch.schema(), upload_url_response_schema());
+        let map = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow_array::MapArray>()
+            .unwrap();
+        assert_eq!(
+            arrow_array::Array::len(&map.value(0)),
+            1,
+            "Content-Length is dropped"
+        );
+    }
+
+    #[test]
+    fn sha256_hex_encodings() {
+        let sha = sha256_hex(b"");
+        assert!(is_sha256_hex(&sha));
+        assert!(!is_sha256_hex(&sha.to_uppercase()));
+        assert!(!is_sha256_hex(&sha[..63]));
+        assert_eq!(
+            sha256_hex_to_b64(&sha).unwrap(),
+            "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+        );
+        assert!(sha256_hex_to_b64("zz").is_err());
+    }
+
+    #[test]
+    fn a_request_pointer_needs_its_sha256() {
+        let storage = InMemoryStorage::new();
+        let cfg = cfg_with(storage.clone(), 0);
+        let batch = big_batch(10);
+        let ptr = maybe_externalize_batch(&batch, batch.schema().as_ref(), None, &cfg)
+            .unwrap()
+            .unwrap();
+        let (ptr, mut md) = (ptr.0, ptr.1);
+        assert!(resolve_request_pointer(&ptr, &md, &cfg).is_ok());
+        md.remove(LOCATION_SHA256_KEY);
+        let err = resolve_request_pointer(&ptr, &md, &cfg).unwrap_err();
+        assert!(
+            err.message.contains("missing vgi_rpc.location.sha256"),
+            "{}",
+            err.message
+        );
     }
 }

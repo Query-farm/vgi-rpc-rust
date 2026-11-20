@@ -75,13 +75,20 @@ impl ExternalStorage for FakeStorage {
 }
 
 impl UploadUrlProvider for FakeStorage {
-    fn generate_upload_url(&self) -> Result<UploadUrl> {
+    fn generate_upload_url(&self, size: u64, sha256_hex: &str) -> Result<UploadUrl> {
         let alloc_url = format!("{}/alloc", self.base_url);
+        // A sized allocation: the fake then verifies the PUT like S3/R2
+        // (length, `x-amz-checksum-sha256`) and returns the header to send.
+        let alloc_body = serde_json::json!({
+            "size": size,
+            "sha256_b64": vgi_rpc::external::sha256_hex_to_b64(sha256_hex)?,
+        })
+        .to_string();
         let alloc_resp: serde_json::Value = self
             .client
             .post(&alloc_url)
             .header("content-type", "application/json")
-            .body("{}")
+            .body(alloc_body)
             .send()
             .and_then(|r| r.error_for_status())
             .and_then(|r| r.json())
@@ -101,6 +108,15 @@ impl UploadUrlProvider for FakeStorage {
             .and_then(|v| v.as_str())
             .unwrap_or(&legacy_url)
             .to_string();
+        let headers = alloc_resp
+            .get("upload_headers")
+            .and_then(|v| v.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
         let now_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as i64)
@@ -110,6 +126,7 @@ impl UploadUrlProvider for FakeStorage {
             upload_url,
             download_url,
             expires_at_micros,
+            headers,
         })
     }
 }

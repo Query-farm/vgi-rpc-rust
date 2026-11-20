@@ -82,10 +82,7 @@ const PUT_PATH: &str = "/v1/blobs/put";
 const GET_PATH: &str = "/v1/blobs/get";
 const DELETE_PATH: &str = "/v1/blobs/delete";
 const DELETE_SCOPE_PATH: &str = "/v1/blobs/delete_scope";
-const UPLOAD_URLS_PATH: &str = "/v1/upload_urls";
 const INFO_PATH: &str = "/v1/info";
-/// Most URL pairs one `/v1/upload_urls` call returns.
-pub const MAX_UPLOAD_URLS: usize = 100;
 /// Most object ids one `/v1/blobs/delete` call takes.
 pub const MAX_DELETE_IDS: usize = 1000;
 
@@ -210,6 +207,8 @@ pub struct PutGrant {
     pub download_url: Option<String>,
     /// When `upload_url` stops working, as Unix microseconds.
     pub expires_at_micros: i64,
+    /// When `download_url` stops working, as Unix microseconds, if given.
+    pub download_expires_at_micros: Option<i64>,
     /// The region the object lives in.
     pub region: Option<String>,
 }
@@ -865,6 +864,10 @@ impl VendorApi {
             required_headers,
             download_url: opt_str_field(&resp, "download_url", "put")?,
             expires_at_micros: parse_expires(field(&resp, "expires_at", "put")?)?,
+            download_expires_at_micros: match resp.get("download_expires_at") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(parse_expires(v)?),
+            },
             region: opt_str_field(&resp, "region", "put")?,
         })
     }
@@ -892,37 +895,6 @@ impl VendorApi {
             json!({"shard": scope.shard, "execution_id": scope.execution_id}),
         )?;
         Ok(resp.get("deleted").and_then(Value::as_u64).unwrap_or(0))
-    }
-
-    fn upload_urls(&self, count: usize) -> VResult<Vec<UploadUrl>> {
-        if !(1..=MAX_UPLOAD_URLS).contains(&count) {
-            return Err(VendorError::new(format!(
-                "count must be between 1 and {MAX_UPLOAD_URLS}"
-            )));
-        }
-        let resp = self.post(UPLOAD_URLS_PATH, "upload_urls", json!({"count": count}))?;
-        let urls = match field(&resp, "urls", "upload_urls")? {
-            Value::Array(items) if !items.is_empty() => items,
-            _ => {
-                return Err(VendorError::new(
-                    "Blob vendor upload_urls response has malformed 'urls'",
-                ))
-            }
-        };
-        urls.iter()
-            .map(|item| {
-                let Value::Object(entry) = item else {
-                    return Err(VendorError::new(
-                        "Blob vendor upload_urls response has a malformed entry",
-                    ));
-                };
-                Ok(UploadUrl {
-                    upload_url: str_field(entry, "upload_url", "upload_urls")?,
-                    download_url: str_field(entry, "download_url", "upload_urls")?,
-                    expires_at_micros: parse_expires(field(entry, "expires_at", "upload_urls")?)?,
-                })
-            })
-            .collect()
     }
 
     fn info(&self) -> VResult<VendorInfo> {
@@ -1184,8 +1156,9 @@ pub fn parse_compression(raw: &str) -> Result<Compression> {
 ///
 /// `upload` asks the vendor for a sized, checksummed grant, PUTs the bytes
 /// with exactly the grant's required headers, and returns the grant's download
-/// URL. `generate_upload_url` asks `/v1/upload_urls` for one unsized PUT/GET
-/// pair. Objects are cleaned up by the vendor; vgi-rpc never deletes them.
+/// URL. `generate_upload_url` asks for the same sized grant (purpose `rpc`)
+/// for the client's declared size and SHA-256, so the storage itself refuses a
+/// client body that does not match. Objects are cleaned up by the vendor; vgi-rpc never deletes them.
 /// Thread-safe.
 pub struct VendorStorage {
     api: Arc<VendorApi>,
@@ -1314,18 +1287,42 @@ impl ExternalStorage for VendorStorage {
 }
 
 impl UploadUrlProvider for VendorStorage {
-    fn generate_upload_url(&self) -> Result<UploadUrl> {
-        let upload = self
+    fn generate_upload_url(&self, size: u64, sha256_hex: &str) -> Result<UploadUrl> {
+        let sha256_b64 = vgi_rpc::external::sha256_hex_to_b64(sha256_hex)?;
+        // Client uploads are request pointers the server fetches back, so
+        // they are always `rpc` objects (a GET URL at `put`), whatever purpose
+        // this storage writes its own results under.
+        let grant = self
             .api
-            .upload_urls(1)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| RpcError::runtime_error("Blob vendor returned no upload URL"))?;
+            .put(size, &sha256_b64, Purpose::Rpc, None, None, None)?;
         if self.pin {
-            self.hosts.check(&upload.upload_url)?;
-            self.hosts.check(&upload.download_url)?;
+            self.hosts.check(&grant.upload_url)?;
         }
-        Ok(upload)
+        let Some(download_url) = grant.download_url else {
+            return Err(RpcError::runtime_error(
+                "Blob vendor put for purpose 'rpc' returned no download_url",
+            ));
+        };
+        if self.pin {
+            self.hosts.check(&download_url)?;
+        }
+        // Both URLs must still work: report the earlier expiry.
+        let expires_at_micros = grant
+            .download_expires_at_micros
+            .map_or(grant.expires_at_micros, |d| d.min(grant.expires_at_micros));
+        // The client frames the body itself with a plain Content-Length, which
+        // the signature covers; `upload_headers` never carries it.
+        let headers = grant
+            .required_headers
+            .into_iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("content-length"))
+            .collect();
+        Ok(UploadUrl {
+            upload_url: grant.upload_url,
+            download_url,
+            expires_at_micros,
+            headers,
+        })
     }
 }
 

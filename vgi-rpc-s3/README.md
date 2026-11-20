@@ -21,11 +21,16 @@ use vgi_rpc::external::{ExternalLocationConfig, Compression};
 use vgi_rpc_s3::{PresignedS3Storage, HttpFetcher};
 
 // Produce method-bound PUT and GET URLs for the same object key.
-let factory = Arc::new(|bucket: &str, key: &str| {
+// Sign the PUT for exactly `req.size` bytes and `x-amz-checksum-sha256:
+// req.sha256_b64()` so S3 itself refuses any other body, and return the
+// signed headers.
+let factory = Arc::new(|req: &vgi_rpc_s3::PresignRequest| {
+    let (bucket, key) = (req.bucket, req.key);
     Ok(vgi_rpc::external::UploadUrl {
         upload_url: format!("https://{bucket}.s3.amazonaws.com/{key}?put-signature=..."),
         download_url: format!("https://{bucket}.s3.amazonaws.com/{key}?get-signature=..."),
         expires_at_micros: 0, // Set to the actual signing expiry.
+        headers: req.s3_checksum_headers(),
     })
 });
 
@@ -45,6 +50,14 @@ let cfg = ExternalLocationConfig::new(Arc::new(storage), Arc::new(fetcher))
 For MinIO / LocalStack testing, use
 `with_url_validator(vgi_rpc::external::any_url_validator())` so
 `http://` URLs are accepted.
+
+## Sized uploads (upload-URL protocol v2)
+
+The factory receives a `PresignRequest` — bucket, key, and the exact size and
+SHA-256 of the body — for both result uploads and client upload URLs. Sign the
+PUT over its content length and `x-amz-checksum-sha256` and return the signed
+headers in `UploadUrl::headers`; they are sent on the PUT verbatim (and handed
+to clients as `upload_headers`).
 
 ## Migrating from the single-URL callback
 

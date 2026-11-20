@@ -36,7 +36,9 @@ use vgi_rpc::external::{
     any_url_validator, validate_external_url, Compression, ExternalLocationConfig, ExternalStorage,
     FetchedPayload, Fetcher, UploadResult, UrlValidator,
 };
-use vgi_rpc::metadata::{CALL_STATE_KEY, CANCEL_KEY, LOCATION_KEY, REQUEST_ID_KEY, STATE_KEY};
+use vgi_rpc::metadata::{
+    CALL_STATE_KEY, CANCEL_KEY, LOCATION_KEY, LOCATION_SHA256_KEY, REQUEST_ID_KEY, STATE_KEY,
+};
 use vgi_rpc::retry::RetryConfig;
 use vgi_rpc::wire::{empty_batch, write_one_batch, Metadata, StreamReader};
 
@@ -79,7 +81,9 @@ const VGI_CONTENT_ENCODING_HEADER: &str = "X-VGI-Content-Encoding";
 const SESSION_ENDPOINT: &str = "__session__";
 // The upload-URL method name is a shared public wire contract, not a
 // client-local literal.
-use vgi_rpc::external::{upload_url_params_schema, UPLOAD_URL_METHOD};
+use vgi_rpc::external::{
+    upload_url_request_batch, UploadRequest, UPLOAD_URL_METHOD, UPLOAD_URL_PROTOCOL_VERSION,
+};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
@@ -362,7 +366,14 @@ pub struct HttpServerCapabilities {
     pub sticky_enabled: bool,
     pub sticky_default_ttl: Option<u64>,
     pub sticky_echo_headers: Vec<String>,
+    /// The server vends upload URLs at all (`VGI-Upload-URL-Support` present,
+    /// any version). Read [`upload_url_version`](Self::upload_url_version)
+    /// before uploading: this client only uploads to version 2.
     pub upload_url_support: bool,
+    /// The upload protocol version the server advertises: `Some(1)` for the
+    /// retired `true` form, `Some(2)` for sized, checksummed uploads, `None`
+    /// when the header is absent.
+    pub upload_url_version: Option<u32>,
     pub max_request_bytes: Option<u64>,
     pub max_response_bytes: Option<u64>,
     pub accept_max_response_bytes_support: bool,
@@ -399,6 +410,7 @@ impl Default for HttpServerCapabilities {
             sticky_default_ttl: None,
             sticky_echo_headers: Vec::new(),
             upload_url_support: false,
+            upload_url_version: None,
             max_request_bytes: None,
             max_response_bytes: None,
             accept_max_response_bytes_support: false,
@@ -415,7 +427,10 @@ impl Default for HttpServerCapabilities {
 pub struct UploadUrl {
     pub upload_url: String,
     pub download_url: String,
+    /// Expiry of both URLs, Unix microseconds (UTC).
     pub expires_at: Option<i64>,
+    /// Headers the `PUT` must carry verbatim (`upload_headers`).
+    pub headers: Vec<(String, String)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,7 +1341,16 @@ impl HttpClient {
 
         // 413: request too large — externalize via upload URL and retry once.
         if status == StatusCode::PAYLOAD_TOO_LARGE {
-            let pointer = self.externalize_request_body(&body)?;
+            let advertised = parse_caps(&resp_headers);
+            let version = if advertised.upload_url_support {
+                advertised.upload_url_version
+            } else {
+                self.caps
+                    .borrow()
+                    .as_ref()
+                    .and_then(|c| c.upload_url_version)
+            };
+            let pointer = self.externalize_request_body(&body, version)?;
             let (h, b, s) = self.send(path, &pointer, retryable)?;
             resp_headers = h;
             bytes = b;
@@ -1783,15 +1807,43 @@ impl HttpClient {
         }
     }
 
-    /// Request `count` pre-signed upload URLs from `__upload_url__/init`.
-    pub fn request_upload_urls(&mut self, count: usize) -> Result<Vec<UploadUrl>> {
-        use arrow_array::{Int64Array, RecordBatch as RB};
-        let schema = upload_url_params_schema();
-        let batch = RB::try_new(schema, vec![Arc::new(Int64Array::from(vec![count as i64]))])?;
+    /// Request one pre-signed upload URL per entry from
+    /// `__upload_url__/init`, each signed for that entry's exact size and
+    /// SHA-256. The reply is in request order.
+    pub fn request_upload_urls(&mut self, uploads: &[UploadRequest]) -> Result<Vec<UploadUrl>> {
+        // Refuse a server that does not speak v2 before sending anything;
+        // the entries themselves go out as given (the server validates them).
+        let known = self.caps.borrow().clone();
+        let caps = match known {
+            Some(c) => Some(c),
+            None if self.first_response_request_limit.is_none() => Some(self.capabilities()?),
+            None => None,
+        };
+        if let Some(caps) = caps {
+            if caps.upload_url_version.is_none() {
+                return Err(RpcError::new(
+                    "NotSupported",
+                    "Server does not support upload URLs",
+                ));
+            }
+            require_upload_url_v2(caps.upload_url_version)?;
+        }
+        let batch = upload_url_request_batch(uploads)?;
         let (_id, md) = self.req_md(UPLOAD_URL_METHOD, None);
         let body = write_one_batch(&batch, Some(&md))?;
         let resp = self.post(&format!("{UPLOAD_URL_METHOD}/init"), body, true)?;
-        parse_upload_urls(&resp, &mut self.on_log)
+        let urls = parse_upload_urls(&resp, &mut self.on_log)?;
+        if urls.len() != uploads.len() {
+            return Err(RpcError::new(
+                "ProtocolError",
+                format!(
+                    "Server returned {} upload URLs for {} requested uploads",
+                    urls.len(),
+                    uploads.len()
+                ),
+            ));
+        }
+        Ok(urls)
     }
 
     // --- sticky sessions --------------------------------------------------
@@ -1864,7 +1916,7 @@ impl HttpClient {
             if caps.upload_url_support {
                 if let Some(max) = caps.max_request_bytes {
                     if body.len() as u64 > max {
-                        return self.externalize_request_body(&body);
+                        return self.externalize_request_body(&body, caps.upload_url_version);
                     }
                 }
             }
@@ -1873,8 +1925,18 @@ impl HttpClient {
     }
 
     /// Upload `body` to a server-vended URL and return a pointer-batch body
-    /// carrying the original dispatch metadata + `vgi_rpc.location`.
-    fn externalize_request_body(&mut self, body: &[u8]) -> Result<Vec<u8>> {
+    /// carrying the original dispatch metadata, `vgi_rpc.location` and
+    /// `vgi_rpc.location.sha256`.
+    ///
+    /// `server_version` is the server's advertised `VGI-Upload-URL-Support`
+    /// version. Only version 2 is spoken: a v1 server is refused rather than
+    /// sent the retired `count` request.
+    fn externalize_request_body(
+        &mut self,
+        body: &[u8],
+        server_version: Option<u32>,
+    ) -> Result<Vec<u8>> {
+        require_upload_url_v2(server_version)?;
         // Parse the original request batch + metadata.
         let (batch, mut md) = {
             let mut r = StreamReader::new(body)?;
@@ -1882,42 +1944,122 @@ impl HttpClient {
                 RpcError::new("TransportError", "empty request body to externalize")
             })?
         };
-        let urls = self.request_upload_urls(1)?;
-        let url = urls
-            .into_iter()
-            .next()
-            .ok_or_else(|| RpcError::new("ProtocolError", "server returned no upload URLs"))?;
+        let upload = UploadRequest::for_body(body);
+        let urls = self.request_upload_urls(std::slice::from_ref(&upload))?;
+        let url = urls.into_iter().next().ok_or_else(|| {
+            RpcError::new(
+                "ProtocolError",
+                "Server returned 0 upload URLs for 1 upload",
+            )
+        })?;
         // PUT the inline body to the upload URL.
-        put_external_body(&self.external_http, &url.upload_url, body)?;
+        put_external_body(&self.external_http, &url.upload_url, &url.headers, body)?;
         // Build the pointer body: zero-row batch (original schema) + original
         // dispatch metadata + vgi_rpc.location.
         md.insert(LOCATION_KEY.to_string(), url.download_url);
+        md.insert(LOCATION_SHA256_KEY.to_string(), upload.sha256);
         let pointer = empty_batch(batch.schema().as_ref())?;
         write_one_batch(&pointer, Some(&md))
     }
 }
 
-fn put_external_body(external: &ExternalHttp, url: &str, body: &[u8]) -> Result<()> {
+/// Refuse to upload to a server that does not speak upload-URL protocol v2.
+///
+/// `None` (no `VGI-Upload-URL-Support`) is `RequestTooLarge`; any other
+/// version is a `ProtocolError` -- `"true"` is v1, the retired `count` shape,
+/// and is never fallen back to.
+fn require_upload_url_v2(version: Option<u32>) -> Result<()> {
+    match version {
+        Some(UPLOAD_URL_PROTOCOL_VERSION) => Ok(()),
+        None => Err(RpcError::new(
+            "RequestTooLarge",
+            "Request exceeds max_request_bytes and the server does not advertise upload_url_support",
+        )),
+        Some(v) if v < UPLOAD_URL_PROTOCOL_VERSION => Err(RpcError::new(
+            "ProtocolError",
+            format!(
+                "Server upload protocol is too old: it advertises {UPLOAD_URL_HEADER} v{v} \
+                 and this client needs {UPLOAD_URL_PROTOCOL_VERSION}"
+            ),
+        )),
+        Some(v) => Err(RpcError::new(
+            "ProtocolError",
+            format!(
+                "Server upload protocol is newer than this client: it advertises \
+                 {UPLOAD_URL_HEADER}: {v} and this client speaks {UPLOAD_URL_PROTOCOL_VERSION}"
+            ),
+        )),
+    }
+}
+
+/// The S3-style `<Code>` of a storage error body, if it has one.
+fn storage_error_code(body: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(&body[..body.len().min(4096)]);
+    let start = text.find("<Code>")? + "<Code>".len();
+    let end = start + text[start..].find("</Code>")?;
+    let code = &text[start..end];
+    (!code.is_empty() && code.len() <= 64 && code.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then(|| code.to_string())
+}
+
+/// Content type of an upload `PUT` when the server lists none (the
+/// reference's `application/octet-stream`).
+const UPLOAD_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// `PUT` exactly `body` to an upload URL with every `upload_headers` entry.
+///
+/// The body is sent with a plain `Content-Length` (never chunked), which the
+/// storage signature covers. A server-sent `Content-Type` replaces the
+/// `application/octet-stream` default; a `Content-Length` entry (which `upload_headers` must never
+/// carry) is ignored in favour of the real length.
+fn put_external_body(
+    external: &ExternalHttp,
+    url: &str,
+    upload_headers: &[(String, String)],
+    body: &[u8],
+) -> Result<()> {
+    let mut headers: Vec<(String, String)> = Vec::with_capacity(upload_headers.len() + 1);
+    if !upload_headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case(CONTENT_TYPE.as_str()))
+    {
+        headers.push((
+            CONTENT_TYPE.as_str().to_string(),
+            UPLOAD_CONTENT_TYPE.to_string(),
+        ));
+    }
+    headers.extend(
+        upload_headers
+            .iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case(CONTENT_LENGTH.as_str()))
+            .cloned(),
+    );
     let failed = || {
         RpcError::new(
             "ExternalUploadFailed",
             format!("PUT to upload URL failed for {}", redact_external_url(url)),
         )
     };
-    let status = match external {
+    let (status, reply) = match external {
         #[cfg(feature = "reqwest")]
-        ExternalHttp::Reqwest(client) => client
-            .put(url)
-            .header(CONTENT_TYPE, ARROW_CONTENT_TYPE)
-            .body(body.to_vec())
-            .send()
-            .map_err(|_| failed())?
-            .status(),
+        ExternalHttp::Reqwest(client) => {
+            let mut req = client.put(url).body(body.to_vec());
+            for (k, v) in &headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            let resp = req.send().map_err(|_| failed())?;
+            let status = resp.status();
+            // Only a refusal's body is read, for its S3 error code.
+            let reply = if status.is_success() {
+                Vec::new()
+            } else {
+                let mut buf = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut resp.take(4096), &mut buf);
+                buf
+            };
+            (status, reply)
+        }
         ExternalHttp::Executor { executor, timeout } => {
-            let headers = [(
-                CONTENT_TYPE.as_str().to_string(),
-                ARROW_CONTENT_TYPE.to_string(),
-            )];
             let response = executor
                 .execute(HttpRequest {
                     method: "PUT",
@@ -1928,13 +2070,21 @@ fn put_external_body(external: &ExternalHttp, url: &str, body: &[u8]) -> Result<
                     follow_redirects: true,
                 })
                 .map_err(|_| failed())?;
-            StatusCode::from_u16(response.status).map_err(|_| failed())?
+            (
+                StatusCode::from_u16(response.status).map_err(|_| failed())?,
+                response.body,
+            )
         }
     };
     if !status.is_success() {
+        // Storage refusing a body it was not signed for (BadDigest,
+        // IncompleteBody, SignatureDoesNotMatch) names itself in the reply.
+        let code = storage_error_code(&reply)
+            .map(|c| format!(" {c}"))
+            .unwrap_or_default();
         return Err(RpcError::new(
             "ExternalUploadFailed",
-            format!("PUT to upload URL failed: HTTP {status}"),
+            format!("PUT to upload URL failed: HTTP {status}{code}"),
         ));
     }
     Ok(())
@@ -2555,17 +2705,42 @@ fn parse_upload_urls(bytes: &[u8], on_log: &mut Option<OnLog>) -> Result<Vec<Upl
                     .ok_or_else(|| RpcError::new("ProtocolError", "download_url missing"))?
                     .as_string::<i32>();
                 let exp = batch.column_by_name("expires_at");
+                let hdrs = batch
+                    .column_by_name("upload_headers")
+                    .ok_or_else(|| RpcError::new("ProtocolError", "upload_headers missing"))?
+                    .as_any()
+                    .downcast_ref::<arrow_array::MapArray>()
+                    .ok_or_else(|| {
+                        RpcError::new("ProtocolError", "upload_headers is not a map<utf8, utf8>")
+                    })?;
                 for i in 0..batch.num_rows() {
                     let expires_at = exp.and_then(|c| {
                         c.as_any()
-                            .downcast_ref::<arrow_array::Int64Array>()
+                            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
                             .filter(|a| !a.is_null(i))
                             .map(|a| a.value(i))
                     });
+                    let mut headers = Vec::new();
+                    if !hdrs.is_null(i) {
+                        let entries = hdrs.value(i);
+                        let keys = entries.column(0).as_string_opt::<i32>().ok_or_else(|| {
+                            RpcError::new("ProtocolError", "upload_headers keys are not utf8")
+                        })?;
+                        let values = entries.column(1).as_string_opt::<i32>().ok_or_else(|| {
+                            RpcError::new("ProtocolError", "upload_headers values are not utf8")
+                        })?;
+                        for j in 0..entries.len() {
+                            if values.is_null(j) {
+                                continue;
+                            }
+                            headers.push((keys.value(j).to_string(), values.value(j).to_string()));
+                        }
+                    }
                     out.push(UploadUrl {
                         upload_url: up.value(i).to_string(),
                         download_url: down.value(i).to_string(),
                         expires_at,
+                        headers,
                     });
                 }
             }
@@ -2671,6 +2846,21 @@ fn parse_content_length(headers: &HeaderMap, label: &str) -> Result<Option<u64>>
     })
 }
 
+/// Read a `VGI-Upload-URL-Support` value: `true` is the retired version 1, a
+/// positive decimal without a leading zero is that version; anything else
+/// (`false`, garbage) is absent.
+fn parse_upload_url_version(raw: &str) -> Option<u32> {
+    let v = raw.trim();
+    if v.eq_ignore_ascii_case("true") {
+        return Some(1);
+    }
+    // A positive decimal without a leading zero (the reference's reading).
+    if v.is_empty() || v.starts_with('0') || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    v.parse::<u32>().ok()
+}
+
 fn parse_caps(h: &HeaderMap) -> HttpServerCapabilities {
     let get = |name: &str| {
         h.get(name)
@@ -2678,6 +2868,7 @@ fn parse_caps(h: &HeaderMap) -> HttpServerCapabilities {
             .map(str::to_string)
     };
     let parse_u64 = |name: &str| get(name).and_then(|s| s.parse::<u64>().ok());
+    let upload_url_version = get(UPLOAD_URL_HEADER).and_then(|v| parse_upload_url_version(&v));
     let split = |name: &str| {
         get(name)
             .map(|s| {
@@ -2692,7 +2883,8 @@ fn parse_caps(h: &HeaderMap) -> HttpServerCapabilities {
         sticky_enabled: get(STICKY_ENABLED_HEADER).as_deref() == Some("true"),
         sticky_default_ttl: parse_u64(STICKY_DEFAULT_TTL_HEADER),
         sticky_echo_headers: split(STICKY_ECHO_HEADERS_HEADER),
-        upload_url_support: get(UPLOAD_URL_HEADER).as_deref() == Some("true"),
+        upload_url_support: upload_url_version.is_some(),
+        upload_url_version,
         max_request_bytes: parse_u64(MAX_REQUEST_BYTES_HEADER),
         max_response_bytes: parse_max_response_bytes(h).ok().flatten(),
         accept_max_response_bytes_support: has_single_response_budget_support(h),
@@ -3017,12 +3209,19 @@ mod tests {
     }
 
     #[test]
-    fn upload_url_request_uses_shared_nullable_count_schema() {
-        let schema = upload_url_params_schema();
-        assert_eq!(schema.fields().len(), 1);
-        assert_eq!(schema.field(0).name(), "count");
-        assert_eq!(schema.field(0).data_type(), &arrow_schema::DataType::Int64);
-        assert!(schema.field(0).is_nullable());
+    fn upload_url_support_header_versions() {
+        assert_eq!(parse_upload_url_version("true"), Some(1));
+        assert_eq!(parse_upload_url_version("2"), Some(2));
+        assert_eq!(parse_upload_url_version(" 2 "), Some(2));
+        assert_eq!(parse_upload_url_version("false"), None);
+        assert_eq!(parse_upload_url_version("0"), None);
+        assert_eq!(parse_upload_url_version("02"), None);
+        assert_eq!(parse_upload_url_version("+2"), None);
+        let mut h = HeaderMap::new();
+        h.insert(UPLOAD_URL_HEADER, HeaderValue::from_static("2"));
+        let caps = parse_caps(&h);
+        assert!(caps.upload_url_support);
+        assert_eq!(caps.upload_url_version, Some(2));
     }
 
     #[cfg(feature = "reqwest")]
@@ -3037,7 +3236,8 @@ mod tests {
             .timeout(Duration::from_millis(250))
             .build()
             .unwrap();
-        let error = put_external_body(&ExternalHttp::Reqwest(client), &url, b"body").unwrap_err();
+        let error =
+            put_external_body(&ExternalHttp::Reqwest(client), &url, &[], b"body").unwrap_err();
         let rendered = format!("{error:?}");
         assert!(
             !rendered.contains(secret),
@@ -3356,8 +3556,8 @@ mod tests {
             executor: executor.clone(),
             timeout: None,
         };
-        put_external_body(&external, "https://store.test/up", b"body").unwrap();
-        assert!(put_external_body(&external, "https://store.test/missing", b"x").is_err());
+        put_external_body(&external, "https://store.test/up", &[], b"body").unwrap();
+        assert!(put_external_body(&external, "https://store.test/missing", &[], b"x").is_err());
         let requests = executor.requests.lock().unwrap().clone();
         assert_eq!(requests[0].0, "PUT");
     }

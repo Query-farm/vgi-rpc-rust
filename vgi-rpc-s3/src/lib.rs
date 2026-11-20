@@ -21,12 +21,17 @@
 //! let storage = PresignedS3Storage::new(
 //!     "my-bucket",
 //!     "vgi-rpc/",
-//!     Arc::new(|bucket: &str, key: &str| {
-//!         // Your AWS SDK calls here — presign PUT and GET independently.
+//!     Arc::new(|req: &vgi_rpc_s3::PresignRequest| {
+//!         // Your AWS SDK calls here — presign PUT and GET independently. Sign
+//!         // the PUT for `req.size` bytes (content-length) and
+//!         // `x-amz-checksum-sha256: req.sha256_b64()` so S3 itself refuses a
+//!         // mismatched body, and return the signed headers.
+//!         let (bucket, key) = (req.bucket, req.key);
 //!         Ok(vgi_rpc::external::UploadUrl {
 //!             upload_url: format!("https://{bucket}.s3.amazonaws.com/{key}?put-signature=..."),
 //!             download_url: format!("https://{bucket}.s3.amazonaws.com/{key}?get-signature=..."),
 //!             expires_at_micros: 0,
+//!             headers: req.s3_checksum_headers(),
 //!         })
 //!     }),
 //! );
@@ -75,9 +80,49 @@ pub(crate) fn redact_url(url: &str) -> String {
     parsed.to_string()
 }
 
-/// User-supplied factory: given `(bucket, key)`, return independently signed
-/// upload (PUT) and download (GET) URLs for that same object.
-pub type PresignUrlPairFactory = Arc<dyn Fn(&str, &str) -> Result<UploadUrl> + Send + Sync>;
+/// What one presigned PUT is for: the object, and the exact size and SHA-256
+/// of the body that will be uploaded to it.
+#[derive(Clone, Copy, Debug)]
+pub struct PresignRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    /// Exact byte length of the body; sign it as the content length.
+    pub size: u64,
+    /// SHA-256 of the body, 64 lowercase hex characters.
+    pub sha256_hex: &'a str,
+}
+
+impl PresignRequest<'_> {
+    /// The SHA-256 as S3's `x-amz-checksum-sha256` value (base64 of the raw
+    /// 32 digest bytes).
+    pub fn sha256_b64(&self) -> String {
+        vgi_rpc::external::sha256_hex_to_b64(self.sha256_hex)
+            .expect("PresignRequest carries a validated sha256")
+    }
+
+    /// The headers an S3/R2 PUT signed for this body must carry:
+    /// `x-amz-checksum-sha256`. A factory that signs other headers adds them.
+    pub fn s3_checksum_headers(&self) -> Vec<(String, String)> {
+        vec![("x-amz-checksum-sha256".to_string(), self.sha256_b64())]
+    }
+
+    /// The header a GCS V4 PUT signed for exactly this size must carry
+    /// (`x-goog-content-length-range: N,N`). GCS cannot verify SHA-256 at
+    /// storage; the server's pointer check catches a wrong body instead.
+    pub fn gcs_length_headers(&self) -> Vec<(String, String)> {
+        vec![(
+            "x-goog-content-length-range".to_string(),
+            format!("{0},{0}", self.size),
+        )]
+    }
+}
+
+/// User-supplied factory: given a [`PresignRequest`], return independently
+/// signed upload (PUT) and download (GET) URLs for that same object, the PUT
+/// signed for the request's size (and SHA-256 where the backend can verify
+/// it), with the signed headers in [`UploadUrl::headers`].
+pub type PresignUrlPairFactory =
+    Arc<dyn Fn(&PresignRequest<'_>) -> Result<UploadUrl> + Send + Sync>;
 
 /// Generic `ExternalStorage` that PUTs objects via a caller-supplied
 /// pre-signed URL factory. Shared between S3 and GCS backends — the only
@@ -119,22 +164,48 @@ impl PresignedPutStorage {
         format!("{}{id}.arrow", self.prefix)
     }
 
-    fn generate_pair(&self) -> Result<UploadUrl> {
+    fn generate_pair(&self, size: u64, sha256_hex: &str) -> Result<UploadUrl> {
+        if !vgi_rpc::external::is_sha256_hex(sha256_hex) {
+            return Err(RpcError::value_error(
+                "sha256 must be 64 lowercase hex characters",
+            ));
+        }
         let key = self.object_key();
-        (self.factory)(&self.bucket, &key)
+        (self.factory)(&PresignRequest {
+            bucket: &self.bucket,
+            key: &key,
+            size,
+            sha256_hex,
+        })
     }
 }
 
 impl ExternalStorage for PresignedPutStorage {
     fn upload(&self, ipc_bytes: &[u8], compression: Compression) -> Result<UploadResult> {
-        let urls = self.generate_pair()?;
-        let mut req = self
-            .client
-            .put(&urls.upload_url)
-            .body(ipc_bytes.to_vec())
-            .header("content-type", "application/vnd.apache.arrow.stream");
-        if let Compression::Zstd(_) = compression {
+        let sha = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(ipc_bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let urls = self.generate_pair(ipc_bytes.len() as u64, &sha)?;
+        let mut req = self.client.put(&urls.upload_url).body(ipc_bytes.to_vec());
+        let signed = |name: &str| {
+            urls.headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case(name))
+        };
+        if !signed("content-type") {
+            req = req.header("content-type", "application/vnd.apache.arrow.stream");
+        }
+        if let (Compression::Zstd(_), false) = (compression, signed("content-encoding")) {
             req = req.header("content-encoding", "zstd");
+        }
+        for (k, v) in &urls.headers {
+            if !k.eq_ignore_ascii_case("content-length") {
+                req = req.header(k.as_str(), v.as_str());
+            }
         }
         let label = self.label;
         let resp = req
@@ -157,8 +228,8 @@ impl ExternalStorage for PresignedPutStorage {
 }
 
 impl UploadUrlProvider for PresignedPutStorage {
-    fn generate_upload_url(&self) -> Result<UploadUrl> {
-        self.generate_pair()
+    fn generate_upload_url(&self, size: u64, sha256_hex: &str) -> Result<UploadUrl> {
+        self.generate_pair(size, sha256_hex)
     }
 }
 
@@ -195,8 +266,8 @@ impl ExternalStorage for PresignedS3Storage {
 }
 
 impl UploadUrlProvider for PresignedS3Storage {
-    fn generate_upload_url(&self) -> Result<UploadUrl> {
-        self.0.generate_upload_url()
+    fn generate_upload_url(&self, size: u64, sha256_hex: &str) -> Result<UploadUrl> {
+        self.0.generate_upload_url(size, sha256_hex)
     }
 }
 
@@ -395,11 +466,12 @@ mod tests {
         let storage = PresignedS3Storage::new(
             "bkt",
             "tenant-a/vgi/",
-            Arc::new(|_, _| {
+            Arc::new(|_: &PresignRequest| {
                 Ok(UploadUrl {
                     upload_url: String::from("https://example/upload"),
                     download_url: String::from("https://example/download"),
                     expires_at_micros: 0,
+                    headers: Vec::new(),
                 })
             }),
         );
@@ -413,7 +485,7 @@ mod tests {
         let storage = PresignedS3Storage::new(
             "bkt",
             "",
-            Arc::new(|_, _| Err(RpcError::runtime_error("nope"))),
+            Arc::new(|_: &PresignRequest| Err(RpcError::runtime_error("nope"))),
         );
         let err = storage
             .upload(&[1, 2, 3], Compression::None)
@@ -475,11 +547,12 @@ mod tests {
         let storage = PresignedS3Storage::new(
             "bucket",
             "prefix/",
-            Arc::new(move |_, _| {
+            Arc::new(move |_: &PresignRequest| {
                 Ok(UploadUrl {
                     upload_url: upload_url.clone(),
                     download_url: download_url.clone(),
                     expires_at_micros: 123,
+                    headers: Vec::new(),
                 })
             }),
         );

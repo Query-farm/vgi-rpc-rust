@@ -138,16 +138,32 @@ fn vendor_client_against_the_fake_vendor() {
         .unwrap();
     assert_eq!(&fetched[..], &payload[..]);
 
-    // Client upload URLs: an unsized PUT/GET pair on the vendor's hosts.
-    let pair = storage.generate_upload_url().unwrap();
+    // Client upload URLs: a sized, checksummed PUT/GET pair on the vendor's
+    // hosts. The PUT carries the returned headers verbatim and never a
+    // Content-Length header of its own.
+    let body = b"client bytes".to_vec();
+    let pair = storage
+        .generate_upload_url(body.len() as u64, &sha_hex(&body))
+        .unwrap();
     (storage.url_validator())(&pair.upload_url).unwrap();
     (storage.url_validator())(&pair.download_url).unwrap();
+    assert!(pair
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("x-amz-checksum-sha256")));
+    assert!(!pair
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-length")));
     let client = reqwest::blocking::Client::new();
-    let put = client
-        .put(&pair.upload_url)
-        .body(b"client bytes".to_vec())
-        .send()
-        .unwrap();
+    let put_with = |url: &str, bytes: &[u8], headers: &[(String, String)]| {
+        let mut req = client.put(url).body(bytes.to_vec());
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        req.send().unwrap()
+    };
+    let put = put_with(&pair.upload_url, &body, &pair.headers);
     assert!(put.status().is_success(), "{}", put.status());
     let got = client
         .get(&pair.download_url)
@@ -155,7 +171,40 @@ fn vendor_client_against_the_fake_vendor() {
         .unwrap()
         .bytes()
         .unwrap();
-    assert_eq!(&got[..], b"client bytes");
+    assert_eq!(&got[..], &body[..]);
+
+    // Storage refuses a body that is not the one the URL was signed for:
+    // same length, different bytes (BadDigest), and a short body.
+    let pair = storage
+        .generate_upload_url(body.len() as u64, &sha_hex(&body))
+        .unwrap();
+    let wrong = put_with(&pair.upload_url, b"client BYTES", &pair.headers);
+    assert_eq!(wrong.status().as_u16(), 400, "wrong bytes must be refused");
+    let short = put_with(&pair.upload_url, b"client", &pair.headers);
+    assert_eq!(short.status().as_u16(), 400, "a short body must be refused");
+    assert!(stat(&url, "upload_refusals") >= 2);
+
+    // The upload fault corrupts the next PUT in transit: the right body with
+    // the right headers is then refused by the storage's checksum check.
+    let pair = storage
+        .generate_upload_url(body.len() as u64, &sha_hex(&body))
+        .unwrap();
+    let refusals = stat(&url, "upload_refusals");
+    let corruptions = stat(&url, "uploads_corrupted");
+    admin(
+        &url,
+        "/__admin__/fault?purpose=upload&action=corrupt&count=1",
+    );
+    let corrupted = put_with(&pair.upload_url, &body, &pair.headers);
+    assert_eq!(
+        corrupted.status().as_u16(),
+        400,
+        "a corrupted upload must be refused"
+    );
+    assert!(corrupted.text().unwrap().contains("BadDigest"));
+    assert_eq!(stat(&url, "upload_refusals"), refusals + 1);
+    assert_eq!(stat(&url, "uploads_corrupted"), corruptions + 1);
+    admin(&url, "/__admin__/reset");
 
     // A wrong token is refused, and the message names no token.
     let bad = VendorBlobClient::new(&url, "wrong-token-SECRET").unwrap();

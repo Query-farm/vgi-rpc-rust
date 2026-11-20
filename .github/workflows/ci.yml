@@ -147,9 +147,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      # vgi-rpc-python protocol-3.4: sized PUT verification + upload faults.
-      # TODO(release-wave): the merged commit.
-      VGI_RPC_FAKE_VENDOR_REF: 3019c650144964fbcdcd94fd9f94721a891809d1
+      # vgi-rpc-python protocol-3.4: sized PUT verification + upload faults;
+      # f0fb675: puts_upload / client_uploads, counted from the origin=client_upload
+      # marker on client-upload grants. TODO(release-wave).
+      VGI_RPC_FAKE_VENDOR_REF: f0fb6754ae5b70900ba21629a1e2d48eb2182774
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.0

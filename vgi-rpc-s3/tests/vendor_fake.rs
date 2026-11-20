@@ -141,10 +141,19 @@ fn vendor_client_against_the_fake_vendor() {
     // Client upload URLs: a sized, checksummed PUT/GET pair on the vendor's
     // hosts. The PUT carries the returned headers verbatim and never a
     // Content-Length header of its own.
+    // The grant request carries origin=client_upload, so the vendor counts it
+    // as a client-upload grant (puts_upload), not a server rpc write.
     let body = b"client bytes".to_vec();
+    let (puts_upload, puts_rpc, client_uploads) = (
+        stat(&url, "puts_upload"),
+        stat(&url, "puts_rpc"),
+        stat(&url, "client_uploads"),
+    );
     let pair = storage
         .generate_upload_url(body.len() as u64, &sha_hex(&body))
         .unwrap();
+    assert_eq!(stat(&url, "puts_upload"), puts_upload + 1);
+    assert_eq!(stat(&url, "puts_rpc"), puts_rpc);
     (storage.url_validator())(&pair.upload_url).unwrap();
     (storage.url_validator())(&pair.download_url).unwrap();
     assert!(pair
@@ -165,6 +174,7 @@ fn vendor_client_against_the_fake_vendor() {
     };
     let put = put_with(&pair.upload_url, &body, &pair.headers);
     assert!(put.status().is_success(), "{}", put.status());
+    assert_eq!(stat(&url, "client_uploads"), client_uploads + 1);
     let got = client
         .get(&pair.download_url)
         .send()

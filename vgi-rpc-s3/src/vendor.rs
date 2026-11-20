@@ -79,6 +79,11 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_FETCH_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 const PUT_PATH: &str = "/v1/blobs/put";
+/// The advisory `origin` a `/v1/blobs/put` grant request carries when the grant
+/// is for a client upload (an `__upload_url__` pair), so a vendor can tell
+/// client uploads from the server's own result and storage writes. The real
+/// vendor ignores it; vgi-rpc-python's fake vendor counts and faults on it.
+const CLIENT_UPLOAD_ORIGIN: &str = "client_upload";
 const GET_PATH: &str = "/v1/blobs/get";
 const DELETE_PATH: &str = "/v1/blobs/delete";
 const DELETE_SCOPE_PATH: &str = "/v1/blobs/delete_scope";
@@ -810,6 +815,7 @@ impl VendorApi {
         self.call(reqwest::Method::POST, path, op, Some(body))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn put(
         &self,
         size: u64,
@@ -818,6 +824,7 @@ impl VendorApi {
         scope: Option<&BlobScope>,
         content_encoding: Option<&str>,
         idempotency_key: Option<&str>,
+        origin: Option<&str>,
     ) -> VResult<PutGrant> {
         let mut body = json!({"size": size, "sha256_b64": sha256_b64, "purpose": purpose.as_str()});
         if let Some(s) = scope {
@@ -828,6 +835,9 @@ impl VendorApi {
         }
         if let Some(k) = idempotency_key {
             body["idempotency_key"] = json!(k);
+        }
+        if let Some(o) = origin {
+            body["origin"] = json!(o);
         }
         let resp = self.post(PUT_PATH, "put", body)?;
         let method = resp
@@ -1262,6 +1272,7 @@ impl ExternalStorage for VendorStorage {
             None,
             encoding,
             None,
+            None,
         )?;
         if self.pin {
             self.hosts.check(&grant.upload_url)?;
@@ -1291,10 +1302,17 @@ impl UploadUrlProvider for VendorStorage {
         let sha256_b64 = vgi_rpc::external::sha256_hex_to_b64(sha256_hex)?;
         // Client uploads are request pointers the server fetches back, so
         // they are always `rpc` objects (a GET URL at `put`), whatever purpose
-        // this storage writes its own results under.
-        let grant = self
-            .api
-            .put(size, &sha256_b64, Purpose::Rpc, None, None, None)?;
+        // this storage writes its own results under. The `origin` marker tells
+        // the vendor this grant is for a client upload, not a server write.
+        let grant = self.api.put(
+            size,
+            &sha256_b64,
+            Purpose::Rpc,
+            None,
+            None,
+            None,
+            Some(CLIENT_UPLOAD_ORIGIN),
+        )?;
         if self.pin {
             self.hosts.check(&grant.upload_url)?;
         }
@@ -1441,6 +1459,7 @@ impl VendorBlobClient {
             scope,
             None,
             idempotency_key,
+            None,
         )?;
         self.hosts.check(&grant.upload_url)?;
         self.api.put_object(&grant, data, None)?;
@@ -1659,6 +1678,92 @@ pub fn max_upload_bytes_from_env() -> Result<Option<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A loopback stand-in for the vendor: answers every request (one per
+    /// connection) and records `(path, JSON body)` for the `/v1/` calls.
+    type Recorded = Arc<Mutex<Vec<(String, Value)>>>;
+
+    fn recording_vendor() -> (String, Recorded) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (record, object_base) = (seen.clone(), base.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.eq_ignore_ascii_case("content-length") {
+                            length = v.trim().parse().unwrap();
+                        }
+                    }
+                }
+                let mut body = vec![0u8; length];
+                reader.read_exact(&mut body).unwrap();
+                let reply = if path == PUT_PATH {
+                    record
+                        .lock()
+                        .unwrap()
+                        .push((path, serde_json::from_slice(&body).unwrap()));
+                    json!({
+                        "object_id": "obj-1",
+                        "upload_url": format!("{object_base}/objects/obj-1?sig=put"),
+                        "required_headers": {"x-amz-checksum-sha256": "c2hh"},
+                        "download_url": format!("{object_base}/objects/obj-1?sig=get"),
+                        "expires_at": 4_000_000_000u64,
+                    })
+                    .to_string()
+                } else {
+                    String::new()
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        (base, seen)
+    }
+
+    #[test]
+    fn client_upload_grants_carry_the_origin_marker() {
+        let (base, seen) = recording_vendor();
+        let storage = VendorStorage::with_options(
+            &base,
+            "token",
+            Purpose::Rpc,
+            false,
+            DEFAULT_TIMEOUT,
+            DEFAULT_INFO_TTL,
+        )
+        .unwrap();
+        let sha = "00".repeat(32);
+        storage.generate_upload_url(12, &sha).unwrap();
+        // A server write (an externalized result) does not send it.
+        storage.upload(b"result bytes", Compression::None).unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0].1["origin"], json!("client_upload"));
+        assert_eq!(seen[0].1["purpose"], json!("rpc"));
+        assert_eq!(seen[0].1["size"], json!(12));
+        assert!(seen[1].1.get("origin").is_none(), "{:?}", seen[1].1);
+    }
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()

@@ -65,7 +65,19 @@ pub struct AuthContext {
     /// Principal name (e.g. subject DN, OAuth `sub` claim, bearer token alias).
     pub principal: String,
     /// Opaque string-keyed claims (e.g. JWT claims, cert extensions).
+    ///
+    /// A claim that is not a JSON string is stored as its JSON text
+    /// (`true`, `1700000000`, `["a","b"]`). When the claim's JSON type
+    /// matters, read it from [`claim_values`](Self::claim_values) instead.
     pub claims: BTreeMap<String, String>,
+    /// The same claims with their JSON types, for authenticators whose
+    /// credential is JSON (a JWT's payload): `email_verified` stays a
+    /// boolean and `exp` a number, so code can tell `true` from `"true"`.
+    /// Empty for authenticators whose claims are plain strings. Set it with
+    /// [`with_claim_value`](Self::with_claim_value), which also keeps
+    /// [`claims`](Self::claims) in step; read it with
+    /// [`claim_value`](Self::claim_value).
+    pub claim_values: BTreeMap<String, serde_json::Value>,
 }
 
 impl AuthContext {
@@ -81,6 +93,7 @@ impl AuthContext {
             authenticated: true,
             principal: principal.into(),
             claims: BTreeMap::new(),
+            claim_values: BTreeMap::new(),
         }
     }
 
@@ -97,6 +110,32 @@ impl AuthContext {
     pub fn with_claim(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.claims.insert(key.into(), value.into());
         self
+    }
+
+    /// Attach a JSON-typed claim. It lands in
+    /// [`claim_values`](Self::claim_values) as given and in
+    /// [`claims`](Self::claims) as a string: a JSON string's own text, any
+    /// other value's JSON text.
+    pub fn with_claim_value(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        let key = key.into();
+        let text = match &value {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        self.claims.insert(key.clone(), text);
+        self.claim_values.insert(key, value);
+        self
+    }
+
+    /// One claim with its JSON type: from
+    /// [`claim_values`](Self::claim_values) when the authenticator recorded
+    /// one, otherwise the string claim as a JSON string. `None` when the
+    /// claim is absent.
+    pub fn claim_value(&self, key: &str) -> Option<serde_json::Value> {
+        self.claim_values
+            .get(key)
+            .cloned()
+            .or_else(|| self.claims.get(key).cloned().map(serde_json::Value::String))
     }
 }
 
@@ -200,6 +239,30 @@ mod tests {
         assert!(anon.require_authenticated().is_err());
         let authd = AuthContext::for_principal("bearer", "alice");
         assert!(authd.require_authenticated().is_ok());
+    }
+
+    #[test]
+    fn claim_values_keep_json_types_and_string_view() {
+        let ctx = AuthContext::for_principal("jwt", "alice")
+            .with_claim_value("email_verified", serde_json::json!(true))
+            .with_claim_value("exp", serde_json::json!(1_700_000_000_i64))
+            .with_claim_value("name", serde_json::json!("Ada"))
+            .with_claim("plain", "x");
+        assert_eq!(
+            ctx.claim_value("email_verified"),
+            Some(serde_json::json!(true))
+        );
+        assert_eq!(
+            ctx.claim_value("exp"),
+            Some(serde_json::json!(1_700_000_000_i64))
+        );
+        assert_eq!(
+            ctx.claims.get("email_verified").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(ctx.claims.get("name").map(String::as_str), Some("Ada"));
+        assert_eq!(ctx.claim_value("plain"), Some(serde_json::json!("x")));
+        assert_eq!(ctx.claim_value("missing"), None);
     }
 
     #[test]

@@ -38,6 +38,23 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ### Added
 
+- **Authenticate every request** (`HttpStateBuilder::authenticate_every_request`):
+  the authenticate callback runs in the outermost middleware, before the body
+  is read, size-checked or decompressed, and on every path (`GET /health`, the
+  landing and describe pages, unknown paths). Anonymous is a 401
+  `missing_credential`. Only `HEAD /health` and CORS preflights (answered by
+  the middleware, 200) are exempt. Used by vgi-rust's Orchard hosted mode.
+- `HttpStateBuilder::www_authenticate` sets the 401 challenge explicitly, and
+  `HttpStateBuilder::cors_credentials(false)` drops
+  `Access-Control-Allow-Credentials` so `cors_origins("*")` can sit beside an
+  authenticate callback whose only credential is a bearer header.
+- **JSON-typed claims**: `AuthContext::claim_values` (with `with_claim_value`
+  and `claim_value`) keeps each claim's JSON type beside its string form in
+  `claims`. `jwt_authenticate` fills it, so `email_verified` stays a boolean
+  and `exp` a number. Adding the field is breaking for code that builds an
+  `AuthContext` with a struct literal; use `AuthContext::for_principal` or
+  `..Default::default()`.
+
 - **Blob-vendor client** (`vgi_rpc_s3::vendor`), a port of vgi-rpc-python's
   `vgi_rpc.vendor` with the same wire format. `VendorStorage` is an
   `ExternalStorage` (results uploaded through sized, checksummed vendor grants,

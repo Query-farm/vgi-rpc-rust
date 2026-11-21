@@ -459,6 +459,7 @@ pub fn proof_authenticate(
             authenticated,
             principal,
             claims: merged,
+            claim_values: Default::default(),
         })
     }))
 }

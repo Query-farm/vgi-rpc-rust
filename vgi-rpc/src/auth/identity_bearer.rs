@@ -89,6 +89,7 @@ pub fn grant_authenticate(keys: GrantKeys) -> Authenticate {
                 ]
                 .into_iter()
                 .collect(),
+                claim_values: Default::default(),
             }),
             Err(invalid) => Err(RpcError::auth_failure(
                 if invalid.expired {
@@ -130,6 +131,7 @@ pub fn resolve_token_authenticate(resolve_token: TokenResolver) -> Authenticate 
                 claims: [("token_name".to_string(), identity.token_name)]
                     .into_iter()
                     .collect(),
+                claim_values: Default::default(),
             }),
             Ok(None) => Ok(AuthContext::anonymous()),
             Err(err) => {

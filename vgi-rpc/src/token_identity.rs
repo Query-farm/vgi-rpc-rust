@@ -1094,6 +1094,7 @@ mod tests {
             authenticated: false,
             principal: principal.into(),
             claims: Default::default(),
+            claim_values: Default::default(),
         }
     }
 

@@ -384,6 +384,13 @@ pub struct HttpState {
     oauth_metadata: Option<Arc<crate::auth::oauth::OAuthResourceMetadata>>,
     oauth_metadata_json: Option<Vec<u8>>,
     www_authenticate: Option<String>,
+    /// Authenticate every request in the outermost middleware, before its
+    /// body is read, size-checked or decompressed, and refuse any that do
+    /// not authenticate. See [`HttpStateBuilder::authenticate_every_request`].
+    authenticate_every_request: bool,
+    /// Whether CORS responses carry `Access-Control-Allow-Credentials: true`
+    /// when an authenticate callback is configured.
+    cors_credentials: bool,
     cors_max_age: u32,
     prefix: String,
     response_compression_level: Option<i32>,
@@ -452,6 +459,9 @@ pub struct HttpStateBuilder {
     oauth_metadata: Option<Arc<crate::auth::oauth::OAuthResourceMetadata>>,
     cors_origins: Option<String>,
     cors_max_age: Option<u32>,
+    cors_credentials: Option<bool>,
+    www_authenticate: Option<String>,
+    authenticate_every_request: Option<bool>,
     prefix: Option<String>,
     /// Two-level option so the builder can tell "never configured" (outer
     /// `None` — take [`DEFAULT_RESPONSE_COMPRESSION_LEVEL`]) apart from
@@ -693,6 +703,49 @@ impl HttpStateBuilder {
         self
     }
 
+    /// Whether cross-origin responses carry
+    /// `Access-Control-Allow-Credentials: true` when an authenticate callback
+    /// is configured (default `true`).
+    ///
+    /// Pass `false` when the only credential is an `Authorization: Bearer`
+    /// header the caller sets itself, never a cookie. A browser sends such a
+    /// header without credentials mode, so a wildcard origin works, and
+    /// [`build`](Self::build) then accepts `cors_origins("*")` alongside an
+    /// authenticate callback.
+    pub fn cors_credentials(mut self, enabled: bool) -> Self {
+        self.cors_credentials = Some(enabled);
+        self
+    }
+
+    /// The `WWW-Authenticate` challenge on every 401. Overrides the one
+    /// derived from [`oauth_resource_metadata`](Self::oauth_resource_metadata);
+    /// unset and without metadata, 401s carry no challenge.
+    pub fn www_authenticate(mut self, challenge: impl Into<String>) -> Self {
+        self.www_authenticate = Some(challenge.into());
+        self
+    }
+
+    /// Authenticate every request, on every path, before anything else
+    /// touches it (default `false`).
+    ///
+    /// The [`authenticate`](Self::authenticate) callback then runs in the
+    /// outermost middleware, ahead of the request body being read,
+    /// size-checked or decompressed, and of routing: `GET /health`, the
+    /// landing and describe pages and unknown paths all need a credential.
+    /// A request the callback leaves anonymous gets a 401
+    /// (`missing_credential`); a rejection or an outage gets the usual
+    /// 401 / 503. Only two requests are exempt: `HEAD /health`, the
+    /// liveness probe, and CORS preflights (an `OPTIONS` request with
+    /// `Origin` and `Access-Control-Request-Method`), which browsers send
+    /// without credentials and which this middleware answers itself.
+    ///
+    /// Requires an authenticate callback; [`build`](Self::build) panics
+    /// without one.
+    pub fn authenticate_every_request(mut self, enabled: bool) -> Self {
+        self.authenticate_every_request = Some(enabled);
+        self
+    }
+
     /// Mount the router under a URL prefix (e.g. `/v1`). Default empty.
     pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = Some(prefix.into());
@@ -870,11 +923,20 @@ impl HttpStateBuilder {
         // `Allow-Credentials: true`. Fail fast at config time instead of
         // shipping a server whose authenticated cross-origin requests
         // silently break.
+        let cors_credentials = self.cors_credentials.unwrap_or(true);
         assert!(
-            !(self.cors_origins.as_deref() == Some("*") && self.authenticate.is_some()),
+            !(self.cors_origins.as_deref() == Some("*")
+                && self.authenticate.is_some()
+                && cors_credentials),
             "HttpStateBuilder: cors_origins(\"*\") cannot be combined with an \
              authenticate callback — browsers reject credentialed requests \
-             against a wildcard origin. Configure a specific origin."
+             against a wildcard origin. Configure a specific origin, or pass \
+             cors_credentials(false) when the only credential is a bearer header."
+        );
+        let authenticate_every_request = self.authenticate_every_request.unwrap_or(false);
+        assert!(
+            !(authenticate_every_request && self.authenticate.is_none()),
+            "HttpStateBuilder: authenticate_every_request(true) needs an authenticate callback"
         );
         // Close the identity loop: accept the deployment's sealed grants and
         // its resolve_token's credentials as bearers, after its own
@@ -925,7 +987,10 @@ impl HttpStateBuilder {
             .oauth_metadata
             .as_ref()
             .map(|m| m.to_json().into_bytes());
-        let www_authenticate = self.oauth_metadata.as_ref().map(|m| m.www_authenticate());
+        let www_authenticate = self
+            .www_authenticate
+            .clone()
+            .or_else(|| self.oauth_metadata.as_ref().map(|m| m.www_authenticate()));
         let sticky = if self.enable_sticky.unwrap_or(false) {
             let ttl = self
                 .sticky_default_ttl
@@ -993,6 +1058,8 @@ impl HttpStateBuilder {
             oauth_metadata: self.oauth_metadata,
             oauth_metadata_json,
             www_authenticate,
+            authenticate_every_request,
+            cors_credentials,
             cors_max_age: self.cors_max_age.unwrap_or(7200),
             prefix: self.prefix.unwrap_or_default(),
             response_compression_level,
@@ -1951,6 +2018,7 @@ fn response_buffer_ceiling(state: &HttpState, headers: &HeaderMap) -> usize {
 pub fn build_router(state: Arc<HttpState>) -> Router {
     let body_limit = state.max_body_size;
     let request_timeout = state.request_timeout;
+    let state_for_gate = state.clone();
     build_router_inner(state.clone())
         .layer(axum::middleware::from_fn_with_state(
             state,
@@ -1968,6 +2036,14 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
         // configured ceiling of 64 MiB.
         .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(tower_http::limit::RequestBodyLimitLayer::new(body_limit))
+        // `authenticate_every_request`: outside the body limit, so a caller
+        // without a credential learns nothing about size limits and no body
+        // byte is read before authentication. Inside the timeout, which
+        // bounds a slow key fetch.
+        .layer(axum::middleware::from_fn_with_state(
+            state_for_gate,
+            authenticate_every_request_middleware,
+        ))
         // Wall-clock ceiling per request so a stalled handler or a
         // slow-loris client can't pin a runtime worker forever.
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
@@ -1979,6 +2055,81 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
         // infallible `Vec` writers and server-controlled schemas, but
         // this is the defence-in-depth net for any that slip through.
         .layer(tower_http::catch_panic::CatchPanicLayer::new())
+}
+
+/// Whether `headers` make an `OPTIONS` request a CORS preflight: a browser
+/// sends `Origin` and `Access-Control-Request-Method`, and no credentials.
+fn is_cors_preflight(method: &axum::http::Method, headers: &HeaderMap) -> bool {
+    method == axum::http::Method::OPTIONS
+        && headers.contains_key(header::ORIGIN)
+        && headers.contains_key(header::ACCESS_CONTROL_REQUEST_METHOD)
+}
+
+/// The [`HttpStateBuilder::authenticate_every_request`] gate. A no-op unless
+/// it is on.
+///
+/// Its own responses (the preflight answer, 401, 503) never reach
+/// `postprocess_middleware`, so they get the CORS and capability headers here.
+async fn authenticate_every_request_middleware(
+    axum::extract::State(state): axum::extract::State<Arc<HttpState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    if !state.authenticate_every_request {
+        return next.run(req).await;
+    }
+    let method = req.method().clone();
+    let headers = req.headers();
+    let requested_headers = headers.get(header::ACCESS_CONTROL_REQUEST_HEADERS).cloned();
+    if is_cors_preflight(&method, headers) {
+        let mut h = HeaderMap::new();
+        attach_cors_headers(&state, &mut h, requested_headers.as_ref(), true);
+        attach_capability_headers(&state, &mut h, &method);
+        return (StatusCode::OK, h).into_response();
+    }
+    if method == axum::http::Method::HEAD && req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0);
+    let path = req.uri().path().to_owned();
+    let refused = match authenticate_request_from_peer(&state, &path, headers, peer).await {
+        Ok(identity) if identity.auth.authenticated => None,
+        // Anonymous with a credential present is already a 401 from
+        // `authenticate_request_from_peer`; anonymous here means none was sent.
+        Ok(_) => {
+            let mut h = HeaderMap::new();
+            if let Some(hv) = state
+                .www_authenticate
+                .as_deref()
+                .and_then(|wa| HeaderValue::from_str(wa).ok())
+            {
+                h.insert(header::WWW_AUTHENTICATE, hv);
+            }
+            Some(state.unauthorized_response(
+                h,
+                AuthReason::MissingCredential,
+                "authentication required",
+            ))
+        }
+        Err(resp) => Some(resp),
+    };
+    match refused {
+        None => next.run(req).await,
+        Some(resp) => {
+            let (mut parts, body) = resp.into_parts();
+            attach_cors_headers(
+                &state,
+                &mut parts.headers,
+                requested_headers.as_ref(),
+                false,
+            );
+            attach_capability_headers(&state, &mut parts.headers, &method);
+            Response::from_parts(parts, body)
+        }
+    }
 }
 
 async fn postprocess_middleware(
@@ -2502,7 +2653,7 @@ fn attach_cors_headers(
     // origin is specific — `HttpStateBuilder::build` rejects the
     // `"*"` + auth combination, so the configured origin here is
     // always concrete.
-    if state.authenticate.is_some() {
+    if state.authenticate.is_some() && state.cors_credentials {
         out.insert(
             header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
             HeaderValue::from_static("true"),

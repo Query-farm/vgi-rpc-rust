@@ -337,8 +337,9 @@ fn validate_token(
         })?
         .to_owned();
     let mut ctx = AuthContext::for_principal(format!("jwt:{}", cfg.issuer), principal);
+    // Typed in `claim_values`, flattened to strings in `claims`.
     for (k, v) in claims.into_iter() {
-        ctx = ctx.with_claim(k, json_claim_to_string(&v));
+        ctx = ctx.with_claim_value(k, v);
     }
     Ok(ctx)
 }
@@ -358,14 +359,6 @@ fn json_to_i64(v: &serde_json::Value) -> Option<i64> {
     v.as_i64()
         .or_else(|| v.as_f64().map(|f| f as i64))
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-}
-
-/// Flatten a JSON claim to the string form stored on [`AuthContext`].
-fn json_claim_to_string(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
 }
 
 fn refresh_jwks(
@@ -696,6 +689,8 @@ mod tests {
             ctx.claims.get("iss").map(String::as_str),
             Some("https://iss")
         );
+        // Numbers keep their JSON type in `claim_values`.
+        assert!(ctx.claim_value("exp").is_some_and(|v| v.is_i64()));
     }
 
     #[test]

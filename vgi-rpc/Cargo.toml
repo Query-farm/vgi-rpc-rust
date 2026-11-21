@@ -122,6 +122,10 @@ name = "http_auth"
 required-features = ["http"]
 
 [[test]]
+name = "http_auth_every_request"
+required-features = ["http"]
+
+[[test]]
 name = "http_blocking_dispatch"
 required-features = ["http"]
 

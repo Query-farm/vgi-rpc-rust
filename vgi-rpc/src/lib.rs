@@ -32,6 +32,7 @@ pub mod hooks;
 pub mod intermediary;
 pub mod log;
 pub mod metadata;
+pub mod object_cache;
 pub mod proxy_protocol;
 #[cfg(feature = "sentry-sdk")]
 pub mod sentry_sdk;
@@ -40,6 +41,7 @@ pub mod sentry_tracing;
 pub mod server;
 #[cfg(feature = "shm")]
 pub mod shm;
+pub mod state_ref;
 pub mod stream;
 // stream_codec is pure serde+bincode (no axum/tokio/crypto) and is used by the
 // core dispatch path, so it's available without the full `http` stack — keeping
@@ -50,6 +52,8 @@ pub mod reflection;
 #[cfg(feature = "stream-codec")]
 pub mod stream_codec;
 pub mod tcp;
+#[cfg(feature = "external")]
+pub mod token_codec;
 /// `vgi_rpc.Identity.v2` -- resolving an opaque credential to a principal, and
 /// minting standing grants. Framework-owned and off unless configured.
 pub mod token_identity;
@@ -125,6 +129,7 @@ pub use server::{
     CallContext, ConnectionContext, HostedProtocol, MethodInfo, MethodRegistry, MethodType,
     Request, RpcServer, RpcServerBuilder, StickySink,
 };
+pub use state_ref::{CursorRule, StateRef, StateRefForm};
 #[cfg(feature = "http")]
 pub use sticky::{DrainHandle, SessionRegistry};
 pub use stream::{ExchangeState, OutputCollector, ProducerState, StreamResult};

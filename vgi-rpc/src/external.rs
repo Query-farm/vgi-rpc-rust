@@ -105,6 +105,65 @@ pub struct UploadResult {
 /// thread pool.
 pub trait ExternalStorage: Send + Sync {
     fn upload(&self, ipc_bytes: &[u8], compression: Compression) -> Result<UploadResult>;
+
+    /// This storage's object API (`put_object` / `get`), when it has one.
+    ///
+    /// The protocol-3.4 storage contract (`STATE_REF_V1.md` §10.1). "Storage
+    /// is configured" for [`StateRef`](crate::state_ref::StateRef)s means the
+    /// server's storage returns `Some` here; one that returns `None` (the
+    /// default, so a third-party backend keeps compiling) keeps every ref
+    /// inline and cannot resolve argument references. Every backend in this
+    /// workspace implements it.
+    fn object_store(&self) -> Option<&dyn ObjectStore> {
+        None
+    }
+}
+
+/// `error_kind` of the error an [`ObjectStore::get`] raises when storage
+/// reports the object absent (HTTP 404, vendor `not_found` / `not_uploaded`).
+///
+/// Distinguishable on purpose: a missing object is final (`state_ref_missing`
+/// / `arguments_ref_missing`); any other failure is transient and surfaces as
+/// `storage_unavailable` (`UNAVAILABLE`).
+pub const ERROR_KIND_OBJECT_MISSING: &str = "object_missing";
+
+/// The error an [`ObjectStore::get`] returns for an absent object. The
+/// message must not carry a signed URL.
+pub fn object_missing_error(message: impl Into<String>) -> RpcError {
+    RpcError::new("LookupError", message).with_status(
+        crate::error_model::Code::NotFound,
+        ERROR_KIND_OBJECT_MISSING,
+    )
+}
+
+/// Whether `err` is [`object_missing_error`]'s "the object is gone".
+pub fn is_object_missing(err: &RpcError) -> bool {
+    err.error_kind() == ERROR_KIND_OBJECT_MISSING
+}
+
+/// Storage that holds opaque objects by id (`STATE_REF_V1.md` §10.1).
+///
+/// Objects carry no TTL and are never deleted by the server: operators must
+/// set a bucket lifecycle rule of **at least one day** on the `rpc` prefix.
+/// Implementations must be thread-safe.
+pub trait ObjectStore: Send + Sync {
+    /// Store `data` as one `rpc`-purpose object and return its id (an S3/GCS
+    /// key, the vendor's `object_id`, a fake-storage blob id; at most 1024
+    /// bytes of UTF-8).
+    ///
+    /// The write must carry the size and SHA-256 of `data` so storage verifies
+    /// the body where it can (a vendor sized grant, an S3 PUT signing
+    /// `content-length` and `x-amz-checksum-sha256`).
+    fn put_object(&self, data: &[u8]) -> Result<String>;
+
+    /// Fetch the object `object_id` names.
+    ///
+    /// The download is minted server-side from the id, pinned to the same
+    /// hosts as other storage fetches, and refused past `max_bytes` (the
+    /// server's `max_fetch_bytes`). Callers verify size and SHA-256
+    /// themselves. An absent object is [`object_missing_error`]; anything
+    /// else is a transient failure.
+    fn get(&self, object_id: &str, max_bytes: usize) -> Result<Vec<u8>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +238,12 @@ pub fn upload_url_response_schema() -> SchemaRef {
             false,
         ),
         Field::new("upload_headers", upload_headers_type(), false),
+        // Protocol 3.4 (STATE_REF_V1.md §10.2): the storage id of the object
+        // the PUT creates, and a sealed argument reference for it
+        // (`vgi_rpc.argref.v1`, bound to the requesting principal). Clients
+        // read the columns by name and may ignore these two.
+        Field::new("object_id", DataType::Utf8, false),
+        Field::new("ref", DataType::Binary, false),
     ]))
 }
 
@@ -386,6 +451,9 @@ pub fn upload_url_response_batch(urls: &[UploadUrl]) -> Result<RecordBatch> {
         headers.append(true)?;
     }
     let headers = headers.finish();
+    let object_ids = StringArray::from_iter_values(urls.iter().map(|u| u.object_id.as_str()));
+    let refs =
+        arrow_array::BinaryArray::from_iter_values(urls.iter().map(|u| u.argument_ref.as_slice()));
     Ok(RecordBatch::try_new(
         upload_url_response_schema(),
         vec![
@@ -393,6 +461,8 @@ pub fn upload_url_response_batch(urls: &[UploadUrl]) -> Result<RecordBatch> {
             Arc::new(download),
             Arc::new(expires),
             Arc::new(headers),
+            Arc::new(object_ids),
+            Arc::new(refs),
         ],
     )?)
 }
@@ -401,7 +471,7 @@ pub fn upload_url_response_batch(urls: &[UploadUrl]) -> Result<RecordBatch> {
 ///
 /// `expires_at` is a Unix-epoch microseconds timestamp (UTC). Mirrors
 /// `vgi_rpc.external.UploadUrl`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct UploadUrl {
     /// Pre-signed `PUT`, signed for the requested size (and SHA-256 where the
     /// backend can verify it).
@@ -414,6 +484,15 @@ pub struct UploadUrl {
     /// `x-amz-checksum-sha256`. Never contains `Content-Length`; the client
     /// sends exactly the requested size with a plain length.
     pub headers: Vec<(String, String)>,
+    /// Storage id of the object the PUT creates (S3/GCS key, vendor
+    /// `object_id`, fake-storage blob id). Every provider must supply it
+    /// (protocol 3.4); the server seals it into the grant's argument
+    /// reference and refuses a grant whose provider left it empty.
+    pub object_id: String,
+    /// The sealed argument reference for this upload (the response's `ref`
+    /// column, `STATE_REF_V1.md` §10.2). Providers leave it empty; the
+    /// `__upload_url__` handler fills it in.
+    pub argument_ref: Vec<u8>,
 }
 
 /// Generates pre-signed upload URL pairs for client-vended uploads.
@@ -1315,6 +1394,8 @@ pub struct InMemoryStorage {
     grants: std::sync::Mutex<std::collections::HashMap<String, (String, u64, String)>>,
     next_id: std::sync::atomic::AtomicU64,
     base_url: String,
+    object_puts: std::sync::atomic::AtomicU64,
+    object_gets: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -1325,6 +1406,8 @@ impl InMemoryStorage {
             grants: std::sync::Mutex::new(std::collections::HashMap::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
             base_url: "https://inmem.test/".to_string(),
+            object_puts: std::sync::atomic::AtomicU64::new(0),
+            object_gets: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1385,16 +1468,75 @@ impl UploadUrlProvider for InMemoryStorage {
             (download_url.clone(), size, sha256_hex.to_string()),
         );
         Ok(UploadUrl {
+            object_id: download_url.clone(),
             upload_url,
             download_url,
             expires_at_micros: 0,
             headers: vec![("x-amz-checksum-sha256".to_string(), checksum)],
+            argument_ref: Vec::new(),
         })
     }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+impl InMemoryStorage {
+    /// Delete one object by id (a test stand-in for the bucket lifecycle).
+    /// Returns whether it existed.
+    pub fn delete_object(&self, object_id: &str) -> bool {
+        self.map.lock().unwrap().remove(object_id).is_some()
+    }
+
+    /// Calls of the object API so far: `(put_object, get)`.
+    pub fn object_calls(&self) -> (u64, u64) {
+        (
+            self.object_puts.load(std::sync::atomic::Ordering::Relaxed),
+            self.object_gets.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl ObjectStore for InMemoryStorage {
+    fn put_object(&self, data: &[u8]) -> Result<String> {
+        self.object_puts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let object_id = format!("{}obj/{id:016x}", self.base_url);
+        self.map
+            .lock()
+            .unwrap()
+            .insert(object_id.clone(), data.to_vec());
+        Ok(object_id)
+    }
+
+    fn get(&self, object_id: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        self.object_gets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bytes = self
+            .map
+            .lock()
+            .unwrap()
+            .get(object_id)
+            .cloned()
+            .ok_or_else(|| object_missing_error("in-memory object is gone"))?;
+        if bytes.len() > max_bytes {
+            return Err(RpcError::runtime_error(format!(
+                "in-memory object is {} bytes, over max_fetch_bytes ({max_bytes})",
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
 impl ExternalStorage for InMemoryStorage {
+    fn object_store(&self) -> Option<&dyn ObjectStore> {
+        Some(self)
+    }
+
     fn upload(&self, ipc_bytes: &[u8], _compression: Compression) -> Result<UploadResult> {
         let id = self
             .next_id
@@ -1812,6 +1954,8 @@ mod tests {
                 ("x-amz-checksum-sha256".into(), "abc=".into()),
                 ("Content-Length".into(), "3".into()),
             ],
+            object_id: "obj-1".into(),
+            argument_ref: vec![1, 2, 3],
         }];
         let batch = upload_url_response_batch(&urls).unwrap();
         assert_eq!(batch.schema(), upload_url_response_schema());

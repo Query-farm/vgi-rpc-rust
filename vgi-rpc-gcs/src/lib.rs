@@ -7,7 +7,9 @@
 
 pub use vgi_rpc_s3::HttpFetcher;
 
-use vgi_rpc::external::{Compression, ExternalStorage, UploadResult, UploadUrl, UploadUrlProvider};
+use vgi_rpc::external::{
+    Compression, ExternalStorage, ObjectStore, UploadResult, UploadUrl, UploadUrlProvider,
+};
 use vgi_rpc::Result;
 pub use vgi_rpc_s3::PresignRequest;
 use vgi_rpc_s3::{PresignUrlPairFactory, PresignedPutStorage};
@@ -37,6 +39,14 @@ impl ExternalStorage for SignedGcsStorage {
     fn upload(&self, ipc_bytes: &[u8], compression: Compression) -> Result<UploadResult> {
         self.0.upload(ipc_bytes, compression)
     }
+
+    /// The object API; `object_id` is the blob name. GCS cannot verify a
+    /// SHA-256 at storage: the upload is length-exact and callers verify the
+    /// digest on read. Set Object Lifecycle Management of at least one day on
+    /// the prefix.
+    fn object_store(&self) -> Option<&dyn ObjectStore> {
+        Some(&self.0)
+    }
 }
 
 impl UploadUrlProvider for SignedGcsStorage {
@@ -64,6 +74,7 @@ mod tests {
                     download_url: String::from("https://example/download"),
                     expires_at_micros: 0,
                     headers: Vec::new(),
+                    ..Default::default()
                 })
             }),
         );
@@ -142,6 +153,7 @@ mod tests {
                     download_url: download_url.clone(),
                     expires_at_micros: 123,
                     headers: Vec::new(),
+                    ..Default::default()
                 })
             }),
         );

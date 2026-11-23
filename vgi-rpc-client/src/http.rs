@@ -431,6 +431,13 @@ pub struct UploadUrl {
     pub expires_at: Option<i64>,
     /// Headers the `PUT` must carry verbatim (`upload_headers`).
     pub headers: Vec<(String, String)>,
+    /// Storage id of the object the `PUT` creates (protocol 3.4 `object_id`
+    /// column); empty when the server predates it.
+    pub object_id: String,
+    /// The sealed argument reference for this upload (protocol 3.4 `ref`
+    /// column, `STATE_REF_V1.md` §10.2); empty when the server predates it.
+    /// Opaque: sent back alongside its size and SHA-256.
+    pub argument_ref: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2705,6 +2712,14 @@ fn parse_upload_urls(bytes: &[u8], on_log: &mut Option<OnLog>) -> Result<Vec<Upl
                     .ok_or_else(|| RpcError::new("ProtocolError", "download_url missing"))?
                     .as_string::<i32>();
                 let exp = batch.column_by_name("expires_at");
+                // Protocol 3.4 grant columns, read by name and optional: a
+                // server without them still answers a v2 client.
+                let object_ids = batch
+                    .column_by_name("object_id")
+                    .and_then(|c| c.as_string_opt::<i32>());
+                let refs = batch
+                    .column_by_name("ref")
+                    .and_then(|c| c.as_binary_opt::<i32>());
                 let hdrs = batch
                     .column_by_name("upload_headers")
                     .ok_or_else(|| RpcError::new("ProtocolError", "upload_headers missing"))?
@@ -2741,6 +2756,14 @@ fn parse_upload_urls(bytes: &[u8], on_log: &mut Option<OnLog>) -> Result<Vec<Upl
                         download_url: down.value(i).to_string(),
                         expires_at,
                         headers,
+                        object_id: object_ids
+                            .filter(|a| !a.is_null(i))
+                            .map(|a| a.value(i).to_string())
+                            .unwrap_or_default(),
+                        argument_ref: refs
+                            .filter(|a| !a.is_null(i))
+                            .map(|a| a.value(i).to_vec())
+                            .unwrap_or_default(),
                     });
                 }
             }

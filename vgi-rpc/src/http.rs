@@ -441,6 +441,9 @@ pub struct HttpState {
     /// `Access-Control-Allow-Origin` value precomputed from `cors_origins`
     /// so the per-response CORS path doesn't re-parse the origin string.
     cors_allow_origin: Option<HeaderValue>,
+    /// `StateRef` machinery: token key, storage, budgets, cursor rule and
+    /// object cache (`STATE_REF_V1.md`).
+    state_refs: Arc<crate::state_ref::StateRefRuntime>,
 }
 
 /// Fluent builder for [`HttpState`].
@@ -487,6 +490,9 @@ pub struct HttpStateBuilder {
     identity_bearer: Option<bool>,
     extra_proxy_auth_headers: Vec<String>,
     call_state_cache_entries: Option<usize>,
+    state_ref_inline_bytes: Option<usize>,
+    cursor_rule: Option<crate::CursorRule>,
+    object_cache: Option<Arc<crate::object_cache::ObjectCache>>,
 }
 
 impl HttpStateBuilder {
@@ -557,9 +563,6 @@ impl HttpStateBuilder {
         self
     }
 
-    /// Maximum age of a state token. Continuation requests with a token
-    /// older than this are rejected. Default `5 minutes`. Set to
-    /// `Duration::ZERO` to disable TTL enforcement.
     /// Size the per-process call-state cache; `0` disables it.
     ///
     /// The cache is a pure accelerator — a miss reopens the call token the
@@ -572,8 +575,48 @@ impl HttpStateBuilder {
         self
     }
 
+    /// Maximum age of cursor tokens, call tokens and stored `StateRef` tags,
+    /// each checked from its own creation time. Older ones are rejected with
+    /// HTTP 400. Default 21600 s (6 h, the maximum stream duration). Set to
+    /// `Duration::ZERO` to disable expiry checking.
     pub fn token_ttl(mut self, ttl: std::time::Duration) -> Self {
         self.token_ttl = Some(ttl);
+        self
+    }
+
+    /// Largest compressed `StateRef` payload kept inline in a token before it
+    /// is stored (`STATE_REF_V1.md` §9); the effective limit is also capped at
+    /// a quarter of the turn budget. Unset reads
+    /// `VGI_RPC_STATE_REF_INLINE_BYTES`, else 16384.
+    ///
+    /// # Panics
+    ///
+    /// When `n` is zero.
+    pub fn state_ref_inline_bytes(mut self, n: usize) -> Self {
+        assert!(n > 0, "state_ref_inline_bytes must be a positive integer");
+        self.state_ref_inline_bytes = Some(n);
+        self
+    }
+
+    /// What happens when a sealed cursor exceeds the turn budget
+    /// (`floor((max_request_bytes - 4096) / 1.34) - call_token_bytes`):
+    /// [`CursorRule::Warn`](crate::CursorRule::Warn) (the default) logs
+    /// `cursor_large` and sends the client a WARN log;
+    /// [`CursorRule::Error`](crate::CursorRule::Error) refuses the turn with
+    /// `cursor_too_large` (only when a request cap is set). A framework that
+    /// keeps its unchanging state in `StateRef`s should pass `Error`. Below a
+    /// 16 KiB request cap the rule is disabled with a startup warning.
+    pub fn cursor_rule(mut self, rule: crate::CursorRule) -> Self {
+        self.cursor_rule = Some(rule);
+        self
+    }
+
+    /// The object cache stored `StateRef`s and argument references resolve
+    /// through. Default: the process-wide
+    /// [`default_object_cache`](crate::object_cache::default_object_cache),
+    /// bounded by `VGI_RPC_OBJECT_CACHE_BYTES`.
+    pub fn object_cache(mut self, cache: Arc<crate::object_cache::ObjectCache>) -> Self {
+        self.object_cache = Some(cache);
         self
     }
 
@@ -814,9 +857,16 @@ impl HttpStateBuilder {
         self
     }
 
-    /// Advertised upper bound on the size of any single client-vended
-    /// upload (header `VGI-Max-Upload-Bytes`). An `__upload_url__` entry
-    /// whose `size` exceeds it is refused before any URL is minted.
+    /// Largest single client-vended upload, advertised as
+    /// `VGI-Max-Upload-Bytes` whenever an upload-URL provider is set. An
+    /// `__upload_url__` entry whose `size` exceeds it is refused before any
+    /// URL is minted.
+    ///
+    /// It may not exceed the server's inbound fetch cap (the external
+    /// config's `max_encoded_bytes`, 1 GiB by default, or 256 MiB without an
+    /// external config): an upload the server would then refuse to fetch
+    /// fails only after the client has sent it all, so [`build`](Self::build)
+    /// panics on a larger value. Unset advertises the fetch cap itself.
     pub fn max_upload_bytes(mut self, n: usize) -> Self {
         self.max_upload_bytes = Some(n);
         self
@@ -1013,12 +1063,59 @@ impl HttpStateBuilder {
         let response_compression_level = self
             .response_compression_level
             .unwrap_or(Some(DEFAULT_RESPONSE_COMPRESSION_LEVEL));
+        // Fix 1: never advertise an upload size the server will not fetch.
+        // An upload comes back as a pointer the server fetches under its
+        // external config's fetch cap, so with a provider the advertised size
+        // defaults to that cap and may not exceed it.
+        let fetch_cap = server
+            .external_config()
+            .map_or(DEFAULT_MAX_FETCH_BYTES, |cfg| cfg.max_encoded_bytes);
+        let max_upload_bytes = match (&self.upload_url_provider, self.max_upload_bytes) {
+            (None, value) => value,
+            (Some(_), None) => Some(fetch_cap),
+            (Some(_), Some(n)) => {
+                assert!(n > 0, "max_upload_bytes must be a positive integer");
+                assert!(
+                    n <= fetch_cap,
+                    "HttpStateBuilder: max_upload_bytes ({n}) exceeds the server's inbound fetch \
+                     cap (external config max_encoded_bytes = {fetch_cap}): clients would upload \
+                     requests the server then refuses to fetch. Raise max_encoded_bytes \
+                     (VGI_RPC_MAX_FETCH_BYTES for vgi_rpc_s3::vendor::external_config_from_env) \
+                     or lower max_upload_bytes."
+                );
+                Some(n)
+            }
+        };
+        let effective_max_request_bytes = [self.max_request_bytes, self.hosting_max_request_bytes]
+            .into_iter()
+            .flatten()
+            .min();
+        let token_ttl = self.token_ttl.unwrap_or_else(|| {
+            std::time::Duration::from_secs(crate::state_ref::DEFAULT_TOKEN_TTL_SECONDS)
+        });
+        let inline_bytes = self.state_ref_inline_bytes.unwrap_or_else(|| {
+            crate::state_ref::state_ref_inline_bytes_from_env()
+                .unwrap_or_else(|err| panic!("HttpStateBuilder: {}", err.message))
+        });
+        let object_cache = self.object_cache.clone().unwrap_or_else(|| {
+            // Refuse a malformed bound at startup rather than on first use.
+            if let Err(err) = crate::object_cache::default_object_cache_bytes() {
+                panic!("HttpStateBuilder: {}", err.message);
+            }
+            crate::object_cache::default_object_cache()
+        });
+        let state_refs = Arc::new(
+            crate::state_ref::StateRefRuntime::new(token_key, fetch_cap)
+                .with_token_ttl(token_ttl.as_secs())
+                .with_storage(server.external_config().map(|cfg| cfg.storage.clone()))
+                .with_max_request_bytes(effective_max_request_bytes)
+                .with_inline_bytes_cap(inline_bytes)
+                .with_cursor_rule(self.cursor_rule.unwrap_or_default())
+                .with_cache(object_cache),
+        );
         let (capability_headers, capability_has_any, cors_expose_headers) =
             build_capability_headers(CapabilityInputs {
-                max_request_bytes: [self.max_request_bytes, self.hosting_max_request_bytes]
-                    .into_iter()
-                    .flatten()
-                    .min(),
+                max_request_bytes: effective_max_request_bytes,
                 max_response_bytes: [self.max_response_bytes, self.hosting_max_response_bytes]
                     .into_iter()
                     .flatten()
@@ -1026,7 +1123,7 @@ impl HttpStateBuilder {
                 max_externalized_response_bytes: self.max_externalized_response_bytes,
                 externalization_enabled: server.external_config().is_some(),
                 upload_url_support: self.upload_url_provider.is_some(),
-                max_upload_bytes: self.max_upload_bytes,
+                max_upload_bytes,
                 sticky: sticky.as_deref(),
                 response_compression_level,
                 proxy_proof_required: self.proxy_proof_required.unwrap_or(false),
@@ -1040,9 +1137,7 @@ impl HttpStateBuilder {
             call_states: std::sync::Mutex::new(HashMap::new()),
             server,
             token_key,
-            token_ttl: self
-                .token_ttl
-                .unwrap_or_else(|| std::time::Duration::from_secs(300)),
+            token_ttl,
             max_body_size: self.max_body_size.unwrap_or(64 * 1024 * 1024),
             request_timeout: self
                 .request_timeout
@@ -1073,13 +1168,14 @@ impl HttpStateBuilder {
             preferred_response_bytes: self.preferred_response_bytes,
             max_externalized_response_bytes: self.max_externalized_response_bytes,
             upload_url_provider: self.upload_url_provider,
-            max_upload_bytes: self.max_upload_bytes,
+            max_upload_bytes,
             sticky,
             landing_info: self.landing_info,
             capability_headers,
             capability_has_any,
             cors_expose_headers,
             cors_allow_origin,
+            state_refs,
         })
     }
 }
@@ -1287,6 +1383,11 @@ impl HttpState {
         self.token_ttl
     }
 
+    /// This server's `StateRef` runtime (key, storage, budgets, object cache).
+    pub fn state_ref_runtime(&self) -> &Arc<crate::state_ref::StateRefRuntime> {
+        &self.state_refs
+    }
+
     pub fn max_body_size(&self) -> usize {
         self.max_body_size
     }
@@ -1316,22 +1417,40 @@ impl HttpState {
     /// Mint a stream's call token and warm the cache with what we already
     /// hold, so the stream's first continuation need not open the token it
     /// was just handed.
+    ///
+    /// Both schemas go behind a `StateRef` (`schemas_ref`) whose inline limit
+    /// is computed with `call_token_bytes = 0`, so a very wide table stores
+    /// them once instead of blowing every continuation's budget.
     pub(crate) fn pack_call_token(
         &self,
         auth: &crate::auth::AuthContext,
         call_id: &[u8; CALL_ID_LEN],
-        resolved: ResolvedCall,
-    ) -> String {
+        protocol: &str,
+        method: &str,
+        mut resolved: ResolvedCall,
+    ) -> Result<String> {
         let aad = compute_call_aad(auth);
+        let schemas_ref = dispatch_sync(|| {
+            self.state_refs.encode_value(
+                &pack_schemas(&resolved),
+                auth,
+                protocol,
+                method,
+                call_id,
+                0,
+            )
+        })?;
         let token = pack_call_token(
             &self.token_key,
             &aad,
             call_id,
+            &schemas_ref,
             &resolved,
             current_unix_secs(),
         );
+        resolved.call_token_bytes = sealed_len(&token);
         self.cache_call(auth, call_id, Arc::new(resolved));
-        token
+        Ok(token)
     }
 
     fn token_ttl_opt(&self) -> Option<std::time::Duration> {
@@ -1467,6 +1586,7 @@ impl HttpState {
         auth: &crate::auth::AuthContext,
         cursor: &UnpackedCursor,
         call_token: Option<&str>,
+        protocol: &str,
     ) -> Result<Arc<ResolvedCall>> {
         let key = Self::cache_key(auth, &cursor.call_id);
         let ttl = self.token_ttl_opt();
@@ -1490,14 +1610,33 @@ impl HttpState {
             ));
         };
         let aad = compute_call_aad(auth);
-        let (call_id, resolved) = unpack_call_token(&self.token_key, &aad, call_token, ttl)?;
-        if call_id != cursor.call_id {
+        let unpacked = unpack_call_token(&self.token_key, &aad, call_token, ttl)?;
+        if unpacked.call_id != cursor.call_id {
             // The cursor named a different call. Uniform message: reachable
             // only by pairing two tokens the same principal legitimately
             // holds, so it carries nothing worth distinguishing.
             return Err(RpcError::runtime_error("Malformed state token"));
         }
-        let resolved = Arc::new(resolved);
+        // Both schemas live behind a StateRef (call token v3): inline in the
+        // common case, one GET per process per stream when a very wide table
+        // stored them, then the object cache.
+        let schemas = dispatch_sync(|| {
+            self.state_refs.resolve_encoded(
+                &unpacked.schemas_ref,
+                auth,
+                protocol,
+                &unpacked.call_id,
+            )
+        })?;
+        let (output_schema_bytes, input_schema_bytes) = unpack_schemas(&schemas)?;
+        let resolved = Arc::new(ResolvedCall {
+            output_schema_bytes,
+            input_schema_bytes,
+            stream_id: unpacked.stream_id,
+            response_limit_bytes: unpacked.response_limit_bytes,
+            preferred_response_bytes: unpacked.preferred_response_bytes,
+            call_token_bytes: unpacked.call_token_bytes,
+        });
         self.cache_call(auth, &cursor.call_id, resolved.clone());
         Ok(resolved)
     }
@@ -1578,14 +1717,15 @@ fn peer_evidence_binding(auth: &crate::auth::AuthContext) -> Option<&str> {
 /// codec-tagged, compressed payload; v6 = cursor-only, with the schemas and
 /// stream id moved into the call token.
 /// Call history: v1 = schemas and stream id; v2 = v1 plus the immutable
-/// effective response budget for continuation requests.
+/// effective response budget for continuation requests; v3 = both schemas
+/// behind a `StateRef` (`schemas_ref`, `STATE_REF_V1.md` §8).
 ///
 /// Each bump matters for rolling deploys: an older plaintext frames
 /// differently, so a newer reader would mis-parse it. Rejecting the old
 /// version outright turns that into the same clean failure as any other
 /// stale token.
 pub(crate) const CURSOR_TOKEN_VERSION: u8 = 0x06;
-pub(crate) const CALL_TOKEN_VERSION: u8 = 0x02;
+pub(crate) const CALL_TOKEN_VERSION: u8 = 0x03;
 
 /// Length of the random per-stream id minted at `/init` that binds a call
 /// token to its cursors.
@@ -1594,46 +1734,19 @@ pub(crate) const CALL_ID_LEN: usize = 16;
 /// Bounds the per-process call-state cache.
 const CALL_STATE_CACHE_ENTRIES: usize = 4096;
 
-/// Codec tags for the token payload, written as the first plaintext byte
-/// inside the seal. See [`pack_token_payload`].
-const TOKEN_CODEC_RAW: u8 = 0x00;
-const TOKEN_CODEC_ZSTD: u8 = 0x01;
+/// Inbound fetch cap assumed for a server without an external config (the
+/// reference's `DEFAULT_MAX_FETCH_BYTES`).
+const DEFAULT_MAX_FETCH_BYTES: usize = 256 << 20;
 
-/// Matches the Python reference's choice. At token payload sizes this
-/// measures the same speed as level 1 and slightly smaller, while the levels
-/// that compress materially better cost many times the CPU for a few hundred
-/// bytes.
-const TOKEN_ZSTD_LEVEL: i32 = 3;
-
-/// Bounds decompression. The payload is authenticated before it is ever
-/// decompressed, so this guards against a framework bug rather than an
-/// attacker — but an unbounded decompress on a request path is not worth
-/// having.
-const MAX_TOKEN_PLAINTEXT_BYTES: usize = 64 << 20;
-
-/// Compress a token payload and tag which codec was used.
+/// Compress a token payload and tag which codec was used (the standard
+/// token codec, [`crate::token_codec`]).
 ///
 /// Compression happens *inside* the seal, and the order is the whole point:
 /// once sealed, a token is ciphertext, so the HTTP body codec can no longer
 /// find any redundancy in it — it recovers only the slack base64 adds, never
 /// the state's own structure. Compressing first reaches the real redundancy.
-///
-/// Compression is skipped when it does not pay, so a small token never grows
-/// beyond its plaintext plus the one tag byte; the tag means the reader never
-/// has to guess.
 fn pack_token_payload(plaintext: &[u8]) -> Vec<u8> {
-    if let Ok(packed) = zstd::bulk::compress(plaintext, TOKEN_ZSTD_LEVEL) {
-        if packed.len() < plaintext.len() {
-            let mut out = Vec::with_capacity(1 + packed.len());
-            out.push(TOKEN_CODEC_ZSTD);
-            out.extend_from_slice(&packed);
-            return out;
-        }
-    }
-    let mut out = Vec::with_capacity(1 + plaintext.len());
-    out.push(TOKEN_CODEC_RAW);
-    out.extend_from_slice(plaintext);
-    out
+    crate::token_codec::pack(plaintext)
 }
 
 /// Reverse [`pack_token_payload`].
@@ -1642,15 +1755,15 @@ fn pack_token_payload(plaintext: &[u8]) -> Vec<u8> {
 /// server did not mint, so both surface as the same uniform error every other
 /// token failure uses.
 fn unpack_token_payload(data: &[u8]) -> Result<Vec<u8>> {
-    let (tag, body) = data
-        .split_first()
-        .ok_or_else(|| RpcError::runtime_error("Malformed state token"))?;
-    match *tag {
-        TOKEN_CODEC_RAW => Ok(body.to_vec()),
-        TOKEN_CODEC_ZSTD => zstd::bulk::decompress(body, MAX_TOKEN_PLAINTEXT_BYTES)
-            .map_err(|_| RpcError::runtime_error("Malformed state token")),
-        _ => Err(RpcError::runtime_error("Malformed state token")),
-    }
+    crate::token_codec::unpack(data, crate::token_codec::MAX_TOKEN_PLAINTEXT_BYTES)
+        .map_err(|_| RpcError::runtime_error("Malformed state token"))
+}
+
+/// Sealed (base64-decoded) length of a standard-base64 token: envelope
+/// version, nonce, ciphertext and tag. The unit of the turn budget.
+pub(crate) fn sealed_len(token: &str) -> usize {
+    let padding = token.bytes().rev().take_while(|b| *b == b'=').count();
+    (token.len() / 4) * 3 - padding.min(2)
 }
 
 /// Decomposed contents of a v4 state token after AEAD authentication.
@@ -1678,6 +1791,11 @@ pub(crate) struct ResolvedCall {
     pub stream_id: String,
     pub response_limit_bytes: Option<usize>,
     pub preferred_response_bytes: Option<usize>,
+    /// Sealed length of this stream's call token: the share of every
+    /// continuation request the turn budget reserves for it. Not carried in
+    /// the token; known at mint and recomputed from the echoed token on a
+    /// cold replica.
+    pub call_token_bytes: usize,
 }
 
 /// Current time as seconds since the UNIX epoch.
@@ -1737,31 +1855,61 @@ pub(crate) fn pack_cursor_token(
     )
 }
 
+/// The value behind a call token's `schemas_ref`:
+/// `u32 LE len || output_schema_bytes || u32 LE len || input_schema_bytes`.
+fn pack_schemas(resolved: &ResolvedCall) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        8 + resolved.output_schema_bytes.len() + resolved.input_schema_bytes.len(),
+    );
+    out.extend_from_slice(&(resolved.output_schema_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&resolved.output_schema_bytes);
+    out.extend_from_slice(&(resolved.input_schema_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&resolved.input_schema_bytes);
+    out
+}
+
+/// Reverse [`pack_schemas`].
+fn unpack_schemas(value: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut pos = 0;
+    let output = read_segment(value, &mut pos)?;
+    let input = read_segment(value, &mut pos)?;
+    if pos != value.len() {
+        return Err(RpcError::runtime_error("Malformed state token"));
+    }
+    Ok((output, input))
+}
+
 /// Seal the half of a stream's state that is fixed for the life of the call.
 /// Minted once, by `/init`; never re-issued.
+///
+/// Call token v3 plaintext (inside the seal, after the token codec):
+///
+/// ```text
+/// [8]  created_at u64 LE
+/// [16] call_id
+/// [4]  len(schemas_ref)  [N] schemas_ref (StateRef bytes, see pack_schemas)
+/// [4]  len(stream_id)    [L] stream_id (UTF-8)
+/// [8]  response_limit_bytes (0 = none)
+/// [8]  preferred_response_bytes (0 = none)
+/// ```
+///
+/// This port's call token never had an application `call_state` slot, so
+/// none is carried.
 pub(crate) fn pack_call_token(
     token_key: &[u8; 32],
     aad: &[u8],
     call_id: &[u8; CALL_ID_LEN],
+    schemas_ref: &[u8],
     resolved: &ResolvedCall,
     created_at: u64,
 ) -> String {
     let mut plaintext = Vec::with_capacity(
-        8 + CALL_ID_LEN
-            + 4
-            + resolved.output_schema_bytes.len()
-            + 4
-            + resolved.input_schema_bytes.len()
-            + 4
-            + resolved.stream_id.len()
-            + 16,
+        8 + CALL_ID_LEN + 4 + schemas_ref.len() + 4 + resolved.stream_id.len() + 16,
     );
     plaintext.extend_from_slice(&created_at.to_le_bytes());
     plaintext.extend_from_slice(call_id);
-    plaintext.extend_from_slice(&(resolved.output_schema_bytes.len() as u32).to_le_bytes());
-    plaintext.extend_from_slice(&resolved.output_schema_bytes);
-    plaintext.extend_from_slice(&(resolved.input_schema_bytes.len() as u32).to_le_bytes());
-    plaintext.extend_from_slice(&resolved.input_schema_bytes);
+    plaintext.extend_from_slice(&(schemas_ref.len() as u32).to_le_bytes());
+    plaintext.extend_from_slice(schemas_ref);
     plaintext.extend_from_slice(&(resolved.stream_id.len() as u32).to_le_bytes());
     plaintext.extend_from_slice(resolved.stream_id.as_bytes());
     plaintext.extend_from_slice(&(resolved.response_limit_bytes.unwrap_or(0) as u64).to_le_bytes());
@@ -1859,7 +2007,7 @@ pub(crate) fn unpack_call_token(
     aad: &[u8],
     token: &str,
     token_ttl: Option<std::time::Duration>,
-) -> Result<([u8; CALL_ID_LEN], ResolvedCall)> {
+) -> Result<UnpackedCall> {
     let (plaintext, _created_at) =
         open_token_plaintext(token_key, aad, token, CALL_TOKEN_VERSION, token_ttl)?;
 
@@ -1867,8 +2015,7 @@ pub(crate) fn unpack_call_token(
     call_id.copy_from_slice(&plaintext[8..8 + CALL_ID_LEN]);
 
     let mut pos = 8 + CALL_ID_LEN;
-    let output_schema_bytes = read_segment(&plaintext, &mut pos)?;
-    let input_schema_bytes = read_segment(&plaintext, &mut pos)?;
+    let schemas_ref = read_segment(&plaintext, &mut pos)?;
     let stream_id_bytes = read_segment(&plaintext, &mut pos)?;
     let stream_id = String::from_utf8(stream_id_bytes)
         .map_err(|_| RpcError::runtime_error("Malformed state token"))?;
@@ -1889,16 +2036,25 @@ pub(crate) fn unpack_call_token(
             usize::try_from(value).map_err(|_| RpcError::runtime_error("Malformed state token"))
         })
         .transpose()?;
-    Ok((
+    Ok(UnpackedCall {
         call_id,
-        ResolvedCall {
-            output_schema_bytes,
-            input_schema_bytes,
-            stream_id,
-            response_limit_bytes,
-            preferred_response_bytes,
-        },
-    ))
+        schemas_ref,
+        stream_id,
+        response_limit_bytes,
+        preferred_response_bytes,
+        call_token_bytes: sealed_len(token),
+    })
+}
+
+/// An opened call token whose `schemas_ref` is not yet resolved.
+#[derive(Debug, Clone)]
+pub(crate) struct UnpackedCall {
+    pub call_id: [u8; CALL_ID_LEN],
+    pub schemas_ref: Vec<u8>,
+    pub stream_id: String,
+    pub response_limit_bytes: Option<usize>,
+    pub preferred_response_bytes: Option<usize>,
+    pub call_token_bytes: usize,
 }
 
 fn read_segment(buf: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
@@ -3595,7 +3751,10 @@ async fn handle_upload_url(
         Ok(identity) => identity,
         Err(resp) => return resp,
     };
-    let _ = identity;
+    // The grant is authenticated exactly like a protocol method (same
+    // authenticators, peer-evidence binding and anonymous fallback), so the
+    // argument references it mints open for the same client's later calls.
+    let grant_auth = identity.auth;
     let (response_limit, _) = match effective_response_budget(&state, &headers) {
         Ok(budget) => budget,
         Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
@@ -3643,7 +3802,24 @@ async fn handle_upload_url(
     let urls_res = tokio::task::block_in_place(|| {
         uploads
             .iter()
-            .map(|u| provider.generate_upload_url(u.size, &u.sha256))
+            .map(|u| {
+                let mut url = provider.generate_upload_url(u.size, &u.sha256)?;
+                // One sealed argument reference per entry, minted from the
+                // *claimed* (size, sha256) under this request's AuthContext.
+                if url.object_id.is_empty() {
+                    return Err(RpcError::runtime_error(
+                        "UploadUrlProvider::generate_upload_url returned no object_id \
+                         (required since vgi-rpc protocol 3.4)",
+                    ));
+                }
+                url.argument_ref = state.state_refs.mint_argument_ref(
+                    &grant_auth,
+                    u.size,
+                    &u.sha256,
+                    &url.object_id,
+                )?;
+                Ok(url)
+            })
             .collect::<std::result::Result<Vec<_>, RpcError>>()
     })
     .and_then(|urls| upload_url_response_batch(&urls));
@@ -4000,6 +4176,9 @@ async fn unary_dispatch(
     if let Some(s) = sticky_sink.clone() {
         ctx.set_sticky(s);
     }
+    // Unary: no stream, so state_ref() is refused; the runtime is here for
+    // resolve_argument_ref().
+    ctx.set_state_ref_scope(state.state_refs.clone(), None);
     let mut dispatch_info = crate::hooks::DispatchInfo::from_request(&server, &req, "unary", &auth);
     // Log the HTTP correlation id, not the Arrow-level one. `X-Request-ID`
     // on the response and `request_id` in the record have to name the same
@@ -4528,18 +4707,29 @@ async fn stream_init_dispatch(
     if let Some(s) = sticky_sink.clone() {
         ctx.set_sticky(s);
     }
+    // The stream's call id, minted before anything runs so every context of
+    // this request (the producer's first turn included) resolves refs in the
+    // stream's own scope. It binds the call token, every cursor and every
+    // stored StateRef tag to this stream.
+    let mut call_id = [0u8; CALL_ID_LEN];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut call_id);
+    // The stream method's own context is the init request: the one place
+    // state_ref() is allowed (STATE_REF_V1.md §2.1).
+    ctx.set_state_ref_scope(state.state_refs.clone(), None);
+    ctx.set_state_ref_init(true);
     // Isolate handler panics into the structured stream error envelope below
     // (see the unary path for rationale).
     let init_result = dispatch_sync(|| {
         crate::server::call_guard(|| (info.stream.as_ref().unwrap())(&req, &ctx)).and_then(|r| r)
     });
+    ctx.set_state_ref_init(false);
     let init_logs = ctx.drain_logs();
 
     let sr = match init_result {
         Ok(s) => s,
         Err(err) => {
             let mut resp = arrow_response(
-                StatusCode::OK,
+                stream_error_status(&err),
                 error_stream_bytes(
                     &empty_schema(),
                     &err,
@@ -4586,6 +4776,11 @@ async fn stream_init_dispatch(
     let mut wrote_error = false;
     // The same failure, kept whole for the access record.
     let mut turn_error: Option<RpcError> = None;
+    // A token that could not be minted after the producer already wrote this
+    // turn's data: the output stream is rebuilt with only the error, so a
+    // refusal never follows data the client would otherwise consume.
+    let mut discard_turn: Option<RpcError> = None;
+    let stream_start = body_buf.len();
     {
         let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
         if header.is_none() {
@@ -4612,6 +4807,7 @@ async fn stream_init_dispatch(
                 Some(req.metadata.as_ref()),
                 response_limit,
                 preferred_response,
+                &call_id,
             );
             finished = turn.finished;
             if let Some(record) = record.as_mut() {
@@ -4630,23 +4826,38 @@ async fn stream_init_dispatch(
                 input_schema.as_ref(),
                 &stream_id,
                 (response_limit, preferred_response),
+                &call_id,
+                &req.protocol,
+                &method,
             ) {
-                Ok((token, call_token, state_bytes)) => {
+                Ok((cursor, call_token)) => {
+                    if let Some(warning) = cursor.warning.as_deref() {
+                        let md = build_log_metadata(
+                            &cursor_warning_log(warning),
+                            &server.server_id,
+                            &req.request_id,
+                        );
+                        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                    }
                     // /init is the one response that hands over the call
                     // token; continuations re-mint the cursor alone.
                     let md = Metadata::from([
-                        (STATE_KEY.to_string(), token),
+                        (STATE_KEY.to_string(), cursor.token),
                         (CALL_STATE_KEY.to_string(), call_token),
                     ]);
                     let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                     if let Some(record) = record.as_mut() {
-                        record.set_response_state(state_bytes);
+                        record.set_response_state(cursor.state_bytes);
                     }
                 }
+                Err(err) if is_producer => {
+                    discard_turn = Some(err);
+                }
                 Err(err) => {
-                    // Handler doesn't implement encode_state — emit as an
-                    // error envelope so the client sees a useful message
-                    // instead of a hung stream.
+                    // Handler doesn't implement encode_state, a StateRef
+                    // could not be stored, or the cursor is over budget —
+                    // emit as an error envelope so the client sees a useful
+                    // message instead of a hung stream.
                     let md = build_error_metadata(
                         &err,
                         &server.server_id,
@@ -4662,6 +4873,23 @@ async fn stream_init_dispatch(
             }
         }
         let _ = sw.finish();
+    }
+    if let Some(err) = discard_turn {
+        body_buf.truncate(stream_start);
+        write_error_only_stream(
+            &mut body_buf,
+            &output_schema,
+            if header.is_none() {
+                &init_logs[..]
+            } else {
+                &[]
+            },
+            &err,
+            &server,
+            &req,
+        );
+        wrote_error = true;
+        turn_error = Some(err);
     }
 
     if let Some(record) = record.as_mut() {
@@ -4683,6 +4911,9 @@ async fn stream_init_dispatch(
         // The body is an EXCEPTION envelope behind a 200; without the flag a
         // client reads the failure as a result.
         stamp_rpc_error(&mut resp);
+        if let Some(err) = turn_error.as_ref() {
+            *resp.status_mut() = stream_error_status(err);
+        }
     }
     if let Some(s) = sticky_sink.as_ref() {
         stamp_session_headers(&mut resp, &state, s);
@@ -4691,15 +4922,22 @@ async fn stream_init_dispatch(
     resp
 }
 
-/// Encode a `StreamStateKind` into a signed state token. The token is
-/// bound to `auth` so a different identity replaying it will fail HMAC
-/// verification on the next continuation request.
+/// A freshly minted cursor: the sealed token, the plaintext it seals (for
+/// the access log's `response_state_bytes`; only the size is ever logged) and
+/// the `cursor_large` warning to send the client, if the cursor is over the
+/// turn budget under the `warn` rule.
+struct MintedCursor {
+    token: String,
+    state_bytes: Vec<u8>,
+    warning: Option<String>,
+}
+
 /// Mint a stream's pair of tokens at `/init`: the call token, which carries
 /// everything fixed for the life of the call, and the first cursor.
 ///
-/// Returns the plaintext state bytes alongside the tokens, so the access log
-/// can report `response_state_bytes` without calling the handler's
-/// `encode_state` a second time. Only the size is ever logged.
+/// The call token is minted first so its sealed length is known: it enters
+/// the cursor's turn budget and the inline limit of the cursor's `StateRef`s.
+#[allow(clippy::too_many_arguments)]
 fn build_init_tokens(
     state: &Arc<HttpState>,
     auth: &crate::auth::AuthContext,
@@ -4708,53 +4946,134 @@ fn build_init_tokens(
     input_schema: Option<&SchemaRef>,
     stream_id: &str,
     response_budget: (Option<usize>, Option<usize>),
-) -> Result<(String, String, Vec<u8>)> {
+    call_id: &[u8; CALL_ID_LEN],
+    protocol: &str,
+    method: &str,
+) -> Result<(MintedCursor, String)> {
     let out_schema_bytes = write_schema_bytes(output_schema.as_ref())?;
     let in_schema_bytes = match input_schema {
         Some(s) => write_schema_bytes(s.as_ref())?,
         None => Vec::new(),
     };
-    let mut call_id = [0u8; CALL_ID_LEN];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut call_id);
-
     let call_token = state.pack_call_token(
         auth,
-        &call_id,
+        call_id,
+        protocol,
+        method,
         ResolvedCall {
             output_schema_bytes: out_schema_bytes,
             input_schema_bytes: in_schema_bytes,
             stream_id: stream_id.to_owned(),
             response_limit_bytes: response_budget.0,
             preferred_response_bytes: response_budget.1,
+            call_token_bytes: 0,
         },
-    );
-    let (cursor, state_bytes) = build_cursor_token(state, auth, ss, &call_id)?;
-    Ok((cursor, call_token, state_bytes))
+    )?;
+    let cursor = build_cursor_token(
+        state,
+        auth,
+        ss,
+        call_id,
+        protocol,
+        method,
+        sealed_len(&call_token),
+    )?;
+    Ok((cursor, call_token))
 }
 
-/// Like [`build_continuation_token`] but takes the already-serialized schema
-/// IPC bytes. Continuation requests carry these verbatim in the incoming
-/// token, so re-serializing the `SchemaRef`s (a decode→re-encode round trip,
-/// plus two `empty_batch` builds) on every turn is pure waste — thread the
-/// bytes straight through instead.
+/// Serialize the stream state and seal it as a cursor, then apply the
+/// cursor rule (`STATE_REF_V1.md` §9).
 ///
-/// Returns the sealed cursor and the plaintext it seals — see
-/// [`build_init_tokens`] for why the plaintext comes back out.
+/// The state is serialized with a `StateRef` encoder installed, so every
+/// un-encoded ref it carries has its form decided here -- inline, or stored
+/// once in the server's object storage -- with the inline limit derived from
+/// the turn budget.
 fn build_cursor_token(
     state: &Arc<HttpState>,
     auth: &crate::auth::AuthContext,
     ss: &StreamStateKind,
     call_id: &[u8; CALL_ID_LEN],
-) -> Result<(String, Vec<u8>)> {
+    protocol: &str,
+    method: &str,
+    call_token_bytes: usize,
+) -> Result<MintedCursor> {
     let state_bytes = dispatch_sync(|| {
-        crate::server::call_guard(|| match ss {
-            StreamStateKind::Producer(p) => p.encode_state(),
-            StreamStateKind::Exchange(e) => e.encode_state(),
-        })
-        .and_then(|result| result)
+        let encoder = crate::state_ref::encoder::Encoder::new(
+            &state.state_refs,
+            auth,
+            protocol,
+            method,
+            call_id,
+            call_token_bytes,
+        );
+        let (result, ref_error) = crate::state_ref::encoder::encoding(encoder, || {
+            crate::server::call_guard(|| match ss {
+                StreamStateKind::Producer(p) => p.encode_state(),
+                StreamStateKind::Exchange(e) => e.encode_state(),
+            })
+            .and_then(|result| result)
+        });
+        // A ref that failed to store raised a typed error a serde codec
+        // flattens into a string; report the typed one.
+        match (result, ref_error) {
+            (Err(_), Some(err)) => Err(err),
+            (result, _) => result,
+        }
     })?;
     let token = state.pack_cursor_token(auth, &state_bytes, call_id);
-    Ok((token, state_bytes))
+    let warning =
+        state
+            .state_refs
+            .check_cursor(sealed_len(&token), call_token_bytes, protocol, method)?;
+    Ok(MintedCursor {
+        token,
+        state_bytes,
+        warning,
+    })
+}
+
+/// HTTP status for a stream turn that ended in `err`: `invalid_state_ref` is
+/// answered 400 like every other token failure (`STATE_REF_V1.md` §6);
+/// everything else is the ordinary `200 + X-VGI-RPC-Error`.
+fn stream_error_status(err: &RpcError) -> StatusCode {
+    if crate::state_ref::is_invalid_state_ref(err) {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::OK
+    }
+}
+
+/// Write a complete output stream carrying `logs` then the EXCEPTION
+/// envelope for `err` -- the body of a turn whose data was discarded.
+fn write_error_only_stream(
+    buf: &mut Vec<u8>,
+    output_schema: &SchemaRef,
+    logs: &[crate::log::LogMessage],
+    err: &RpcError,
+    server: &RpcServer,
+    req: &Request,
+) {
+    let mut sw = StreamWriter::new(buf, output_schema.as_ref()).unwrap();
+    for log in logs {
+        let md = build_log_metadata(log, &server.server_id, &req.request_id);
+        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+    }
+    let md = build_error_metadata(
+        err,
+        &server.server_id,
+        &req.request_id,
+        server
+            .traceback_origin(&req.protocol, &req.method)
+            .as_deref(),
+    );
+    let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+    let _ = sw.finish();
+}
+
+/// The client-directed `WARN` log that carries a `cursor_large` warning.
+fn cursor_warning_log(warning: &str) -> crate::log::LogMessage {
+    crate::log::LogMessage::new(crate::log::LogLevel::Warn, warning.to_string())
+        .with_extra("kind", "cursor_large")
 }
 
 /// What the HTTP stream paths should do with one output batch after the
@@ -4904,6 +5223,7 @@ fn run_producer<W: std::io::Write>(
     tick_md: Option<&Metadata>,
     response_limit: Option<usize>,
     preferred_response: Option<usize>,
+    call_id: &[u8; CALL_ID_LEN],
 ) -> ProducerTurn {
     let server = &state.server;
     let mut ctx = CallContext::with_auth_cookies(
@@ -4913,6 +5233,10 @@ fn run_producer<W: std::io::Write>(
         evidence.clone(),
         std::collections::BTreeMap::new(),
     );
+    // A producer turn is never the init request (the first one folds into
+    // /init on HTTP, but on pipe it is a continuation), so state_ref() is
+    // refused here; resolve() works in the stream's scope.
+    ctx.set_state_ref_scope(state.state_refs.clone(), Some(*call_id));
     if let Some(s) = sticky {
         ctx.set_sticky(s.clone());
     }
@@ -5123,9 +5447,29 @@ async fn stream_exchange_dispatch(
         Ok(u) => u,
         Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
     };
-    let call = match state.resolve_call(&auth, &unpacked, call_token.as_deref()) {
+    let call = match state.resolve_call(
+        &auth,
+        &unpacked,
+        call_token.as_deref(),
+        path_protocol.as_deref().unwrap_or(""),
+    ) {
         Ok(c) => c,
-        Err(err) => return arrow_error(&state, StatusCode::BAD_REQUEST, &err, ""),
+        Err(err) => {
+            // A token or schemas_ref failure is a 400 like any token failure;
+            // a storage failure resolving a stored schemas_ref is not the
+            // client's fault.
+            let status =
+                if crate::state_ref::is_invalid_state_ref(&err) || err.error_kind().is_empty() {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::OK
+                };
+            let mut resp = arrow_error(&state, status, &err, "");
+            if status == StatusCode::OK {
+                stamp_rpc_error(&mut resp);
+            }
+            return resp;
+        }
     };
     response_limit = [response_limit, call.response_limit_bytes]
         .into_iter()
@@ -5244,6 +5588,9 @@ async fn stream_exchange_dispatch(
     if let Some(s) = sticky_sink.clone() {
         ctx.set_sticky(s);
     }
+    // A continuation (or cancel): resolve() works in the stream's scope,
+    // state_ref() is refused.
+    ctx.set_state_ref_scope(state.state_refs.clone(), Some(unpacked.call_id));
 
     let mut body_buf = Vec::new();
 
@@ -5304,6 +5651,7 @@ async fn stream_exchange_dispatch(
         let mut wrote_error = false;
         // Assigned unconditionally from the turn below, before any read.
         let mut turn_error: Option<RpcError>;
+        let mut discard_turn: Option<RpcError> = None;
         {
             let mut sw = StreamWriter::new(&mut body_buf, output_schema.as_ref()).unwrap();
             // The continuation request's custom metadata is this turn's tick
@@ -5330,6 +5678,7 @@ async fn stream_exchange_dispatch(
                 Some(&continuation_md),
                 response_limit,
                 preferred_response,
+                &unpacked.call_id,
             );
             if let Some(record) = record.as_mut() {
                 record.stats.output_batches = turn.output_batches;
@@ -5338,30 +5687,45 @@ async fn stream_exchange_dispatch(
             turn_error = turn.error;
             wrote_error |= turn_error.is_some();
             if !turn.finished {
-                match build_cursor_token(&state, &auth, &ss, &unpacked.call_id) {
-                    Ok((new_token, state_bytes)) => {
-                        let md = Metadata::from([(STATE_KEY.to_string(), new_token)]);
+                match build_cursor_token(
+                    &state,
+                    &auth,
+                    &ss,
+                    &unpacked.call_id,
+                    &req.protocol,
+                    &method,
+                    call.call_token_bytes,
+                ) {
+                    Ok(cursor) => {
+                        if let Some(warning) = cursor.warning.as_deref() {
+                            let md = build_log_metadata(
+                                &cursor_warning_log(warning),
+                                &server.server_id,
+                                &req.request_id,
+                            );
+                            let _ =
+                                sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                        }
+                        let md = Metadata::from([(STATE_KEY.to_string(), cursor.token)]);
                         let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                         if let Some(record) = record.as_mut() {
-                            record.set_response_state(state_bytes);
+                            record.set_response_state(cursor.state_bytes);
                         }
                     }
                     Err(err) => {
-                        let md = build_error_metadata(
-                            &err,
-                            &server.server_id,
-                            &req.request_id,
-                            server
-                                .traceback_origin(&req.protocol, &req.method)
-                                .as_deref(),
-                        );
-                        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
-                        wrote_error = true;
-                        turn_error = Some(err);
+                        // Never follow data the client would consume with a
+                        // refusal: the turn is rebuilt below as the error.
+                        discard_turn = Some(err);
                     }
                 }
             }
             let _ = sw.finish();
+        }
+        if let Some(err) = discard_turn {
+            body_buf.clear();
+            write_error_only_stream(&mut body_buf, &output_schema, &[], &err, &server, &req);
+            wrote_error = true;
+            turn_error = Some(err);
         }
         if let Some(record) = record.as_mut() {
             record.set_externalized_bytes(externalized.finish());
@@ -5379,6 +5743,9 @@ async fn stream_exchange_dispatch(
         );
         if wrote_error {
             stamp_rpc_error(&mut resp);
+            if let Some(err) = turn_error.as_ref() {
+                *resp.status_mut() = stream_error_status(err);
+            }
         }
         if let Some(s) = sticky_sink.as_ref() {
             stamp_session_headers(&mut resp, &state, s);
@@ -5458,12 +5825,28 @@ async fn stream_exchange_dispatch(
             wrote_error = true;
             turn_error = Some(err);
         } else {
-            let new_token = match build_cursor_token(&state, &auth, &ss, &unpacked.call_id) {
-                Ok((token, state_bytes)) => {
+            let new_token = match build_cursor_token(
+                &state,
+                &auth,
+                &ss,
+                &unpacked.call_id,
+                &req.protocol,
+                &method,
+                call.call_token_bytes,
+            ) {
+                Ok(cursor) => {
                     if let Some(record) = record.as_mut() {
-                        record.set_response_state(state_bytes);
+                        record.set_response_state(cursor.state_bytes);
                     }
-                    token
+                    if let Some(warning) = cursor.warning.as_deref() {
+                        let md = build_log_metadata(
+                            &cursor_warning_log(warning),
+                            &server.server_id,
+                            &req.request_id,
+                        );
+                        let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
+                    }
+                    cursor.token
                 }
                 Err(err) => {
                     let md = build_error_metadata(
@@ -5477,7 +5860,7 @@ async fn stream_exchange_dispatch(
                     let _ = sw.write(&empty_batch(output_schema.as_ref()).unwrap(), Some(&md));
                     let _ = sw.finish();
                     drop(sw);
-                    let mut resp = arrow_response(StatusCode::OK, body_buf);
+                    let mut resp = arrow_response(stream_error_status(&err), body_buf);
                     stamp_rpc_error(&mut resp);
                     finish_stream_record(record, Some(&err), &mut resp);
                     return resp;
@@ -5578,6 +5961,9 @@ async fn stream_exchange_dispatch(
         // The handler raised; the envelope is in the body behind a 200.
         // (A cap overshoot is already flagged by `cap_error_response`.)
         stamp_rpc_error(&mut resp);
+        if let Some(err) = turn_error.as_ref() {
+            *resp.status_mut() = stream_error_status(err);
+        }
     }
     if let Some(s) = sticky_sink.as_ref() {
         stamp_session_headers(&mut resp, &state, s);
@@ -5782,7 +6168,11 @@ mod tests {
     fn token_payload_compresses_when_redundant() {
         let plaintext = b"vgi-rpc-state-".repeat(1000);
         let packed = pack_token_payload(&plaintext);
-        assert_eq!(packed[0], TOKEN_CODEC_ZSTD, "expected the zstd codec tag");
+        assert_eq!(
+            packed[0],
+            crate::token_codec::CODEC_ZSTD,
+            "expected the zstd codec tag"
+        );
         assert!(
             packed.len() < plaintext.len() / 4,
             "expected real compression on a redundant payload, got {} from {}",
@@ -5798,7 +6188,11 @@ mod tests {
         // get smaller, never larger than its plaintext plus the one tag byte.
         let plaintext: Vec<u8> = (0u8..=255).collect();
         let packed = pack_token_payload(&plaintext);
-        assert_eq!(packed[0], TOKEN_CODEC_RAW, "expected the raw codec tag");
+        assert_eq!(
+            packed[0],
+            crate::token_codec::CODEC_RAW,
+            "expected the raw codec tag"
+        );
         assert_eq!(
             packed.len(),
             plaintext.len() + 1,
@@ -5832,7 +6226,7 @@ mod tests {
             unpack_token_payload(&[0x7f, b'p', b'a', b'y']).is_err(),
             "unknown codec tag"
         );
-        let mut corrupt = vec![TOKEN_CODEC_ZSTD];
+        let mut corrupt = vec![crate::token_codec::CODEC_ZSTD];
         corrupt.extend_from_slice(b"not-a-zstd-frame");
         assert!(unpack_token_payload(&corrupt).is_err(), "corrupt zstd body");
     }
@@ -5871,18 +6265,26 @@ mod tests {
         assert_eq!(unpacked.call_id, TEST_CALL_ID);
 
         // The schemas and stream id ride the call token now, not the cursor.
-        let call_token = s.pack_call_token(
-            &auth,
-            &TEST_CALL_ID,
-            ResolvedCall {
-                output_schema_bytes: out_sch.clone(),
-                input_schema_bytes: in_sch.clone(),
-                stream_id: "sid-123".into(),
-                response_limit_bytes: Some(4096),
-                preferred_response_bytes: Some(2048),
-            },
-        );
-        let call = s.resolve_call(&auth, &unpacked, Some(&call_token)).unwrap();
+        let call_token = s
+            .pack_call_token(
+                &auth,
+                &TEST_CALL_ID,
+                "P",
+                "m",
+                ResolvedCall {
+                    output_schema_bytes: out_sch.clone(),
+                    input_schema_bytes: in_sch.clone(),
+                    stream_id: "sid-123".into(),
+                    response_limit_bytes: Some(4096),
+                    preferred_response_bytes: Some(2048),
+                    call_token_bytes: 0,
+                },
+            )
+            .unwrap();
+        let call = s
+            .resolve_call(&auth, &unpacked, Some(&call_token), "P")
+            .unwrap();
+        assert_eq!(call.call_token_bytes, sealed_len(&call_token));
         assert_eq!(call.output_schema_bytes, out_sch);
         assert_eq!(call.input_schema_bytes, in_sch);
         assert_eq!(call.stream_id, "sid-123");
@@ -5906,17 +6308,22 @@ mod tests {
         assert!(state.unpack_cursor_token(&second, &cursor).is_err());
 
         let schema = sample_schema_bytes();
-        let call = state.pack_call_token(
-            &first,
-            &TEST_CALL_ID,
-            ResolvedCall {
-                output_schema_bytes: schema.clone(),
-                input_schema_bytes: schema,
-                stream_id: "stream".into(),
-                response_limit_bytes: None,
-                preferred_response_bytes: None,
-            },
-        );
+        let call = state
+            .pack_call_token(
+                &first,
+                &TEST_CALL_ID,
+                "P",
+                "m",
+                ResolvedCall {
+                    output_schema_bytes: schema.clone(),
+                    input_schema_bytes: schema,
+                    stream_id: "stream".into(),
+                    response_limit_bytes: None,
+                    preferred_response_bytes: None,
+                    call_token_bytes: 0,
+                },
+            )
+            .unwrap();
         assert!(unpack_call_token(
             &state.token_key,
             &compute_call_aad(&second),

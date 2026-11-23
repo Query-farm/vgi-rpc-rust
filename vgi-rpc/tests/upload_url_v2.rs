@@ -203,8 +203,18 @@ async fn a_v2_upload_round_trips_through_a_request_pointer() {
             .iter()
             .map(|f| f.name().as_str())
             .collect::<Vec<_>>(),
-        ["upload_url", "download_url", "expires_at", "upload_headers"]
+        [
+            "upload_url",
+            "download_url",
+            "expires_at",
+            "upload_headers",
+            "object_id",
+            "ref"
+        ]
     );
+    // Protocol 3.4 grant columns: the object's id and a sealed argument ref.
+    assert!(!resp.column(4).as_string::<i32>().value(0).is_empty());
+    assert!(!resp.column(5).as_binary::<i32>().value(0).is_empty());
     let up = resp.column(0).as_string::<i32>().value(0).to_string();
     let down = resp.column(1).as_string::<i32>().value(0).to_string();
     let headers = resp.column(3).as_any().downcast_ref::<MapArray>().unwrap();

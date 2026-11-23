@@ -50,8 +50,8 @@ use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use vgi_rpc::external::{
-    Compression, ExternalLocationConfig, ExternalStorage, UploadResult, UploadUrl,
-    UploadUrlProvider, UrlValidator,
+    object_missing_error, Compression, ExternalLocationConfig, ExternalStorage, ObjectStore,
+    UploadResult, UploadUrl, UploadUrlProvider, UrlValidator,
 };
 use vgi_rpc::{Result, RpcError};
 
@@ -69,6 +69,8 @@ pub const ENV_THRESHOLD: &str = "VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES";
 pub const ENV_COMPRESSION: &str = "VGI_RPC_EXTERNAL_COMPRESSION";
 /// Size advertised to clients for vendor upload URLs.
 pub const ENV_MAX_UPLOAD_BYTES: &str = "VGI_RPC_MAX_UPLOAD_BYTES";
+/// The server's inbound fetch cap (`ExternalLocationConfig::max_encoded_bytes`).
+pub const ENV_MAX_FETCH_BYTES: &str = "VGI_RPC_MAX_FETCH_BYTES";
 
 const DEFAULT_THRESHOLD: usize = 1_048_576;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -84,6 +86,9 @@ const PUT_PATH: &str = "/v1/blobs/put";
 /// client uploads from the server's own result and storage writes. The real
 /// vendor ignores it; vgi-rpc-python's fake vendor counts and faults on it.
 const CLIENT_UPLOAD_ORIGIN: &str = "client_upload";
+/// `origin` of a `put` grant for a stored `StateRef` object
+/// (`ObjectStore::put_object`). Advisory, like `client_upload`.
+const STATE_REF_ORIGIN: &str = "state_ref";
 const GET_PATH: &str = "/v1/blobs/get";
 const DELETE_PATH: &str = "/v1/blobs/delete";
 const DELETE_SCOPE_PATH: &str = "/v1/blobs/delete_scope";
@@ -1259,6 +1264,10 @@ impl VendorStorage {
 }
 
 impl ExternalStorage for VendorStorage {
+    fn object_store(&self) -> Option<&dyn ObjectStore> {
+        Some(self)
+    }
+
     fn upload(&self, ipc_bytes: &[u8], compression: Compression) -> Result<UploadResult> {
         let digest = Sha256::digest(ipc_bytes);
         let encoding = match compression {
@@ -1336,11 +1345,68 @@ impl UploadUrlProvider for VendorStorage {
             .filter(|(k, _)| !k.eq_ignore_ascii_case("content-length"))
             .collect();
         Ok(UploadUrl {
+            object_id: grant.object_id,
             upload_url: grant.upload_url,
             download_url,
             expires_at_micros,
             headers,
+            argument_ref: Vec::new(),
         })
+    }
+}
+
+/// The object API (`STATE_REF_V1.md` §10.1): `put_object` asks for a sized,
+/// checksummed `rpc` grant marked `origin: "state_ref"`; `get` asks the vendor
+/// for a fresh download URL (`/v1/blobs/get`), pins it to the vendor's hosts
+/// and caps the download at `max_bytes`. Vendor `not_found` / `not_uploaded`
+/// and a storage 404 are [`object_missing_error`].
+impl ObjectStore for VendorStorage {
+    fn put_object(&self, data: &[u8]) -> Result<String> {
+        let digest = Sha256::digest(data);
+        let grant = self.api.put(
+            data.len() as u64,
+            &B64.encode(digest),
+            Purpose::Rpc,
+            None,
+            None,
+            None,
+            Some(STATE_REF_ORIGIN),
+        )?;
+        if self.pin {
+            self.hosts.check(&grant.upload_url)?;
+        }
+        self.api.put_object(&grant, data, None)?;
+        Ok(grant.object_id)
+    }
+
+    fn get(&self, object_id: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        let missing = |e: VendorError| -> RpcError {
+            if e.is_missing() {
+                object_missing_error("vendored object is gone")
+            } else {
+                e.into()
+            }
+        };
+        let location = self.api.get(object_id).map_err(missing)?;
+        if location.size > max_bytes as u64 {
+            return Err(RpcError::runtime_error(format!(
+                "vendored object is {} bytes, over max_fetch_bytes ({max_bytes})",
+                location.size
+            )));
+        }
+        if let Some(enc) = location.content_encoding.as_deref() {
+            if enc != "identity" {
+                return Err(RpcError::runtime_error(format!(
+                    "vendored object has unsupported content_encoding {enc:?}"
+                )));
+            }
+        }
+        if self.pin {
+            self.hosts.check(&location.download_url)?;
+        }
+        self.api
+            .download(&location.download_url, max_bytes as u64)
+            .map_err(missing)
     }
 }
 
@@ -1643,10 +1709,35 @@ pub fn external_config_from_lookup(
         .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
         .unwrap_or(DEFAULT_THRESHOLD);
     let compression = parse_compression(&lookup(ENV_COMPRESSION).unwrap_or_default())?;
-    let config = ExternalLocationConfig::new(storage.clone(), Arc::new(crate::HttpFetcher::new()))
-        .with_threshold_bytes(threshold)
-        .with_compression(compression)
-        .with_url_validator(storage.url_validator());
+    let mut config =
+        ExternalLocationConfig::new(storage.clone(), Arc::new(crate::HttpFetcher::new()))
+            .with_threshold_bytes(threshold)
+            .with_compression(compression)
+            .with_url_validator(storage.url_validator());
+    // The inbound fetch cap. Unset it is the 1 GiB default raised to
+    // VGI_RPC_MAX_UPLOAD_BYTES when that is larger: setting the upload size
+    // is how an operator says "accept requests this large". Both set with
+    // upload > fetch is an explicit contradiction and refused.
+    let max_upload = parse_positive(lookup, ENV_MAX_UPLOAD_BYTES)?;
+    match parse_positive(lookup, ENV_MAX_FETCH_BYTES)? {
+        Some(fetch) => {
+            if let Some(upload) = max_upload.filter(|u| *u > fetch) {
+                return Err(RpcError::value_error(format!(
+                    "{ENV_MAX_UPLOAD_BYTES} ({upload}) exceeds {ENV_MAX_FETCH_BYTES} ({fetch}): \
+                     clients would upload requests the server then refuses to fetch"
+                )));
+            }
+            config = config.with_max_encoded_bytes(usize::try_from(fetch).unwrap_or(usize::MAX));
+        }
+        None => {
+            if let Some(upload) = max_upload {
+                let upload = usize::try_from(upload).unwrap_or(usize::MAX);
+                if upload > config.max_encoded_bytes {
+                    config = config.with_max_encoded_bytes(upload);
+                }
+            }
+        }
+    }
     Ok(Some((config, storage)))
 }
 
@@ -1881,6 +1972,32 @@ mod tests {
             (ENV_URL, "https://v.example"),
             (ENV_TOKEN, "t"),
             (ENV_THRESHOLD, "0"),
+        ]))
+        .is_err());
+        // Fix 1: the fetch cap follows an upload cap above it, an explicit
+        // fetch cap below the upload cap is refused.
+        assert_eq!(cfg.max_encoded_bytes, 1 << 30);
+        let (cfg, _) = external_config_from_lookup(&vars(&[
+            (ENV_URL, "https://v.example"),
+            (ENV_TOKEN, "t"),
+            (ENV_MAX_UPLOAD_BYTES, "2147483648"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.max_encoded_bytes, 2 << 30);
+        let (cfg, _) = external_config_from_lookup(&vars(&[
+            (ENV_URL, "https://v.example"),
+            (ENV_TOKEN, "t"),
+            (ENV_MAX_FETCH_BYTES, "4096"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.max_encoded_bytes, 4096);
+        assert!(external_config_from_lookup(&vars(&[
+            (ENV_URL, "https://v.example"),
+            (ENV_TOKEN, "t"),
+            (ENV_MAX_FETCH_BYTES, "4096"),
+            (ENV_MAX_UPLOAD_BYTES, "4097"),
         ]))
         .is_err());
     }

@@ -204,7 +204,14 @@ fn upload_url_contract_is_exported() {
             .iter()
             .map(|f| f.name().as_str())
             .collect::<Vec<_>>(),
-        ["upload_url", "download_url", "expires_at", "upload_headers"]
+        [
+            "upload_url",
+            "download_url",
+            "expires_at",
+            "upload_headers",
+            "object_id",
+            "ref"
+        ]
     );
 }
 

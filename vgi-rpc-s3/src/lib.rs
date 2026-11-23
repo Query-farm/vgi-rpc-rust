@@ -32,6 +32,8 @@
 //!             download_url: format!("https://{bucket}.s3.amazonaws.com/{key}?get-signature=..."),
 //!             expires_at_micros: 0,
 //!             headers: req.s3_checksum_headers(),
+//!             // `object_id` defaults to `req.key` when left empty.
+//!             ..Default::default()
 //!         })
 //!     }),
 //! );
@@ -45,8 +47,8 @@ use std::sync::Arc;
 pub mod vendor;
 
 use vgi_rpc::external::{
-    validate_external_url, Compression, ExternalStorage, FetchedPayload, Fetcher, UploadResult,
-    UploadUrl, UploadUrlProvider, UrlValidator,
+    object_missing_error, validate_external_url, Compression, ExternalStorage, FetchedPayload,
+    Fetcher, ObjectStore, UploadResult, UploadUrl, UploadUrlProvider, UrlValidator,
 };
 use vgi_rpc::{Result, RpcError};
 
@@ -171,33 +173,40 @@ impl PresignedPutStorage {
             ));
         }
         let key = self.object_key();
-        (self.factory)(&PresignRequest {
+        self.presign(&key, size, sha256_hex)
+    }
+
+    /// Run the factory for `key`; an `object_id` the factory left empty is
+    /// the key (the S3/GCS object id, `STATE_REF_V1.md` §10.1).
+    fn presign(&self, key: &str, size: u64, sha256_hex: &str) -> Result<UploadUrl> {
+        let mut urls = (self.factory)(&PresignRequest {
             bucket: &self.bucket,
-            key: &key,
+            key,
             size,
             sha256_hex,
-        })
+        })?;
+        if urls.object_id.is_empty() {
+            urls.object_id = key.to_string();
+        }
+        Ok(urls)
     }
-}
 
-impl ExternalStorage for PresignedPutStorage {
-    fn upload(&self, ipc_bytes: &[u8], compression: Compression) -> Result<UploadResult> {
-        let sha = {
-            use sha2::Digest as _;
-            sha2::Sha256::digest(ipc_bytes)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        };
-        let urls = self.generate_pair(ipc_bytes.len() as u64, &sha)?;
-        let mut req = self.client.put(&urls.upload_url).body(ipc_bytes.to_vec());
+    /// PUT `body` to a presigned URL with exactly its signed headers.
+    fn put_body(
+        &self,
+        urls: &UploadUrl,
+        body: &[u8],
+        content_type: &str,
+        compression: Compression,
+    ) -> Result<()> {
+        let mut req = self.client.put(&urls.upload_url).body(body.to_vec());
         let signed = |name: &str| {
             urls.headers
                 .iter()
                 .any(|(k, _)| k.eq_ignore_ascii_case(name))
         };
         if !signed("content-type") {
-            req = req.header("content-type", "application/vnd.apache.arrow.stream");
+            req = req.header("content-type", content_type);
         }
         if let (Compression::Zstd(_), false) = (compression, signed("content-encoding")) {
             req = req.header("content-encoding", "zstd");
@@ -218,12 +227,94 @@ impl ExternalStorage for PresignedPutStorage {
                 redact_url(&urls.upload_url)
             )));
         }
+        Ok(())
+    }
+}
+
+fn sha256_hex_of(data: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The object API (`STATE_REF_V1.md` §10.1). `object_id` is the object key.
+///
+/// `put_object` stores under a fresh key with a PUT signed for the body's
+/// size and SHA-256 (the factory's [`PresignRequest::s3_checksum_headers`]
+/// make S3/R2 verify it). `get` asks the same factory to presign `object_id`
+/// and uses only the GET URL (the PUT half, presigned for an empty body, is
+/// discarded), so a factory needs no second entry point. Objects carry no
+/// TTL: set a bucket lifecycle rule of at least one day on the prefix.
+impl ObjectStore for PresignedPutStorage {
+    fn put_object(&self, data: &[u8]) -> Result<String> {
+        let sha = sha256_hex_of(data);
+        let key = format!("{}{}.bin", self.prefix, uuid::Uuid::new_v4());
+        let urls = self.presign(&key, data.len() as u64, &sha)?;
+        self.put_body(&urls, data, "application/octet-stream", Compression::None)?;
+        Ok(key)
+    }
+
+    fn get(&self, object_id: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let label = self.label;
+        let urls = self.presign(object_id, 0, &sha256_hex_of(b""))?;
+        let mut resp = self.client.get(&urls.download_url).send().map_err(|_| {
+            RpcError::runtime_error(format!(
+                "{label} GET failed for {}",
+                redact_url(&urls.download_url)
+            ))
+        })?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(object_missing_error(format!("{label} object is gone")));
+        }
+        if !resp.status().is_success() {
+            return Err(RpcError::runtime_error(format!(
+                "{label} GET returned {} for {}",
+                resp.status(),
+                redact_url(&urls.download_url)
+            )));
+        }
+        if resp.content_length().is_some_and(|n| n > max_bytes as u64) {
+            return Err(RpcError::runtime_error(format!(
+                "{label} object exceeds max_fetch_bytes ({max_bytes})"
+            )));
+        }
+        let mut out = Vec::new();
+        resp.by_ref()
+            .take(max_bytes as u64 + 1)
+            .read_to_end(&mut out)
+            .map_err(|_| RpcError::runtime_error(format!("{label} GET body read failed")))?;
+        if out.len() > max_bytes {
+            return Err(RpcError::runtime_error(format!(
+                "{label} object exceeds max_fetch_bytes ({max_bytes})"
+            )));
+        }
+        Ok(out)
+    }
+}
+
+impl ExternalStorage for PresignedPutStorage {
+    fn upload(&self, ipc_bytes: &[u8], compression: Compression) -> Result<UploadResult> {
+        let sha = sha256_hex_of(ipc_bytes);
+        let urls = self.generate_pair(ipc_bytes.len() as u64, &sha)?;
+        self.put_body(
+            &urls,
+            ipc_bytes,
+            "application/vnd.apache.arrow.stream",
+            compression,
+        )?;
         // sha256 is computed by ExternalLocationConfig's caller; return an
         // empty string here as the field is populated upstream.
         Ok(UploadResult {
             url: urls.download_url,
             sha256: String::new(),
         })
+    }
+
+    fn object_store(&self) -> Option<&dyn ObjectStore> {
+        Some(self)
     }
 }
 
@@ -262,6 +353,10 @@ impl PresignedS3Storage {
 impl ExternalStorage for PresignedS3Storage {
     fn upload(&self, ipc_bytes: &[u8], compression: Compression) -> Result<UploadResult> {
         self.0.upload(ipc_bytes, compression)
+    }
+
+    fn object_store(&self) -> Option<&dyn ObjectStore> {
+        Some(&self.0)
     }
 }
 
@@ -472,6 +567,7 @@ mod tests {
                     download_url: String::from("https://example/download"),
                     expires_at_micros: 0,
                     headers: Vec::new(),
+                    ..Default::default()
                 })
             }),
         );
@@ -553,6 +649,7 @@ mod tests {
                     download_url: download_url.clone(),
                     expires_at_micros: 123,
                     headers: Vec::new(),
+                    ..Default::default()
                 })
             }),
         );

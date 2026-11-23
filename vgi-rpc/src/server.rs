@@ -266,6 +266,9 @@ pub struct CallContext {
     /// A pre-published reference the unary handler answered with, if any
     /// (see [`CallContext::respond_with_external_ref`]).
     pub(crate) external_ref: Arc<Mutex<Option<crate::external_ref::ExternalRef>>>,
+    /// The `StateRef` view of this request (runtime, call id, init flag);
+    /// see [`CallContext::state_ref`].
+    pub(crate) state_refs: Arc<crate::state_ref::StateRefScope>,
 }
 
 /// Authentication and peer evidence fixed for the lifetime of a stateful
@@ -352,6 +355,106 @@ impl CallContext {
         lock_ok(&self.external_ref).take()
     }
 
+    // --- StateRef (STATE_REF_V1.md) ---------------------------------------
+
+    /// Wrap `value` in a [`StateRef`](crate::StateRef): a value carried in
+    /// stream state by reference.
+    ///
+    /// Allowed **only while the stream method itself runs** -- the handler
+    /// that builds the stream (HTTP `/init`, or stream construction on the
+    /// byte-stream transports). Everywhere else (`produce` / `exchange`, the
+    /// first producer turn HTTP folds into `/init`, `on_cancel`, unary calls)
+    /// it fails with `state_ref_misuse` (`FAILED_PRECONDITION`). Keep the ref
+    /// in a field of the stream state and read it with [`Self::resolve`] on any
+    /// turn; state transitions copy the ref, never call this again.
+    ///
+    /// Within one init, byte-equal values return the same ref (so at most one
+    /// object is stored). On HTTP the form -- inline in the token, or stored
+    /// once in the server's object storage with a sealed tag in the token --
+    /// is decided when the cursor is first minted; on every other transport
+    /// the value simply stays in memory.
+    ///
+    /// # Errors
+    ///
+    /// `state_ref_misuse` outside the init handler.
+    pub fn state_ref(&self, value: impl AsRef<[u8]>) -> Result<crate::StateRef> {
+        self.state_refs.state_ref(value.as_ref())
+    }
+
+    /// [`Self::state_ref`] of a serde value (encoded with the bincode stream
+    /// codec); read it back with [`Self::resolve_serde`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::state_ref`], or when the value does not encode.
+    #[cfg(feature = "stream-codec")]
+    pub fn state_ref_serde<T: serde::Serialize>(&self, value: &T) -> Result<crate::StateRef> {
+        self.state_ref(crate::stream_codec::bincode_encode(value)?)
+    }
+
+    /// The value bytes `r` names. Valid on every turn and every transport.
+    ///
+    /// A ref still in memory returns its value; an inline ref is decoded; a
+    /// stored ref is fetched through the process's object cache (one GET per
+    /// process per object).
+    ///
+    /// # Errors
+    ///
+    /// `invalid_state_ref` (tampered, foreign, expired or malformed),
+    /// `state_ref_missing`, `state_ref_too_large`, `storage_unavailable`.
+    pub fn resolve(&self, r: &crate::StateRef) -> Result<bytes::Bytes> {
+        self.state_refs.resolve(r, &self.auth)
+    }
+
+    /// [`Self::resolve`], decoded with the bincode stream codec.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resolve`], or when the bytes do not decode as `T`.
+    #[cfg(feature = "stream-codec")]
+    pub fn resolve_serde<T: serde::de::DeserializeOwned>(&self, r: &crate::StateRef) -> Result<T> {
+        crate::stream_codec::bincode_decode(&self.resolve(r)?)
+    }
+
+    /// Resolve an argument reference minted by this server's
+    /// `__upload_url__/init` grant (`STATE_REF_V1.md` §10.2).
+    ///
+    /// `r` is the grant's sealed `ref`; `size` and `sha256` (64 lowercase hex)
+    /// are the values the caller sent alongside it. Opens the ref under this
+    /// request's principal, checks the sealed size and digest equal the
+    /// claimed ones, fetches through the object cache and verifies the bytes.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_arguments_ref` (including on transports other than HTTP,
+    /// which vend no grants), `arguments_ref_integrity`,
+    /// `arguments_ref_missing`, `storage_unavailable`.
+    pub fn resolve_argument_ref(&self, r: &[u8], size: u64, sha256: &str) -> Result<bytes::Bytes> {
+        self.state_refs
+            .resolve_argument_ref(&self.auth, r, size, sha256)
+    }
+
+    /// Mark this context as (not) handling a stream's init request.
+    pub(crate) fn set_state_ref_init(&self, init: bool) {
+        self.state_refs.set_init(init);
+    }
+
+    /// Install the HTTP transport's `StateRef` scope.
+    #[cfg(feature = "http")]
+    pub(crate) fn set_state_ref_scope(
+        &mut self,
+        runtime: Arc<crate::state_ref::StateRefRuntime>,
+        call_id: Option<[u8; 16]>,
+    ) {
+        let mut scope = crate::state_ref::StateRefScope::new(
+            &self.state_refs.protocol,
+            &self.state_refs.method,
+        );
+        scope.runtime = Some(runtime);
+        scope.call_id = call_id;
+        self.state_refs = Arc::new(scope);
+    }
+
     /// Per-tick input-batch custom metadata value (e.g. `vgi_pushdown_filters`),
     /// set by the producer/exchange loop for the current iteration.
     pub fn tick_metadata(&self, key: &str) -> Option<String> {
@@ -391,6 +494,10 @@ impl CallContext {
             tick_metadata: Arc::new(Mutex::new(Metadata::default())),
             sticky: None,
             external_ref: Arc::new(Mutex::new(None)),
+            state_refs: Arc::new(crate::state_ref::StateRefScope::new(
+                &req.protocol,
+                &req.method,
+            )),
         }
     }
 
@@ -421,6 +528,10 @@ impl CallContext {
             tick_metadata: Arc::new(Mutex::new(Metadata::default())),
             sticky: None,
             external_ref: Arc::new(Mutex::new(None)),
+            state_refs: Arc::new(crate::state_ref::StateRefScope::new(
+                &req.protocol,
+                &req.method,
+            )),
         }
     }
 
@@ -2136,7 +2247,12 @@ impl RpcServer {
         #[cfg_attr(not(feature = "shm"), allow(unused_variables))] shm: Option<&ShmSegment>,
     ) -> Result<bool> {
         let tb = self.traceback_origin(&req.protocol, &req.method);
+        // The stream method's own run is the init request: the one place
+        // `ctx.state_ref()` is allowed (STATE_REF_V1.md §2.1). The same
+        // context then serves every lockstep turn, which must refuse it.
+        ctx.set_state_ref_init(true);
         let init_result = call_guard(|| (info.stream.as_ref().unwrap())(req, ctx)).and_then(|r| r);
+        ctx.set_state_ref_init(false);
         let init_logs = ctx.drain_logs();
         let stream = match init_result {
             Ok(s) => s,

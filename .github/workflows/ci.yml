@@ -165,7 +165,9 @@ jobs:
         run: |
           set -euo pipefail
           log="$(mktemp)"
-          uvx --from "git+https://github.com/Query-farm/vgi-rpc-python@${VGI_RPC_FAKE_VENDOR_REF}" \
+          # --with zstandard: since f22d435 the reference's base import pulls
+          # vgi_rpc._token_codec (zstandard), which the bare install lacks.
+          uvx --with zstandard --from "git+https://github.com/Query-farm/vgi-rpc-python@${VGI_RPC_FAKE_VENDOR_REF}" \
             vgi-rpc-fake-vendor --test-routes --token "test-token=tenant-a" >"$log" 2>&1 &
           pid=$!
           trap 'kill $pid 2>/dev/null || true' EXIT

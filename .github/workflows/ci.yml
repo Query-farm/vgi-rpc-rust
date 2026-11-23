@@ -147,13 +147,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      # vgi-rpc-python protocol-3.4: sized PUT verification + upload faults;
-      # f0fb675: puts_upload / client_uploads, counted from the origin=client_upload
-      # marker on client-upload grants; 3a06983: object API stats
-      # (puts_state_ref / gets_state_ref) and /__admin__/delete?origin=;
-      # 6a21ee3: zstandard imported lazily (the bare install runs).
-      # TODO(release-wave).
-      VGI_RPC_FAKE_VENDOR_REF: 6a21ee3b2fb21d9c348c9b615fd97dce8e0bb852
+      # vgi-rpc-python 0.57.0 (protocol 3.4): sized PUT verification + upload
+      # faults, puts_upload / client_uploads counted from the
+      # origin=client_upload marker, object API stats (puts_state_ref /
+      # gets_state_ref), /__admin__/delete?origin= and a bare install that
+      # imports (lazy zstandard).
+      VGI_RPC_FAKE_VENDOR_REF: v0.57.0
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -295,8 +294,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: Query-farm/vgi-rpc-python
-          # TODO(release-wave): back to main once protocol-3.4 merges.
-          ref: protocol-3.4
+          ref: main
           path: vgi-python
 
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -468,8 +466,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: Query-farm/vgi-rpc-python
-          # TODO(release-wave): back to main once protocol-3.4 merges.
-          ref: protocol-3.4
+          ref: main
           path: vgi-python
 
       - uses: dtolnay/rust-toolchain@1.97.0

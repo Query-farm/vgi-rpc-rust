@@ -2,7 +2,7 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
-## [Unreleased]
+## [0.33.0] — 2026-11-23
 
 ### Added (protocol 3.4: large values, `STATE_REF_V1.md`)
 

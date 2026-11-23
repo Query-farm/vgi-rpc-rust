@@ -54,8 +54,10 @@ Ports vgi-rpc-python's `StateRef` reference (`f22d435`, `8f689a7`).
   300 s). It also bounds stored `StateRef` tags.
 - **Fix 1**: with an upload-URL provider, `VGI-Max-Upload-Bytes` is always
   advertised and defaults to the inbound fetch cap (`max_encoded_bytes`, or
-  256 MiB without an external config); `build()` panics on an explicit
-  `max_upload_bytes` above it. `vendor::external_config_from_lookup` reads
+  256 MiB without an external config). A larger `max_upload_bytes` raises a
+  fetch cap left at its default (request pointers are fetched under the
+  raised cap); `build()` panics only when an explicit fetch cap
+  (`with_max_encoded_bytes`, new `max_encoded_bytes_explicit`) is below it. `vendor::external_config_from_lookup` reads
   `VGI_RPC_MAX_FETCH_BYTES` (unset: 1 GiB raised to `VGI_RPC_MAX_UPLOAD_BYTES`;
   both set with upload > fetch is an error).
 

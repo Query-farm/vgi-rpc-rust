@@ -444,6 +444,9 @@ pub struct HttpState {
     /// `StateRef` machinery: token key, storage, budgets, cursor rule and
     /// object cache (`STATE_REF_V1.md`).
     state_refs: Arc<crate::state_ref::StateRefRuntime>,
+    /// The server's external config with the effective inbound fetch cap,
+    /// used to resolve request pointers (Fix 1).
+    request_pointer_config: Option<crate::external::ExternalLocationConfig>,
 }
 
 /// Fluent builder for [`HttpState`].
@@ -862,11 +865,13 @@ impl HttpStateBuilder {
     /// `__upload_url__` entry whose `size` exceeds it is refused before any
     /// URL is minted.
     ///
-    /// It may not exceed the server's inbound fetch cap (the external
-    /// config's `max_encoded_bytes`, 1 GiB by default, or 256 MiB without an
-    /// external config): an upload the server would then refuse to fetch
-    /// fails only after the client has sent it all, so [`build`](Self::build)
-    /// panics on a larger value. Unset advertises the fetch cap itself.
+    /// It never exceeds the server's inbound fetch cap (the external config's
+    /// `max_encoded_bytes`, 1 GiB by default, or 256 MiB without an external
+    /// config). A larger value raises a fetch cap that was left at its
+    /// default to match; against an *explicit* fetch cap
+    /// ([`ExternalLocationConfig::with_max_encoded_bytes`](crate::external::ExternalLocationConfig::with_max_encoded_bytes))
+    /// it is a contradiction and [`build`](Self::build) panics. Unset
+    /// advertises the fetch cap itself.
     pub fn max_upload_bytes(mut self, n: usize) -> Self {
         self.max_upload_bytes = Some(n);
         self
@@ -1067,14 +1072,25 @@ impl HttpStateBuilder {
         // An upload comes back as a pointer the server fetches under its
         // external config's fetch cap, so with a provider the advertised size
         // defaults to that cap and may not exceed it.
-        let fetch_cap = server
+        //
+        // A fetch cap the operator never set follows an explicit upload cap
+        // above it (configuring the upload size is how an operator says
+        // "accept requests this large"); only an explicit fetch cap below the
+        // upload cap is a contradiction, refused here.
+        let mut fetch_cap = server
             .external_config()
             .map_or(DEFAULT_MAX_FETCH_BYTES, |cfg| cfg.max_encoded_bytes);
+        let fetch_cap_explicit = server
+            .external_config()
+            .is_some_and(|cfg| cfg.max_encoded_bytes_explicit);
         let max_upload_bytes = match (&self.upload_url_provider, self.max_upload_bytes) {
             (None, value) => value,
             (Some(_), None) => Some(fetch_cap),
             (Some(_), Some(n)) => {
                 assert!(n > 0, "max_upload_bytes must be a positive integer");
+                if n > fetch_cap && !fetch_cap_explicit {
+                    fetch_cap = n;
+                }
                 assert!(
                     n <= fetch_cap,
                     "HttpStateBuilder: max_upload_bytes ({n}) exceeds the server's inbound fetch \
@@ -1103,6 +1119,16 @@ impl HttpStateBuilder {
                 panic!("HttpStateBuilder: {}", err.message);
             }
             crate::object_cache::default_object_cache()
+        });
+        // Inbound request pointers are fetched under the effective fetch cap
+        // (raised above when it followed the upload cap).
+        let request_pointer_config = server.external_config().map(|cfg| {
+            let mut cfg: crate::external::ExternalLocationConfig = (**cfg).clone();
+            if fetch_cap > cfg.max_encoded_bytes {
+                cfg.max_encoded_bytes = fetch_cap;
+                cfg.max_decompressed_bytes = cfg.max_decompressed_bytes.max(fetch_cap);
+            }
+            cfg
         });
         let state_refs = Arc::new(
             crate::state_ref::StateRefRuntime::new(token_key, fetch_cap)
@@ -1176,6 +1202,7 @@ impl HttpStateBuilder {
             cors_expose_headers,
             cors_allow_origin,
             state_refs,
+            request_pointer_config,
         })
     }
 }
@@ -4130,7 +4157,7 @@ async fn unary_dispatch(
     // the inner batch's columns for parameter extraction. Dispatch
     // metadata (method, request_id) is taken from the outer batch.
     if md_get(&req.metadata, crate::metadata::LOCATION_KEY).is_some() {
-        if let Some(cfg) = server.external_config().as_ref() {
+        if let Some(cfg) = state.request_pointer_config.as_ref() {
             let outer_md = req.metadata.clone();
             let outer_batch = req.batch.clone();
             let resolved = tokio::task::block_in_place(|| {
@@ -4643,7 +4670,7 @@ async fn stream_init_dispatch(
     // unary calls. Keep routing metadata from the pointer request and replace
     // only the parameter batch with the fetched batch.
     if md_get(&req.metadata, crate::metadata::LOCATION_KEY).is_some() {
-        if let Some(cfg) = server.external_config().as_ref() {
+        if let Some(cfg) = state.request_pointer_config.as_ref() {
             let resolved = tokio::task::block_in_place(|| {
                 crate::external::resolve_request_pointer(&req.batch, &req.metadata, cfg)
             });
@@ -5410,7 +5437,7 @@ async fn stream_exchange_dispatch(
     // or dispatching. The resolver merges outer and inner metadata, preserving
     // cursor/call tokens regardless of which side of the pointer carried them.
     if md_get(&metadata, crate::metadata::LOCATION_KEY).is_some() {
-        if let Some(cfg) = server.external_config().as_ref() {
+        if let Some(cfg) = state.request_pointer_config.as_ref() {
             let resolved = tokio::task::block_in_place(|| {
                 crate::external::resolve_request_pointer(&batch, &metadata, cfg)
             });
@@ -6018,6 +6045,74 @@ mod tests {
             .token_ttl(Duration::from_millis(50))
             .max_body_size(1024)
             .build()
+    }
+
+    fn fix1_state(explicit_fetch: Option<usize>, upload: Option<usize>) -> Arc<HttpState> {
+        use crate::external::{ExternalLocationConfig, ExternalStorage, InMemoryStorage};
+        use crate::server::RpcServer;
+        let storage = InMemoryStorage::new();
+        let s: Arc<dyn ExternalStorage> = storage.clone();
+        let mut cfg = ExternalLocationConfig::new(s, storage.clone());
+        if let Some(n) = explicit_fetch {
+            cfg = cfg.with_max_encoded_bytes(n);
+        }
+        let server = Arc::new(
+            RpcServer::builder()
+                .server_id("test")
+                .with_external_location(cfg)
+                .build(),
+        );
+        let mut b = HttpState::builder()
+            .server(server)
+            .token_key(&[7u8; 32])
+            .upload_url_provider(storage);
+        if let Some(n) = upload {
+            b = b.max_upload_bytes(n);
+        }
+        b.build()
+    }
+
+    fn advertised_upload(state: &HttpState) -> Option<String> {
+        state
+            .capability_headers
+            .get("vgi-max-upload-bytes")
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn fix1_upload_cap_defaults_to_the_fetch_cap() {
+        let state = fix1_state(None, None);
+        assert_eq!(advertised_upload(&state).as_deref(), Some("1073741824"));
+    }
+
+    #[test]
+    fn fix1_upload_cap_raises_a_default_fetch_cap() {
+        let state = fix1_state(None, Some(2 << 30));
+        assert_eq!(advertised_upload(&state).as_deref(), Some("2147483648"));
+        let cfg = state.request_pointer_config.as_ref().unwrap();
+        assert_eq!(cfg.max_encoded_bytes, 2 << 30);
+        assert!(cfg.max_decompressed_bytes >= 2 << 30);
+        assert_eq!(state.state_refs.max_fetch_bytes(), 2 << 30);
+    }
+
+    #[test]
+    fn fix1_upload_cap_within_an_explicit_fetch_cap() {
+        let state = fix1_state(Some(8192), Some(4096));
+        assert_eq!(advertised_upload(&state).as_deref(), Some("4096"));
+        assert_eq!(
+            state
+                .request_pointer_config
+                .as_ref()
+                .unwrap()
+                .max_encoded_bytes,
+            8192
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the server's inbound fetch cap")]
+    fn fix1_explicit_fetch_cap_below_the_upload_cap_is_refused() {
+        let _ = fix1_state(Some(4096), Some(8192));
     }
 
     #[test]

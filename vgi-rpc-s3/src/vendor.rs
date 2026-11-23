@@ -1732,8 +1732,10 @@ pub fn external_config_from_lookup(
         None => {
             if let Some(upload) = max_upload {
                 let upload = usize::try_from(upload).unwrap_or(usize::MAX);
+                // Raised, not made explicit: it is still the default
+                // following the upload cap.
                 if upload > config.max_encoded_bytes {
-                    config = config.with_max_encoded_bytes(upload);
+                    config.max_encoded_bytes = upload;
                 }
             }
         }

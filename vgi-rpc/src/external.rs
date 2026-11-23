@@ -619,6 +619,11 @@ pub struct ExternalLocationConfig {
     /// Hard ceiling on bytes received from storage before decompression.
     /// Default 1 GiB, matching the historical combined ceiling.
     pub max_encoded_bytes: usize,
+    /// Whether [`Self::max_encoded_bytes`] was set explicitly (through
+    /// [`Self::with_max_encoded_bytes`]). A default fetch cap follows a larger
+    /// configured upload cap (`HttpStateBuilder::max_upload_bytes`); an
+    /// explicit one below it is refused.
+    pub max_encoded_bytes_explicit: bool,
     /// Maximum number of redirect hops. Default 5.
     pub max_redirects: usize,
 }
@@ -763,6 +768,7 @@ impl ExternalLocationConfig {
             url_validator: safe_https_validator(),
             max_decompressed_bytes: 1024 * 1024 * 1024,
             max_encoded_bytes: 1024 * 1024 * 1024,
+            max_encoded_bytes_explicit: false,
             max_redirects: 5,
         }
     }
@@ -792,6 +798,7 @@ impl ExternalLocationConfig {
     /// Override the hard ceiling on encoded bytes read from storage.
     pub fn with_max_encoded_bytes(mut self, n: usize) -> Self {
         self.max_encoded_bytes = n;
+        self.max_encoded_bytes_explicit = true;
         self
     }
 

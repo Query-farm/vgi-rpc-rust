@@ -6,8 +6,14 @@
 //!   → `{"object_url": "{base}/blob/{id}"}`
 //! - `PUT  {object_url}`  upload raw bytes (echo `Content-Encoding`).
 //! - `GET  {object_url}`  download raw bytes.
+//! - Protocol 3.4 object API: every `/alloc` response carries `object_id`;
+//!   `"purpose": "object"` marks a `put_object` (counted `object_puts`);
+//!   `GET /objects/{id}` is `get` (counted `object_gets`, 404 when absent).
 
-use vgi_rpc::external::{Compression, ExternalStorage, UploadResult, UploadUrl, UploadUrlProvider};
+use vgi_rpc::external::{
+    object_missing_error, Compression, ExternalStorage, ObjectStore, UploadResult, UploadUrl,
+    UploadUrlProvider,
+};
 use vgi_rpc::{Result, RpcError};
 
 pub struct FakeStorage {
@@ -25,6 +31,10 @@ impl FakeStorage {
 }
 
 impl ExternalStorage for FakeStorage {
+    fn object_store(&self) -> Option<&dyn ObjectStore> {
+        Some(self)
+    }
+
     fn upload(&self, ipc_bytes: &[u8], compression: Compression) -> Result<UploadResult> {
         let alloc_url = format!("{}/alloc", self.base_url);
         let alloc_body = match compression {
@@ -122,11 +132,90 @@ impl UploadUrlProvider for FakeStorage {
             .map(|d| d.as_micros() as i64)
             .unwrap_or(0);
         let expires_at_micros = now_us + 60 * 60 * 1_000_000; // +1h
+        let object_id = alloc_resp
+            .get("object_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
         Ok(UploadUrl {
             upload_url,
             download_url,
             expires_at_micros,
             headers,
+            object_id,
+            argument_ref: Vec::new(),
         })
+    }
+}
+
+impl ObjectStore for FakeStorage {
+    fn put_object(&self, data: &[u8]) -> Result<String> {
+        use sha2::Digest as _;
+        let sha_hex: String = sha2::Sha256::digest(data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let body = serde_json::json!({
+            "size": data.len(),
+            "sha256_b64": vgi_rpc::external::sha256_hex_to_b64(&sha_hex)?,
+            "purpose": "object",
+        })
+        .to_string();
+        let alloc: serde_json::Value = self
+            .client
+            .post(format!("{}/alloc", self.base_url))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json())
+            .map_err(|e| RpcError::runtime_error(format!("fake-storage alloc failed: {e}")))?;
+        let object_id = alloc
+            .get("object_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RpcError::runtime_error("alloc response missing object_id"))?
+            .to_string();
+        let upload_url = alloc
+            .get("upload_url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RpcError::runtime_error("alloc response missing upload_url"))?;
+        let mut req = self
+            .client
+            .put(upload_url)
+            .body(data.to_vec())
+            .header("content-type", "application/octet-stream");
+        if let Some(headers) = alloc.get("upload_headers").and_then(|v| v.as_object()) {
+            for (k, v) in headers {
+                if let Some(v) = v.as_str() {
+                    req = req.header(k.as_str(), v);
+                }
+            }
+        }
+        req.send()
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| RpcError::runtime_error(format!("fake-storage PUT failed: {e}")))?;
+        Ok(object_id)
+    }
+
+    fn get(&self, object_id: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        let resp = self
+            .client
+            .get(format!("{}/objects/{object_id}", self.base_url))
+            .send()
+            .map_err(|e| RpcError::runtime_error(format!("fake-storage GET failed: {e}")))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(object_missing_error("fake storage object is gone"));
+        }
+        let data = resp
+            .error_for_status()
+            .and_then(|r| r.bytes())
+            .map_err(|e| RpcError::runtime_error(format!("fake-storage GET failed: {e}")))?;
+        if data.len() > max_bytes {
+            return Err(RpcError::runtime_error(format!(
+                "object is {} bytes, over max_fetch_bytes ({max_bytes})",
+                data.len()
+            )));
+        }
+        Ok(data.to_vec())
     }
 }

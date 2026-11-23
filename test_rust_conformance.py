@@ -568,6 +568,91 @@ def conformance_fake_storage() -> Iterator[str]:
         shutdown()
 
 
+# --- StateRef / object cache / argument references (STATE_REF_V1.md §15) ----
+# The shared suite (vgi_rpc.conformance._state_ref_pytest) drives these three
+# fixtures over raw HTTP. Each spawns its own workers so its configuration
+# (no request cap, cursor rule, token key, object-cache bound, required
+# principal) is exactly what the suite documents.
+
+
+def _state_ref_worker_cmd(storage_url: str | None, *flags: str) -> list[str]:
+    """Argv for one StateRef fixture worker, with or without fake storage."""
+    if SERVER == "python":
+        base = [_VENV_PY, _PY_SERVE_HTTP]
+        if storage_url is not None:
+            base += ["--fake-storage", storage_url]
+        return [*base, *flags]
+    if SERVER == "rust":
+        if storage_url is not None:
+            return [RUST_WORKER, "--http-with-storage", storage_url, *flags]
+        return [RUST_WORKER, "--http", *flags]
+    pytest.skip(f"StateRef fixture workers are not wired for SERVER={SERVER}")
+
+
+def _spawn_state_ref_worker(
+    stack: contextlib.ExitStack, storage_url: str | None, *flags: str
+) -> int:
+    proc, port = _spawn_read_port(_state_ref_worker_cmd(storage_url, *flags))
+
+    def _stop() -> None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    stack.callback(_stop)
+    return port
+
+
+@pytest.fixture(scope="session")
+def conformance_state_ref_replicas(conformance_fake_storage: str) -> Iterator[Any]:
+    """Two workers sharing a token key and the fake storage.
+
+    No request cap, cursor rule ``error``, object cache bound
+    ``OBJECT_CACHE_TEST_BYTES``, ``X-Conformance-Principal`` required.
+    """
+    from vgi_rpc.conformance._state_ref_pytest import OBJECT_CACHE_TEST_BYTES, StateRefReplicas
+
+    flags = (
+        "--token-key",
+        os.urandom(32).hex(),
+        "--max-request-bytes",
+        "0",
+        "--cursor-rule",
+        "error",
+        "--object-cache-bytes",
+        str(OBJECT_CACHE_TEST_BYTES),
+        "--require-principal",
+    )
+    with contextlib.ExitStack() as stack:
+        a = _spawn_state_ref_worker(stack, conformance_fake_storage, *flags)
+        b = _spawn_state_ref_worker(stack, conformance_fake_storage, *flags)
+        yield StateRefReplicas(ports=(a, b), storage_url=conformance_fake_storage)
+
+
+@pytest.fixture(scope="session")
+def conformance_state_ref_short_ttl_port(conformance_fake_storage: str) -> Iterator[int]:
+    """One worker with the fake storage, no request cap and ``token_ttl`` 2 s."""
+    with contextlib.ExitStack() as stack:
+        yield _spawn_state_ref_worker(
+            stack, conformance_fake_storage, "--max-request-bytes", "0", "--token-ttl", "2"
+        )
+
+
+@pytest.fixture(scope="session")
+def conformance_cursor_budget_ports() -> Iterator[Any]:
+    """The warn / error / floor cursor-rule workers, without storage."""
+    from vgi_rpc.conformance._state_ref_pytest import CursorBudgetPorts
+
+    with contextlib.ExitStack() as stack:
+        warn = _spawn_state_ref_worker(stack, None, "--max-request-bytes", "32768", "--cursor-rule", "warn")
+        error = _spawn_state_ref_worker(stack, None, "--max-request-bytes", "32768", "--cursor-rule", "error")
+        floor = _spawn_state_ref_worker(stack, None, "--max-request-bytes", "9000", "--cursor-rule", "error")
+        yield CursorBudgetPorts(warn=warn, error=error, floor=floor)
+
+
 def _bytestream_external_cmd(storage_url: str) -> list[str]:
     """Argv for a byte-stream conformance server that externalises everything.
 
@@ -1557,7 +1642,7 @@ class TestRustDescribeConformance:
 def _assert_describe(desc) -> None:  # type: ignore[no-untyped-def]
     assert desc.protocol_name == "ConformanceService"
     assert desc.describe_version == DESCRIBE_VERSION
-    assert len(desc.methods) == 90, sorted(desc.methods.keys())
+    assert len(desc.methods) == 94, sorted(desc.methods.keys())
     suite = run_describe_conformance(desc)
     if not suite.success:
         failures = [r for r in suite.results if not r.passed]

@@ -149,8 +149,10 @@ jobs:
     env:
       # vgi-rpc-python protocol-3.4: sized PUT verification + upload faults;
       # f0fb675: puts_upload / client_uploads, counted from the origin=client_upload
-      # marker on client-upload grants. TODO(release-wave).
-      VGI_RPC_FAKE_VENDOR_REF: f0fb6754ae5b70900ba21629a1e2d48eb2182774
+      # marker on client-upload grants; 3a06983: object API stats
+      # (puts_state_ref / gets_state_ref) and /__admin__/delete?origin=.
+      # TODO(release-wave).
+      VGI_RPC_FAKE_VENDOR_REF: 3a069830eb296ab452bd83f87a243ca71f7f7a3e
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.0

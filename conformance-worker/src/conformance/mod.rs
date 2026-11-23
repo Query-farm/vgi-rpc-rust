@@ -10,6 +10,7 @@
 mod macro_demo;
 mod params;
 mod published;
+mod state_ref;
 mod streams;
 mod types;
 mod unary;
@@ -171,6 +172,7 @@ fn build_server_with_external_and_hook(
     unary::register(&mut srv);
     published::register(&mut srv, published_external.as_ref());
     streams::register(&mut srv);
+    state_ref::register(&mut srv);
     srv
 }
 
@@ -233,7 +235,7 @@ mod hash_tests {
     /// over serialized Arrow IPC bytes of the retired `__describe__` payload,
     /// and each language may legitimately spell those differently for the same
     /// logical schema -- so it was only ever comparable against itself.
-    const CANONICAL: &str = "05479410c96f34410a2b10a4f6a49d59dcfd9d6d1d45ce9a9807d060a3bd6014";
+    const CANONICAL: &str = "22426518ead543d7e8ca3903280815d5855b9450f46739790fe66804c7e77331";
 
     #[test]
     fn the_access_log_publishes_the_canonical_digest() {

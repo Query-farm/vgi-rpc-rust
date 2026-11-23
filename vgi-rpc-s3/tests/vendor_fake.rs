@@ -6,7 +6,7 @@
 //! fault routes are vendor-wide, so everything runs in one test, in order.
 
 use sha2::{Digest, Sha256};
-use vgi_rpc::external::{Compression, ExternalStorage, UploadUrlProvider};
+use vgi_rpc::external::{is_object_missing, Compression, ExternalStorage, UploadUrlProvider};
 use vgi_rpc_s3::vendor::{BlobScope, VendorBlobClient, VendorStorage};
 
 fn vendor() -> Option<(String, String)> {
@@ -214,6 +214,34 @@ fn vendor_client_against_the_fake_vendor() {
     assert!(corrupted.text().unwrap().contains("BadDigest"));
     assert_eq!(stat(&url, "upload_refusals"), refusals + 1);
     assert_eq!(stat(&url, "uploads_corrupted"), corruptions + 1);
+    admin(&url, "/__admin__/reset");
+
+    // Protocol 3.4 object API (STATE_REF_V1.md §10): put_object grants carry
+    // origin=state_ref (counted in puts_state_ref and puts_rpc), get mints the
+    // download server-side, and a deleted object reports missing.
+    let objects = storage
+        .object_store()
+        .expect("VendorStorage is an ObjectStore");
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i % 253) as u8).collect();
+    let (puts_state_ref, puts_rpc) = (stat(&url, "puts_state_ref"), stat(&url, "puts_rpc"));
+    let object_id = objects.put_object(&payload).unwrap();
+    assert!(!object_id.is_empty());
+    assert_eq!(stat(&url, "puts_state_ref"), puts_state_ref + 1);
+    assert_eq!(stat(&url, "puts_rpc"), puts_rpc + 1);
+    let gets_state_ref = stat(&url, "gets_state_ref");
+    assert_eq!(objects.get(&object_id, 1 << 20).unwrap(), payload);
+    assert_eq!(stat(&url, "gets_state_ref"), gets_state_ref + 1);
+    assert!(
+        objects.get(&object_id, 100).is_err(),
+        "max_bytes is enforced"
+    );
+    let grant = storage
+        .generate_upload_url(body.len() as u64, &sha_hex(&body))
+        .unwrap();
+    assert!(!grant.object_id.is_empty(), "grants carry the object_id");
+    admin(&url, "/__admin__/delete?origin=state_ref");
+    let gone = objects.get(&object_id, 1 << 20).unwrap_err();
+    assert!(is_object_missing(&gone), "{gone:?}");
     admin(&url, "/__admin__/reset");
 
     // A wrong token is refused, and the message names no token.

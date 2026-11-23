@@ -249,8 +249,8 @@ Streaming is **stateless on the wire**: the full `StreamStateKind` is
 sealed into an XChaCha20-Poly1305 AEAD token carried in the
 `vgi_rpc.stream_state#b64` metadata key. Any worker behind a load
 balancer with the same `token_key` can resume any continuation request.
-No server-side session map, no reaper task. The token TTL (default 5
-min) is embedded in the encrypted payload as a `created_at` timestamp
+No server-side session map, no reaper task. The token TTL (default 6
+h, 21600 s) is embedded in the encrypted payload as a `created_at` timestamp
 and checked after decryption.
 
 **Token format v4** (matches Python `vgi_rpc/http/server/_state_token.py`):

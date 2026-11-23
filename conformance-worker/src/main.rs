@@ -152,6 +152,11 @@ fn main() {
             std::env::set_var(var, value);
         }
     }
+    // `--object-cache-bytes N` bounds the process's object cache; it must be
+    // in the environment before the cache is first created.
+    if let Some(value) = parse_str_flag(&args, "--object-cache-bytes") {
+        std::env::set_var(vgi_rpc::object_cache::OBJECT_CACHE_BYTES_ENV, value);
+    }
     if args.iter().any(|a| a == "--access-log-async") {
         std::env::set_var("VGI_ACCESS_LOG_ASYNC", "1");
     }
@@ -228,6 +233,7 @@ fn main() {
         // the ``externalize-always`` mode (threshold=1, cap=1MiB) keeps
         // normal-sized request bodies flowing inline. Defaults to 4096 to
         // preserve the previous fixed cap for the existing storage tests.
+        // `0` means "no request cap" (the StateRef replica fixtures).
         let max_req = parse_usize_flag(&args, "--max-request-bytes").unwrap_or(4096);
         run_http_with_storage(
             &storage_url,
@@ -419,6 +425,39 @@ fn parse_secs_flag(args: &[String], flag: &str) -> Option<f64> {
     raw.parse::<f64>().ok()
 }
 
+/// The `StateRef` fixture flags shared by the HTTP modes (`STATE_REF_V1.md`
+/// §15): `--cursor-rule warn|error`, `--token-ttl SECONDS` and
+/// `--require-principal` (authenticate every route by
+/// `X-Conformance-Principal`, answering 401 without it).
+fn apply_state_ref_flags(
+    mut builder: vgi_rpc::http::HttpStateBuilder,
+    args: &[String],
+) -> vgi_rpc::http::HttpStateBuilder {
+    if let Some(rule) = parse_str_flag(args, "--cursor-rule") {
+        builder = builder.cursor_rule(rule.parse().expect("--cursor-rule warn|error"));
+    }
+    if let Some(ttl) = parse_str_flag(args, "--token-ttl").and_then(|v| v.parse::<u64>().ok()) {
+        builder = builder.token_ttl(std::time::Duration::from_secs(ttl));
+    }
+    if args.iter().any(|a| a == "--require-principal") {
+        builder = builder.authenticate(Arc::new(required_principal));
+    }
+    builder
+}
+
+/// Like `authenticate_from_headers`, but a request without
+/// `X-Conformance-Principal` is refused (401). Backs `--require-principal`:
+/// the shared StateRef / argument-reference cases need two principals and an
+/// unauthenticated grant refused exactly like an unauthenticated call.
+fn required_principal(req: &vgi_rpc::auth::AuthRequest) -> vgi_rpc::auth::AuthResult {
+    match req.header(identity_fixture::PRINCIPAL_HEADER) {
+        Some(p) if !p.is_empty() => identity_fixture::authenticate_from_headers(req),
+        _ => Err(vgi_rpc::RpcError::value_error(
+            "X-Conformance-Principal is required",
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_http_with_storage(
     storage_url: &str,
@@ -470,11 +509,25 @@ fn run_http_with_storage(
         .build()
         .expect("tokio runtime");
     rt.block_on(async move {
+        let argv = std::env::args().collect::<Vec<_>>();
         let mut builder = vgi_rpc::http::HttpState::builder()
             .server(server)
-            .upload_url_provider(upload_provider)
-            .max_request_bytes(max_request_bytes)
-            .max_upload_bytes(64 * 1024 * 1024);
+            .upload_url_provider(upload_provider);
+        // Fix 1: the advertised upload cap may not exceed the fetch cap. The
+        // external-security worker's 4 KiB fetch cap is then what it
+        // advertises (as the reference worker does).
+        if !external_security {
+            builder = builder.max_upload_bytes(64 * 1024 * 1024);
+        }
+        if max_request_bytes > 0 {
+            builder = builder.max_request_bytes(max_request_bytes);
+        }
+        // `--token-key` lets two storage workers act as replicas of one
+        // deployment (one key, one storage).
+        if let Some(hex) = parse_str_flag(&argv, "--token-key") {
+            builder = builder.token_key_hex(&hex);
+        }
+        builder = apply_state_ref_flags(builder, &argv);
         if let Some(n) = max_response_bytes {
             builder = builder.max_response_bytes(n);
         }
@@ -643,9 +696,11 @@ fn run_http(
         }
         if let Some(n) =
             parse_usize_flag(&std::env::args().collect::<Vec<_>>(), "--max-request-bytes")
+                .filter(|n| *n > 0)
         {
             builder = builder.max_request_bytes(n);
         }
+        builder = apply_state_ref_flags(builder, &std::env::args().collect::<Vec<_>>());
         // Sticky sessions on by default (matches Python's
         // serve_conformance_http.py) so the canonical TestSticky group
         // runs. A fixed marker echo header gives

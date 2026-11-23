@@ -4,6 +4,61 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## [Unreleased]
 
+### Added (protocol 3.4: large values, `STATE_REF_V1.md`)
+
+Ports vgi-rpc-python's `StateRef` reference (`f22d435`, `8f689a7`).
+
+- **`StateRef`** (`vgi_rpc::state_ref`): `ctx.state_ref(bytes)` (only while
+  the stream method itself runs; elsewhere `state_ref_misuse`),
+  `ctx.resolve(&ref)` on any turn and transport, plus `state_ref_serde` /
+  `resolve_serde`. A ref is a serde field of the stream state. On HTTP its
+  form is decided when the cursor is first minted: inline
+  (`0x01 || codec || body`) or, with object storage and a payload over the
+  inline limit, stored once as AEAD ciphertext with a sealed tag
+  (`0x02 || tag`, scopes `vgi_rpc.stateref.v1` / `.object.v1` over
+  `BASE_AAD(auth, protocol) || call_id`). Pipe, unix, TCP keep the value in
+  memory. Error kinds `invalid_state_ref` (HTTP 400), `state_ref_missing`,
+  `state_ref_too_large`, `state_ref_misuse`, `cursor_too_large`,
+  `storage_unavailable`.
+- **Turn budget and cursor rule**: `HttpStateBuilder::cursor_rule(Warn|Error)`
+  (default `Warn`: a client WARN log starting `cursor_large:`) and
+  `state_ref_inline_bytes(n)` (else `VGI_RPC_STATE_REF_INLINE_BYTES`, default
+  16384). Below a 16 KiB `max_request_bytes` the rule is disabled with a
+  startup warning. Producer turns mint the cursor before emitting data.
+- **Call token v3**: both schemas behind a `StateRef` (`schemas_ref`).
+- **Standard token codec** (`vgi_rpc::token_codec`): `0x00` raw / `0x01` zstd,
+  bounded streaming decompression.
+- **Object cache** (`vgi_rpc::object_cache`): per process, keyed by
+  `object_id`, single-flight, byte-bounded (`VGI_RPC_OBJECT_CACHE_BYTES`,
+  default `min(1 GiB, 40%` of memory`)`), entries stale after 1 day.
+- **Storage contract**: `ObjectStore { put_object, get(object_id, max_bytes) }`,
+  exposed through `ExternalStorage::object_store()` (default `None`); missing
+  objects are `external::object_missing_error`. Implemented by
+  `InMemoryStorage`, `PresignedS3Storage`/`PresignedPutStorage`,
+  `SignedGcsStorage` and `VendorStorage` (`origin: "state_ref"` grants).
+- **Grant columns**: `__upload_url__/init` answers `object_id` and `ref` (a
+  sealed `vgi_rpc.argref.v1` argument reference bound to the requesting
+  principal); `UploadUrl` gains `object_id` and `argument_ref` (also on the
+  client's `UploadUrl`, read by name). A provider returning no `object_id` is
+  refused. `ctx.resolve_argument_ref(ref, size, sha256)` and
+  `state_ref::{mint,open,resolve}_argument_ref` for the vgi layer, with kinds
+  `invalid_arguments_ref`, `arguments_ref_integrity`, `arguments_ref_missing`.
+- Conformance worker: `state_ref_exchange`, `object_cache_stats`,
+  `object_cache_age`, `resolve_argument_ref` (94 methods) and the
+  `--cursor-rule`, `--token-ttl`, `--object-cache-bytes`,
+  `--require-principal`, `--max-request-bytes 0` flags.
+
+### Changed (breaking, protocol 3.4)
+
+- **`token_ttl` defaults to 21600 s** (6 h, the maximum stream duration; was
+  300 s). It also bounds stored `StateRef` tags.
+- **Fix 1**: with an upload-URL provider, `VGI-Max-Upload-Bytes` is always
+  advertised and defaults to the inbound fetch cap (`max_encoded_bytes`, or
+  256 MiB without an external config); `build()` panics on an explicit
+  `max_upload_bytes` above it. `vendor::external_config_from_lookup` reads
+  `VGI_RPC_MAX_FETCH_BYTES` (unset: 1 GiB raised to `VGI_RPC_MAX_UPLOAD_BYTES`;
+  both set with upload > fetch is an error).
+
 ### Changed (breaking)
 
 - **Upload-URL protocol v2** (`VGI-Upload-URL-Support: 2`, vgi protocol 3.4),

@@ -195,6 +195,7 @@ where
 /// Run `fut` on the storage runtime and block until it finishes; `Err` when
 /// it panicked (e.g. a third-party credential provider), instead of
 /// propagating the panic into the caller.
+#[cfg(feature = "aws")]
 pub(crate) fn try_block_on<F>(fut: F) -> std::result::Result<F::Output, ()>
 where
     F: Future + Send + 'static,

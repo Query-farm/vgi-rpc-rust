@@ -67,6 +67,18 @@ Code returning one `String` must add a GET presign operation and populate
 `download_url`; reusing the PUT URL is not supported because method-bound cloud
 signatures cannot be downloaded with GET.
 
+## Direct S3 (feature `aws`)
+
+`vgi_rpc_s3::s3::S3Storage` signs its own URLs against your bucket (AWS S3 or
+any S3-compatible service) with the standard AWS credential chain; configure
+it with `S3Settings::from_env()` (`VGI_STORAGE_S3_BUCKET`, `_ENDPOINT`,
+`_REGION`, `_FORCE_PATH_STYLE`, `_PUBLIC_ENDPOINT`, `_CHECKSUM`, explicit
+`_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` / `_SESSION_TOKEN`,
+`VGI_STORAGE_URL_TTL_SECONDS`), or let `vgi_rpc_s3::backend::storage_from_env()`
+pick the backend from `VGI_STORAGE_BACKEND`. Add a bucket lifecycle rule
+expiring `<prefix>rpc/` and `<prefix>obj/` after 1–2 days; the worker never
+deletes.
+
 ## License
 
 Apache-2.0.

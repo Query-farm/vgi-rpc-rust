@@ -1841,15 +1841,33 @@ pub fn external_config_from_lookup(
     }
     let (url, token) = url_and_token(lookup)?;
     let storage = Arc::new(VendorStorage::new(&url, &token)?);
+    let config = external_config_with(lookup, storage.clone(), storage.url_validator())?;
+    Ok(Some((config, storage)))
+}
+
+/// A server external-location config over any `storage`, honouring
+/// `VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES`, `VGI_RPC_EXTERNAL_COMPRESSION`,
+/// `VGI_RPC_MAX_FETCH_BYTES` and `VGI_RPC_MAX_UPLOAD_BYTES` (as
+/// [`external_config_from_env`]), fetching inbound pointers with a bare
+/// [`HttpFetcher`](crate::HttpFetcher) pinned by `validator`.
+///
+/// # Errors
+///
+/// If a variable will not parse, or the upload cap exceeds an explicit fetch
+/// cap.
+pub fn external_config_with(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    storage: Arc<dyn ExternalStorage>,
+    validator: UrlValidator,
+) -> Result<ExternalLocationConfig> {
     let threshold = parse_positive(lookup, ENV_THRESHOLD)?
         .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
         .unwrap_or(DEFAULT_THRESHOLD);
     let compression = parse_compression(&lookup(ENV_COMPRESSION).unwrap_or_default())?;
-    let mut config =
-        ExternalLocationConfig::new(storage.clone(), Arc::new(crate::HttpFetcher::new()))
-            .with_threshold_bytes(threshold)
-            .with_compression(compression)
-            .with_url_validator(storage.url_validator());
+    let mut config = ExternalLocationConfig::new(storage, Arc::new(crate::HttpFetcher::new()))
+        .with_threshold_bytes(threshold)
+        .with_compression(compression)
+        .with_url_validator(validator);
     // The inbound fetch cap. Unset it is the 1 GiB default raised to
     // VGI_RPC_MAX_UPLOAD_BYTES when that is larger: setting the upload size
     // is how an operator says "accept requests this large". Both set with
@@ -1876,7 +1894,7 @@ pub fn external_config_from_lookup(
             }
         }
     }
-    Ok(Some((config, storage)))
+    Ok(config)
 }
 
 /// A URL validator for clients that hold a vendor token (e.g. a worker calling

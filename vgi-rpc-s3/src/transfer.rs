@@ -180,7 +180,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 
 /// Run `fut` on the storage runtime and block the calling thread until it
 /// finishes.
-fn block_on<F>(fut: F) -> F::Output
+pub(crate) fn block_on<F>(fut: F) -> F::Output
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -190,6 +190,21 @@ where
         let _ = tx.send(fut.await);
     });
     rx.recv().expect("storage runtime task dropped")
+}
+
+/// Run `fut` on the storage runtime and block until it finishes; `Err` when
+/// it panicked (e.g. a third-party credential provider), instead of
+/// propagating the panic into the caller.
+pub(crate) fn try_block_on<F>(fut: F) -> std::result::Result<F::Output, ()>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    runtime().spawn(async move {
+        let _ = tx.send(fut.await);
+    });
+    rx.recv().map_err(|_| ())
 }
 
 /// Milliseconds since `origin` of the last observed byte movement; `0` means

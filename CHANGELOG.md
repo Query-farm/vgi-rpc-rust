@@ -4,6 +4,38 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## [Unreleased]
 
+### Added (vgi-rpc-s3: direct S3 storage, direct-storage contract v1)
+
+- **`vgi_rpc_s3::s3::S3Storage`** (feature `aws`): the worker signs its own
+  SigV4 URLs against the operator's bucket, AWS S3 or any S3-compatible
+  service, with no blob vendor. All three roles: result externalization (PUT +
+  presigned GET), upload grants (presigned PUT signed for `content-length` and
+  `x-amz-checksum-sha256`), and the object store (`StateRef` / argument
+  references, re-signed on every fetch). Configured by `VGI_STORAGE_S3_*`
+  (`BUCKET`, `PREFIX`, `ENDPOINT`, `REGION`, `FORCE_PATH_STYLE`,
+  `PUBLIC_ENDPOINT`, `CHECKSUM`, `VERIFY`, `ACCESS_KEY_ID` /
+  `SECRET_ACCESS_KEY` / `SESSION_TOKEN`) and `VGI_STORAGE_URL_TTL_SECONDS`.
+  Credentials: explicit keys, else the standard AWS chain via `aws-config`
+  (env, profile with assume-role / `credential_process` / SSO, web identity,
+  ECS / EKS Pod Identity, IMDSv2), refreshed at least 5 minutes before
+  expiry; each URL's lifetime is capped at `expiry - now - 60 s` (15 minutes
+  needed for a grant). `VGI_STORAGE_S3_CHECKSUM=none` stores without a
+  checksum header and issues no upload grants. A bucket HEAD on first use (or
+  at startup with `VERIFY=1`) names a missing bucket, denied access or the
+  wrong region. Keys: `<prefix>rpc/`, `<prefix>obj/`, `<prefix>fs/`; the
+  worker never deletes (add a lifecycle rule).
+- **`vgi_rpc_s3::backend`**: `VGI_STORAGE_BACKEND` = `vendor` | `s3` | `gcs` |
+  `none` selection (or inferred from `VGI_BLOB_VENDOR_URL` /
+  `VGI_STORAGE_S3_BUCKET` / `VGI_STORAGE_GCS_BUCKET`, a conflict refused) and
+  `storage_from_env()` wiring. `gcs` is refused: this port has no GCS signer.
+- **`vendor::external_config_with`**: the threshold / compression / fetch-cap
+  config over any storage.
+- **Native TLS roots**: reqwest's `rustls-tls-native-roots` alongside the
+  bundled roots, so a private-CA endpoint (MinIO, Ceph) works via the system
+  store or `SSL_CERT_FILE`.
+- **CI lane `s3-lane`** (`scripts/s3-lane.sh`): RustFS over http and TLS,
+  static keys and STS session tokens, credential rotation; fails on a skip.
+
 ### Fixed (vgi-rpc-s3, vgi-rpc-gcs: storage transfer timeouts)
 
 - **Large storage transfers no longer fail on slow links.** Every signed-URL

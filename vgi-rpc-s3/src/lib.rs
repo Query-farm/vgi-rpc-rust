@@ -51,6 +51,9 @@
 
 use std::sync::Arc;
 
+pub mod backend;
+#[cfg(feature = "aws")]
+pub mod s3;
 pub mod transfer;
 pub mod vendor;
 
@@ -247,97 +250,138 @@ impl PresignedPutStorage {
                 headers.push((k.clone(), v.clone()));
             }
         }
-        let label = self.label;
-        let data = bytes::Bytes::copy_from_slice(body);
-        let mut last = String::new();
-        for attempt in 0..self.retry.attempts() {
-            self.retry.pause(attempt);
-            let resp = match self.client.send(
-                reqwest::Method::PUT,
-                &urls.upload_url,
-                &headers,
-                Some(data.clone()),
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    last = e.label().to_string();
-                    continue;
-                }
-            };
-            let status = resp.status();
-            if status.as_u16() == 429 || status.is_server_error() {
-                last = format!("HTTP {status}");
-                continue;
-            }
-            if !status.is_success() {
-                return Err(RpcError::runtime_error(format!(
-                    "{label} PUT returned {status} for {}",
-                    redact_url(&urls.upload_url)
-                )));
-            }
-            // Drain the (empty) body so the connection can be reused; a
-            // failure here does not undo the stored object.
-            let _ = resp.read_capped(64 * 1024);
-            return Ok(());
-        }
-        Err(RpcError::runtime_error(format!(
-            "{label} PUT failed after {} attempts ({last}) for {}",
-            self.retry.attempts(),
-            redact_url(&urls.upload_url)
-        )))
+        signed_put(
+            &self.client,
+            &self.retry,
+            self.label,
+            &urls.upload_url,
+            &headers,
+            bytes::Bytes::copy_from_slice(body),
+        )
     }
 
     /// GET `url` with retries; `None` for a 404.
     fn get_body(&self, url: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
-        let label = self.label;
-        let mut last = String::new();
-        for attempt in 0..self.retry.attempts() {
-            self.retry.pause(attempt);
-            let resp = match self.client.send(reqwest::Method::GET, url, &[], None) {
-                Ok(r) => r,
-                Err(e) => {
-                    last = e.label().to_string();
-                    continue;
-                }
-            };
-            let status = resp.status();
-            if status == reqwest::StatusCode::NOT_FOUND {
-                return Ok(None);
-            }
-            if status.as_u16() == 429 || status.is_server_error() {
-                last = format!("HTTP {status}");
+        signed_get(&self.client, &self.retry, self.label, url, max_bytes)
+    }
+}
+
+/// PUT `data` to a signed URL with exactly `headers`, retrying transient
+/// failures (connect, stall, reset, 429, 5xx).
+pub(crate) fn signed_put(
+    client: &StorageClient,
+    retry: &RetryPolicy,
+    label: &str,
+    url: &str,
+    headers: &[(String, String)],
+    data: bytes::Bytes,
+) -> Result<()> {
+    let mut last = String::new();
+    for attempt in 0..retry.attempts() {
+        retry.pause(attempt);
+        let resp = match client.send(reqwest::Method::PUT, url, headers, Some(data.clone())) {
+            Ok(r) => r,
+            Err(e) => {
+                last = e.label().to_string();
                 continue;
             }
-            if !status.is_success() {
-                return Err(RpcError::runtime_error(format!(
-                    "{label} GET returned {status} for {}",
-                    redact_url(url)
-                )));
+        };
+        let status = resp.status();
+        if status.as_u16() == 429 || status.is_server_error() {
+            last = format!("HTTP {status}");
+            continue;
+        }
+        if !status.is_success() {
+            let body = resp.read_capped(64 * 1024).unwrap_or_default();
+            let code = s3_error_code(&body)
+                .map(|c| format!(" {c}"))
+                .unwrap_or_default();
+            return Err(RpcError::runtime_error(format!(
+                "{label} PUT returned {status}{code} for {}",
+                redact_url(url)
+            )));
+        }
+        // Drain the (empty) body so the connection can be reused; a failure
+        // here does not undo the stored object.
+        let _ = resp.read_capped(64 * 1024);
+        return Ok(());
+    }
+    Err(RpcError::runtime_error(format!(
+        "{label} PUT failed after {} attempts ({last}) for {}",
+        retry.attempts(),
+        redact_url(url)
+    )))
+}
+
+/// GET a signed URL with retries; `None` for a 404.
+pub(crate) fn signed_get(
+    client: &StorageClient,
+    retry: &RetryPolicy,
+    label: &str,
+    url: &str,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
+    let mut last = String::new();
+    for attempt in 0..retry.attempts() {
+        retry.pause(attempt);
+        let resp = match client.send(reqwest::Method::GET, url, &[], None) {
+            Ok(r) => r,
+            Err(e) => {
+                last = e.label().to_string();
+                continue;
             }
-            if resp.content_length().is_some_and(|n| n > max_bytes as u64) {
+        };
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if status.as_u16() == 429 || status.is_server_error() {
+            last = format!("HTTP {status}");
+            continue;
+        }
+        if !status.is_success() {
+            let body = resp.read_capped(64 * 1024).unwrap_or_default();
+            let code = s3_error_code(&body)
+                .map(|c| format!(" {c}"))
+                .unwrap_or_default();
+            return Err(RpcError::runtime_error(format!(
+                "{label} GET returned {status}{code} for {}",
+                redact_url(url)
+            )));
+        }
+        if resp.content_length().is_some_and(|n| n > max_bytes as u64) {
+            return Err(RpcError::runtime_error(format!(
+                "{label} object exceeds max_fetch_bytes ({max_bytes})"
+            )));
+        }
+        match resp.read_capped(max_bytes as u64) {
+            Ok(out) => return Ok(Some(out)),
+            Err(ReadError::TooLarge) => {
                 return Err(RpcError::runtime_error(format!(
                     "{label} object exceeds max_fetch_bytes ({max_bytes})"
-                )));
+                )))
             }
-            match resp.read_capped(max_bytes as u64) {
-                Ok(out) => return Ok(Some(out)),
-                Err(ReadError::TooLarge) => {
-                    return Err(RpcError::runtime_error(format!(
-                        "{label} object exceeds max_fetch_bytes ({max_bytes})"
-                    )))
-                }
-                Err(ReadError::Transfer(e)) => {
-                    last = format!("body {}", e.label());
-                    continue;
-                }
+            Err(ReadError::Transfer(e)) => {
+                last = format!("body {}", e.label());
+                continue;
             }
         }
-        Err(RpcError::runtime_error(format!(
-            "{label} GET failed after {} attempts ({last}) for {}",
-            self.retry.attempts(),
-            redact_url(url)
-        )))
     }
+    Err(RpcError::runtime_error(format!(
+        "{label} GET failed after {} attempts ({last}) for {}",
+        retry.attempts(),
+        redact_url(url)
+    )))
+}
+
+/// The `<Code>` of an S3 XML error body, if any.
+pub(crate) fn s3_error_code(body: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    let start = text.find("<Code>")? + "<Code>".len();
+    let end = text[start..].find("</Code>")? + start;
+    let code = text[start..end].trim();
+    (!code.is_empty() && code.len() <= 64 && code.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then(|| code.to_string())
 }
 
 fn sha256_hex_of(data: &[u8]) -> String {

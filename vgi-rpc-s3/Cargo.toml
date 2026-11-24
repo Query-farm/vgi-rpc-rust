@@ -12,15 +12,35 @@ readme = "README.md"
 keywords = ["vgi-rpc", "s3", "arrow", "storage"]
 categories = ["network-programming"]
 
+[features]
+default = []
+# Direct S3 backend (`vgi_rpc_s3::s3`): signs its own URLs with the AWS
+# credential chain. Off by default: it pulls in aws-config.
+aws = ["dep:aws-config", "dep:aws-smithy-http-client", "dep:aws-credential-types", "dep:aws-sigv4", "dep:aws-smithy-runtime-api", "dep:http"]
+
 [dependencies]
 vgi-rpc = { path = "../vgi-rpc", version = "0.33.0", default-features = false, features = ["http"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# Both root stores: the bundled webpki roots and the platform's (or
+# SSL_CERT_FILE / SSL_CERT_DIR), so a private-CA MinIO or Ceph endpoint works.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "rustls-tls-native-roots"] }
 uuid = { version = "1", features = ["v4"] }
 # Storage transfers (`transfer`): async reqwest on a small dedicated runtime,
 # so a transfer can have a stall timeout instead of a whole-request deadline.
 bytes.workspace = true
 http-body = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+# Direct S3 (`s3`, feature `aws`): SigV4 presigning and the standard AWS
+# credential chain (env, profile/assume-role/credential_process/SSO, web
+# identity, ECS/EKS Pod Identity, IMDSv2).
+# No `default-https-client`: that pulls rustls with aws-lc-rs, and two rustls
+# crypto providers in one build leave rustls unable to pick a default (other
+# workspace crates panic). The STS/SSO/IMDS/ECS client is built on ring below.
+aws-config = { version = "1.8", optional = true, default-features = false, features = ["rt-tokio", "credentials-process", "sso", "behavior-version-latest"] }
+aws-smithy-http-client = { version = "1.1", optional = true, default-features = false, features = ["rustls-ring"] }
+aws-credential-types = { version = "1.2", optional = true }
+aws-sigv4 = { version = "1.3", optional = true, default-features = false, features = ["sign-http", "http1"] }
+aws-smithy-runtime-api = { version = "1.8", optional = true, default-features = false }
+http = { version = "1", optional = true }
 # Blob-vendor client (`vendor`): JSON wire shapes, digests, expiry parsing.
 base64.workspace = true
 chrono.workspace = true

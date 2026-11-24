@@ -182,6 +182,28 @@ jobs:
           # The test skips (passes) without the vendor; make sure it ran.
           ! grep -q "skipping:" test.log
 
+  # Direct S3 (vgi_rpc_s3::s3, feature `aws`) against RustFS over plain http
+  # (path style) and TLS with a private CA (native roots via SSL_CERT_FILE),
+  # each with static keys and with an STS AssumeRole session token, plus a
+  # credential_process rotation test. The script fails if a storage test skips.
+  s3-lane:
+    name: Direct S3 (RustFS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: AWS CLI (STS calls in the lane)
+        run: |
+          command -v aws || {
+            curl -sSfL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o "$RUNNER_TEMP/awscli.zip"
+            unzip -q "$RUNNER_TEMP/awscli.zip" -d "$RUNNER_TEMP" && sudo "$RUNNER_TEMP/aws/install"
+          }
+          aws --version
+      - name: Run the direct-S3 lane
+        run: scripts/s3-lane.sh "$RUNNER_TEMP/s3-lane"
+
   fmt-clippy-test:
     runs-on: ubuntu-latest
     steps:

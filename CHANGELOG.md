@@ -4,6 +4,34 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## [Unreleased]
 
+### Added (protocol version negotiation, PROTOCOL_VERSIONS_V1)
+
+- **Server:** every HTTP response carries `VGI-Protocol-Versions:
+  name=MIN-MAX[, ...]` (every gated protocol; empty when none), including
+  401/404/413/5xx, `HEAD /health` and preflights (an outermost layer covers
+  the panic/body-limit/timeout responses too); CORS-exposed, and preflights
+  allow `VGI-Client-Protocol-Versions`. Reflection results,
+  `__transport_options__` replies and refusals carry the same string as
+  `vgi_rpc.protocol_versions` on every transport. The gate accepts any
+  `major.minor` inside the binding's window (exactly the declared version by
+  default, so 3.4 ↔ 3.4 is unchanged); `RpcServerBuilder::protocol_version_range`
+  overrides a protocol's window (fixtures). Refusals are
+  `protocol_version_unsupported` / `FAILED_PRECONDITION` naming both windows
+  and which side to upgrade, with `PreconditionFailure` + `ErrorInfo` details
+  (`RpcError::protocol_version_unsupported`); `protocol_version_mismatch` is
+  retired. `RpcServer::protocol_versions()`, `vgi_rpc::protocol_versions`.
+- **Client** (`vgi-rpc-client`): per-endpoint `negotiation::Negotiation`;
+  `protocol_version_range` on `HttpClientBuilder` and `RpcClient`; sends
+  `vgi_rpc.protocol_versions_client` / `VGI-Client-Protocol-Versions`; speaks
+  its newest version until a response advertises the server's window, then the
+  highest common `major.minor` with its own patch; a legacy refusal's
+  `Server: X.Y.Z` is spoken when no header is present; once no common version
+  is known, calls fail before sending; a wide-window pipe client probes
+  `list_protocols` first; a refused reflection call is retried once.
+- **Conformance:** `vgi-rpc-negotiating-client` (in the client-driver crate)
+  backs the `conformance_negotiating_client` hook; CI pins vgi-rpc-python's
+  protocol-3.4 suite until the release wave.
+
 ### Added (vgi-rpc-s3: direct S3 storage, direct-storage contract v1)
 
 - **`vgi_rpc_s3::s3::S3Storage`** (feature `aws`): the worker signs its own

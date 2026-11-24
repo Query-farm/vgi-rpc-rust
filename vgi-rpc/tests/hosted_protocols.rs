@@ -204,9 +204,11 @@ fn the_version_gate_is_per_binding() {
     );
     let md = error_md(&frames);
     assert_eq!(md[ERROR_CODE_KEY], "FAILED_PRECONDITION");
-    assert_eq!(md[ERROR_KIND_KEY], "protocol_version_mismatch");
+    assert_eq!(md[ERROR_KIND_KEY], "protocol_version_unsupported");
     assert!(md[ERROR_DETAILS_KEY].contains("\"subject\":\"Primary\""));
-    assert!(md[ERROR_DETAILS_KEY].contains("major and minor must match"));
+    assert!(md[ERROR_DETAILS_KEY].contains("server supports 2.0-2.0"));
+    // The windows ride the error batch and the ErrorInfo detail.
+    assert_eq!(md["vgi_rpc.protocol_versions"], "Primary=2.0-2.0");
 }
 
 /// Major **and minor** must match; patch is ignored; an absent or malformed
@@ -238,7 +240,7 @@ fn the_gate_compares_major_and_minor() {
     ] {
         assert_eq!(
             outcome(refused).as_deref(),
-            Some("protocol_version_mismatch"),
+            Some("protocol_version_unsupported"),
             "{refused:?}"
         );
     }

@@ -1,5 +1,6 @@
 """Run Python conformance tests against the Rust conformance worker."""
 import contextlib
+import json
 import os
 import socket
 import subprocess
@@ -1650,3 +1651,61 @@ def _assert_describe(desc) -> None:  # type: ignore[no-untyped-def]
         raise AssertionError(
             f"{suite.failed}/{suite.total} describe conformance tests failed:\n{details}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Client-side protocol version negotiation (PROTOCOL_VERSIONS_V1.md §6, §9)
+# ---------------------------------------------------------------------------
+
+
+class _NegotiationError(Exception):
+    """A ping the Rust client refused or the server rejected."""
+
+    def __init__(self, error_kind: str, message: str) -> None:
+        super().__init__(message)
+        self.error_kind = error_kind
+        self.error_message = message
+
+
+class _NegotiatingProxy:
+    def __init__(self, proc: subprocess.Popen[str]) -> None:
+        self._proc = proc
+
+    def ping(self) -> str:
+        assert self._proc.stdin is not None and self._proc.stdout is not None
+        self._proc.stdin.write("ping\n")
+        self._proc.stdin.flush()
+        line = self._proc.stdout.readline()
+        if not line:
+            raise RuntimeError("vgi-rpc-negotiating-client exited")
+        reply = json.loads(line)
+        if "ok" in reply:
+            return str(reply["ok"])
+        raise _NegotiationError(str(reply.get("error_kind", "")), str(reply.get("message", "")))
+
+
+@pytest.fixture
+def conformance_negotiating_client() -> Any:
+    """The Rust ``HttpClient`` under test (``vgi-rpc-negotiating-client`` helper binary)."""
+    binary = os.environ.get("VGI_NEGOTIATING_CLIENT") or str(
+        Path(__file__).parent / "target" / "debug" / "vgi-rpc-negotiating-client"
+    )
+    if not Path(binary).exists():
+        pytest.skip(f"vgi-rpc-negotiating-client not built ({binary}); cargo build -p vgi-rpc-conformance-client-driver")
+
+    @contextlib.contextmanager
+    def factory(base_url: str, protocol: str, version: str, version_range: str) -> Iterator[_NegotiatingProxy]:
+        proc = subprocess.Popen(
+            [binary, base_url, protocol, version, version_range],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            yield _NegotiatingProxy(proc)
+        finally:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            proc.wait(timeout=10)
+
+    return factory

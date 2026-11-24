@@ -157,76 +157,21 @@ pub(crate) fn parse_semver(value: &str) -> Option<(u64, u64, u64)> {
     Some(v)
 }
 
-/// Gate a request on the resolved binding's declared `protocol_version`
-/// (WIRE_PROTOCOL.md §13).
-///
-/// A binding that declares no version is not gated. When it declares one,
-/// the client MUST send its own, in canonical semver, and the **major and
-/// minor** must match exactly; patch is ignored. An absent, malformed or
-/// mismatched client version is `protocol_version_mismatch`, with a message
-/// naming both versions and which side to upgrade. Shared by the pipe/unix
-/// and HTTP dispatch paths so their behaviour cannot drift.
-///
-/// A server version that is not itself canonical semver (the builder accepts
-/// a free-form label) is compared on its first two dot-separated components.
-pub(crate) fn validate_protocol_version(
-    protocol: &str,
-    server_version: &str,
-    request_metadata: &Metadata,
-) -> Result<()> {
-    if server_version.is_empty() {
-        return Ok(());
+/// The version window a declared `protocol_version` implies: exactly its
+/// `major.minor`. A free-form label (the builder accepts one) is read on its
+/// first two dot-separated numeric components; `None` when it has none, and
+/// such a binding is not gated.
+fn declared_window(version: &str) -> Option<crate::protocol_versions::VersionRange> {
+    if let Some(w) = crate::protocol_versions::VersionRange::exactly(version) {
+        return Some(w);
     }
-    let mismatch = |client: &str, direction: &str| {
-        RpcError::protocol_version_mismatch(protocol, client, server_version, direction)
-    };
-    let Some(client_version) = md_get(request_metadata, PROTOCOL_VERSION_KEY) else {
-        return Err(mismatch(
-            "",
-            "the client did not send a vgi_rpc.protocol_version metadata key. This is \
-             either a framework bug or a client of another protocol connecting to this one.",
-        ));
-    };
-    let Some(client) = parse_semver(client_version) else {
-        return Err(mismatch(
-            client_version,
-            "client sent a malformed protocol_version. Expected canonical semver \
-             MAJOR.MINOR.PATCH.",
-        ));
-    };
-    let compatible = match parse_semver(server_version) {
-        Some(server) => {
-            if (client.0, client.1) == (server.0, server.1) {
-                true
-            } else {
-                let direction = if (client.0, client.1) < (server.0, server.1) {
-                    format!(
-                        "client is too old; upgrade the client to a version supporting \
-                         protocol_version {server_version}."
-                    )
-                } else {
-                    format!(
-                        "server is too old; upgrade the server to a version supporting \
-                         protocol_version {client_version}."
-                    )
-                };
-                return Err(mismatch(client_version, &direction));
-            }
-        }
-        None => {
-            let mut s = server_version.split('.');
-            let (major, minor) = (s.next().unwrap_or(""), s.next().unwrap_or(""));
-            client.0.to_string() == major && client.1.to_string() == minor
-        }
-    };
-    if compatible {
-        Ok(())
-    } else {
-        Err(mismatch(
-            client_version,
-            "the major and minor versions must match.",
-        ))
-    }
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some(crate::protocol_versions::VersionRange {
+        min: (major, minor),
+        max: (major, minor),
+    })
 }
 
 /// Context supplied to each handler invocation.
@@ -749,6 +694,7 @@ pub struct RpcServerBuilder {
     on_serve_start: Option<crate::transport::ServeStartHook>,
     extra_protocols: Vec<HostedProtocol>,
     omit_tracebacks: bool,
+    protocol_version_ranges: Vec<(String, String)>,
     #[cfg(feature = "crypto")]
     grant_keys: GrantKeysSetting,
     #[cfg(feature = "http")]
@@ -771,6 +717,33 @@ pub enum GrantKeysSetting {
 }
 
 impl RpcServerBuilder {
+    /// Override the `major.minor` window a hosted protocol accepts and
+    /// advertises (`PROTOCOL_VERSIONS_V1.md` §5), e.g.
+    /// `.protocol_version_range("vgi.v3", "3.3-3.4")`. Default: exactly the
+    /// protocol's declared `protocol_version`. Naming a protocol that is not
+    /// hosted, or that declares no version, or a malformed range, fails
+    /// [`try_build`](Self::try_build). How a fixture worker impersonates an
+    /// older (or newer) server.
+    pub fn protocol_version_range(
+        mut self,
+        protocol: impl Into<String>,
+        range: impl Into<String>,
+    ) -> Self {
+        self.protocol_version_ranges
+            .push((protocol.into(), range.into()));
+        self
+    }
+
+    /// [`protocol_version_range`](Self::protocol_version_range) for each
+    /// `(protocol, range)` pair.
+    pub fn protocol_version_ranges(
+        mut self,
+        ranges: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.protocol_version_ranges.extend(ranges);
+        self
+    }
+
     /// Sealed-grant configuration (WIRE_PROTOCOL.md §16, IDENTITY_V2_SPEC §9).
     ///
     /// Default [`GrantKeysSetting::Env`]: `VGI_RPC_GRANT_KEYS` (comma-separated
@@ -958,7 +931,46 @@ impl RpcServerBuilder {
         };
         #[cfg(not(feature = "crypto"))]
         let identity = self.identity;
+        // Version windows (PROTOCOL_VERSIONS_V1.md §5): every versioned
+        // application protocol, primary first, exactly its declared
+        // major.minor unless overridden.
+        let protocol_version = self.protocol_version.clone().unwrap_or_default();
+        let versioned: Vec<(String, String)> =
+            std::iter::once((protocol_name.clone(), protocol_version.clone()))
+                .chain(
+                    self.extra_protocols
+                        .iter()
+                        .map(|p| (p.name.clone(), p.version.clone())),
+                )
+                .filter(|(_, v)| !v.is_empty())
+                .collect();
+        let mut version_windows: Vec<(String, crate::protocol_versions::VersionRange)> = versioned
+            .iter()
+            .filter_map(|(n, v)| declared_window(v).map(|w| (n.clone(), w)))
+            .collect();
+        for (name, range) in &self.protocol_version_ranges {
+            let Some(slot) = version_windows.iter_mut().find(|(n, _)| n == name) else {
+                return Err(RpcError::value_error(format!(
+                    "protocol_version_range names {name:?}, which is not a hosted protocol that \
+                     declares a protocol_version. Versioned protocols here: {:?}",
+                    versioned
+                        .iter()
+                        .map(|(n, _)| n.as_str())
+                        .collect::<Vec<_>>()
+                )));
+            };
+            slot.1 = crate::protocol_versions::VersionRange::parse(range).ok_or_else(|| {
+                RpcError::value_error(format!(
+                    "protocol_version_range for {name:?} is not a MIN-MAX range of MAJOR.MINOR: {range:?}"
+                ))
+            })?;
+        }
+        let protocol_versions = crate::protocol_versions::format_versions(
+            version_windows.iter().map(|(n, w)| (n.as_str(), *w)),
+        );
         Ok(RpcServer {
+            version_windows,
+            protocol_versions,
             methods: HashMap::new(),
             server_id: self.server_id.unwrap_or_else(crate::util::short_random_id),
             server_version: self.server_version.unwrap_or_default(),
@@ -967,7 +979,7 @@ impl RpcServerBuilder {
             // make the server unreachable rather than permissive. "Service"
             // matches the other ports' default.
             protocol_name,
-            protocol_version: self.protocol_version.unwrap_or_default(),
+            protocol_version,
             protocol_hash: std::sync::OnceLock::new(),
             reflection_hash: std::sync::OnceLock::new(),
             // Built after everything else so the binding -- and therefore its
@@ -1330,6 +1342,10 @@ pub struct RpcServer {
     /// Additional application protocols, in registration order. Fixed at
     /// construction.
     pub(crate) extra_protocols: Vec<HostedProtocol>,
+    /// Each gated protocol's version window, in hosting order.
+    pub(crate) version_windows: Vec<(String, crate::protocol_versions::VersionRange)>,
+    /// The `VGI-Protocol-Versions` advertisement.
+    pub(crate) protocol_versions: String,
     /// [`RpcServerBuilder::include_tracebacks`]`(false)`.
     omit_tracebacks: bool,
     #[cfg(feature = "http")]
@@ -1458,6 +1474,120 @@ impl RpcServer {
 
     pub fn protocol_version(&self) -> &str {
         &self.protocol_version
+    }
+
+    /// The `VGI-Protocol-Versions` advertisement (`PROTOCOL_VERSIONS_V1.md`
+    /// §4.1): `name=MIN-MAX[, ...]` for every gated protocol, primary first.
+    /// Empty when nothing here is versioned (reflection is exempt and
+    /// unversioned protocols are not gated). Sent on every HTTP response and as
+    /// `vgi_rpc.protocol_versions` on reflection results,
+    /// `__transport_options__` replies and refusals.
+    pub fn protocol_versions(&self) -> &str {
+        &self.protocol_versions
+    }
+
+    /// The window a gated protocol accepts, if it is gated.
+    pub fn protocol_version_window(
+        &self,
+        protocol: &str,
+    ) -> Option<crate::protocol_versions::VersionRange> {
+        self.version_windows
+            .iter()
+            .find(|(n, _)| n == protocol)
+            .map(|(_, w)| *w)
+    }
+
+    /// Gate a request on its binding's version window
+    /// (`PROTOCOL_VERSIONS_V1.md` §4.3, §5). A binding that declares no
+    /// version is not gated. The request's `major.minor` must lie inside the
+    /// window (patch is informational); an absent, malformed or out-of-window
+    /// version is `protocol_version_unsupported`, naming both sides' windows
+    /// and which side to upgrade. The client's own windows
+    /// (`vgi_rpc.protocol_versions_client`) are quoted, never a reason to
+    /// refuse. Shared by the pipe/unix/tcp and HTTP dispatch paths.
+    pub(crate) fn check_protocol_version(
+        &self,
+        protocol: &str,
+        declared: &str,
+        request_metadata: &Metadata,
+    ) -> Result<()> {
+        if declared.is_empty() {
+            return Ok(());
+        }
+        let Some(window) = self.protocol_version_window(protocol) else {
+            return Ok(());
+        };
+        let client_ranges = md_get(
+            request_metadata,
+            crate::protocol_versions::CLIENT_PROTOCOL_VERSIONS_KEY,
+        )
+        .unwrap_or("");
+        if !client_ranges.is_empty() {
+            tracing::debug!(
+                protocol,
+                client_versions = client_ranges,
+                "client protocol versions"
+            );
+        }
+        let server_window = format!("this server supports {protocol} {window}");
+        let refuse = |client_version: &str, message: String| {
+            RpcError::protocol_version_unsupported(
+                protocol,
+                message,
+                client_version,
+                &window.to_string(),
+                &self.protocol_versions,
+                client_ranges,
+            )
+        };
+        let unsupported = crate::protocol_versions::PROTOCOL_VERSION_UNSUPPORTED;
+        let Some(client_version) = md_get(request_metadata, PROTOCOL_VERSION_KEY) else {
+            return Err(refuse(
+                "",
+                format!(
+                    "{unsupported}: the client did not send vgi_rpc.protocol_version for \
+                     {protocol}; {server_window}. This is either a vgi-rpc framework bug or a \
+                     non-VGI client connecting to a VGI worker."
+                ),
+            ));
+        };
+        let Some(client) = parse_semver(client_version) else {
+            return Err(refuse(
+                client_version,
+                format!(
+                    "{unsupported}: the client sent a malformed protocol_version {client_version:?} \
+                     for {protocol} (expected canonical semver MAJOR.MINOR.PATCH); {server_window}."
+                ),
+            ));
+        };
+        let mm = (client.0, client.1);
+        if window.contains(mm) {
+            return Ok(());
+        }
+        let client_mm = format!("{}.{}", client.0, client.1);
+        let supports = crate::protocol_versions::parse_versions(client_ranges)
+            .get(protocol)
+            .map(|r| format!(" (supports {r})"))
+            .unwrap_or_default();
+        let direction = if mm < window.min {
+            format!(
+                "The client is too old (this server is too new for it). Upgrade the client, or use \
+                 a worker that supports {protocol} {client_mm}."
+            )
+        } else {
+            format!(
+                "The server is too old (the client is too new for it). Upgrade the worker, or use \
+                 a client that supports {protocol} {}.{}.",
+                window.max.0, window.max.1
+            )
+        };
+        Err(refuse(
+            client_version,
+            format!(
+                "{unsupported}: client speaks {protocol} {client_mm}{supports}; {server_window}. \
+                 {direction}"
+            ),
+        ))
     }
 
     /// The application protocol's canonical hash. Computed lazily and cached.
@@ -1860,6 +1990,10 @@ impl RpcServer {
         // clients, since it is the negotiation they perform before `init`.
         if req.method == crate::transport_options::TRANSPORT_OPTIONS_METHOD_NAME {
             let mut md = crate::transport_options::worker_transport_metadata();
+            md.insert(
+                crate::protocol_versions::PROTOCOL_VERSIONS_KEY.to_string(),
+                self.protocol_versions.clone(),
+            );
             md.insert(REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string());
             md.insert(SERVER_ID_KEY.to_string(), self.server_id.clone());
             let schema = empty_schema();
@@ -1925,7 +2059,8 @@ impl RpcServer {
         // available for negotiation). A binding that declares no version --
         // the identity protocol, or an added protocol without one -- is not
         // gated, so a client of the primary's version can still reach it.
-        if let Err(err) = validate_protocol_version(binding.name, binding.version, &req.metadata) {
+        if let Err(err) = self.check_protocol_version(binding.name, binding.version, &req.metadata)
+        {
             write_error_stream(
                 w,
                 &empty_schema(),
@@ -2701,6 +2836,17 @@ impl<'a> EnvelopeMeta<'a> {
             extra.insert("traceback".into(), tb.into());
         }
 
+        // A version refusal names the server's windows on the batch itself
+        // too (PROTOCOL_VERSIONS_V1.md §4.3), beside the ErrorInfo detail.
+        if err.error_kind.as_deref() == Some(crate::protocol_versions::PROTOCOL_VERSION_UNSUPPORTED)
+        {
+            if let Some(v) = err.error_info().and_then(|m| {
+                m.get(crate::protocol_versions::PROTOCOL_VERSIONS_KEY)
+                    .cloned()
+            }) {
+                self.set(crate::protocol_versions::PROTOCOL_VERSIONS_KEY, v);
+            }
+        }
         self.set(LOG_LEVEL_KEY, "EXCEPTION".to_string());
         self.set(LOG_MESSAGE_KEY, err.message.clone());
         self.set(LOG_EXTRA_KEY, serde_json::Value::Object(extra).to_string());

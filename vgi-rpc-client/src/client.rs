@@ -20,6 +20,7 @@ use crate::introspect::{
 use crate::pointer::{resolve_with, ExternalHandle};
 use crate::request::{build_request_metadata, generate_request_id};
 use crate::transport::{RpcDeadline, Transport};
+use vgi_rpc::metadata::PROTOCOL_VERSION_KEY;
 
 struct DeadlineTurn(Option<RpcDeadline>);
 
@@ -128,6 +129,10 @@ pub struct RpcClient {
     /// registered first.
     protocol: Option<String>,
     protocol_version: Option<String>,
+    protocol_version_range: Option<String>,
+    /// Protocol version negotiation state for this connection (§6), built on
+    /// first use from the bound protocol, version and range.
+    negotiation: Option<crate::negotiation::Negotiation>,
     relax_nullability: bool,
     shm: ShmHandle,
     /// External-location resolver. `None` means a pointer batch is an error
@@ -143,6 +148,8 @@ impl RpcClient {
             on_log: None,
             protocol: None,
             protocol_version: None,
+            protocol_version_range: None,
+            negotiation: None,
             relax_nullability: false,
             shm: None,
             external: None,
@@ -297,7 +304,78 @@ impl RpcClient {
     /// Send `vgi_rpc.protocol_version` on every request.
     pub fn protocol_version(mut self, v: impl Into<String>) -> Self {
         self.protocol_version = Some(v.into());
+        self.negotiation = None;
         self
+    }
+
+    /// The window of the bound protocol this client supports (`MIN-MAX`),
+    /// default exactly [`protocol_version`](Self::protocol_version). With a
+    /// window wider than one version the client reads the server's windows
+    /// from reflection before its first call (`PROTOCOL_VERSIONS_V1.md` §6).
+    pub fn protocol_version_range(mut self, range: impl Into<String>) -> Self {
+        self.protocol_version_range = Some(range.into());
+        self.negotiation = None;
+        self
+    }
+
+    /// The negotiated version to send and the client-windows value, probing
+    /// reflection first when the window is wide and nothing is learned yet.
+    fn negotiated(&mut self, protocol: Option<&str>) -> Result<Option<(String, String)>> {
+        if self.negotiation.is_none() {
+            if let (Some(p), Some(v)) = (self.protocol.as_deref(), self.protocol_version.as_deref())
+            {
+                self.negotiation = crate::negotiation::Negotiation::new(
+                    p,
+                    v,
+                    self.protocol_version_range.as_deref(),
+                );
+            }
+        }
+        let bound = self.protocol.clone();
+        let wants_probe = self
+            .negotiation
+            .as_ref()
+            .is_some_and(|n| n.is_wide() && !n.learned())
+            && protocol.is_some_and(|p| Some(p) == bound.as_deref());
+        if wants_probe {
+            let empty = std::sync::Arc::new(arrow_schema::Schema::empty());
+            let params = RecordBatch::new_empty(empty);
+            // A server without reflection leaves the endpoint unlearned.
+            if let Ok((_, md)) = self.call_unary_on(
+                Some("vgi_rpc.Reflection.v1"),
+                "list_protocols",
+                &params,
+                None,
+            ) {
+                if let (Some(v), Some(n)) = (
+                    md.get(vgi_rpc::protocol_versions::PROTOCOL_VERSIONS_KEY)
+                        .cloned(),
+                    self.negotiation.as_mut(),
+                ) {
+                    n.learn_advertisement(&v);
+                }
+            }
+        }
+        match self.negotiation.as_ref() {
+            Some(n) => Ok(Some((n.version_to_send()?, n.client_versions()))),
+            None => Ok(None),
+        }
+    }
+
+    fn learn_refusal(&mut self, err: &RpcError) {
+        if let Some(n) = self.negotiation.as_mut() {
+            n.learn_refusal(err);
+        }
+    }
+
+    fn with_versions(md: &mut Metadata, negotiated: &Option<(String, String)>) {
+        if let Some((version, client)) = negotiated {
+            md.insert(PROTOCOL_VERSION_KEY.to_string(), version.clone());
+            md.insert(
+                vgi_rpc::protocol_versions::CLIENT_PROTOCOL_VERSIONS_KEY.to_string(),
+                client.clone(),
+            );
+        }
     }
 
     /// Resolve external-location pointer batches, validating storage URLs with
@@ -370,6 +448,26 @@ impl RpcClient {
         params: &RecordBatch,
         metadata: Option<&Metadata>,
     ) -> Result<(RecordBatch, Metadata)> {
+        let negotiated = if protocol == Some("vgi_rpc.Reflection.v1") {
+            None
+        } else {
+            self.negotiated(protocol)?
+        };
+        let outcome = self.call_unary_once(protocol, method, params, metadata, &negotiated);
+        if let Err(err) = &outcome {
+            self.learn_refusal(err);
+        }
+        outcome
+    }
+
+    fn call_unary_once(
+        &mut self,
+        protocol: Option<&str>,
+        method: &str,
+        params: &RecordBatch,
+        metadata: Option<&Metadata>,
+        negotiated: &Option<(String, String)>,
+    ) -> Result<(RecordBatch, Metadata)> {
         let _deadline = DeadlineTurn::start(self.transport.rpc_deadline())?;
         let req_id = generate_request_id();
         // Advertise the shm segment (when present) so the server may return
@@ -377,13 +475,14 @@ impl RpcClient {
         // the server resolves shm only for stream input and writes shm only for
         // output, so the client never writes request params to shm.
         let shm_md = shm_request_md(&self.shm, metadata);
-        let req_md = build_request_metadata(
+        let mut req_md = build_request_metadata(
             method,
             &req_id,
             protocol,
             self.protocol_version.as_deref(),
             shm_md.as_ref().or(metadata),
         );
+        Self::with_versions(&mut req_md, negotiated);
         let relax = self.relax_nullability;
         let on_log = &mut self.on_log;
         let shm = &self.shm;
@@ -469,17 +568,20 @@ impl RpcClient {
         has_header: bool,
         kind: StreamKind,
     ) -> Result<StreamSession<'_>> {
+        let bound = self.protocol.clone();
+        let negotiated = self.negotiated(bound.as_deref())?;
         let deadline = self.transport.rpc_deadline();
         let _deadline_turn = DeadlineTurn::start(deadline.clone())?;
         let req_id = generate_request_id();
         let shm_md = shm_request_md(&self.shm, metadata);
-        let req_md = build_request_metadata(
+        let mut req_md = build_request_metadata(
             method,
             &req_id,
             self.protocol.as_deref(),
             self.protocol_version.as_deref(),
             shm_md.as_ref().or(metadata),
         );
+        Self::with_versions(&mut req_md, &negotiated);
         let relax = self.relax_nullability;
         #[cfg(feature = "shm")]
         let shm = self.shm.clone();

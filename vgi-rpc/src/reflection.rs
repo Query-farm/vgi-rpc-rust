@@ -614,7 +614,14 @@ impl crate::server::RpcServer {
             vec![Arc::new(arrow_array::BinaryArray::from(vec![nested.as_slice()])) as ArrayRef],
         )
         .map_err(|e| RpcError::protocol_error(format!("building reflection result: {e}")))?;
-        let md = crate::server::build_envelope_metadata(&self.server_id, &req.request_id);
+        let mut md = crate::server::build_envelope_metadata(&self.server_id, &req.request_id);
+        // Reflection is exempt from the version gate, so its results are where
+        // a client of any version learns the server's windows, on every
+        // transport (PROTOCOL_VERSIONS_V1.md §4.1). Present even when empty.
+        md.insert(
+            crate::protocol_versions::PROTOCOL_VERSIONS_KEY.to_string(),
+            self.protocol_versions().to_string(),
+        );
         write_unary_response(w, &out, &md)?;
         Ok(true)
     }

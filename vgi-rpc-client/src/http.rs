@@ -794,6 +794,7 @@ pub struct HttpClientBuilder {
     /// The routing key stamped on every request.
     protocol: Option<String>,
     protocol_version: Option<String>,
+    protocol_version_range: Option<String>,
     #[cfg(feature = "reqwest")]
     inner: Option<ReqwestClient>,
     executor: Option<Arc<dyn HttpExecutor>>,
@@ -901,6 +902,15 @@ impl HttpClientBuilder {
 
     pub fn protocol_version(mut self, v: impl Into<String>) -> Self {
         self.protocol_version = Some(v.into());
+        self
+    }
+
+    /// The window of the bound protocol this client supports (`MIN-MAX` of
+    /// `MAJOR.MINOR`, ending at [`protocol_version`](Self::protocol_version)'s);
+    /// default exactly `protocol_version`. The client negotiates within it per
+    /// `PROTOCOL_VERSIONS_V1.md` §6.
+    pub fn protocol_version_range(mut self, range: impl Into<String>) -> Self {
+        self.protocol_version_range = Some(range.into());
         self
     }
 
@@ -1092,10 +1102,34 @@ impl HttpClientBuilder {
                 "cached capabilities must acknowledge response budgets",
             ));
         }
+        // Protocol version negotiation (PROTOCOL_VERSIONS_V1.md §6): per
+        // client (= endpoint), only when a semver version is bound.
+        let negotiation = match (self.protocol.as_deref(), self.protocol_version.as_deref()) {
+            (Some(p), Some(v)) => {
+                let n = crate::negotiation::Negotiation::new(
+                    p,
+                    v,
+                    self.protocol_version_range.as_deref(),
+                );
+                if n.is_none() && self.protocol_version_range.is_some() {
+                    return Err(RpcError::value_error(
+                        "protocol_version_range needs a semver protocol_version and a MIN-MAX range",
+                    ));
+                }
+                n
+            }
+            _ => None,
+        };
+        let mut headers = self.headers;
+        if let Some(n) = &negotiation {
+            if let Ok(v) = HeaderValue::from_str(&n.client_versions()) {
+                headers.insert(HeaderName::from_static("vgi-client-protocol-versions"), v);
+            }
+        }
         let client = HttpClient {
             base_url: self.base_url.trim_end_matches('/').to_string(),
             prefix: self.prefix,
-            headers: self.headers,
+            headers,
             backend,
             external_http,
             on_log: self.on_log,
@@ -1116,6 +1150,7 @@ impl HttpClientBuilder {
             send_compressed: RefCell::new(self.compression_level.is_some()),
             session: None,
             session_stack: Vec::new(),
+            negotiation: RefCell::new(negotiation),
         };
         if let Some(caps) = client.caps.borrow().as_ref() {
             client.apply_supported_encodings(&caps.supported_encodings);
@@ -1168,6 +1203,8 @@ pub struct HttpClient {
     /// Outer sessions suspended by a nested `begin_session` (restored on
     /// `end_session`), so concurrent sessions on one client don't clobber.
     session_stack: Vec<SessionState>,
+    /// Protocol version negotiation state for this endpoint (§6).
+    negotiation: RefCell<Option<crate::negotiation::Negotiation>>,
 }
 
 impl HttpClient {
@@ -1181,6 +1218,7 @@ impl HttpClient {
             relax_nullability: false,
             protocol: None,
             protocol_version: None,
+            protocol_version_range: None,
             #[cfg(feature = "reqwest")]
             inner: None,
             executor: None,
@@ -1321,6 +1359,7 @@ impl HttpClient {
         // Proactive externalization when caps are known and the body is large.
         let body = self.maybe_externalize_request(body)?;
         let (mut resp_headers, mut bytes, mut status) = self.send(path, &body, retryable)?;
+        self.learn_versions(&resp_headers);
         if self.first_response_request_limit.is_some() {
             // `send` checked the support marker and bounded the first body.
             // All capabilities come from this response, not guessed defaults.
@@ -1575,13 +1614,24 @@ impl HttpClient {
         extra: Option<&Metadata>,
     ) -> (String, Metadata) {
         let id = generate_request_id();
-        let md = build_request_metadata(
+        let negotiated = self
+            .negotiation
+            .borrow()
+            .as_ref()
+            .and_then(|n| n.version_to_send().ok());
+        let mut md = build_request_metadata(
             method,
             &id,
             protocol,
-            self.protocol_version.as_deref(),
+            negotiated.as_deref().or(self.protocol_version.as_deref()),
             extra,
         );
+        if let Some(n) = self.negotiation.borrow().as_ref() {
+            md.insert(
+                vgi_rpc::protocol_versions::CLIENT_PROTOCOL_VERSIONS_KEY.to_string(),
+                n.client_versions(),
+            );
+        }
         (id, md)
     }
 
@@ -1592,12 +1642,56 @@ impl HttpClient {
         params: &RecordBatch,
         metadata: Option<&Metadata>,
     ) -> Result<(RecordBatch, Metadata)> {
-        let (_id, md) = self.req_md(method, metadata);
-        let body = write_one_batch(params, Some(&md))?;
-        let resp = self.post(&self.route(method), body, true)?;
-        let relax = self.relax_nullability;
-        let external = self.external.clone();
-        read_unary(&resp, &mut self.on_log, relax, external.as_ref())
+        let retry_safe = self
+            .protocol
+            .as_deref()
+            .is_some_and(crate::negotiation::is_retry_safe);
+        let mut attempt = 0;
+        loop {
+            self.check_negotiated()?;
+            let (_id, md) = self.req_md(method, metadata);
+            let body = write_one_batch(params, Some(&md))?;
+            let outcome = self.post(&self.route(method), body, true).and_then(|resp| {
+                let relax = self.relax_nullability;
+                let external = self.external.clone();
+                read_unary(&resp, &mut self.on_log, relax, external.as_ref())
+            });
+            match outcome {
+                Err(err) if self.learn_refusal(&err) && retry_safe && attempt == 0 => {
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Fail before sending when the server's window is known to share no
+    /// version with this client's (§6).
+    fn check_negotiated(&self) -> Result<()> {
+        match self.negotiation.borrow().as_ref() {
+            Some(n) => n.version_to_send().map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
+    /// Learn from a version refusal; whether `err` was one.
+    fn learn_refusal(&self, err: &RpcError) -> bool {
+        self.negotiation
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|n| n.learn_refusal(err))
+    }
+
+    /// Learn the server's windows from a response's `VGI-Protocol-Versions`.
+    fn learn_versions(&self, headers: &HeaderMap) {
+        if let Some(v) = headers
+            .get("vgi-protocol-versions")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some(n) = self.negotiation.borrow_mut().as_mut() {
+                n.learn_advertisement(v);
+            }
+        }
     }
 
     /// What protocols this server hosts, via `vgi_rpc.Reflection.v1`, through

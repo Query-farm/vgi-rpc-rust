@@ -49,8 +49,8 @@ use std::collections::HashMap;
 
 use crate::metadata::{CALL_STATE_KEY, CANCEL_KEY, REQUEST_ID_KEY, STATE_KEY};
 use crate::server::{
-    build_error_metadata, build_log_metadata, cast_batch, validate_parameter_batch,
-    validate_protocol_version, CallContext, MethodType, Request, RpcServer,
+    build_error_metadata, build_log_metadata, cast_batch, validate_parameter_batch, CallContext,
+    MethodType, Request, RpcServer,
 };
 use crate::stream::{empty_schema, Emitted, OutputCollector, StreamResult, StreamStateKind};
 use crate::unauthorized::{AuthReason, AUTH_PROXY_REQUIRED_HEADER, AUTH_REASON_HEADER};
@@ -1153,6 +1153,7 @@ impl HttpStateBuilder {
                 sticky: sticky.as_deref(),
                 response_compression_level,
                 proxy_proof_required: self.proxy_proof_required.unwrap_or(false),
+                protocol_versions: server.protocol_versions(),
             });
         Arc::new(HttpState {
             extra_proxy_auth_headers: self.extra_proxy_auth_headers.clone(),
@@ -1219,6 +1220,7 @@ struct CapabilityInputs<'a> {
     sticky: Option<&'a crate::sticky::StickyContext>,
     response_compression_level: Option<i32>,
     proxy_proof_required: bool,
+    protocol_versions: &'a str,
 }
 
 /// Response headers a browser client must be able to read that are *not*
@@ -1266,9 +1268,19 @@ fn build_capability_headers(inputs: CapabilityInputs<'_>) -> (HeaderMap, bool, H
         sticky,
         response_compression_level,
         proxy_proof_required,
+        protocol_versions,
     } = inputs;
     let mut out = HeaderMap::new();
     let mut any = false;
+    // Protocol version negotiation (PROTOCOL_VERSIONS_V1.md §4.1): the window
+    // of every gated protocol, on every response -- 401, 404, 413, 5xx,
+    // `HEAD /health` and preflights included. Always present, even empty:
+    // present-but-empty is "negotiates, gates nothing", absent is a server
+    // released before negotiation. Like the other always-present flags it does
+    // not flip `any`. Exposed to browsers through the derived expose list.
+    if let Ok(v) = HeaderValue::from_str(protocol_versions) {
+        out.insert(HeaderName::from_static("vgi-protocol-versions"), v);
+    }
     // Compression codecs usable in both directions. Always emitted, even
     // empty: present-but-empty says "I speak no compression", while an
     // absent header means "legacy server, assume zstd". Like
@@ -2199,6 +2211,8 @@ fn response_buffer_ceiling(state: &HttpState, headers: &HeaderMap) -> usize {
 /// concurrent progress. Synchronous RPC callbacks use `block_in_place` there;
 /// on a current-thread runtime one callback necessarily delays other requests.
 pub fn build_router(state: Arc<HttpState>) -> Router {
+    let protocol_versions = HeaderValue::from_str(state.server.protocol_versions())
+        .unwrap_or_else(|_| HeaderValue::from_static(""));
     let body_limit = state.max_body_size;
     let request_timeout = state.request_timeout;
     let state_for_gate = state.clone();
@@ -2238,6 +2252,19 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
         // infallible `Vec` writers and server-controlled schemas, but
         // this is the defence-in-depth net for any that slip through.
         .layer(tower_http::catch_panic::CatchPanicLayer::new())
+        // Outermost: every response names the protocol windows
+        // (PROTOCOL_VERSIONS_V1.md §4.1), including the ones the layers above
+        // produce without passing through the capability stamping -- a caught
+        // panic's 500, a body-limit 413, a timeout's 408.
+        .layer(axum::middleware::map_response(move |mut resp: Response| {
+            let versions = protocol_versions.clone();
+            async move {
+                resp.headers_mut()
+                    .entry(HeaderName::from_static("vgi-protocol-versions"))
+                    .or_insert(versions);
+                resp
+            }
+        }))
 }
 
 /// Whether `headers` make an `OPTIONS` request a CORS preflight: a browser
@@ -2866,7 +2893,8 @@ fn attach_cors_headers(
                 HeaderValue::from_static(
                     "Content-Type, Authorization, Cookie, Accept-Encoding, \
                      X-VGI-Accept-Encoding, VGI-Session, VGI-Session-Accept, \
-                     VGI-Proxy-Proof, VGI-Accept-Max-Response-Bytes",
+                     VGI-Proxy-Proof, VGI-Accept-Max-Response-Bytes, \
+                     VGI-Client-Protocol-Versions",
                 ),
             );
         }
@@ -4148,7 +4176,7 @@ async fn unary_dispatch(
         Ok(binding) => binding,
         Err(err) => return route_error(&state, &err, &req.request_id),
     };
-    if let Err(err) = validate_protocol_version(binding.name, binding.version, &req.metadata) {
+    if let Err(err) = server.check_protocol_version(binding.name, binding.version, &req.metadata) {
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
 
@@ -4662,7 +4690,7 @@ async fn stream_init_dispatch(
         Ok(binding) => binding,
         Err(err) => return route_error(&state, &err, &req.request_id),
     };
-    if let Err(err) = validate_protocol_version(binding.name, binding.version, &req.metadata) {
+    if let Err(err) = server.check_protocol_version(binding.name, binding.version, &req.metadata) {
         return arrow_error(&state, StatusCode::BAD_REQUEST, &err, &req.request_id);
     }
 

@@ -90,6 +90,9 @@ pub const ERROR_KIND_PROTOCOL_NOT_SPECIFIED: &str = "protocol_not_specified";
 pub const ERROR_KIND_PROTOCOL_NOT_SUPPORTED: &str = "protocol_not_supported";
 /// `protocol_version_mismatch` -> `FAILED_PRECONDITION`.
 pub const ERROR_KIND_PROTOCOL_VERSION_MISMATCH: &str = "protocol_version_mismatch";
+/// `protocol_version_unsupported` -> `FAILED_PRECONDITION` (the refusal since
+/// `PROTOCOL_VERSIONS_V1.md`; clients still recognise the older kind above).
+pub const ERROR_KIND_PROTOCOL_VERSION_UNSUPPORTED: &str = "protocol_version_unsupported";
 /// `session_lost` -> `ABORTED`.
 pub const ERROR_KIND_SESSION_LOST: &str = "session_lost";
 /// `server_draining` -> `UNAVAILABLE` + `RetryInfo`.
@@ -255,6 +258,51 @@ impl RpcError {
                 ),
             }],
         }])
+    }
+
+    /// A request's version is absent, malformed or outside the server's window
+    /// (`PROTOCOL_VERSIONS_V1.md` §4.3). Kind `protocol_version_unsupported`,
+    /// code `FAILED_PRECONDITION`, a `PreconditionFailure` violation naming
+    /// `protocol`, and an `ErrorInfo` carrying the server's full advertisement
+    /// (`vgi_rpc.protocol_versions`) and the client's windows when it sent them.
+    pub fn protocol_version_unsupported(
+        protocol: &str,
+        message: String,
+        client_version: &str,
+        server_window: &str,
+        server_versions: &str,
+        client_versions: &str,
+    ) -> Self {
+        let client = if client_version.is_empty() {
+            "<none>"
+        } else {
+            client_version
+        };
+        let mut details = vec![ErrorDetail::PreconditionFailure {
+            violations: vec![crate::error_model::PreconditionViolation {
+                r#type: "protocol_version".into(),
+                subject: protocol.into(),
+                description: format!("client declares {client}, server supports {server_window}"),
+            }],
+        }];
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(
+            crate::protocol_versions::PROTOCOL_VERSIONS_KEY.to_string(),
+            server_versions.to_string(),
+        );
+        if !client_versions.is_empty() {
+            metadata.insert(
+                crate::protocol_versions::CLIENT_PROTOCOL_VERSIONS_KEY.to_string(),
+                client_versions.to_string(),
+            );
+        }
+        details.push(ErrorDetail::ErrorInfo { metadata });
+        Self::version_error(message)
+            .with_status(
+                Code::FailedPrecondition,
+                ERROR_KIND_PROTOCOL_VERSION_UNSUPPORTED,
+            )
+            .with_details(details)
     }
 
     // --- The error model (WIRE_PROTOCOL.md §8) --------------------------

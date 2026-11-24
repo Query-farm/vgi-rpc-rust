@@ -10,6 +10,12 @@ publish = false
 name = "vgi-rpc-conformance-client-driver"
 path = "src/main.rs"
 
+# The client under test for the conformance hook `conformance_negotiating_client`
+# (PROTOCOL_VERSIONS_V1.md §9): an HttpClient negotiating per §6.
+[[bin]]
+name = "vgi-rpc-negotiating-client"
+path = "src/negotiating_client.rs"
+
 [dependencies]
 vgi-rpc-client = { path = "../vgi-rpc-client", features = ["shm"] }
 vgi-rpc = { path = "../vgi-rpc", default-features = false }

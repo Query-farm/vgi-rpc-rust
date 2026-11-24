@@ -23,6 +23,7 @@
 pub mod client;
 pub mod envelope;
 pub mod introspect;
+pub mod negotiation;
 mod pointer;
 pub mod request;
 pub mod transport;

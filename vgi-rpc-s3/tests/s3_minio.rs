@@ -21,7 +21,20 @@ fn settings(extra: &[(&str, String)]) -> Option<S3Settings> {
     let mut map: HashMap<String, String> = HashMap::new();
     map.insert("VGI_STORAGE_S3_ENDPOINT".into(), endpoint);
     map.insert("VGI_STORAGE_S3_BUCKET".into(), env("VGI_TEST_S3_BUCKET")?);
-    map.insert("VGI_STORAGE_S3_PREFIX".into(), "vgi-rust-test/".into());
+    map.insert(
+        "VGI_STORAGE_S3_PREFIX".into(),
+        format!(
+            "{}vgi-rust-test/",
+            env("VGI_TEST_S3_PREFIX").unwrap_or_default()
+        ),
+    );
+    map.insert("VGI_STORAGE_ALLOW_PLAIN_HTTP".into(), "1".into());
+    if let Some(r) = env("VGI_TEST_S3_REGION") {
+        map.insert("VGI_STORAGE_S3_REGION".into(), r);
+    }
+    if let Some(e) = env("VGI_TEST_S3_SESSION_EXPIRES") {
+        map.insert("VGI_STORAGE_S3_SESSION_EXPIRES".into(), e);
+    }
     map.insert(
         "VGI_STORAGE_S3_ACCESS_KEY_ID".into(),
         env("VGI_TEST_S3_ACCESS_KEY_ID")?,
@@ -61,9 +74,12 @@ fn object_store_round_trip_and_missing() {
     s.verify().unwrap();
     let data = b"state ref object \x00\x01".repeat(1000);
     let id = s.put_object(&data).unwrap();
-    assert!(id.starts_with("vgi-rust-test/obj/"), "{id}");
+    let prefix = s.settings().prefix.clone();
+    assert!(id.starts_with(&format!("{prefix}rpc/")), "{id}");
     assert_eq!(s.get(&id, 1 << 20).unwrap(), data);
-    let err = s.get("vgi-rust-test/obj/nope.bin", 1 << 20).unwrap_err();
+    let err = s
+        .get(&format!("{prefix}rpc/nope.bin"), 1 << 20)
+        .unwrap_err();
     assert!(vgi_rpc::external::is_object_missing(&err), "{err:?}");
     assert!(s.get(&id, 10).is_err(), "cap must hold");
 }
@@ -108,9 +124,11 @@ fn upload_grant_is_bound_to_size_and_digest() {
     };
     let mut flipped = body.clone();
     flipped[3] ^= 1;
-    // Storage refuses each (R2 and MinIO differ on 400 vs 403).
+    // A body with another digest is a checksum failure (400): the checksum is
+    // a signed header, not an unsigned query parameter the store would ignore.
+    assert_eq!(put(&flipped, true), 400, "flipped byte");
+    // Storage refuses the rest (stores differ on 400 vs 403).
     for (what, status) in [
-        ("flipped byte", put(&flipped, true)),
         ("short body", put(&body[1..], true)),
         ("checksum header dropped", put(&body, false)),
     ] {
@@ -144,19 +162,67 @@ fn bucket_check_names_the_problem() {
         "vgi-no-such-bucket-4c1e".to_string()
     )]);
     let err = missing.verify().unwrap_err();
-    assert!(err.message.contains("does not exist"), "{}", err.message);
+    // A bucket-scoped credential (R2 tokens) gets 403 for any other bucket.
+    assert!(
+        err.message.contains("does not exist") || err.message.contains("access denied"),
+        "{}",
+        err.message
+    );
     assert!(missing.put_object(b"x").is_err());
     let denied = storage_or_skip!(&[
-        ("VGI_STORAGE_S3_ACCESS_KEY_ID", "AKIDWRONGWRONG".to_string()),
+        (
+            "VGI_STORAGE_S3_ACCESS_KEY_ID",
+            "0123456789abcdef0123456789abcdef".to_string()
+        ),
         (
             "VGI_STORAGE_S3_SECRET_ACCESS_KEY",
-            "wrongwrongwrong".to_string()
+            "wrongwrongwrongwrongwrongwrongwrongwrongwrongwrongwrongwrongwron".to_string()
         ),
         ("VGI_STORAGE_S3_SESSION_TOKEN", String::new()),
     ]);
     let err = denied.verify().unwrap_err();
-    assert!(err.message.contains("access denied"), "{}", err.message);
+    // RustFS/MinIO answer 403; R2 answers 400 for an unknown access key.
+    assert!(
+        err.message.contains("access denied") || err.message.contains("was refused"),
+        "{}",
+        err.message
+    );
     assert!(!err.message.contains("wrongwrongwrong"));
+}
+
+#[test]
+fn function_storage_deletes_are_best_effort() {
+    let s = storage_or_skip!(&[]);
+    let scope = s.fs_key(&format!("scope-{}/", uuid_like()));
+    for name in ["a", "b", "c"] {
+        s.put_key(
+            &format!("{scope}{name}"),
+            name.as_bytes(),
+            "application/octet-stream",
+            None,
+        )
+        .unwrap();
+    }
+    s.delete_key(&format!("{scope}a"));
+    assert!(s.get_key(&format!("{scope}a"), 10).unwrap().is_none());
+    s.delete_key(&format!("{scope}missing")); // no error
+    s.delete_prefix(&scope);
+    // VGI_TEST_S3_NO_LIST: a credential without ListBucket (an R2 object
+    // token) cannot delete by prefix; best effort means no error either way.
+    if env("VGI_TEST_S3_NO_LIST").is_none() {
+        assert!(s.get_key(&format!("{scope}b"), 10).unwrap().is_none());
+        assert!(s.get_key(&format!("{scope}c"), 10).unwrap().is_none());
+    }
+}
+
+fn uuid_like() -> String {
+    format!(
+        "{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }
 
 #[test]
@@ -167,6 +233,10 @@ fn public_endpoint_is_used_only_for_handed_out_urls() {
         eprintln!("skipping: VGI_TEST_S3_ENDPOINT is not set");
         return;
     };
+    if !endpoint.contains("127.0.0.1") {
+        eprintln!("public-endpoint check needs a loopback endpoint; not applicable");
+        return;
+    }
     let public = endpoint.replace("127.0.0.1", "localhost");
     let s = storage_or_skip!(&[("VGI_STORAGE_S3_PUBLIC_ENDPOINT", public.clone())]);
     let r = s.upload(b"public", Compression::None).unwrap();

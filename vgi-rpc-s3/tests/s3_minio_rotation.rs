@@ -53,6 +53,7 @@ fn objects_survive_credential_rotation() {
         ("VGI_STORAGE_S3_ENDPOINT", endpoint),
         ("VGI_STORAGE_S3_BUCKET", bucket),
         ("VGI_STORAGE_S3_PREFIX", "vgi-rust-rotation/".to_string()),
+        ("VGI_STORAGE_ALLOW_PLAIN_HTTP", "1".to_string()),
     ]);
     let settings = S3Settings::from_lookup(&|k| map.get(k).cloned()).unwrap();
     assert!(settings.explicit_credentials.is_none());

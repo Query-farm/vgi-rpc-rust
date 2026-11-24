@@ -41,11 +41,24 @@
 //!
 //! # Keys and lifecycle
 //!
-//! Results and client uploads go under `<prefix>rpc/`, `StateRef` / argument
-//! objects under `<prefix>obj/`, function-storage blobs under `<prefix>fs/`.
-//! The worker never deletes: add a lifecycle rule expiring `rpc/` and `obj/`
-//! after 1–2 days (function-storage values under `fs/` live as long as the
-//! values that point at them).
+//! Results, client uploads (upload grants), `StateRef` and argument objects
+//! go under `<prefix>rpc/`, function-storage blobs under
+//! `<prefix>fs/<scope>/`. Add lifecycle rules expiring `rpc/` after 1 day and
+//! `fs/` after 2 days, as the vendor does. Only function storage deletes (best
+//! effort, [`S3Storage::delete_key`] / [`S3Storage::delete_prefix`]).
+//!
+//! # Endpoints
+//!
+//! `http://` endpoints (and public endpoints) are refused unless
+//! `VGI_STORAGE_ALLOW_PLAIN_HTTP=1` (the extension needs its own
+//! `vgi_storage_allow_plain_http`). With `VGI_STORAGE_S3_PUBLIC_ENDPOINT`, the
+//! worker must be able to reach the public endpoint too: request-upload
+//! pointers are fetched by URL. Argument references and `StateRef`s go by
+//! object id and use the endpoint.
+//!
+//! An explicit `VGI_STORAGE_S3_SESSION_TOKEN` has no known expiry: set
+//! `VGI_STORAGE_S3_SESSION_EXPIRES` (RFC 3339 or epoch seconds) so URL
+//! lifetimes are capped, or use `credential_process` / the standard chain.
 //!
 //! # Checksums
 //!
@@ -95,6 +108,10 @@ pub const ENV_ACCESS_KEY_ID: &str = "VGI_STORAGE_S3_ACCESS_KEY_ID";
 pub const ENV_SECRET_ACCESS_KEY: &str = "VGI_STORAGE_S3_SECRET_ACCESS_KEY";
 /// Explicit session token.
 pub const ENV_SESSION_TOKEN: &str = "VGI_STORAGE_S3_SESSION_TOKEN";
+/// Expiry of the explicit session credentials (RFC 3339 or epoch seconds).
+pub const ENV_SESSION_EXPIRES: &str = "VGI_STORAGE_S3_SESSION_EXPIRES";
+/// `1` allows `http://` endpoints.
+pub const ENV_ALLOW_PLAIN_HTTP: &str = "VGI_STORAGE_ALLOW_PLAIN_HTTP";
 
 /// Default presigned URL lifetime.
 pub const DEFAULT_URL_TTL: Duration = Duration::from_secs(3600);
@@ -231,6 +248,18 @@ impl S3Settings {
         })?;
         let endpoint = parse_endpoint(lookup, ENV_ENDPOINT)?;
         let public_endpoint = parse_endpoint(lookup, ENV_PUBLIC_ENDPOINT)?;
+        let allow_http = parse_bool(lookup, ENV_ALLOW_PLAIN_HTTP)?.unwrap_or(false);
+        for (name, url) in [
+            (ENV_ENDPOINT, &endpoint),
+            (ENV_PUBLIC_ENDPOINT, &public_endpoint),
+        ] {
+            if url.as_ref().is_some_and(|u| u.scheme() == "http") && !allow_http {
+                return Err(RpcError::value_error(format!(
+                    "{name} is plain http; set {ENV_ALLOW_PLAIN_HTTP}=1 to allow it (test and \
+                     private networks only)"
+                )));
+            }
+        }
         let region = trimmed(lookup, ENV_REGION)
             .or_else(|| trimmed(lookup, "AWS_REGION"))
             .or_else(|| trimmed(lookup, "AWS_DEFAULT_REGION"))
@@ -263,14 +292,26 @@ impl S3Settings {
         let verify_at_startup = parse_bool(lookup, ENV_VERIFY)?.unwrap_or(false);
         let key = trimmed(lookup, ENV_ACCESS_KEY_ID);
         let secret = trimmed(lookup, ENV_SECRET_ACCESS_KEY);
+        let token = trimmed(lookup, ENV_SESSION_TOKEN);
+        let expires = match trimmed(lookup, ENV_SESSION_EXPIRES) {
+            None => None,
+            Some(raw) => Some(parse_expiry(&raw).ok_or_else(|| {
+                RpcError::value_error(format!(
+                    "{ENV_SESSION_EXPIRES} must be an RFC 3339 timestamp or epoch seconds, got {raw:?}"
+                ))
+            })?),
+        };
         let explicit_credentials = match (key, secret) {
-            (Some(k), Some(s)) => Some(Credentials::new(
-                k,
-                s,
-                trimmed(lookup, ENV_SESSION_TOKEN),
-                None,
-                "VGI_STORAGE_S3",
-            )),
+            (Some(k), Some(s)) => {
+                if token.is_some() && expires.is_none() {
+                    tracing::warn!(
+                        "{ENV_SESSION_TOKEN} is set without {ENV_SESSION_EXPIRES}: presigned URL \
+                         lifetimes cannot be capped at the credentials' expiry; set it, or use \
+                         credential_process or the standard AWS chain"
+                    );
+                }
+                Some(Credentials::new(k, s, token, expires, "VGI_STORAGE_S3"))
+            }
             (None, None) => {
                 if trimmed(lookup, ENV_SESSION_TOKEN).is_some() {
                     return Err(RpcError::value_error(format!(
@@ -307,6 +348,16 @@ impl S3Settings {
         }
         Ok(s)
     }
+}
+
+/// An RFC 3339 timestamp or integer epoch seconds.
+fn parse_expiry(raw: &str) -> Option<SystemTime> {
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+    }
+    let t = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+    let secs = u64::try_from(t.timestamp()).ok()?;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
 }
 
 fn is_dns_bucket(b: &str) -> bool {
@@ -693,8 +744,12 @@ impl S3Storage {
                 reported.unwrap_or_default()
             ),
             404 => format!("s3: bucket {bucket:?} does not exist (HTTP 404); check {ENV_BUCKET}"),
-            403 => format!(
-                "s3: access denied to bucket {bucket:?} (HTTP 403); check the credentials and \
+            400 => format!(
+                "s3: bucket check for {bucket:?} was refused (HTTP 400); check the credentials, \
+                 {ENV_REGION} and {ENV_ENDPOINT}"
+            ),
+            401 | 403 => format!(
+                "s3: access denied to bucket {bucket:?} (HTTP {status}); check the credentials and \
                  that they allow s3:ListBucket, s3:GetObject and s3:PutObject on it"
             ),
             other => format!("s3: bucket check for {bucket:?} failed: HTTP {other}"),
@@ -758,11 +813,92 @@ impl S3Storage {
         signed_get(&self.client, &self.retry, "s3", &signed, max_bytes)
     }
 
-    /// The full key of a function-storage blob named `name`
-    /// (`<prefix>fs/<name>`).
+    /// The full key of a function-storage path (`<prefix>fs/<name>`).
     pub fn fs_key(&self, name: &str) -> String {
         format!("{}fs/{name}", self.settings.prefix)
     }
+
+    /// Delete `key`, best effort: one attempt, failures ignored (a missing
+    /// object is not an error). Lifecycle rules are the backstop.
+    pub fn delete_key(&self, key: &str) {
+        let Ok((creds, ttl)) = self.signing_credentials(OWN_MIN) else {
+            return;
+        };
+        let url = self.object_url(Audience::Worker, key);
+        if let Ok(signed) = self.presign(&creds, "DELETE", &url, &[], ttl.min(OWN_MIN * 15)) {
+            if let Ok(resp) = self
+                .client
+                .send(reqwest::Method::DELETE, &signed, &[], None)
+            {
+                let _ = resp.read_capped(64 * 1024);
+            }
+        }
+    }
+
+    /// Delete every object under `prefix` (a full key prefix), best effort:
+    /// ListObjectsV2 pages and one DELETE per key, failures ignored.
+    pub fn delete_prefix(&self, prefix: &str) {
+        let mut token: Option<String> = None;
+        for _ in 0..100 {
+            let Ok((creds, ttl)) = self.signing_credentials(OWN_MIN) else {
+                return;
+            };
+            let mut url = self.object_url(Audience::Worker, "");
+            {
+                let mut q = url.query_pairs_mut();
+                q.append_pair("list-type", "2");
+                q.append_pair("prefix", prefix);
+                if let Some(t) = &token {
+                    q.append_pair("continuation-token", t);
+                }
+            }
+            let Ok(signed) = self.presign(&creds, "GET", &url, &[], ttl.min(OWN_MIN * 15)) else {
+                return;
+            };
+            let Ok(Some(body)) = signed_get(
+                &self.client,
+                &RetryPolicy::default(),
+                "s3",
+                &signed,
+                8 << 20,
+            ) else {
+                return;
+            };
+            let text = String::from_utf8_lossy(&body);
+            for key in xml_values(&text, "Key") {
+                if key.starts_with(prefix) {
+                    self.delete_key(&key);
+                }
+            }
+            token = xml_values(&text, "NextContinuationToken")
+                .into_iter()
+                .next();
+            if token.is_none() {
+                return;
+            }
+        }
+    }
+}
+
+/// The text of every `<tag>...</tag>` in `xml`, entity-decoded.
+fn xml_values(xml: &str, tag: &str) -> Vec<String> {
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find(&open) {
+        rest = &rest[i + open.len()..];
+        let Some(j) = rest.find(&close) else { break };
+        out.push(
+            rest[..j]
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&apos;", "'")
+                .replace("&amp;", "&"),
+        );
+        rest = &rest[j + close.len()..];
+    }
+    out
 }
 
 fn sha256_b64(data: &[u8]) -> String {
@@ -851,7 +987,7 @@ impl UploadUrlProvider for S3Storage {
 /// Objects are re-signed on every fetch, so they survive credential rotation.
 impl ObjectStore for S3Storage {
     fn put_object(&self, data: &[u8]) -> Result<String> {
-        let key = self.new_key("obj", ".bin");
+        let key = self.new_key("rpc", ".bin");
         self.put_key(&key, data, "application/octet-stream", None)?;
         Ok(key)
     }
@@ -884,6 +1020,7 @@ mod tests {
         let mut all = vec![
             (ENV_ACCESS_KEY_ID, "AKIDEXAMPLE"),
             (ENV_SECRET_ACCESS_KEY, "secretsecret"),
+            (ENV_ALLOW_PLAIN_HTTP, "1"),
         ];
         all.extend_from_slice(pairs);
         S3Storage::new(S3Settings::from_lookup(&lookup(&all)).unwrap())
@@ -899,6 +1036,7 @@ mod tests {
         let s = S3Settings::from_lookup(&lookup(&[
             (ENV_BUCKET, "bkt1"),
             (ENV_ENDPOINT, "http://minio:9000"),
+            (ENV_ALLOW_PLAIN_HTTP, "1"),
             ("AWS_DEFAULT_REGION", "eu-west-1"),
         ]))
         .unwrap();
@@ -925,6 +1063,13 @@ mod tests {
             vec![(ENV_BUCKET, "bkt1"), (ENV_SESSION_TOKEN, "t")],
             vec![(ENV_BUCKET, "Bad_Bucket")],
             vec![(ENV_BUCKET, "bkt1"), (ENV_FORCE_PATH_STYLE, "maybe")],
+            // Plain http needs the opt-in, for the endpoint and the public endpoint.
+            vec![(ENV_BUCKET, "bkt1"), (ENV_ENDPOINT, "http://minio:9000")],
+            vec![
+                (ENV_BUCKET, "bkt1"),
+                (ENV_PUBLIC_ENDPOINT, "http://s3.example.com"),
+            ],
+            vec![(ENV_BUCKET, "bkt1"), (ENV_SESSION_EXPIRES, "tomorrow")],
         ] {
             assert!(S3Settings::from_lookup(&lookup(&bad)).is_err(), "{bad:?}");
         }
@@ -939,6 +1084,40 @@ mod tests {
             .unwrap()
         );
         assert!(!debug.contains("SUPERSECRET") && !debug.contains("TOKENSECRET"));
+    }
+
+    #[test]
+    fn explicit_session_expiry_caps_url_lifetime() {
+        let in_20_min = SystemTime::now() + Duration::from_secs(1200);
+        let epoch = in_20_min
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        let rfc3339 = chrono::DateTime::<chrono::Utc>::from(in_20_min).to_rfc3339();
+        for expires in [epoch, rfc3339] {
+            let s = storage(&[
+                (ENV_BUCKET, "bkt1"),
+                (ENV_SESSION_TOKEN, "tok"),
+                (ENV_SESSION_EXPIRES, expires.as_str()),
+            ]);
+            let (_, ttl) = s.signing_credentials(OWN_MIN).unwrap();
+            assert!(
+                ttl <= Duration::from_secs(1140) && ttl > Duration::from_secs(1130),
+                "{ttl:?}"
+            );
+        }
+        // Without an expiry the configured TTL applies (and a warning is logged).
+        let s = storage(&[(ENV_BUCKET, "bkt1"), (ENV_SESSION_TOKEN, "tok")]);
+        assert_eq!(s.signing_credentials(OWN_MIN).unwrap().1, DEFAULT_URL_TTL);
+    }
+
+    #[test]
+    fn xml_listing_values() {
+        let xml = "<ListBucketResult><Contents><Key>p/fs/a&amp;b</Key></Contents>\
+                   <Contents><Key>p/fs/c</Key></Contents><NextContinuationToken>t+1</NextContinuationToken></ListBucketResult>";
+        assert_eq!(xml_values(xml, "Key"), vec!["p/fs/a&b", "p/fs/c"]);
+        assert_eq!(xml_values(xml, "NextContinuationToken"), vec!["t+1"]);
     }
 
     #[test]

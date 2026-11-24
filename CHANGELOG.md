@@ -22,8 +22,11 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
   needed for a grant). `VGI_STORAGE_S3_CHECKSUM=none` stores without a
   checksum header and issues no upload grants. A bucket HEAD on first use (or
   at startup with `VERIFY=1`) names a missing bucket, denied access or the
-  wrong region. Keys: `<prefix>rpc/`, `<prefix>obj/`, `<prefix>fs/`; the
-  worker never deletes (add a lifecycle rule).
+  wrong region. Keys: `<prefix>rpc/` (results, grants, objects), `<prefix>fs/`;
+  only function storage deletes, best effort (add lifecycle rules: 1 day on
+  `rpc/`, 2 days on `fs/`). `VGI_STORAGE_S3_SESSION_EXPIRES` caps URL
+  lifetimes for an explicit session token; `VGI_STORAGE_ALLOW_PLAIN_HTTP=1` is
+  required for an `http://` endpoint.
 - **`vgi_rpc_s3::backend`**: `VGI_STORAGE_BACKEND` = `vendor` | `s3` | `gcs` |
   `none` selection (or inferred from `VGI_BLOB_VENDOR_URL` /
   `VGI_STORAGE_S3_BUCKET` / `VGI_STORAGE_GCS_BUCKET`, a conflict refused) and

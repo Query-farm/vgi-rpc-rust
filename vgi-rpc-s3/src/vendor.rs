@@ -31,6 +31,7 @@
 //! | `VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES` | Result-batch size at which the server externalizes (default 1 MiB). |
 //! | `VGI_RPC_EXTERNAL_COMPRESSION` | `none` (default) or `zstd`, optionally `zstd:<level>`. |
 //! | `VGI_RPC_MAX_UPLOAD_BYTES` | Size advertised to clients for vendor upload URLs. |
+//! | `VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS` | Seconds a signed PUT/GET may move no bytes before it fails and is retried (default 30). See [`crate::transfer`]. |
 //!
 //! # Credentials
 //!
@@ -41,7 +42,6 @@
 //! output: URLs are redacted to scheme, host, port and path.
 
 use std::fmt;
-use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -56,6 +56,10 @@ use vgi_rpc::external::{
 use vgi_rpc::{Result, RpcError};
 
 use crate::redact_url;
+use crate::transfer::{
+    rand_unit, ReadError, RetryPolicy, StorageClient, StorageResponse, TransferError,
+    TransferTimeouts,
+};
 
 /// Vendor base URL.
 pub const ENV_URL: &str = "VGI_BLOB_VENDOR_URL";
@@ -73,6 +77,10 @@ pub const ENV_MAX_UPLOAD_BYTES: &str = "VGI_RPC_MAX_UPLOAD_BYTES";
 pub const ENV_MAX_FETCH_BYTES: &str = "VGI_RPC_MAX_FETCH_BYTES";
 
 const DEFAULT_THRESHOLD: usize = 1_048_576;
+/// Total timeout of one vendor API call (`/v1/info`, `/v1/blobs/put`, ...).
+/// Storage transfers (the signed PUT and GET) have no total deadline: they use
+/// [`TransferTimeouts`] (connect 30 s, stall 30 s or
+/// `VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS`).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_INFO_TTL: Duration = Duration::from_secs(600);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
@@ -617,6 +625,7 @@ struct Reply {
 }
 
 /// HTTP transport, retries, and the vendor's request/response shapes.
+#[derive(Clone)]
 struct VendorApi {
     base_url: String,
     token: String,
@@ -626,8 +635,9 @@ struct VendorApi {
     /// Vendor API requests.
     client: reqwest::blocking::Client,
     /// Storage-host (signed URL) requests: a separate bare client, so nothing
-    /// configured for the vendor ever reaches a storage host.
-    storage: reqwest::blocking::Client,
+    /// configured for the vendor ever reaches a storage host. Connect + stall
+    /// timeouts, no total deadline.
+    storage: StorageClient,
 }
 
 impl fmt::Debug for VendorApi {
@@ -641,8 +651,10 @@ impl fmt::Debug for VendorApi {
 
 fn bare_client(timeout: Duration) -> reqwest::blocking::Client {
     // No redirects: a redirect could carry the bearer token or a signed URL to
-    // a host nobody vetted.
+    // a host nobody vetted. A total timeout is fine here: vendor API calls are
+    // small JSON exchanges, never object bodies.
     reqwest::blocking::Client::builder()
+        .connect_timeout(timeout.min(crate::transfer::DEFAULT_CONNECT_TIMEOUT))
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -650,7 +662,7 @@ fn bare_client(timeout: Duration) -> reqwest::blocking::Client {
 }
 
 impl VendorApi {
-    fn new(url: &str, token: &str, timeout: Duration) -> Result<Self> {
+    fn new(url: &str, token: &str, timeout: Duration, transfer: TransferTimeouts) -> Result<Self> {
         let parsed = url::Url::parse(url).map_err(|_| {
             RpcError::value_error(format!(
                 "Blob vendor URL must be an absolute https URL: {}",
@@ -682,8 +694,92 @@ impl VendorApi {
             max_attempts: 3,
             backoff: Duration::from_millis(250),
             client: bare_client(timeout),
-            storage: bare_client(timeout),
+            storage: StorageClient::new(transfer),
         })
+    }
+
+    fn retry(&self) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: self.max_attempts,
+            backoff: self.backoff,
+        }
+    }
+
+    /// Send one storage (signed URL) request, retrying connect errors,
+    /// stalls, resets, 429 and 5xx. The request carries exactly `headers`
+    /// (plus the transport's own framing headers). A transfer that keeps
+    /// moving bytes is never cut off, however long it takes.
+    fn send_storage(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        op: &str,
+        headers: &[(String, String)],
+        body: Option<&[u8]>,
+    ) -> VResult<Reply> {
+        let retry = self.retry();
+        let body = body.map(bytes::Bytes::copy_from_slice);
+        let mut last_error = String::new();
+        let mut status = None;
+        for attempt in 0..retry.attempts() {
+            retry.pause(attempt);
+            let resp = match self
+                .storage
+                .send(method.clone(), url, headers, body.clone())
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    status = None;
+                    last_error = e.label().to_string();
+                    tracing::debug!(
+                        "Blob vendor {op} {last_error} (attempt {}/{}): {}",
+                        attempt + 1,
+                        retry.attempts(),
+                        redact_url(url)
+                    );
+                    continue;
+                }
+            };
+            let code = resp.status().as_u16();
+            if code == 429 || code >= 500 {
+                status = Some(code);
+                last_error = format!("HTTP {code}");
+                tracing::debug!(
+                    "Blob vendor {op} got HTTP {code} (attempt {}/{}): {}",
+                    attempt + 1,
+                    retry.attempts(),
+                    redact_url(url)
+                );
+                continue;
+            }
+            match resp.read_capped(64 * 1024 * 1024) {
+                Ok(body) => return Ok(Reply { status: code, body }),
+                Err(ReadError::Transfer(e)) => {
+                    status = Some(code);
+                    last_error = format!("response body {}", e.label());
+                    continue;
+                }
+                Err(ReadError::TooLarge) => {
+                    return Err(VendorError::with(
+                        format!(
+                            "Blob vendor {op} response is too large: {}",
+                            redact_url(url)
+                        ),
+                        Some(code),
+                        None,
+                    ))
+                }
+            }
+        }
+        Err(VendorError::with(
+            format!(
+                "Blob vendor {op} failed after {} attempts ({last_error}): {}",
+                retry.attempts(),
+                redact_url(url)
+            ),
+            status,
+            None,
+        ))
     }
 
     /// Send one request, retrying transport errors, 429 and 5xx with backoff.
@@ -696,9 +792,8 @@ impl VendorApi {
         op: &str,
         headers: &[(String, String)],
         body: Option<&[u8]>,
-        storage: bool,
     ) -> VResult<Reply> {
-        let client = if storage { &self.storage } else { &self.client };
+        let client = &self.client;
         let mut last_error = String::new();
         let mut status = None;
         for attempt in 0..self.max_attempts {
@@ -750,7 +845,7 @@ impl VendorApi {
                 );
                 continue;
             }
-            let body = read_capped(resp, u64::MAX).map_err(|_| {
+            let body = read_capped_blocking(resp).map_err(|_| {
                 VendorError::with(
                     format!("Blob vendor {op} body read failed: {}", redact_url(url)),
                     Some(code),
@@ -789,7 +884,7 @@ impl VendorApi {
         if content.is_some() {
             headers.push(("Content-Type".to_string(), "application/json".to_string()));
         }
-        let reply = self.send(method, &url, op, &headers, content.as_deref(), false)?;
+        let reply = self.send(method, &url, op, &headers, content.as_deref())?;
         if !(200..300).contains(&reply.status) {
             let (code, detail) = error_detail(&reply.body);
             return Err(VendorError::with(
@@ -961,13 +1056,12 @@ impl VendorApi {
         if let (Some(enc), false) = (content_encoding, has_encoding) {
             headers.push(("Content-Encoding".to_string(), enc.to_string()));
         }
-        let reply = self.send(
+        let reply = self.send_storage(
             reqwest::Method::PUT,
             &grant.upload_url,
             "upload",
             &headers,
             Some(data),
-            true,
         )?;
         if !(200..300).contains(&reply.status) {
             let code = s3_error_code(&reply.body);
@@ -985,27 +1079,26 @@ impl VendorApi {
         Ok(())
     }
 
-    /// GET a signed download URL, capped at `max_bytes`.
+    /// GET a signed download URL, capped at `max_bytes`. Connect errors,
+    /// stalls (also mid-body), resets, 429 and 5xx are retried; a body that
+    /// keeps arriving is read to the end however slowly it comes.
     fn download(&self, url: &str, max_bytes: u64) -> VResult<Vec<u8>> {
+        let retry = self.retry();
         let mut last = None;
-        for attempt in 0..self.max_attempts {
-            if attempt > 0 {
-                std::thread::sleep(
-                    self.backoff
-                        .saturating_mul(1 << (attempt - 1))
-                        .min(MAX_BACKOFF),
-                );
-            }
-            let resp = match self.storage.get(url).send() {
-                Ok(r) => r,
-                Err(_) => {
-                    last = Some(VendorError::new(format!(
-                        "Signed download failed (transport error): {}",
-                        redact_url(url)
-                    )));
-                    continue;
-                }
-            };
+        for attempt in 0..retry.attempts() {
+            retry.pause(attempt);
+            let resp: StorageResponse =
+                match self.storage.send(reqwest::Method::GET, url, &[], None) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        last = Some(VendorError::new(format!(
+                            "Signed download failed ({}): {}",
+                            e.label(),
+                            redact_url(url)
+                        )));
+                        continue;
+                    }
+                };
             let status = resp.status().as_u16();
             if status == 429 || status >= 500 {
                 last = Some(VendorError::with(
@@ -1016,7 +1109,7 @@ impl VendorApi {
                 continue;
             }
             if !(200..300).contains(&status) {
-                let body = read_capped(resp, 64 * 1024).unwrap_or_default();
+                let body = resp.read_capped(64 * 1024).unwrap_or_default();
                 let code = s3_error_code(&body);
                 return Err(VendorError::with(
                     format!(
@@ -1044,49 +1137,43 @@ impl VendorApi {
                     "Signed download is larger than max_fetch_bytes ({max_bytes})"
                 )));
             }
-            return read_capped(resp, max_bytes).map_err(|e| match e {
-                ReadError::TooLarge => VendorError::new(format!(
-                    "Signed download is larger than max_fetch_bytes ({max_bytes})"
-                )),
-                ReadError::Io => VendorError::new(format!(
-                    "Signed download body read failed: {}",
-                    redact_url(url)
-                )),
-            });
+            match resp.read_capped(max_bytes) {
+                Ok(body) => return Ok(body),
+                Err(ReadError::TooLarge) => {
+                    return Err(VendorError::new(format!(
+                        "Signed download is larger than max_fetch_bytes ({max_bytes})"
+                    )))
+                }
+                Err(ReadError::Transfer(e)) => {
+                    let e: TransferError = e;
+                    last = Some(VendorError::new(format!(
+                        "Signed download body {}: {}",
+                        e.label(),
+                        redact_url(url)
+                    )));
+                    tracing::debug!(
+                        "Signed download body {} (attempt {}/{}): {}",
+                        e.label(),
+                        attempt + 1,
+                        retry.attempts(),
+                        redact_url(url)
+                    );
+                    continue;
+                }
+            }
         }
         Err(last.unwrap_or_else(|| VendorError::new("Signed download failed")))
     }
 }
 
-enum ReadError {
-    TooLarge,
-    Io,
-}
-
-fn read_capped(
+/// Read a (small) vendor API response body.
+fn read_capped_blocking(
     mut resp: reqwest::blocking::Response,
-    max: u64,
-) -> std::result::Result<Vec<u8>, ReadError> {
+) -> std::result::Result<Vec<u8>, std::io::Error> {
+    use std::io::Read as _;
     let mut out = Vec::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = resp.read(&mut buf).map_err(|_| ReadError::Io)?;
-        if n == 0 {
-            return Ok(out);
-        }
-        if out.len() as u64 + n as u64 > max {
-            return Err(ReadError::TooLarge);
-        }
-        out.extend_from_slice(&buf[..n]);
-    }
-}
-
-/// A uniform `[0, 1)` value for retry jitter (no RNG dependency needed).
-fn rand_unit() -> f64 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(Instant::now().elapsed().as_nanos());
-    (h.finish() >> 11) as f64 / (1u64 << 53) as f64
+    resp.read_to_end(&mut out)?;
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1223,7 +1310,12 @@ impl VendorStorage {
         timeout: Duration,
         info_ttl: Duration,
     ) -> Result<Self> {
-        let api = Arc::new(VendorApi::new(url, token, timeout)?);
+        let api = Arc::new(VendorApi::new(
+            url,
+            token,
+            timeout,
+            TransferTimeouts::from_env(),
+        )?);
         let hosts = Arc::new(HostsValidator {
             api: api.clone(),
             ttl: info_ttl,
@@ -1235,6 +1327,14 @@ impl VendorStorage {
             purpose,
             pin: pin_hosts,
         })
+    }
+
+    /// Replace the storage-transfer timeouts (default:
+    /// [`TransferTimeouts::from_env`]).
+    #[must_use]
+    pub fn with_transfer_timeouts(self, timeouts: TransferTimeouts) -> Self {
+        let (api, hosts) = rebuild(&self.api, &self.hosts, timeouts);
+        VendorStorage { api, hosts, ..self }
     }
 
     /// Build from `VGI_BLOB_VENDOR_URL` and the vendor token variables.
@@ -1410,6 +1510,24 @@ impl ObjectStore for VendorStorage {
     }
 }
 
+/// A copy of `api` with a storage client for `timeouts`, and a fresh host pin
+/// over it.
+fn rebuild(
+    api: &Arc<VendorApi>,
+    hosts: &Arc<HostsValidator>,
+    timeouts: TransferTimeouts,
+) -> (Arc<VendorApi>, Arc<HostsValidator>) {
+    let mut copy = (**api).clone();
+    copy.storage = StorageClient::new(timeouts);
+    let api = Arc::new(copy);
+    let hosts = Arc::new(HostsValidator {
+        api: api.clone(),
+        ttl: hosts.ttl,
+        cache: Mutex::new(None),
+    });
+    (api, hosts)
+}
+
 // ---------------------------------------------------------------------------
 // VendorBlobClient
 // ---------------------------------------------------------------------------
@@ -1468,7 +1586,12 @@ impl VendorBlobClient {
         info_ttl: Duration,
         max_fetch_bytes: u64,
     ) -> Result<Self> {
-        let api = Arc::new(VendorApi::new(url, token, timeout)?);
+        let api = Arc::new(VendorApi::new(
+            url,
+            token,
+            timeout,
+            TransferTimeouts::from_env(),
+        )?);
         let hosts = Arc::new(HostsValidator {
             api: api.clone(),
             ttl: info_ttl,
@@ -1480,6 +1603,14 @@ impl VendorBlobClient {
             purpose,
             max_fetch_bytes,
         })
+    }
+
+    /// Replace the storage-transfer timeouts (default:
+    /// [`TransferTimeouts::from_env`]).
+    #[must_use]
+    pub fn with_transfer_timeouts(self, timeouts: TransferTimeouts) -> Self {
+        let (api, hosts) = rebuild(&self.api, &self.hosts, timeouts);
+        VendorBlobClient { api, hosts, ..self }
     }
 
     /// Build from `VGI_BLOB_VENDOR_URL` and the vendor token variables, or
@@ -1665,7 +1796,12 @@ impl VendorBlobClient {
 ///
 /// For a malformed vendor URL or an empty token.
 pub fn vendor_url_validator(url: &str, token: &str, ttl: Duration) -> Result<UrlValidator> {
-    let api = Arc::new(VendorApi::new(url, token, DEFAULT_TIMEOUT)?);
+    let api = Arc::new(VendorApi::new(
+        url,
+        token,
+        DEFAULT_TIMEOUT,
+        TransferTimeouts::default(),
+    )?);
     Ok(Arc::new(HostsValidator {
         api,
         ttl,

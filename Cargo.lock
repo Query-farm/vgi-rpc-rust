@@ -5339,7 +5339,9 @@ name = "vgi-rpc-s3"
 version = "0.33.0"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
  "chrono",
+ "http-body",
  "reqwest 0.12.28",
  "serde_json",
  "sha2 0.10.9",

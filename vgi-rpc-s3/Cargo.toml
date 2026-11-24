@@ -16,6 +16,11 @@ categories = ["network-programming"]
 vgi-rpc = { path = "../vgi-rpc", version = "0.33.0", default-features = false, features = ["http"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
+# Storage transfers (`transfer`): async reqwest on a small dedicated runtime,
+# so a transfer can have a stall timeout instead of a whole-request deadline.
+bytes.workspace = true
+http-body = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 # Blob-vendor client (`vendor`): JSON wire shapes, digests, expiry parsing.
 base64.workspace = true
 chrono.workspace = true

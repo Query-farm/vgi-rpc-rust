@@ -2,6 +2,31 @@
 
 All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
+## [Unreleased]
+
+### Fixed (vgi-rpc-s3, vgi-rpc-gcs: storage transfer timeouts)
+
+- **Large storage transfers no longer fail on slow links.** Every signed-URL
+  transfer (blob-vendor PUT and GET, `PresignedS3Storage` /
+  `SignedGcsStorage` PUT and object GET, `HttpFetcher` pointer fetches) used
+  `reqwest::blocking` with a 30 s whole-request timeout that also covered
+  sending the body, so a 100 MB upload at 2 MB/s failed after 3 attempts
+  (each resending the whole body). Transfers now run through
+  `vgi_rpc_s3::transfer::StorageClient`: a **30 s connect timeout**, a **30 s
+  stall timeout** (no request-body chunk taken by the connection, or no
+  response bytes, for that long; the body is fed in 64 KiB chunks so the
+  clock restarts per chunk) and **no total deadline**. Matches
+  vgi-rpc-python.
+- **`VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS`** (new, every SDK): the stall
+  timeout in seconds (default 30). Also `TransferTimeouts`,
+  `with_transfer_timeouts` on `VendorStorage`, `VendorBlobClient` and
+  `PresignedPutStorage`, and `HttpFetcher::with_timeouts`.
+- **Retries** (3 attempts, 0.25 s × 2^(n-1) backoff capped at 5 s, jitter
+  ×[0.5, 1.0)) on connect errors, stalls, resets, 429 and 5xx now also cover
+  a stall or reset mid-body on a download, and the S3/GCS backends and
+  `HttpFetcher` (which did not retry before). Vendor API calls (`/v1/info`,
+  `/v1/blobs/*`) keep their 30 s total timeout.
+
 ## [0.33.0] — 2026-11-23
 
 ### Added (protocol 3.4: large values, `STATE_REF_V1.md`)

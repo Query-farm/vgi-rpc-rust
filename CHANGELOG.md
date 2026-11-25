@@ -4,6 +4,8 @@ All notable changes to `vgi-rpc` (the Rust port) are listed here.
 
 ## [Unreleased]
 
+## [0.33.1] — 2026-11-25
+
 ### Added (protocol version negotiation, PROTOCOL_VERSIONS_V1)
 
 - **Server:** every HTTP response carries `VGI-Protocol-Versions:

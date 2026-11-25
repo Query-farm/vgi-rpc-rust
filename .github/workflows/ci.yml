@@ -316,10 +316,6 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: Query-farm/vgi-rpc-python
-          # TODO(release-wave): back to main once vgi-rpc-python's protocol-3.4
-          # branch (PROTOCOL_VERSIONS_V1: protocol_version_unsupported, the
-          # _protocol_versions_pytest.py groups) is merged and released.
-          ref: 1d40c513ebf4afa493437c34257951d76b39ce41
           path: vgi-python
 
       - uses: dtolnay/rust-toolchain@1.97.0

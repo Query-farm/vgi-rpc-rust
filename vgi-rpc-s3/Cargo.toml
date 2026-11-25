@@ -19,7 +19,7 @@ default = []
 aws = ["dep:aws-config", "dep:aws-smithy-http-client", "dep:aws-credential-types", "dep:aws-sigv4", "dep:aws-smithy-runtime-api", "dep:http"]
 
 [dependencies]
-vgi-rpc = { path = "../vgi-rpc", version = "0.33.0", default-features = false, features = ["http"] }
+vgi-rpc = { path = "../vgi-rpc", version = "0.33.1", default-features = false, features = ["http"] }
 # Both root stores: the bundled webpki roots and the platform's (or
 # SSL_CERT_FILE / SSL_CERT_DIR), so a private-CA MinIO or Ceph endpoint works.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "rustls-tls-native-roots"] }
